@@ -156,34 +156,11 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Variant of `copy_match` used with `inflateBack`. It does not attempt a chunked
-    /// copy, because there is no padding at the end.
+    /// Variant used by `inflateBack`. Match expansion itself needs no padding now,
+    /// so it shares the exact-copy implementation with ordinary inflate.
     #[inline(always)]
     pub fn copy_match_back(&mut self, offset_from_end: usize, length: usize) {
-        let capacity = self.buf.len();
-        let len = Ord::min(self.filled + length, capacity);
-        let buf = &mut self.buf.as_mut_slice()[..len];
-
-        let current = self.filled;
-        self.filled += length;
-
-        // Note also that the referenced string may overlap the current
-        // position; for example, if the last 2 bytes decoded have values
-        // X and Y, a string reference with <length = 5, distance = 2>
-        // adds X,Y,X,Y,X to the output stream.
-
-        match offset_from_end {
-            1 => {
-                // this will just repeat this value many times
-                let element = buf[current - 1];
-                buf[current..][..length].fill(element);
-            }
-            _ => {
-                for i in 0..length {
-                    buf[current + i] = buf[current - offset_from_end + i];
-                }
-            }
-        }
+        self.copy_match(offset_from_end, length);
     }
 }
 
