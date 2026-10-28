@@ -1,49 +1,9 @@
 //! The adler32 checksum algorithm.
 
-#[cfg(target_arch = "x86_64")]
-mod avx2;
-#[cfg(feature = "avx512")]
-#[cfg(target_arch = "x86_64")]
-mod avx512;
-#[cfg(feature = "avx512")]
-#[cfg(target_arch = "x86_64")]
-mod avx512_vnni;
-mod generic;
-#[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
-mod lsx;
-#[cfg(target_arch = "aarch64")]
-mod neon;
-#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
-mod wasm;
+mod simd;
 
 pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
-    #[cfg(feature = "avx512")]
-    #[cfg(target_arch = "x86_64")]
-    if cfg!(all(target_feature = "avx512f", target_feature = "avx512bw")) {
-        return avx512::adler32_avx512(start_checksum, data);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    if crate::cpu_features::is_enabled_avx2_and_bmi2() {
-        return avx2::adler32_avx2(start_checksum, data);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    if crate::cpu_features::is_enabled_neon() {
-        return self::neon::adler32_neon(start_checksum, data);
-    }
-
-    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
-    if crate::cpu_features::is_enabled_simd128() {
-        return self::wasm::adler32_wasm(start_checksum, data);
-    }
-
-    #[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
-    if crate::cpu_features::is_enabled_lsx() {
-        return self::lsx::adler32_lsx(start_checksum, data);
-    }
-
-    generic::adler32_rust(start_checksum, data)
+    simd::adler32(start_checksum, data)
 }
 
 pub(crate) fn adler32_fold_copy(start_checksum: u32, dst: &mut [u8], src: &[u8]) -> u32 {
@@ -113,7 +73,42 @@ mod test {
     fn naive_is_fancy_small_inputs() {
         for i in 0..128 {
             let v = (0u8..i).collect::<Vec<_>>();
-            assert_eq!(naive_adler32(1, &v), generic::adler32_rust(1, &v));
+            assert_eq!(naive_adler32(1, &v), adler32(1, &v));
+        }
+    }
+
+    quickcheck::quickcheck! {
+        fn portable_simd_matches_naive(data: Vec<u8>, start: u32) -> bool {
+            adler32(start, &data) == naive_adler32(start, &data)
+        }
+    }
+
+    #[test]
+    fn portable_simd_matches_naive_at_chunk_boundaries() {
+        const LENGTHS: &[usize] = &[
+            0,
+            1,
+            15,
+            16,
+            17,
+            NMAX as usize - 1,
+            NMAX as usize,
+            NMAX as usize + 1,
+            2 * NMAX as usize + 7,
+        ];
+
+        for &len in LENGTHS {
+            let data: Vec<_> = (0..len)
+                .map(|index| (index.wrapping_mul(131).wrapping_add(17) & 0xff) as u8)
+                .collect();
+
+            for start in [0, 1, 42, u32::MAX] {
+                assert_eq!(
+                    adler32(start, &data),
+                    naive_adler32(start, &data),
+                    "len={len}, start={start}"
+                );
+            }
         }
     }
 
