@@ -1402,7 +1402,7 @@ impl State<'_> {
 
                             if self.wrap & 4 != 0 {
                                 if self.gzip_flags != 0 {
-                                    self.crc_fold.fold(self.writer.filled(), self.checksum);
+                                    self.crc_fold.fold(self.writer.filled());
                                     self.checksum = self.crc_fold.finish();
                                 } else {
                                     self.checksum = adler32(self.checksum, self.writer.filled());

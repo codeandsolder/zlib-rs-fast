@@ -1701,7 +1701,7 @@ pub(crate) fn read_buf_window(stream: &mut DeflateStream, offset: usize, size: u
         unsafe { window.copy_and_initialize(offset..offset + len, stream.next_in) };
 
         let data = &stream.state.window.filled()[offset..][..len];
-        stream.state.crc_fold.fold(data, CRC32_INITIAL_VALUE);
+        stream.state.crc_fold.fold(data);
     } else if stream.state.wrap == 1 {
         // we likely cannot fuse the adler32 and the copy here because the input can be changed by
         // a concurrent thread. Therefore it cannot be converted into a slice!

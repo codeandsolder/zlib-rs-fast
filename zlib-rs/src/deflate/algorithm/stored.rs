@@ -268,7 +268,7 @@ fn read_buf_direct_copy(stream: &mut DeflateStream, size: usize) -> usize {
         unsafe { core::ptr::copy_nonoverlapping(stream.next_in, output, len) }
 
         let data = unsafe { core::slice::from_raw_parts(output, len) };
-        stream.state.crc_fold.fold(data, 0);
+        stream.state.crc_fold.fold(data);
     } else if stream.state.wrap == 1 {
         // we cannot fuse the adler and the copy in our case, because adler32 takes a slice.
         // Another process is allowed to concurrently modify stream.next_in, so we cannot turn it

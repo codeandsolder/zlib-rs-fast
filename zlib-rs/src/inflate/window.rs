@@ -110,7 +110,7 @@ impl<'a> Window<'a> {
 
             if update_checksum {
                 if flags != 0 {
-                    crc_fold.fold(non_window_slice, 0);
+                    crc_fold.fold(non_window_slice);
                     crc_fold.fold_copy(&mut self.buf.as_mut_slice()[..wsize], window_slice);
                 } else {
                     *checksum = adler32(*checksum, non_window_slice);
