@@ -1,5 +1,6 @@
 #![doc = core::include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![feature(portable_simd)]
 #![cfg_attr(
     all(any(miri, feature = "lsx"), target_arch = "loongarch64"),
     feature(stdarch_loongarch)
