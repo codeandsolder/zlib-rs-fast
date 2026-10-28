@@ -3,6 +3,9 @@ name: Benchmark
 permissions:
   contents: read
 
+env:
+  RUST_TOOLCHAIN: nightly-2026-08-01
+
 on:
   push:
     branches:
@@ -41,7 +44,6 @@ jobs:
             os: [benchmark, loong64, linux]
             target: "loongarch64-unknown-linux-musl"
             flags: "--features=lsx"
-            rust: nightly
     steps:
       - name: Checkout sources
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
@@ -52,7 +54,7 @@ jobs:
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ matrix.rust || 'stable' }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: "${{ matrix.target }}"
       - name: cargo build
         env:
