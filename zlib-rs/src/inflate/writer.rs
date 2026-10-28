@@ -2,7 +2,6 @@ use core::fmt;
 use core::mem::MaybeUninit;
 use core::ops::Range;
 
-use crate::cpu_features::CpuFeatures;
 use crate::weak_slice::WeakSliceMut;
 
 pub struct Writer<'a> {
@@ -104,90 +103,8 @@ impl<'a> Writer<'a> {
 
     #[inline(always)]
     pub fn extend_from_window(&mut self, window: &super::window::Window, range: Range<usize>) {
-        self.extend_from_window_with_features::<{ CpuFeatures::NONE }>(window, range)
-    }
-
-    pub fn extend_from_window_with_features<const FEATURES: usize>(
-        &mut self,
-        window: &super::window::Window,
-        range: Range<usize>,
-    ) {
-        match FEATURES {
-            #[cfg(target_arch = "x86_64")]
-            CpuFeatures::AVX2 => self.extend_from_window_help::<32>(window, range),
-            _ => self.extend_from_window_runtime_dispatch(window, range),
-        }
-    }
-
-    fn extend_from_window_runtime_dispatch(
-        &mut self,
-        window: &super::window::Window,
-        range: Range<usize>,
-    ) {
-        // NOTE: the dynamic check for avx512 makes avx2 slower. Measure this carefully before re-enabling
-        //
-        //        #[cfg(target_arch = "x86_64")]
-        //        if crate::cpu_features::is_enabled_avx512() {
-        //            return self.extend_from_window_help::<64>(window, range);
-        //        }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_avx2_and_bmi2() {
-            return self.extend_from_window_help::<32>(window, range);
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_sse() {
-            return self.extend_from_window_help::<16>(window, range);
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        if crate::cpu_features::is_enabled_neon() {
-            return self.extend_from_window_help::<16>(window, range);
-        }
-
-        #[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
-        if crate::cpu_features::is_enabled_lsx() {
-            return self.extend_from_window_help::<16>(window, range);
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        if crate::cpu_features::is_enabled_simd128() {
-            return self.extend_from_window_help::<16>(window, range);
-        }
-
-        self.extend_from_window_help::<8>(window, range)
-    }
-
-    #[inline(always)]
-    fn extend_from_window_help<const N: usize>(
-        &mut self,
-        window: &super::window::Window,
-        range: Range<usize>,
-    ) {
-        let len = range.end - range.start;
-
-        if self.remaining() >= len + N {
-            // SAFETY: we know that our window has at least a N extra bytes
-            // at the end, making it always safe to perform an (unaligned) Chunk read anywhere in
-            // the window slice.
-            //
-            // The calling function checks for CPU features requirements for C.
-            unsafe {
-                let src = window.as_ptr();
-                Self::copy_chunk_unchecked::<N>(
-                    src.wrapping_add(range.start).cast(),
-                    self.next_out(),
-                    len,
-                )
-            }
-        } else {
-            let buf = &window.as_slice()[range];
-            self.buf.as_mut_slice()[self.filled..][..buf.len()]
-                .copy_from_slice(slice_to_uninit(buf));
-        }
-
-        self.filled += len;
+        let src = &window.as_slice()[range];
+        self.extend(src);
     }
 
     /// Variant of `extend_from_window` used with `inflateBack`. It does not attempt a chunked
@@ -210,90 +127,32 @@ impl<'a> Writer<'a> {
 
     #[inline(always)]
     pub fn copy_match(&mut self, offset_from_end: usize, length: usize) {
-        self.copy_match_with_features::<{ CpuFeatures::NONE }>(offset_from_end, length)
-    }
-
-    #[inline(always)]
-    pub fn copy_match_with_features<const FEATURES: usize>(
-        &mut self,
-        offset_from_end: usize,
-        length: usize,
-    ) {
-        match FEATURES {
-            #[cfg(target_arch = "x86_64")]
-            CpuFeatures::AVX2 => self.copy_match_help::<32>(offset_from_end, length),
-            _ => self.copy_match_runtime_dispatch(offset_from_end, length),
-        }
-    }
-
-    fn copy_match_runtime_dispatch(&mut self, offset_from_end: usize, length: usize) {
-        // NOTE: the dynamic check for avx512 makes avx2 slower. Measure this carefully before re-enabling
-        //
-        //        #[cfg(target_arch = "x86_64")]
-        //        if crate::cpu_features::is_enabled_avx512() {
-        //            return self.copy_match_help::<core::arch::x86_64::__m512i>(offset_from_end, length);
-        //        }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_avx2_and_bmi2() {
-            return self.copy_match_help::<32>(offset_from_end, length);
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_sse() {
-            return self.copy_match_help::<16>(offset_from_end, length);
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        if crate::cpu_features::is_enabled_neon() {
-            return self.copy_match_help::<16>(offset_from_end, length);
-        }
-
-        #[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
-        if crate::cpu_features::is_enabled_lsx() {
-            return self.copy_match_help::<16>(offset_from_end, length);
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        if crate::cpu_features::is_enabled_simd128() {
-            return self.copy_match_help::<16>(offset_from_end, length);
-        }
-
-        self.copy_match_help::<8>(offset_from_end, length)
-    }
-
-    #[inline(always)]
-    fn copy_match_help<const N: usize>(&mut self, offset_from_end: usize, length: usize) {
-        let capacity = self.buf.len();
-        let len = Ord::min(self.filled + length + N, capacity);
-        let buf = &mut self.buf.as_mut_slice()[..len];
-
         let current = self.filled;
-        self.filled += length;
+        let start = current
+            .checked_sub(offset_from_end)
+            .expect("match distance in bounds");
+        let end = current.checked_add(length).expect("match length in bounds");
+        assert!(end <= self.capacity(), "match fits output buffer");
 
-        // Note also that the referenced string may overlap the current
-        // position; for example, if the last 2 bytes decoded have values
-        // X and Y, a string reference with <length = 5, distance = 2>
-        // adds X,Y,X,Y,X to the output stream.
+        let buf = self.buf.as_mut_slice();
+        self.filled = end;
 
+        // DEFLATE matches may overlap their output. `copy_within` has memmove semantics,
+        // which is not enough for a match longer than its distance: newly written bytes
+        // become the source for later bytes. Seed at most one distance, then repeatedly
+        // double the initialized prefix. This expresses that recurrence directly without
+        // architecture dispatch or copying past the logical end of the match.
         if length > offset_from_end {
-            match offset_from_end {
-                1 => {
-                    // this will just repeat this value many times
-                    let element = buf[current - 1];
-                    buf[current..][..length].fill(element);
-                }
-                _ => {
-                    // there is a SIMD implementation of this logic, which _should_ be faster, but
-                    // isn't in measurements on x86_64. It still might be for other architectures,
-                    // adds a lot of complexity and unsafe code.
-                    for i in 0..length {
-                        buf[current + i] = buf[current - offset_from_end + i];
-                    }
-                }
+            let seed_len = length.min(offset_from_end);
+            buf.copy_within(start..start + seed_len, current);
+            let mut initialized = seed_len;
+            while initialized < length {
+                let copy_len = initialized.min(length - initialized);
+                buf.copy_within(current..current + copy_len, current + initialized);
+                initialized += copy_len;
             }
         } else {
-            Self::copy_chunked_within::<N>(buf, capacity, current, offset_from_end, length);
+            buf.copy_within(start..start + length, current);
         }
     }
 
@@ -326,90 +185,6 @@ impl<'a> Writer<'a> {
             }
         }
     }
-
-    #[inline(always)]
-    fn copy_chunked_within<const N: usize>(
-        buf: &mut [MaybeUninit<u8>],
-        capacity: usize,
-        current: usize,
-        offset_from_end: usize,
-        length: usize,
-    ) {
-        let start = current.checked_sub(offset_from_end).expect("in bounds");
-
-        if current + length + N < capacity {
-            let ptr = buf.as_mut_ptr();
-            // SAFETY: if statement and checked_sub ensures we stay in bounds.
-            unsafe { Self::copy_chunk_unchecked::<N>(ptr.add(start), ptr.add(current), length) }
-        } else {
-            // a full simd copy does not fit in the output buffer
-            buf.copy_within(start..start + length, current);
-        }
-    }
-
-    /// # Safety
-    ///
-    /// `src..src + length` must be safe to perform reads in chunks of N elements until
-    /// `src + length` is reached. `dst` must be safe to (unaligned) write that number of chunks.
-    #[inline(always)]
-    unsafe fn copy_chunk_unchecked<const N: usize>(
-        mut src: *const MaybeUninit<u8>,
-        mut dst: *mut MaybeUninit<u8>,
-        length: usize,
-    ) {
-        if length == 0 {
-            return;
-        }
-
-        // SAFETY: The caller ensured that src + length is within (or just at the end of)
-        // a readable range of bytes. LLVM disallows allocations bigger than isize::MAX,
-        // so if src..src+length is a valid allocation (a precondition of this function)
-        // the length will never exceed isize::MAX.
-        let end = unsafe { src.add(length) };
-
-        // SAFETY: We checked above that length != 0, so there is at least one chunk remaining.
-        let chunk = unsafe { load_chunk::<N>(src) };
-        unsafe { store_chunk::<N>(dst, chunk) };
-
-        // SAFETY: src and dest haven't been modified yet, and we checked above that
-        // length != 0, so adding one chunk (N bytes) to both src and dst will result in
-        // a pointer in (or just at the end of) each of the underlying buffers.
-        src = unsafe { src.add(N) };
-        dst = unsafe { dst.add(N) };
-
-        while src < end {
-            // SAFETY: The caller ensured that src and dst contain enough bytes to support
-            // reads (from src) or writes (to dst) up to and including the chunk that contains
-            // end. Note that, if length is not a multiple of N, we will copy up to N-1 bytes
-            // past end.
-            let chunk = unsafe { load_chunk::<N>(src) };
-            unsafe { store_chunk::<N>(dst, chunk) };
-
-            // SAFETY: Because src is currently < end, we have at least one more chunk available
-            // to copy, so there is room to advance the pointers by N within both the src and
-            // dst bufs.
-            src = unsafe { src.add(N) };
-            dst = unsafe { dst.add(N) };
-        }
-    }
-}
-
-/// # Safety
-///
-/// Must be valid to read a `[u8; N]` value from `from` with an unaligned read.
-#[inline(always)]
-unsafe fn load_chunk<const N: usize>(from: *const MaybeUninit<u8>) -> [MaybeUninit<u8>; N] {
-    // SAFETY: Checked by the caller.
-    unsafe { core::ptr::read_unaligned(from.cast::<[MaybeUninit<u8>; N]>()) }
-}
-
-/// # Safety
-///
-/// Must be valid to write a `[u8; N]` value to `out` with an unaligned write.
-#[inline(always)]
-unsafe fn store_chunk<const N: usize>(out: *mut MaybeUninit<u8>, chunk: [MaybeUninit<u8>; N]) {
-    // SAFETY: checked by the caller.
-    unsafe { core::ptr::write_unaligned(out.cast(), chunk) }
 }
 
 impl fmt::Debug for Writer<'_> {
@@ -430,8 +205,8 @@ fn slice_to_uninit(slice: &[u8]) -> &[MaybeUninit<u8>] {
 mod test {
     use super::*;
 
-    const N: usize = 128;
-    const M: usize = 64;
+    const N: usize = 512;
+    const M: usize = 128;
 
     fn test_array() -> [MaybeUninit<u8>; N] {
         core::array::from_fn(|i| MaybeUninit::new(if i < M { i as u8 } else { 0xAAu8 }))
@@ -451,8 +226,8 @@ mod test {
             naive[M + i] = naive[M - offset_from_end + i];
         }
 
-        let buf = unsafe { core::mem::transmute::<[MaybeUninit<u8>; 128], [u8; N]>(buf) };
-        let naive = unsafe { core::mem::transmute::<[MaybeUninit<u8>; 128], [u8; N]>(naive) };
+        let buf = unsafe { core::mem::transmute::<[MaybeUninit<u8>; N], [u8; N]>(buf) };
+        let naive = unsafe { core::mem::transmute::<[MaybeUninit<u8>; N], [u8; N]>(naive) };
         assert_eq!(
             buf[M..][..length],
             naive[M..][..length],
@@ -461,67 +236,33 @@ mod test {
     }
 
     #[test]
-    fn copy_chunk_unchecked() {
-        let offset_from_end = 17;
-        let length = 17;
-
-        macro_rules! helper {
-            ($func:expr) => {
-                let mut buf = test_array();
-                let mut writer = Writer {
-                    buf: unsafe { WeakSliceMut::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) },
-                    filled: M,
-                };
-
-                $func(&mut writer, offset_from_end, length);
-            };
+    fn copy_match_boundaries_and_overlap() {
+        for &(distance, length) in &[
+            (1, 1),
+            (1, 64),
+            (2, 63),
+            (3, 64),
+            (7, 31),
+            (16, 16),
+            (17, 33),
+            (64, 64),
+        ] {
+            test_copy_match(distance, length);
         }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_avx512() {
-            helper!(Writer::copy_match_help::<64>);
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_avx2_and_bmi2() {
-            helper!(Writer::copy_match_help::<32>);
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu_features::is_enabled_sse() {
-            helper!(Writer::copy_match_help::<16>);
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        if crate::cpu_features::is_enabled_neon() {
-            helper!(Writer::copy_match_help::<16>);
-        }
-
-        #[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
-        if crate::cpu_features::is_enabled_lsx() {
-            helper!(Writer::copy_match_help::<16>);
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        if crate::cpu_features::is_enabled_simd128() {
-            helper!(Writer::copy_match_help::<16>);
-        }
-
-        helper!(Writer::copy_match_help::<8>);
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "slow")]
     fn copy_match() {
-        for offset_from_end in 1..=64 {
-            for length in 0..=64 {
+        for offset_from_end in 1..=M {
+            for length in 0..=258 {
                 test_copy_match(offset_from_end, length)
             }
         }
     }
 
     #[test]
-    fn copy_match_insufficient_space_for_simd() {
+    fn copy_match_at_exact_buffer_end() {
         let mut buf = [1, 2, 3, 0xAA, 0xAA].map(MaybeUninit::new);
         let mut writer = Writer {
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) },

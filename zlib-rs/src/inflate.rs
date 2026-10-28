@@ -15,7 +15,6 @@ mod writer;
 
 use crate::allocate::Allocator;
 use crate::c_api::internal_state;
-use crate::cpu_features::CpuFeatures;
 use crate::{
     adler32::adler32,
     c_api::{gz_header, z_checksum, z_size, z_stream, Z_DEFLATED},
@@ -1878,36 +1877,8 @@ impl State<'_> {
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
 unsafe fn inflate_fast_help(state: &mut State, start: usize) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    if crate::cpu_features::is_enabled_avx2_and_bmi2() {
-        // SAFETY: we've verified the target features and the caller ensured enough bytes_remaining
-        return unsafe { inflate_fast_help_avx2(state, start) };
-    }
-
-    // SAFETY: The caller ensured enough bytes_remaining
-    unsafe { inflate_fast_help_vanilla(state, start) };
-}
-
-/// # Safety
-///
-/// `state.bit_reader` must have at least 15 bytes available to read, as
-/// indicated by `state.bit_reader.bytes_remaining() >= 15`
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-#[target_feature(enable = "bmi2")]
-#[target_feature(enable = "bmi1")]
-unsafe fn inflate_fast_help_avx2(state: &mut State, start: usize) {
-    // SAFETY: `bytes_remaining` checked by our caller
-    unsafe { inflate_fast_help_impl::<{ CpuFeatures::AVX2 }>(state, start) };
-}
-
-/// # Safety
-///
-/// `state.bit_reader` must have at least 15 bytes available to read, as
-/// indicated by `state.bit_reader.bytes_remaining() >= 15`
-unsafe fn inflate_fast_help_vanilla(state: &mut State, start: usize) {
-    // SAFETY: `bytes_remaining` checked by our caller
-    unsafe { inflate_fast_help_impl::<{ CpuFeatures::NONE }>(state, start) };
+    // SAFETY: The caller ensured enough bytes remain for the fast decoder.
+    unsafe { inflate_fast_help_impl(state, start) };
 }
 
 /// # Safety
@@ -1915,7 +1886,7 @@ unsafe fn inflate_fast_help_vanilla(state: &mut State, start: usize) {
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
 #[inline(always)]
-unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _start: usize) {
+unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
     let mut bit_reader = BitReader::new(&[]);
     core::mem::swap(&mut bit_reader, &mut state.bit_reader);
     debug_assert!(bit_reader.bytes_remaining() >= 15);
@@ -2080,32 +2051,23 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                                     // window, and part of it has wrapped around to the start. Copy
                                     // the end section here, the start section will be copied below.
                                     len -= op as u16;
-                                    writer.extend_from_window_with_features::<FEATURES>(
-                                        &state.window,
-                                        from..from + op,
-                                    );
+                                    writer.extend_from_window(&state.window, from..from + op);
                                     from = 0;
                                     op = window_next;
                                 }
                             }
 
                             let copy = Ord::min(op, len as usize);
-                            writer.extend_from_window_with_features::<FEATURES>(
-                                &state.window,
-                                from..from + copy,
-                            );
+                            writer.extend_from_window(&state.window, from..from + copy);
 
                             if op < len as usize {
                                 // here we need some bytes from the output itself
-                                writer.copy_match_with_features::<FEATURES>(
-                                    dist as usize,
-                                    len as usize - op,
-                                );
+                                writer.copy_match(dist as usize, len as usize - op);
                             }
                         } else if extra_safe {
                             todo!()
                         } else {
-                            writer.copy_match_with_features::<FEATURES>(dist as usize, len as usize)
+                            writer.copy_match(dist as usize, len as usize)
                         }
                     } else if (op & 64) == 0 {
                         // 2nd level distance code
