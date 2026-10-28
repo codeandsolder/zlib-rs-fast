@@ -1,350 +1,368 @@
-use crate::deflate::{Pos, State, MIN_LOOKAHEAD, STD_MAX_MATCH, STD_MIN_MATCH};
+#![forbid(unsafe_code)]
+
+use crate::deflate::{Pos, State, STD_MAX_MATCH, STD_MIN_MATCH};
 
 const EARLY_EXIT_TRIGGER_LEVEL: i8 = 5;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SearchCursor {
+    /// Position stored in the hash chain. For slow matching this may point at
+    /// an interior substring of the candidate rather than its first byte.
+    hash_pos: Pos,
+    /// Offset of `hash_pos` from the beginning of the candidate.
+    offset: usize,
+}
+
+impl SearchCursor {
+    fn candidate_start(self) -> Option<usize> {
+        usize::from(self.hash_pos).checked_sub(self.offset)
+    }
+}
+
 /// Find the (length, offset) in the window of the longest match for the string
-/// at offset cur_match
-pub fn longest_match(state: &crate::deflate::State, cur_match: u16) -> (usize, u16) {
+/// at offset `cur_match`.
+pub fn longest_match(state: &State, cur_match: u16) -> (usize, u16) {
     longest_match_help::<false>(state, cur_match)
 }
 
-pub fn longest_match_slow(state: &crate::deflate::State, cur_match: u16) -> (usize, u16) {
+pub fn longest_match_slow(state: &State, cur_match: u16) -> (usize, u16) {
     longest_match_help::<true>(state, cur_match)
 }
 
-fn longest_match_help<const SLOW: bool>(
-    state: &crate::deflate::State,
-    mut cur_match: u16,
-) -> (usize, u16) {
-    let mut match_start = state.match_start;
-
+fn longest_match_help<const SLOW: bool>(state: &State, cur_match: Pos) -> (usize, Pos) {
     let strstart = state.strstart;
-    let wmask = state.w_mask();
-    let window = state.window.filled();
-    let scan = &window[strstart..];
-
-    // Elide bounds checks in the loop.
-    let prev = &state.prev.as_slice()[..=wmask];
-    let mut limit: Pos;
-    let limit_base: Pos;
-    let early_exit: bool;
-
-    let mut chain_length: u16;
-    let mut best_len: usize;
-
     let lookahead = state.lookahead;
-    let mut match_offset = 0;
+    let initialized_end = strstart
+        .checked_add(lookahead)
+        .expect("deflate window position overflow");
+    let window = state.window.filled();
+    let initialized = window
+        .get(..initialized_end)
+        .expect("lookahead extends beyond the deflate window");
+    let scan = &initialized[strstart..];
+    let prev = &state.prev.as_slice()[..=state.w_mask()];
+    let wmask = state.w_mask();
+    let limit_base = strstart.saturating_sub(state.max_dist());
 
-    macro_rules! goto_next_in_chain {
-        () => {
-            chain_length -= 1;
-            if chain_length > 0 {
-                cur_match = prev[cur_match as usize & wmask];
-
-                if cur_match > limit {
-                    continue;
-                }
-            }
-
-            return (best_len, match_start);
-        };
-    }
-
-    // The code is optimized for STD_MAX_MATCH-2 multiple of 16.
-    assert_eq!(STD_MAX_MATCH, 258, "Code too clever");
-
-    // length of the previous match (if any), hence <= STD_MAX_MATCH
-    best_len = if state.prev_length > 0 {
-        state.prev_length as usize
+    let mut best_len = if state.prev_length > 0 {
+        usize::from(state.prev_length)
     } else {
         STD_MIN_MATCH - 1
     };
+    let mut match_start = state.match_start;
 
-    // Calculate read offset which should only extend an extra byte to find the next best match length.
-    let mut offset = best_len - 1;
-    if best_len >= core::mem::size_of::<u32>() {
-        offset -= 2;
-        if best_len >= core::mem::size_of::<u64>() {
-            offset -= 4;
-        }
+    // A previous lazy match can be longer than the input remaining at end of
+    // stream. There is then no candidate that can improve it.
+    if best_len >= lookahead {
+        return (lookahead, match_start);
     }
 
-    let mut mbase_start = window.as_ptr();
-    let mut mbase_end = window[offset..].as_ptr();
-
-    // Don't waste too much time by following a chain if we already have a good match
-    chain_length = state.max_chain_length;
-    if best_len >= state.good_match as usize {
-        chain_length >>= 2;
+    let mut chain_remaining = state.max_chain_length;
+    if best_len >= usize::from(state.good_match) {
+        chain_remaining >>= 2;
     }
-    let nice_match = state.nice_match;
-
-    // Stop when cur_match becomes <= limit. To simplify the code,
-    // we prevent matches with the string of window index 0
-    limit = strstart.saturating_sub(state.max_dist()) as Pos;
-
-    // look for a better string offset
-    if SLOW {
-        limit_base = limit;
-
-        if best_len >= STD_MIN_MATCH {
-            /* We're continuing search (lazy evaluation). */
-            let mut pos: Pos;
-
-            // Find a most distant chain starting from scan with index=1 (index=0 corresponds
-            // to cur_match). We cannot use s->prev[strstart+1,...] immediately, because
-            // these strings are not yet inserted into the hash table.
-            let Some([_cur_match, scan1, scan2, scanrest @ ..]) = scan.get(..best_len + 1) else {
-                panic!("invalid scan");
-            };
-
-            let mut hash = 0;
-            hash = state.update_hash(hash, *scan1 as u32);
-            hash = state.update_hash(hash, *scan2 as u32);
-
-            for (i, b) in scanrest.iter().enumerate() {
-                hash = state.update_hash(hash, *b as u32);
-
-                /* If we're starting with best_len >= 3, we can use offset search. */
-                pos = state.head.as_slice()[hash as usize];
-                if pos < cur_match {
-                    match_offset = (i + 1) as Pos;
-                    cur_match = pos;
-                }
-            }
-
-            /* Update offset-dependent variables */
-            limit = limit_base + match_offset;
-            if cur_match <= limit {
-                return break_matching(state, best_len, match_start);
-            }
-
-            mbase_start = mbase_start.wrapping_sub(match_offset as usize);
-            mbase_end = mbase_end.wrapping_sub(match_offset as usize);
-        }
-
-        early_exit = false;
-    } else {
-        // must initialize this variable
-        limit_base = 0;
-        early_exit = state.level < EARLY_EXIT_TRIGGER_LEVEL;
+    if chain_remaining == 0 {
+        return break_matching(state, best_len, match_start);
     }
 
-    let scan_start = window[strstart..].as_ptr();
-    let mut scan_end = window[strstart + offset..].as_ptr();
+    let mut cursor = SearchCursor {
+        hash_pos: cur_match,
+        offset: 0,
+    };
 
-    assert!(
-        strstart <= state.window_size.saturating_sub(MIN_LOOKAHEAD),
-        "need lookahead"
-    );
+    if SLOW && best_len >= STD_MIN_MATCH {
+        let Some(next) = initial_slow_cursor(state, scan, best_len, cursor, limit_base) else {
+            return break_matching(state, best_len, match_start);
+        };
+        cursor = next;
+    }
+
+    let early_exit = !SLOW && state.level < EARLY_EXIT_TRIGGER_LEVEL;
 
     loop {
-        if cur_match as usize >= strstart {
+        let Some(candidate_start) = cursor.candidate_start() else {
+            break;
+        };
+        if candidate_start >= strstart {
             break;
         }
 
-        // Skip to next match if the match length cannot increase or if the match length is
-        // less than 2. Note that the checks below for insufficient lookahead only occur
-        // occasionally for performance reasons.
-        // Therefore uninitialized memory will be accessed and conditional jumps will be made
-        // that depend on those values. However the length of the match is limited to the
-        // lookahead, so the output of deflate is not affected by the uninitialized values.
-
-        /// # Safety
-        ///
-        /// The two pointers must be valid for reads of N bytes.
-        #[inline(always)]
-        unsafe fn memcmp_n_ptr<const N: usize>(src0: *const u8, src1: *const u8) -> bool {
-            unsafe {
-                let src0_cmp = core::ptr::read(src0 as *const [u8; N]);
-                let src1_cmp = core::ptr::read(src1 as *const [u8; N]);
-                src0_cmp == src1_cmp
-            }
+        let max_len = lookahead.min(STD_MAX_MATCH);
+        if best_len >= max_len {
+            break;
         }
 
-        /// # Safety
-        ///
-        /// scan_start and scan_end must be valid for reads of N bytes. mbase_end and mbase_start
-        /// must be valid for reads of N + cur_match bytes.
-        #[inline(always)]
-        unsafe fn is_match<const N: usize>(
-            cur_match: u16,
-            mbase_start: *const u8,
-            mbase_end: *const u8,
-            scan_start: *const u8,
-            scan_end: *const u8,
-        ) -> bool {
-            let be = mbase_end.wrapping_add(cur_match as usize);
-            let bs = mbase_start.wrapping_add(cur_match as usize);
-            unsafe { memcmp_n_ptr::<N>(be, scan_end) && memcmp_n_ptr::<N>(bs, scan_start) }
-        }
+        let candidate = &initialized[candidate_start..candidate_start + max_len];
+        let scan = &scan[..max_len];
 
-        // first, do a quick check on the start and end bytes. Go to the next item in the chain if
-        // these bytes don't match.
-        // SAFETY: we read up to 8 bytes in this block.
-        // Note that scan_start >= mbase_start and scan_end >= mbase_end.
-        // the surrounding loop breaks before cur_match gets past strstart, which is bounded by
-        // `window_size - 258 + 3 + 1` (`window_size - MIN_LOOKAHEAD`).
-        //
-        // With 262 bytes of space at the end, and 8 byte reads of scan_start is always in-bounds.
-        //
-        // scan_end is a bit trickier: it reads at a bounded offset from scan_start:
-        //
-        // - >= 8: scan_end is bounded by `258 - (4 + 2 + 1)`, so an 8-byte read is in-bounds
-        // - >= 4: scan_end is bounded by `258 - (2 + 1)`, so a 4-byte read is in-bounds
-        // - >= 2: scan_end is bounded by `258 - 1`, so a 2-byte read is in-bounds
-        let mut len = 0;
-        unsafe {
-            if best_len < core::mem::size_of::<u64>() {
-                let scan_val = u64::from_ne_bytes(
-                    core::slice::from_raw_parts(scan_start, 8)
-                        .try_into()
-                        .unwrap(),
-                );
-                loop {
-                    let bs = mbase_start.wrapping_add(cur_match as usize);
-                    let match_val =
-                        u64::from_ne_bytes(core::slice::from_raw_parts(bs, 8).try_into().unwrap());
-                    let cmp = scan_val ^ match_val;
-                    if cmp == 0 {
-                        // The first 8 bytes all matched. Additional scanning will be needed
-                        // (the compare256 call below) to determine the full match length.
-                        break;
-                    }
-                    // Compute the number of leading bytes that match.
-                    let cmp_len = cmp.to_le().trailing_zeros() as usize / 8;
-                    if cmp_len > best_len {
-                        // The match is fully contained within the 8 bytes just compared,
-                        // so we know the match length without needing to do the more
-                        // expensive compare256 operation.
-                        len = cmp_len;
-                        break;
-                    }
-                    goto_next_in_chain!();
-                }
-            } else {
-                loop {
-                    if is_match::<8>(cur_match, mbase_start, mbase_end, scan_start, scan_end) {
-                        break;
-                    }
-
-                    goto_next_in_chain!();
-                }
-            }
-        }
-
-        // we know that there is at least some match. Now count how many bytes really match
-        if len == 0 {
-            len = {
-                // SAFETY: cur_match is bounded by window_size - MIN_LOOKAHEAD, where MIN_LOOKAHEAD
-                // is 258 + 3 + 1, so 258-byte reads of mbase_start are in-bounds.
-                let src1 = unsafe {
-                    core::slice::from_raw_parts(
-                        mbase_start.wrapping_add(cur_match as usize + 2),
-                        256,
-                    )
-                };
-
-                crate::deflate::compare256::compare256_slice(&scan[2..], src1) + 2
+        // Reject candidates that provably cannot improve the current best
+        // before doing the full prefix comparison. The probes are entirely
+        // inside initialized input; unlike the old pointer path they never
+        // depend on bytes beyond lookahead.
+        if !could_beat_best(scan, candidate, best_len) {
+            let Some(next) = next_in_chain(cursor, prev, wmask, limit_base, &mut chain_remaining)
+            else {
+                break;
             };
+            cursor = next;
+            continue;
         }
 
-        assert!(
-            scan.as_ptr() as usize + len <= window.as_ptr() as usize + (state.window_size - 1),
-            "wild scan"
-        );
+        let len = common_match_length(scan, candidate);
 
         if len > best_len {
-            match_start = cur_match - match_offset;
+            match_start = candidate_start as Pos;
 
-            // Do not look for better matches if the current match reaches
-            // or exceeds the end of the input. See also #459.
             if len >= lookahead {
                 return (lookahead, match_start);
             }
+
             best_len = len;
-            if best_len >= nice_match as usize {
+            if best_len >= usize::from(state.nice_match) {
                 return (best_len, match_start);
             }
 
-            offset = best_len - 1;
-            if best_len >= core::mem::size_of::<u32>() {
-                offset -= 2;
-                if best_len >= core::mem::size_of::<u64>() {
-                    offset -= 4;
-                }
-            }
-
-            scan_end = window[strstart + offset..].as_ptr();
-
-            // Look for a better string offset
-            if SLOW && len > STD_MIN_MATCH && match_start as usize + len < strstart {
-                let mut pos: Pos;
-                // uint32_t i, hash;
-                // unsigned char *scan_endstr;
-
-                /* Go back to offset 0 */
-                cur_match -= match_offset;
-                match_offset = 0;
-                let mut next_pos = cur_match;
-
-                for i in 0..=len - STD_MIN_MATCH {
-                    pos = prev[(cur_match as usize + i) & wmask];
-                    if pos < next_pos {
-                        /* Hash chain is more distant, use it */
-                        if pos <= limit_base + i as Pos {
-                            return break_matching(state, best_len, match_start);
-                        }
-                        next_pos = pos;
-                        match_offset = i as Pos;
-                    }
-                }
-                /* Switch cur_match to next_pos chain */
-                cur_match = next_pos;
-
-                /* Try hash head at len-(STD_MIN_MATCH-1) position to see if we could get
-                 * a better cur_match at the end of string. Using (STD_MIN_MATCH-1) lets
-                 * us include one more byte into hash - the byte which will be checked
-                 * in main loop now, and which allows to grow match by 1.
-                 */
-                let [scan0, scan1, scan2, ..] = scan[len - (STD_MIN_MATCH + 1)..] else {
-                    panic!("index out of bounds");
+            // The high-compression search can jump into a more distant chain
+            // rooted at an interior substring of the match. Keep that heuristic,
+            // but represent the rebasing explicitly instead of manufacturing
+            // pointers before the window allocation.
+            if SLOW && len > STD_MIN_MATCH && candidate_start + len < strstart {
+                let Some(next) =
+                    next_slow_cursor(state, scan, candidate_start, len, limit_base, wmask)
+                else {
+                    return break_matching(state, best_len, match_start);
                 };
-
-                let mut hash = 0;
-                hash = state.update_hash(hash, scan0 as u32);
-                hash = state.update_hash(hash, scan1 as u32);
-                hash = state.update_hash(hash, scan2 as u32);
-
-                pos = state.head.as_slice()[hash as usize];
-                if pos < cur_match {
-                    match_offset = (len - (STD_MIN_MATCH + 1)) as Pos;
-                    if pos <= limit_base + match_offset {
-                        return break_matching(state, best_len, match_start);
-                    }
-                    cur_match = pos;
-                }
-
-                /* Update offset-dependent variables */
-                limit = limit_base + match_offset;
-                mbase_start = window.as_ptr().wrapping_sub(match_offset as usize);
-                mbase_end = mbase_start.wrapping_add(offset);
+                cursor = next;
                 continue;
             }
-
-            mbase_end = mbase_start.wrapping_add(offset);
-        } else if !SLOW && early_exit {
-            // The probability of finding a match later if we here is pretty low, so for
-            // performance it's best to outright stop here for the lower compression levels
+        } else if early_exit {
             break;
         }
 
-        goto_next_in_chain!();
+        let Some(next) = next_in_chain(cursor, prev, wmask, limit_base, &mut chain_remaining)
+        else {
+            break;
+        };
+        cursor = next;
     }
 
     (best_len, match_start)
 }
 
-fn break_matching(state: &State, best_len: usize, match_start: u16) -> (usize, u16) {
-    (Ord::min(best_len, state.lookahead), match_start)
+fn initial_slow_cursor(
+    state: &State,
+    scan: &[u8],
+    best_len: usize,
+    mut cursor: SearchCursor,
+    limit_base: usize,
+) -> Option<SearchCursor> {
+    let probe = scan.get(..best_len + 1)?;
+    let mut hash = 0;
+    hash = state.update_hash(hash, u32::from(probe[1]));
+    hash = state.update_hash(hash, u32::from(probe[2]));
+
+    // Each update below hashes the next three-byte substring beginning at
+    // offsets 1..=best_len-2. Prefer a more distant chain exactly as the old
+    // slow matcher did.
+    for (index, byte) in probe[3..].iter().enumerate() {
+        hash = state.update_hash(hash, u32::from(*byte));
+        let hash_pos = state.head.as_slice()[hash as usize];
+        if hash_pos < cursor.hash_pos {
+            cursor = SearchCursor {
+                hash_pos,
+                offset: index + 1,
+            };
+        }
+    }
+
+    (usize::from(cursor.hash_pos) > limit_base + cursor.offset).then_some(cursor)
+}
+
+fn next_slow_cursor(
+    state: &State,
+    scan: &[u8],
+    candidate_start: usize,
+    match_len: usize,
+    limit_base: usize,
+    wmask: usize,
+) -> Option<SearchCursor> {
+    let prev = state.prev.as_slice();
+    let mut next = SearchCursor {
+        hash_pos: candidate_start as Pos,
+        offset: 0,
+    };
+
+    for offset in 0..=match_len - STD_MIN_MATCH {
+        let hash_pos = prev[(candidate_start + offset) & wmask];
+        if hash_pos < next.hash_pos {
+            if usize::from(hash_pos) <= limit_base + offset {
+                return None;
+            }
+            next = SearchCursor { hash_pos, offset };
+        }
+    }
+
+    // Also inspect the current hash head near the end of the match. Using
+    // MIN_MATCH + 1 leaves one byte for the main comparison to extend by.
+    let offset = match_len - (STD_MIN_MATCH + 1);
+    let bytes = scan.get(offset..offset + STD_MIN_MATCH)?;
+    let mut hash = 0;
+    for byte in bytes {
+        hash = state.update_hash(hash, u32::from(*byte));
+    }
+    let hash_pos = state.head.as_slice()[hash as usize];
+    if hash_pos < next.hash_pos {
+        if usize::from(hash_pos) <= limit_base + offset {
+            return None;
+        }
+        next = SearchCursor { hash_pos, offset };
+    }
+
+    Some(next)
+}
+
+fn next_in_chain(
+    cursor: SearchCursor,
+    prev: &[Pos],
+    wmask: usize,
+    limit_base: usize,
+    chain_remaining: &mut u16,
+) -> Option<SearchCursor> {
+    *chain_remaining -= 1;
+    if *chain_remaining == 0 {
+        return None;
+    }
+
+    let hash_pos = prev[usize::from(cursor.hash_pos) & wmask];
+    (usize::from(hash_pos) > limit_base + cursor.offset)
+        .then_some(SearchCursor { hash_pos, ..cursor })
+}
+
+#[inline]
+fn could_beat_best(scan: &[u8], candidate: &[u8], best_len: usize) -> bool {
+    debug_assert_eq!(scan.len(), candidate.len());
+    debug_assert!(best_len < scan.len());
+
+    let prefix_len = (best_len + 1).min(8);
+    if scan[..prefix_len] != candidate[..prefix_len] {
+        return false;
+    }
+
+    if best_len + 1 > prefix_len {
+        let tail_start = (best_len + 1).saturating_sub(8);
+        if scan[tail_start..=best_len] != candidate[tail_start..=best_len] {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[inline]
+fn common_match_length(scan: &[u8], candidate: &[u8]) -> usize {
+    debug_assert_eq!(scan.len(), candidate.len());
+    debug_assert!(scan.len() <= STD_MAX_MATCH);
+
+    if scan.len() == STD_MAX_MATCH {
+        if scan[0] != candidate[0] {
+            return 0;
+        }
+        if scan[1] != candidate[1] {
+            return 1;
+        }
+        return crate::deflate::compare256::compare256_slice(&scan[2..], &candidate[2..]) + 2;
+    }
+
+    scan.iter()
+        .zip(candidate)
+        .position(|(left, right)| left != right)
+        .unwrap_or(scan.len())
+}
+
+fn break_matching(state: &State, best_len: usize, match_start: Pos) -> (usize, Pos) {
+    (best_len.min(state.lookahead), match_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_match_length_finds_every_mismatch_position() {
+        let scan = [b'a'; STD_MAX_MATCH];
+        let mut candidate = scan;
+
+        for mismatch in 0..STD_MAX_MATCH {
+            candidate[mismatch] = b'b';
+            assert_eq!(common_match_length(&scan, &candidate), mismatch);
+            candidate[mismatch] = b'a';
+        }
+        assert_eq!(common_match_length(&scan, &candidate), STD_MAX_MATCH);
+    }
+
+    #[test]
+    fn common_match_length_respects_short_initialized_prefixes() {
+        let scan = [b'x'; 37];
+        let mut candidate = scan;
+        candidate[36] = b'y';
+
+        assert_eq!(common_match_length(&scan[..7], &candidate[..7]), 7);
+        assert_eq!(common_match_length(&scan, &candidate), 36);
+    }
+
+    #[test]
+    fn search_cursor_maps_interior_hash_positions_to_candidate_start() {
+        assert_eq!(
+            SearchCursor {
+                hash_pos: 123,
+                offset: 17,
+            }
+            .candidate_start(),
+            Some(106)
+        );
+        assert_eq!(
+            SearchCursor {
+                hash_pos: 3,
+                offset: 4,
+            }
+            .candidate_start(),
+            None
+        );
+    }
+
+    #[test]
+    fn quick_rejection_never_discards_an_improving_match() {
+        let scan = [b'a'; 32];
+        let mut candidate = scan;
+
+        for best_len in 0..scan.len() {
+            assert!(could_beat_best(&scan, &candidate, best_len));
+
+            for mismatch in 0..scan.len() {
+                candidate[mismatch] = b'b';
+                let actual_len = common_match_length(&scan, &candidate);
+                if actual_len > best_len {
+                    assert!(
+                        could_beat_best(&scan, &candidate, best_len),
+                        "rejected improving match: best_len={best_len}, mismatch={mismatch}"
+                    );
+                }
+                candidate[mismatch] = b'a';
+            }
+        }
+
+        candidate[0] = b'b';
+        assert!(!could_beat_best(&scan, &candidate, 15));
+        candidate[0] = b'a';
+
+        candidate[15] = b'b';
+        assert!(!could_beat_best(&scan, &candidate, 15));
+        candidate[15] = b'a';
+
+        // For a longer known match the first and last eight bytes leave an
+        // unprobed middle. False positives there are intentional: the full
+        // prefix comparison decides the actual length.
+        candidate[12] = b'b';
+        assert!(could_beat_best(&scan, &candidate, 23));
+    }
 }
