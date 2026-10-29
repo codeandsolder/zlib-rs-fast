@@ -1,29 +1,19 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
+use super::{BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
-use crate::{
-    deflate::{
-        BlockState, Compressor, MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
-    },
-    DeflateFlush,
-};
+use crate::deflate::{MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 type Match = MatchCandidate;
 
-pub fn deflate_medium(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    let mut producer = MediumProducer::new(stream.state);
-    drive_standard(stream, flush, &mut producer)
-}
-
-struct MediumProducer {
+pub(super) struct MediumProducer {
     early_exit: bool,
     current_match: Match,
     next_match: Match,
 }
 
 impl MediumProducer {
-    fn new(state: &State<'_>) -> Self {
+    pub(super) fn new(state: &State<'_>) -> Self {
         Self {
             early_exit: state.level < 5,
             current_match: Match::EMPTY,

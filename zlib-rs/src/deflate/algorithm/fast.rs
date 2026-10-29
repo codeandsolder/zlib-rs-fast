@@ -1,17 +1,10 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
+use super::{BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
-use crate::{
-    deflate::{BlockState, Compressor, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
-    DeflateFlush,
-};
+use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
-pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    drive_standard(stream, flush, &mut FastProducer)
-}
-
-struct FastProducer;
+pub(super) struct FastProducer;
 
 impl TokenProducer for FastProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {

@@ -1,16 +1,9 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
-use crate::{
-    deflate::{BlockState, Compressor, State},
-    DeflateFlush,
-};
+use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use crate::deflate::State;
 
-pub fn deflate_huff(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    drive_standard(stream, flush, &mut HuffmanProducer)
-}
-
-struct HuffmanProducer;
+pub(super) struct HuffmanProducer;
 
 impl TokenProducer for HuffmanProducer {
     fn preferred_lookahead(&self) -> usize {

@@ -1,19 +1,11 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
-use crate::{
-    deflate::{
-        compare256::compare256_rle_slice, BlockState, Compressor, State, MIN_LOOKAHEAD,
-        STD_MAX_MATCH, STD_MIN_MATCH,
-    },
-    DeflateFlush,
+use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use crate::deflate::{
+    compare256::compare256_rle_slice, State, MIN_LOOKAHEAD, STD_MAX_MATCH, STD_MIN_MATCH,
 };
 
-pub fn deflate_rle(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    drive_standard(stream, flush, &mut RleProducer)
-}
-
-struct RleProducer;
+pub(super) struct RleProducer;
 
 impl TokenProducer for RleProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {

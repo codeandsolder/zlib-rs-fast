@@ -1,25 +1,15 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
-use crate::{
-    deflate::{
-        BlockState, Compressor, State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
-    },
-    DeflateFlush,
-};
+use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
-pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    let mut producer = SlowProducer::new(stream.state);
-    drive_standard(stream, flush, &mut producer)
-}
-
-struct SlowProducer {
+pub(super) struct SlowProducer {
     use_longest_match_slow: bool,
     match_available: bool,
 }
 
 impl SlowProducer {
-    fn new(state: &State<'_>) -> Self {
+    pub(super) fn new(state: &State<'_>) -> Self {
         Self {
             use_longest_match_slow: state.max_chain_length > 1024,
             match_available: state.match_available,

@@ -92,6 +92,77 @@ pub(super) trait TokenProducer {
     fn finish(&mut self, state: &mut State<'_>) -> usize;
 }
 
+/// Uniform resumable state for the ordinary token-producing algorithms.
+///
+/// This value has no borrowed data or heap allocation, so a scheduler can keep one alongside each
+/// compression stream and advance heterogeneous Fast/Medium/Slow/Huffman/RLE jobs through the same
+/// `next_core_event` interface.
+pub(super) struct StandardProducer(StandardProducerKind);
+
+enum StandardProducerKind {
+    Fast(fast::FastProducer),
+    Medium(medium::MediumProducer),
+    Slow(slow::SlowProducer),
+    Huffman(huff::HuffmanProducer),
+    Rle(rle::RleProducer),
+}
+
+impl StandardProducer {
+    pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+        let kind = match algorithm {
+            Algorithm::Fast => StandardProducerKind::Fast(fast::FastProducer),
+            Algorithm::Medium => StandardProducerKind::Medium(medium::MediumProducer::new(state)),
+            Algorithm::Slow => StandardProducerKind::Slow(slow::SlowProducer::new(state)),
+            Algorithm::Huffman => StandardProducerKind::Huffman(huff::HuffmanProducer),
+            Algorithm::Rle => StandardProducerKind::Rle(rle::RleProducer),
+            Algorithm::Stored | Algorithm::Quick => return None,
+        };
+        Some(Self(kind))
+    }
+}
+
+impl TokenProducer for StandardProducer {
+    fn preferred_lookahead(&self) -> usize {
+        match &self.0 {
+            StandardProducerKind::Fast(producer) => producer.preferred_lookahead(),
+            StandardProducerKind::Medium(producer) => producer.preferred_lookahead(),
+            StandardProducerKind::Slow(producer) => producer.preferred_lookahead(),
+            StandardProducerKind::Huffman(producer) => producer.preferred_lookahead(),
+            StandardProducerKind::Rle(producer) => producer.preferred_lookahead(),
+        }
+    }
+
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        match &mut self.0 {
+            StandardProducerKind::Fast(producer) => producer.produce(state, allow_short_tail),
+            StandardProducerKind::Medium(producer) => producer.produce(state, allow_short_tail),
+            StandardProducerKind::Slow(producer) => producer.produce(state, allow_short_tail),
+            StandardProducerKind::Huffman(producer) => producer.produce(state, allow_short_tail),
+            StandardProducerKind::Rle(producer) => producer.produce(state, allow_short_tail),
+        }
+    }
+
+    fn after_refill(&mut self, state: &mut State<'_>) {
+        match &mut self.0 {
+            StandardProducerKind::Fast(producer) => producer.after_refill(state),
+            StandardProducerKind::Medium(producer) => producer.after_refill(state),
+            StandardProducerKind::Slow(producer) => producer.after_refill(state),
+            StandardProducerKind::Huffman(producer) => producer.after_refill(state),
+            StandardProducerKind::Rle(producer) => producer.after_refill(state),
+        }
+    }
+
+    fn finish(&mut self, state: &mut State<'_>) -> usize {
+        match &mut self.0 {
+            StandardProducerKind::Fast(producer) => producer.finish(state),
+            StandardProducerKind::Medium(producer) => producer.finish(state),
+            StandardProducerKind::Slow(producer) => producer.finish(state),
+            StandardProducerKind::Huffman(producer) => producer.finish(state),
+            StandardProducerKind::Rle(producer) => producer.finish(state),
+        }
+    }
+}
+
 /// A scheduler-visible boundary reached while advancing one ordinary compression stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CoreEvent {
@@ -108,10 +179,10 @@ pub(super) enum CoreEvent {
 /// This function may refill the LZ window, but it never encodes a token block and never drains
 /// output. A batch scheduler can therefore collect `TokenBlockReady` events from multiple streams
 /// before choosing where and when to run the block-encoding stage.
-pub(super) fn next_core_event<P: TokenProducer>(
+pub(super) fn next_core_event(
     stream: &mut Compressor<'_, '_>,
     flush: DeflateFlush,
-    producer: &mut P,
+    producer: &mut StandardProducer,
 ) -> CoreEvent {
     loop {
         let preferred_lookahead = producer.preferred_lookahead();
@@ -150,10 +221,10 @@ pub(super) fn next_core_event<P: TokenProducer>(
 /// It currently consumes core events immediately. Future batch scheduling can replace this loop
 /// while reusing `next_core_event`, the state-only token producers, and the independent
 /// encode/drain stages unchanged.
-pub(super) fn drive_standard<P: TokenProducer>(
+pub(super) fn drive_standard(
     stream: &mut Compressor<'_, '_>,
     flush: DeflateFlush,
-    producer: &mut P,
+    producer: &mut StandardProducer,
 ) -> BlockState {
     loop {
         match next_core_event(stream, flush, producer) {
@@ -233,11 +304,11 @@ impl Algorithm {
         match self {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
-            Self::Fast => fast::deflate_fast(stream, flush),
-            Self::Medium => medium::deflate_medium(stream, flush),
-            Self::Slow => slow::deflate_slow(stream, flush),
-            Self::Huffman => huff::deflate_huff(stream, flush),
-            Self::Rle => rle::deflate_rle(stream, flush),
+            algorithm => {
+                let mut producer = StandardProducer::for_algorithm(algorithm, stream.state)
+                    .expect("ordinary algorithm must have a token producer");
+                drive_standard(stream, flush, &mut producer)
+            }
         }
     }
 }
