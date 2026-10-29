@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::flush_block;
+use super::{ensure_input, finish_standard, InputStatus};
 use crate::{
     deflate::{
         compare256::compare256_rle_slice, BlockState, Compressor, MIN_LOOKAHEAD, STD_MAX_MATCH,
@@ -14,18 +14,10 @@ pub fn deflate_rle(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     let mut bflush;
 
     loop {
-        // Make sure that we always have enough lookahead, except
-        // at the end of the input file. We need STD_MAX_MATCH bytes
-        // for the next match, plus WANT_MIN_MATCH bytes to insert the
-        // string following the next match.
-        if stream.state.lookahead < MIN_LOOKAHEAD {
-            stream.fill_window();
-            if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
-                return BlockState::NeedMore;
-            }
-            if stream.state.lookahead == 0 {
-                break; /* flush the current block */
-            }
+        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+            InputStatus::Ready => {}
+            InputStatus::NeedMore => return BlockState::NeedMore,
+            InputStatus::Exhausted => break,
         }
 
         /* See how many times the previous byte repeats */
@@ -65,20 +57,11 @@ pub fn deflate_rle(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
         }
 
         if bflush {
-            flush_block!(stream, false);
+            if let Some(blocked) = stream.flush_block(false) {
+                return blocked;
+            }
         }
     }
 
-    stream.state.insert = 0;
-
-    if flush == DeflateFlush::Finish {
-        flush_block!(stream, true);
-        return BlockState::FinishDone;
-    }
-
-    if !stream.state.sym_buf.is_empty() {
-        flush_block!(stream, false);
-    }
-
-    BlockState::BlockDone
+    finish_standard(stream, flush, 0)
 }

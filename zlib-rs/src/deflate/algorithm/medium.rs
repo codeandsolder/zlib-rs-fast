@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::flush_block;
+use super::{ensure_input, finish_standard, InputStatus};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
     deflate::{BlockState, Compressor, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
@@ -29,22 +29,15 @@ pub fn deflate_medium(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     loop {
         let mut hash_head;
 
-        /* Make sure that we always have enough lookahead, except
-         * at the end of the input file. We need STD_MAX_MATCH bytes
-         * for the next match, plus WANT_MIN_MATCH bytes to insert the
-         * string following the next match.
-         */
-        if stream.state.lookahead < MIN_LOOKAHEAD {
-            stream.fill_window();
-
-            if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
-                return BlockState::NeedMore;
-            }
-
-            if stream.state.lookahead == 0 {
-                break; /* flush the current block */
-            }
-
+        let refilled = stream.state.lookahead < MIN_LOOKAHEAD;
+        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+            InputStatus::Ready => {}
+            InputStatus::NeedMore => return BlockState::NeedMore,
+            InputStatus::Exhausted => break,
+        }
+        if refilled {
+            // A cached look-ahead match was derived before the refill and cannot be carried across
+            // a possible window slide.
             next_match.match_length = 0;
         }
 
@@ -157,22 +150,14 @@ pub fn deflate_medium(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         state.strstart += current_match.match_length as usize;
 
         if bflush {
-            flush_block!(stream, false);
+            if let Some(blocked) = stream.flush_block(false) {
+                return blocked;
+            }
         }
     }
 
-    stream.state.insert = Ord::min(stream.state.strstart, STD_MIN_MATCH - 1);
-
-    if flush == DeflateFlush::Finish {
-        flush_block!(stream, true);
-        return BlockState::FinishDone;
-    }
-
-    if !stream.state.sym_buf.is_empty() {
-        flush_block!(stream, false);
-    }
-
-    BlockState::BlockDone
+    let insert = Ord::min(stream.state.strstart, STD_MIN_MATCH - 1);
+    finish_standard(stream, flush, insert)
 }
 
 #[repr(C)]

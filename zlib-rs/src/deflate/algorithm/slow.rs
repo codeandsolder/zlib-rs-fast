@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::flush_block;
+use super::{ensure_input, finish_standard, InputStatus};
 use crate::{
     deflate::{BlockState, Compressor, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
     DeflateFlush,
@@ -19,20 +19,10 @@ pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
 
     /* Process the input block. */
     loop {
-        /* Make sure that we always have enough lookahead, except
-         * at the end of the input file. We need STD_MAX_MATCH bytes
-         * for the next match, plus WANT_MIN_MATCH bytes to insert the
-         * string following the next match.
-         */
-        if stream.state.lookahead < MIN_LOOKAHEAD {
-            stream.fill_window();
-            if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
-                return BlockState::NeedMore;
-            }
-
-            if stream.state.lookahead == 0 {
-                break; /* flush the current block */
-            }
+        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+            InputStatus::Ready => {}
+            InputStatus::NeedMore => return BlockState::NeedMore,
+            InputStatus::Exhausted => break,
         }
 
         let state = &mut stream.state;
@@ -104,7 +94,9 @@ pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
             state.strstart += mov_fwd + 1;
 
             if bflush {
-                flush_block!(stream, false);
+                if let Some(blocked) = stream.flush_block(false) {
+                    return blocked;
+                }
             }
         } else if match_available {
             // If there was no match at the previous position, output a
@@ -113,7 +105,7 @@ pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
             let lc = state.window.filled()[state.strstart - 1];
             bflush = state.tally_lit(lc);
             if bflush {
-                stream.flush_block(false);
+                let _ = stream.flush_block(false);
             }
 
             stream.state.prev_length = match_len as u16;
@@ -143,16 +135,6 @@ pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
         state.match_available = false;
     }
 
-    state.insert = Ord::min(state.strstart, STD_MIN_MATCH - 1);
-
-    if flush == DeflateFlush::Finish {
-        flush_block!(stream, true);
-        return BlockState::FinishDone;
-    }
-
-    if !stream.state.sym_buf.is_empty() {
-        flush_block!(stream, false);
-    }
-
-    BlockState::BlockDone
+    let insert = Ord::min(state.strstart, STD_MIN_MATCH - 1);
+    finish_standard(stream, flush, insert)
 }

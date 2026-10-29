@@ -115,8 +115,13 @@ impl<'a, 'state> Compressor<'a, 'state> {
         flush_pending_core(self);
     }
 
-    pub(crate) fn flush_block(&mut self, is_last: bool) {
+    pub(crate) fn flush_block(&mut self, is_last: bool) -> Option<BlockState> {
         flush_block_only_core(self, is_last);
+        (self.io.avail_out == 0).then_some(if is_last {
+            BlockState::FinishStarted
+        } else {
+            BlockState::NeedMore
+        })
     }
 
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {

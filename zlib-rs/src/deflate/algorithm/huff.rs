@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::flush_block;
+use super::{ensure_input, finish_standard, InputStatus};
 use crate::{
     deflate::{BlockState, Compressor},
     DeflateFlush,
@@ -8,16 +8,10 @@ use crate::{
 
 pub fn deflate_huff(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     loop {
-        /* Make sure that we have a literal to write. */
-        if stream.state.lookahead == 0 {
-            stream.fill_window();
-
-            if stream.state.lookahead == 0 {
-                match flush {
-                    DeflateFlush::NoFlush => return BlockState::NeedMore,
-                    _ => break, /* flush the current block */
-                }
-            }
+        match ensure_input(stream, 1, flush) {
+            InputStatus::Ready => {}
+            InputStatus::NeedMore => return BlockState::NeedMore,
+            InputStatus::Exhausted => break,
         }
 
         /* Output a literal byte */
@@ -27,20 +21,11 @@ pub fn deflate_huff(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
         state.lookahead -= 1;
         state.strstart += 1;
         if bflush {
-            flush_block!(stream, false);
+            if let Some(blocked) = stream.flush_block(false) {
+                return blocked;
+            }
         }
     }
 
-    stream.state.insert = 0;
-
-    if flush == DeflateFlush::Finish {
-        flush_block!(stream, true);
-        return BlockState::FinishDone;
-    }
-
-    if !stream.state.sym_buf.is_empty() {
-        flush_block!(stream, false);
-    }
-
-    BlockState::BlockDone
+    finish_standard(stream, flush, 0)
 }

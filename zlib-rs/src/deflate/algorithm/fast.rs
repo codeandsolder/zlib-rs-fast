@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::flush_block;
+use super::{ensure_input, finish_standard, InputStatus};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
     deflate::{BlockState, Compressor, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
@@ -9,18 +9,10 @@ use crate::{
 
 pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     loop {
-        // Make sure that we always have enough lookahead, except
-        // at the end of the input file. We need STD_MAX_MATCH bytes
-        // for the next match, plus WANT_MIN_MATCH bytes to insert the
-        // string following the next match.
-        if stream.state.lookahead < MIN_LOOKAHEAD {
-            stream.fill_window();
-            if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
-                return BlockState::NeedMore;
-            }
-            if stream.state.lookahead == 0 {
-                break; /* flush the current block */
-            }
+        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+            InputStatus::Ready => {}
+            InputStatus::NeedMore => return BlockState::NeedMore,
+            InputStatus::Exhausted => break,
         }
 
         let state = &mut stream.state;
@@ -77,7 +69,9 @@ pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
                          */
                     }
                     if bflush {
-                        flush_block!(stream, false);
+                        if let Some(blocked) = stream.flush_block(false) {
+                            return blocked;
+                        }
                     }
                     continue;
                 }
@@ -91,24 +85,12 @@ pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
         state.lookahead -= 1;
         state.strstart += 1;
         if bflush {
-            flush_block!(stream, false);
+            if let Some(blocked) = stream.flush_block(false) {
+                return blocked;
+            }
         }
     }
 
-    stream.state.insert = if stream.state.strstart < (STD_MIN_MATCH - 1) {
-        stream.state.strstart
-    } else {
-        STD_MIN_MATCH - 1
-    };
-
-    if flush == DeflateFlush::Finish {
-        flush_block!(stream, true);
-        return BlockState::FinishDone;
-    }
-
-    if !stream.state.sym_buf.is_empty() {
-        flush_block!(stream, false);
-    }
-
-    BlockState::BlockDone
+    let insert = Ord::min(stream.state.strstart, STD_MIN_MATCH - 1);
+    finish_standard(stream, flush, insert)
 }

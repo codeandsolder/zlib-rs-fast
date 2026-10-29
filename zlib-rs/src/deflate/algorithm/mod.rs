@@ -11,19 +11,64 @@ mod rle;
 mod slow;
 mod stored;
 
-macro_rules! flush_block {
-    ($stream:expr, $is_last_block:expr) => {
-        $stream.flush_block($is_last_block);
-
-        if $stream.io.avail_out == 0 {
-            return match $is_last_block {
-                true => BlockState::FinishStarted,
-                false => BlockState::NeedMore,
-            };
-        }
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InputStatus {
+    Ready,
+    NeedMore,
+    Exhausted,
 }
-pub(crate) use flush_block;
+
+/// Refill the compression window until the algorithm has its preferred lookahead, or until the
+/// caller must provide more input / the current input is exhausted.
+///
+/// A flushing caller may process a short tail below `preferred_lookahead`; a `NoFlush` caller
+/// preserves zlib's streaming contract and yields `NeedMore` instead.
+pub(super) fn ensure_input(
+    stream: &mut Compressor<'_, '_>,
+    preferred_lookahead: usize,
+    flush: DeflateFlush,
+) -> InputStatus {
+    if stream.state.lookahead < preferred_lookahead {
+        stream.fill_window();
+    }
+
+    if stream.state.lookahead >= preferred_lookahead {
+        InputStatus::Ready
+    } else if flush == DeflateFlush::NoFlush {
+        InputStatus::NeedMore
+    } else if stream.state.lookahead == 0 {
+        InputStatus::Exhausted
+    } else {
+        InputStatus::Ready
+    }
+}
+
+/// Finalize the ordinary token-producing algorithms after input processing stops.
+///
+/// `insert` records how much tail state must be rebuilt when more input arrives. Stored and Quick
+/// have different block mechanics and intentionally do not use this path.
+pub(super) fn finish_standard(
+    stream: &mut Compressor<'_, '_>,
+    flush: DeflateFlush,
+    insert: usize,
+) -> BlockState {
+    stream.state.insert = insert;
+
+    if flush == DeflateFlush::Finish {
+        if let Some(blocked) = stream.flush_block(true) {
+            return blocked;
+        }
+        return BlockState::FinishDone;
+    }
+
+    if !stream.state.sym_buf.is_empty() {
+        if let Some(blocked) = stream.flush_block(false) {
+            return blocked;
+        }
+    }
+
+    BlockState::BlockDone
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Algorithm {
