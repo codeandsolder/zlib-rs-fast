@@ -58,7 +58,6 @@ pub(crate) struct CompressionIo {
     pub(crate) next_out: *mut crate::c_api::Bytef,
     pub(crate) avail_out: crate::c_api::uInt,
     pub(crate) total_out: crate::c_api::z_size,
-    pub(crate) data_type: core::ffi::c_int,
     pub(crate) adler: crate::c_api::z_checksum,
 }
 
@@ -71,7 +70,6 @@ impl CompressionIo {
             next_out: stream.next_out,
             avail_out: stream.avail_out,
             total_out: stream.total_out,
-            data_type: stream.data_type,
             adler: stream.adler,
         }
     }
@@ -83,7 +81,6 @@ impl CompressionIo {
         stream.next_out = self.next_out;
         stream.avail_out = self.avail_out;
         stream.total_out = self.total_out;
-        stream.data_type = self.data_type;
         stream.adler = self.adler;
     }
 }
@@ -195,13 +192,18 @@ pub(crate) fn with_compressor<'state, R>(
     stream: &mut DeflateStream<'state>,
     f: impl FnOnce(&mut Compressor<'_, 'state>) -> R,
 ) -> R {
+    // `data_type` is public z_stream metadata, so honor caller overrides at each ABI entry. The
+    // encoder owns the working copy in State and publishes any lazy detection result on return.
+    stream.state.data_type = stream.data_type;
     let io = CompressionIo::from_stream(stream);
-    let (result, io) = {
+    let (result, io, data_type) = {
         let mut compressor = Compressor::new(&mut *stream.state, io);
         let result = f(&mut compressor);
-        (result, compressor.into_io())
+        let data_type = compressor.state.data_type;
+        (result, compressor.into_io(), data_type)
     };
     io.apply(stream);
+    stream.data_type = data_type;
     result
 }
 
@@ -561,6 +563,7 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         gzhead: None,
         gzindex: 0,
         medium_next_match: MatchCandidate::EMPTY,
+        data_type: crate::c_api::Z_UNKNOWN,
 
         //
         match_start: 0,
@@ -577,7 +580,7 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         _cache_line_1: (),
         _cache_line_2: (),
         _cache_line_3: (),
-        _padding_0: [0; 8],
+        _padding_0: [0; 4],
     };
 
     let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
@@ -851,13 +854,14 @@ pub fn copy<'a>(
         gzhead: None,
         gzindex: source_state.gzindex,
         medium_next_match: source_state.medium_next_match,
+        data_type: source_state.data_type,
         allocation_start,
         total_allocation_size: allocs.total_size,
         _cache_line_0: (),
         _cache_line_1: (),
         _cache_line_2: (),
         _cache_line_3: (),
-        _padding_0: [0; 8],
+        _padding_0: [0; 4],
     };
 
     // write the cloned state into state_ptr
@@ -913,6 +917,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     stream.data_type = crate::c_api::Z_UNKNOWN;
 
     let state = &mut stream.state;
+    state.data_type = crate::c_api::Z_UNKNOWN;
 
     state.bit_writer.pending.reset_keep();
 
@@ -1541,7 +1546,10 @@ pub(crate) struct State<'a> {
     /// makes compression decisions independent of caller output chunking. It occupies bytes that
     /// were previously explicit alignment padding, so the hand-packed cache-line layout is stable.
     pub(crate) medium_next_match: MatchCandidate,
-    _padding_0: [u8; 8],
+    /// Working copy of z_stream::data_type. Kept in compression state so block encoding is
+    /// independent of the caller I/O cursor; synchronized at `with_compressor` boundaries.
+    pub(crate) data_type: core::ffi::c_int,
+    _padding_0: [u8; 4],
 
     _cache_line_3: (),
 
@@ -2498,7 +2506,7 @@ fn build_bl_tree(state: &mut State) -> usize {
 }
 
 fn zng_tr_flush_block(
-    stream: &mut Compressor<'_, '_>,
+    state: &mut State<'_>,
     window_offset: Option<usize>,
     stored_len: u32,
     last: bool,
@@ -2511,15 +2519,13 @@ fn zng_tr_flush_block(
     let static_lenb;
     let mut max_blindex = 0;
 
-    let state = &mut stream.state;
-
     if state.sym_buf.is_empty() {
         opt_lenb = 0;
         static_lenb = 0;
         state.static_len = 7;
     } else if state.level > 0 {
-        if stream.io.data_type == DataType::Unknown as i32 {
-            stream.io.data_type = State::detect_data_type(&state.l_desc.dyn_tree) as i32;
+        if state.data_type == DataType::Unknown as i32 {
+            state.data_type = State::detect_data_type(&state.l_desc.dyn_tree) as i32;
         }
 
         {
@@ -2619,7 +2625,7 @@ fn zng_tr_flush_block(
 
 fn encode_block_core(stream: &mut Compressor<'_, '_>, is_last: bool) {
     zng_tr_flush_block(
-        stream,
+        stream.state,
         (stream.state.block_start >= 0).then_some(stream.state.block_start as usize),
         (stream.state.strstart as isize - stream.state.block_start) as u32,
         is_last,
@@ -3587,6 +3593,29 @@ mod test {
         let mut non_text = empty();
         non_text[7] = Value::new(1, 0);
         assert_eq!(State::detect_data_type(&non_text), DataType::Binary);
+    }
+
+    #[test]
+    fn data_type_override_round_trips_through_state_only_encoder() {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        // zlib only auto-detects when this field is Z_UNKNOWN. Preserve arbitrary caller metadata.
+        const CALLER_DATA_TYPE: i32 = 12_345;
+        stream.data_type = CALLER_DATA_TYPE;
+
+        let input = b"plain text that is compressible plain text that is compressible";
+        let mut output = [0u8; 1024];
+        stream.next_in = input.as_ptr() as *mut _;
+        stream.avail_in = input.len() as _;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = output.len() as _;
+
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        assert_eq!(stream.data_type, CALLER_DATA_TYPE);
+        assert_eq!(stream.state.data_type, CALLER_DATA_TYPE);
+        assert!(end(stream).is_ok());
     }
 
     #[test]
