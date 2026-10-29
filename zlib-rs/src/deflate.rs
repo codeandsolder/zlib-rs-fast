@@ -4135,6 +4135,10 @@ mod test {
             jobs[0].match_search_turns > 0,
             "Fast must yield detached match-search work in the scheduler regression"
         );
+        assert!(
+            jobs[2].match_search_turns > 0,
+            "Slow must yield detached match-search work in the scheduler regression"
+        );
 
         for (job, reference) in jobs.into_iter().zip(references) {
             assert!(

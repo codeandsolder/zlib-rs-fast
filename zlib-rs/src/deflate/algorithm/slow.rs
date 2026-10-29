@@ -1,12 +1,20 @@
 #![forbid(unsafe_code)]
 
 use super::{BlockContinuation, ProduceStatus, TokenProducer};
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchRequest};
+use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlowPhase {
+    Ready,
+    AwaitingSearch,
+    SearchReady(MatchSearchResult),
+}
 
 pub(super) struct SlowProducer {
     use_longest_match_slow: bool,
     match_available: bool,
+    phase: SlowPhase,
 }
 
 impl SlowProducer {
@@ -14,6 +22,7 @@ impl SlowProducer {
         Self {
             use_longest_match_slow: state.max_chain_length > 1024,
             match_available: state.match_available,
+            phase: SlowPhase::Ready,
         }
     }
 }
@@ -21,37 +30,50 @@ impl SlowProducer {
 impl TokenProducer for SlowProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         loop {
-            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
-                return ProduceStatus::NeedInput;
-            }
-
-            let hash_head = if state.lookahead >= WANT_MIN_MATCH {
-                state.quick_insert_string(state.strstart)
-            } else {
-                0
-            };
-
-            state.prev_match = state.match_start;
-            let mut match_len = STD_MIN_MATCH - 1;
-            let distance = state.strstart as isize - hash_head as isize;
-
-            if (1..=state.max_dist() as isize).contains(&distance)
-                && state.prev_length < state.max_lazy_match
-                && hash_head != 0
-            {
-                let kind = if self.use_longest_match_slow {
-                    MatchSearchKind::Slow
-                } else {
-                    MatchSearchKind::Standard
-                };
-                let result = MatchSearchRequest::from_state(state, hash_head, kind).execute();
-                match_len = result.length;
-                state.match_start = result.start;
-
-                if match_len <= 5 && state.strategy == Strategy::Filtered {
-                    match_len = STD_MIN_MATCH - 1;
+            let match_len = match self.phase {
+                SlowPhase::SearchReady(result) => {
+                    self.phase = SlowPhase::Ready;
+                    state.match_start = result.start;
+                    let mut length = result.length;
+                    if length <= 5 && state.strategy == Strategy::Filtered {
+                        length = STD_MIN_MATCH - 1;
+                    }
+                    length
                 }
-            }
+                SlowPhase::Ready => {
+                    if state.lookahead == 0
+                        || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD)
+                    {
+                        return ProduceStatus::NeedInput;
+                    }
+
+                    let hash_head = if state.lookahead >= WANT_MIN_MATCH {
+                        state.quick_insert_string(state.strstart)
+                    } else {
+                        0
+                    };
+
+                    state.prev_match = state.match_start;
+                    let distance = state.strstart as isize - hash_head as isize;
+                    if (1..=state.max_dist() as isize).contains(&distance)
+                        && state.prev_length < state.max_lazy_match
+                        && hash_head != 0
+                    {
+                        let kind = if self.use_longest_match_slow {
+                            MatchSearchKind::Slow
+                        } else {
+                            MatchSearchKind::Standard
+                        };
+                        self.phase = SlowPhase::AwaitingSearch;
+                        return ProduceStatus::MatchSearch(MatchSearchWork::new(hash_head, kind));
+                    }
+
+                    STD_MIN_MATCH - 1
+                }
+                SlowPhase::AwaitingSearch => {
+                    panic!("slow producer cannot advance while match search is outstanding")
+                }
+            };
 
             if usize::from(state.prev_length) >= STD_MIN_MATCH
                 && match_len <= usize::from(state.prev_length)
@@ -102,7 +124,21 @@ impl TokenProducer for SlowProducer {
         }
     }
 
+    fn complete_match_search(&mut self, _state: &mut State<'_>, result: MatchSearchResult) {
+        assert_eq!(
+            self.phase,
+            SlowPhase::AwaitingSearch,
+            "slow producer received a match result without an outstanding search"
+        );
+        self.phase = SlowPhase::SearchReady(result);
+    }
+
     fn finish(&mut self, state: &mut State<'_>) -> usize {
+        assert_eq!(
+            self.phase,
+            SlowPhase::Ready,
+            "slow producer cannot finish while match search is outstanding"
+        );
         if state.match_available {
             let literal = state.window.filled()[state.strstart - 1];
             let _ = state.tally_lit(literal);
