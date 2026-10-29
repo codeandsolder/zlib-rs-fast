@@ -906,6 +906,8 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
 
     state.last_flush = -2;
     state.medium_next_match = MatchCandidate::EMPTY;
+    // Match zlib's deflateResetKeep(): a custom gzip header applies only until reset.
+    state.gzhead = None;
 
     state.zng_tr_init();
 
@@ -4584,6 +4586,57 @@ mod test {
                 0xf5, 0x63, 0x60, 0x60, 0x3, 0x0, 0xee, 0x8a, 0x88, 0x67,
             ],
         )
+    }
+
+    #[test]
+    fn reset_clears_custom_gzip_header() {
+        let name = b"must-not-survive-reset\0";
+        let mut header = gz_header {
+            text: 1,
+            time: 0x1234_5678,
+            xflags: 0,
+            os: 3,
+            extra: core::ptr::null_mut(),
+            extra_len: 0,
+            extra_max: 0,
+            name: name.as_ptr() as *mut _,
+            name_max: 0,
+            comment: core::ptr::null_mut(),
+            comm_max: 0,
+            hcrc: 1,
+            done: 0,
+        };
+
+        let config = DeflateConfig {
+            window_bits: 31,
+            ..Default::default()
+        };
+        let mut stream = z_stream::default();
+        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+        assert_eq!(
+            unsafe { set_header(stream, Some(&mut header)) },
+            ReturnCode::Ok
+        );
+
+        assert_eq!(reset(stream), ReturnCode::Ok);
+
+        let input = b"gzip after reset";
+        let mut output = [0u8; 128];
+        stream.next_in = input.as_ptr() as *mut _;
+        stream.avail_in = input.len() as _;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = output.len() as _;
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+
+        // A reset stream has the ordinary default gzip header: no optional fields, zero mtime,
+        // level-6 XFL, and the platform OS byte.
+        assert_eq!(
+            &output[..10],
+            &[31, 139, 8, 0, 0, 0, 0, 0, 0, gz_header::OS_CODE]
+        );
+
+        assert!(end(stream).is_ok());
     }
 
     #[test]
