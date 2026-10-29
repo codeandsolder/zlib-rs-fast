@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ProduceStatus, TokenProducer};
+use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
     deflate::{
@@ -138,7 +138,7 @@ impl TokenProducer for MediumProducer {
 
             if block_ready {
                 self.save_next(state);
-                return ProduceStatus::BlockReady;
+                return ProduceStatus::BlockReady(BlockContinuation::None);
             }
         }
     }

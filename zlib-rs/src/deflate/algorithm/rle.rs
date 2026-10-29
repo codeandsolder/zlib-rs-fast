@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ProduceStatus, TokenProducer};
+use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
 use crate::{
     deflate::{
         compare256::compare256_rle_slice, BlockState, Compressor, State, MIN_LOOKAHEAD,
@@ -49,7 +49,7 @@ impl TokenProducer for RleProducer {
             };
 
             if block_ready {
-                return ProduceStatus::BlockReady;
+                return ProduceStatus::BlockReady(BlockContinuation::None);
             }
         }
     }

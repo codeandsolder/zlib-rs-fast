@@ -46,9 +46,28 @@ pub(super) fn ensure_input(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BlockContinuation {
+    None,
+    AdvanceLazyMatch { match_len: u16 },
+}
+
+impl BlockContinuation {
+    fn apply(self, state: &mut State<'_>) {
+        match self {
+            Self::None => {}
+            Self::AdvanceLazyMatch { match_len } => {
+                state.prev_length = match_len;
+                state.strstart += 1;
+                state.lookahead -= 1;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProduceStatus {
     NeedInput,
-    BlockReady,
+    BlockReady(BlockContinuation),
 }
 
 /// A resumable token producer over already-buffered compression state.
@@ -67,10 +86,6 @@ pub(super) trait TokenProducer {
 
     /// A refill may slide the window, invalidating speculative positions cached by a producer.
     fn after_refill(&mut self, _state: &mut State<'_>) {}
-
-    /// Apply state changes that zlib intentionally performs after a full block has been encoded.
-    /// Most algorithms have no such continuation; Slow uses it for one lazy-match transition.
-    fn after_block_flush(&mut self, _state: &mut State<'_>) {}
 
     /// Finalize algorithm-local state once no buffered or caller input remains and return the tail
     /// insertion count expected by the common block finalizer.
@@ -111,11 +126,15 @@ pub(super) fn drive_standard<P: TokenProducer>(
             ProduceStatus::NeedInput => {
                 debug_assert!(stream.state.lookahead < preferred_lookahead);
             }
-            ProduceStatus::BlockReady => {
-                let blocked = stream.flush_block(false);
-                producer.after_block_flush(stream.state);
-                if let Some(blocked) = blocked {
-                    return blocked;
+            ProduceStatus::BlockReady(continuation) => {
+                // Consume the scheduler-visible token block in two explicit stages: first encode
+                // it into pending bytes, then drain those bytes to the caller. The continuation is
+                // compression state and therefore belongs to block consumption, not output I/O.
+                stream.encode_block(false);
+                continuation.apply(stream.state);
+                stream.flush_pending();
+                if stream.io.avail_out == 0 {
+                    return BlockState::NeedMore;
                 }
             }
         }
@@ -134,15 +153,20 @@ pub(super) fn finish_standard(
     stream.state.insert = insert;
 
     if flush == DeflateFlush::Finish {
-        if let Some(blocked) = stream.flush_block(true) {
-            return blocked;
-        }
-        return BlockState::FinishDone;
+        stream.encode_block(true);
+        stream.flush_pending();
+        return if stream.io.avail_out == 0 {
+            BlockState::FinishStarted
+        } else {
+            BlockState::FinishDone
+        };
     }
 
     if !stream.state.sym_buf.is_empty() {
-        if let Some(blocked) = stream.flush_block(false) {
-            return blocked;
+        stream.encode_block(false);
+        stream.flush_pending();
+        if stream.io.avail_out == 0 {
+            return BlockState::NeedMore;
         }
     }
 

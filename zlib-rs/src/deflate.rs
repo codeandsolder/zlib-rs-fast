@@ -115,13 +115,9 @@ impl<'a, 'state> Compressor<'a, 'state> {
         flush_pending_core(self);
     }
 
-    pub(crate) fn flush_block(&mut self, is_last: bool) -> Option<BlockState> {
-        flush_block_only_core(self, is_last);
-        (self.io.avail_out == 0).then_some(if is_last {
-            BlockState::FinishStarted
-        } else {
-            BlockState::NeedMore
-        })
+    /// Encode the current token block into the pending byte buffer without touching caller output.
+    pub(crate) fn encode_block(&mut self, is_last: bool) {
+        encode_block_core(self, is_last);
     }
 
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
@@ -2621,7 +2617,7 @@ fn zng_tr_flush_block(
     // Tracev((stderr, "\ncomprlen {}(%lu) ", s->compressed_len>>3, s->compressed_len-7*last));
 }
 
-fn flush_block_only_core(stream: &mut Compressor<'_, '_>, is_last: bool) {
+fn encode_block_core(stream: &mut Compressor<'_, '_>, is_last: bool) {
     zng_tr_flush_block(
         stream,
         (stream.state.block_start >= 0).then_some(stream.state.block_start as usize),
@@ -2630,7 +2626,6 @@ fn flush_block_only_core(stream: &mut Compressor<'_, '_>, is_last: bool) {
     );
 
     stream.state.block_start = stream.state.strstart as isize;
-    stream.flush_pending();
 }
 
 fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {

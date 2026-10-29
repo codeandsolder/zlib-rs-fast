@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ProduceStatus, TokenProducer};
+use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
 use crate::{
     deflate::{BlockState, Compressor, State},
     DeflateFlush,
@@ -28,7 +28,7 @@ impl TokenProducer for HuffmanProducer {
             state.lookahead -= 1;
             state.strstart += 1;
             if block_ready {
-                return ProduceStatus::BlockReady;
+                return ProduceStatus::BlockReady(BlockContinuation::None);
             }
         }
     }

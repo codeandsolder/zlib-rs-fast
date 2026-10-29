@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ProduceStatus, TokenProducer};
+use super::{drive_standard, BlockContinuation, ProduceStatus, TokenProducer};
 use crate::{
     deflate::{
         BlockState, Compressor, State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
@@ -16,7 +16,6 @@ pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
 struct SlowProducer {
     use_longest_match_slow: bool,
     match_available: bool,
-    deferred_match_len: Option<usize>,
 }
 
 impl SlowProducer {
@@ -24,15 +23,12 @@ impl SlowProducer {
         Self {
             use_longest_match_slow: state.max_chain_length > 1024,
             match_available: state.match_available,
-            deferred_match_len: None,
         }
     }
 }
 
 impl TokenProducer for SlowProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
-        debug_assert!(self.deferred_match_len.is_none());
-
         loop {
             if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
                 return ProduceStatus::NeedInput;
@@ -86,7 +82,7 @@ impl TokenProducer for SlowProducer {
                 state.strstart += move_forward + 1;
 
                 if block_ready {
-                    return ProduceStatus::BlockReady;
+                    return ProduceStatus::BlockReady(BlockContinuation::None);
                 }
             } else if self.match_available {
                 let literal = state.window.filled()[state.strstart - 1];
@@ -94,8 +90,9 @@ impl TokenProducer for SlowProducer {
                 if block_ready {
                     // zlib encodes this full block before advancing the lazy-match cursor. Keep that
                     // ordering explicit so stored-block length/accounting remains bit-for-bit stable.
-                    self.deferred_match_len = Some(match_len);
-                    return ProduceStatus::BlockReady;
+                    return ProduceStatus::BlockReady(BlockContinuation::AdvanceLazyMatch {
+                        match_len: match_len as u16,
+                    });
                 }
 
                 state.prev_length = match_len as u16;
@@ -109,16 +106,6 @@ impl TokenProducer for SlowProducer {
                 state.lookahead -= 1;
             }
         }
-    }
-
-    fn after_block_flush(&mut self, state: &mut State<'_>) {
-        let Some(match_len) = self.deferred_match_len.take() else {
-            return;
-        };
-
-        state.prev_length = match_len as u16;
-        state.strstart += 1;
-        state.lookahead -= 1;
     }
 
     fn finish(&mut self, state: &mut State<'_>) -> usize {
