@@ -92,16 +92,27 @@ pub(super) trait TokenProducer {
     fn finish(&mut self, state: &mut State<'_>) -> usize;
 }
 
-/// Drive a token producer until the public streaming contract requires a return.
+/// A scheduler-visible boundary reached while advancing one ordinary compression stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CoreEvent {
+    /// Caller input was exhausted before the producer's preferred lookahead could be restored.
+    NeedInput,
+    /// A complete token block is resident in `State::sym_buf` and is ready for block encoding.
+    TokenBlockReady(BlockContinuation),
+    /// No more input remains for this call. `insert` is the tail state needed by a later refill.
+    Finished { insert: usize },
+}
+
+/// Advance one stream only until it reaches a scheduling boundary.
 ///
-/// This is the only ordinary-algorithm layer that touches raw stream I/O: it refills the window,
-/// asks the pure state producer for more tokens, and encodes/drains full token blocks. The split is
-/// the scheduling seam for later fair multi-stream CPU/GPU batching.
-pub(super) fn drive_standard<P: TokenProducer>(
+/// This function may refill the LZ window, but it never encodes a token block and never drains
+/// output. A batch scheduler can therefore collect `TokenBlockReady` events from multiple streams
+/// before choosing where and when to run the block-encoding stage.
+pub(super) fn next_core_event<P: TokenProducer>(
     stream: &mut Compressor<'_, '_>,
     flush: DeflateFlush,
     producer: &mut P,
-) -> BlockState {
+) -> CoreEvent {
     loop {
         let preferred_lookahead = producer.preferred_lookahead();
         let mut allow_short_tail = false;
@@ -112,11 +123,12 @@ pub(super) fn drive_standard<P: TokenProducer>(
 
             if stream.state.lookahead < preferred_lookahead {
                 if flush == DeflateFlush::NoFlush {
-                    return BlockState::NeedMore;
+                    return CoreEvent::NeedInput;
                 }
                 if stream.state.lookahead == 0 {
-                    let insert = producer.finish(stream.state);
-                    return finish_standard(stream, flush, insert);
+                    return CoreEvent::Finished {
+                        insert: producer.finish(stream.state),
+                    };
                 }
                 allow_short_tail = true;
             }
@@ -127,9 +139,26 @@ pub(super) fn drive_standard<P: TokenProducer>(
                 debug_assert!(stream.state.lookahead < preferred_lookahead);
             }
             ProduceStatus::BlockReady(continuation) => {
-                // Consume the scheduler-visible token block in two explicit stages: first encode
-                // it into pending bytes, then drain those bytes to the caller. The continuation is
-                // compression state and therefore belongs to block consumption, not output I/O.
+                return CoreEvent::TokenBlockReady(continuation);
+            }
+        }
+    }
+}
+
+/// Compatibility driver for the ordinary zlib streaming API.
+///
+/// It currently consumes core events immediately. Future batch scheduling can replace this loop
+/// while reusing `next_core_event`, the state-only token producers, and the independent
+/// encode/drain stages unchanged.
+pub(super) fn drive_standard<P: TokenProducer>(
+    stream: &mut Compressor<'_, '_>,
+    flush: DeflateFlush,
+    producer: &mut P,
+) -> BlockState {
+    loop {
+        match next_core_event(stream, flush, producer) {
+            CoreEvent::NeedInput => return BlockState::NeedMore,
+            CoreEvent::TokenBlockReady(continuation) => {
                 stream.encode_block(false);
                 continuation.apply(stream.state);
                 stream.flush_pending();
@@ -137,6 +166,7 @@ pub(super) fn drive_standard<P: TokenProducer>(
                     return BlockState::NeedMore;
                 }
             }
+            CoreEvent::Finished { insert } => return finish_standard(stream, flush, insert),
         }
     }
 }
