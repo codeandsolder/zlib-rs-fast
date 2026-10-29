@@ -1311,7 +1311,8 @@ pub unsafe extern "C" fn deflate(strm: *mut z_stream, flush: i32) -> c_int {
 ///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`deflateInit_`] or similar
 /// * Either
 ///     - `head` is `NULL`
-///     - `head` satisfies the requirements of `&mut *head` and satisfies the following:
+///     - `head` remains valid while the stream may still emit the gzip header, is not mutated
+///       concurrently with a stream operation that reads it, and satisfies the following:
 ///         - `head.extra` is `NULL` or is readable for at least `head.extra_len` bytes
 ///         - `head.name` is `NULL` or satisfies the requirements of [`core::ffi::CStr::from_ptr`]
 ///         - `head.comment` is `NULL` or satisfies the requirements of [`core::ffi::CStr::from_ptr`]

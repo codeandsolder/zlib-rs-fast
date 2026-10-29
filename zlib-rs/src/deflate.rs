@@ -823,7 +823,7 @@ pub fn copy<'a>(
         ins_h: source_state.ins_h,
         hash_calc_variant: source_state.hash_calc_variant,
         crc_fold: source_state.crc_fold,
-        gzhead: None,
+        gzhead: source_state.gzhead,
         gzindex: source_state.gzindex,
         medium_next_match: source_state.medium_next_match,
         data_type: source_state.data_type,
@@ -842,10 +842,6 @@ pub fn copy<'a>(
     // insert the state_ptr into `dest`
     let field_ptr = unsafe { core::ptr::addr_of_mut!((*dest.as_mut_ptr()).state) };
     unsafe { core::ptr::write(field_ptr as *mut *mut State, state_allocation) };
-
-    // update the gzhead field (it contains a mutable reference so we need to be careful
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*dest.as_mut_ptr()).state.gzhead) };
-    unsafe { core::ptr::copy(&source_state.gzhead, field_ptr, 1) };
 
     ReturnCode::Ok
 }
@@ -1510,7 +1506,9 @@ pub(crate) struct State<'a> {
     /// in the colder state line rather than perturbing the hand-packed match-search cache line.
     pub(crate) max_lazy_match: u16,
 
-    gzhead: Option<&'a mut gz_header>,
+    /// Caller-owned gzip header. zlib permits `deflateCopy()` to duplicate this pointer, so this
+    /// must not be represented as a long-lived Rust `&mut` reference.
+    gzhead: Option<NonNull<gz_header>>,
     gzindex: usize,
 
     /// Medium's speculative next match must survive an output-blocking return. Keeping it here
@@ -2755,7 +2753,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
             0
         };
 
-        match &stream.state.gzhead {
+        match stream.state.gzhead {
             None => {
                 let bytes = [0, 0, 0, 0, 0, extra_flags, gz_header::OS_CODE];
                 stream.state.bit_writer.pending.extend(&bytes);
@@ -2769,6 +2767,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                 }
             }
             Some(gzhead) => {
+                // SAFETY: `set_header` requires the caller-owned header to remain valid while the
+                // stream can use it. Deflate only reads the header.
+                let gzhead = unsafe { gzhead.as_ref() };
                 stream.state.bit_writer.pending.extend(&[gzhead.flags()]);
                 let bytes = (gzhead.time as u32).to_le_bytes();
                 stream.state.bit_writer.pending.extend(&bytes);
@@ -2797,7 +2798,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     }
 
     if stream.state.status == Status::Extra {
-        if let Some(gzhead) = stream.state.gzhead.as_ref() {
+        if let Some(gzhead) = stream.state.gzhead {
+            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
+            let gzhead = unsafe { gzhead.as_ref() };
             if !gzhead.extra.is_null() {
                 let gzhead_extra = gzhead.extra;
 
@@ -2819,7 +2822,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     }
 
     if stream.state.status == Status::Name {
-        if let Some(gzhead) = stream.state.gzhead.as_ref() {
+        if let Some(gzhead) = stream.state.gzhead {
+            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
+            let gzhead = unsafe { gzhead.as_ref() };
             if !gzhead.name.is_null() {
                 // SAFETY: user satisfies precondition that gzhead.name is a C string.
                 let gzhead_name = unsafe { CStr::from_ptr(gzhead.name.cast()) };
@@ -2833,7 +2838,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     }
 
     if stream.state.status == Status::Comment {
-        if let Some(gzhead) = stream.state.gzhead.as_ref() {
+        if let Some(gzhead) = stream.state.gzhead {
+            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
+            let gzhead = unsafe { gzhead.as_ref() };
             if !gzhead.comment.is_null() {
                 // SAFETY: user satisfies precondition that gzhead.name is a C string.
                 let gzhead_comment = unsafe { CStr::from_ptr(gzhead.comment.cast()) };
@@ -2847,7 +2854,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     }
 
     if stream.state.status == Status::Hcrc {
-        if let Some(gzhead) = stream.state.gzhead.as_ref() {
+        if let Some(gzhead) = stream.state.gzhead {
+            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
+            let gzhead = unsafe { gzhead.as_ref() };
             if gzhead.hcrc != 0 {
                 let bytes = (stream.adler as u16).to_le_bytes();
                 if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
@@ -3323,7 +3332,8 @@ impl Heap {
 ///
 /// The caller must guarantee:
 ///
-/// * If `head` is `Some`
+/// * If `head` is `Some`, the header remains valid while this stream may still emit it, and
+///   is not mutated concurrently with an operation on the stream that reads it.
 ///     - `head.extra` is `NULL` or is readable for at least `head.extra_len` bytes
 ///     - `head.name` is `NULL` or satisfies the requirements of [`core::ffi::CStr::from_ptr`]
 ///     - `head.comment` is `NULL` or satisfies the requirements of [`core::ffi::CStr::from_ptr`]
@@ -3334,7 +3344,7 @@ pub unsafe fn set_header<'a>(
     if stream.state.wrap != 2 {
         ReturnCode::StreamError
     } else {
-        stream.state.gzhead = head;
+        stream.state.gzhead = head.map(NonNull::from);
         ReturnCode::Ok
     }
 }
@@ -3408,7 +3418,10 @@ pub fn bound(stream: Option<&mut DeflateStream>, source_len: usize) -> usize {
             // gzip wrapper
             let mut gz_wrap_len = GZIP_WRAPLEN;
 
-            if let Some(header) = &stream.state.gzhead {
+            if let Some(header) = stream.state.gzhead {
+                // SAFETY: `set_header` requires the header and nested pointers to remain valid
+                // while the stream can use them. `bound` only reads them.
+                let header = unsafe { header.as_ref() };
                 if !header.extra.is_null() {
                     gz_wrap_len += 2 + header.extra_len as usize;
                 }
@@ -4680,6 +4693,70 @@ mod test {
         let output_rs = &mut output[..n];
 
         assert_eq!(output_rs.len(), 500 + 99);
+    }
+
+    #[test]
+    fn gzip_header_is_shared_safely_across_deflate_copy() {
+        let extra = b"copy-extra\0";
+        let name = b"copy-name\0";
+        let comment = b"copy-comment\0";
+        let mut header = gz_header {
+            text: 1,
+            time: 0x1234_5678,
+            xflags: 0,
+            os: 3,
+            extra: extra.as_ptr() as *mut _,
+            extra_len: extra.len() as _,
+            extra_max: 0,
+            name: name.as_ptr() as *mut _,
+            name_max: 0,
+            comment: comment.as_ptr() as *mut _,
+            comm_max: 0,
+            hcrc: 1,
+            done: 0,
+        };
+
+        let config = DeflateConfig {
+            window_bits: 31,
+            ..Default::default()
+        };
+        let mut source_stream = z_stream::default();
+        assert_eq!(init(&mut source_stream, config), ReturnCode::Ok);
+        let source = unsafe { DeflateStream::from_stream_mut(&mut source_stream) }.unwrap();
+        assert_eq!(
+            unsafe { set_header(source, Some(&mut header)) },
+            ReturnCode::Ok
+        );
+
+        // Copy before either stream starts emitting the caller-owned header. zlib semantics require
+        // both compressors to retain the same header pointer.
+        let mut copied = MaybeUninit::<DeflateStream>::uninit();
+        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
+        let copied = unsafe { copied.assume_init_mut() };
+
+        let input = b"same payload through both copied streams";
+        let mut source_output = [0u8; 256];
+        source.next_in = input.as_ptr() as *mut _;
+        source.avail_in = input.len() as _;
+        source.next_out = source_output.as_mut_ptr();
+        source.avail_out = source_output.len() as _;
+
+        let mut copied_output = [0u8; 256];
+        copied.next_in = input.as_ptr() as *mut _;
+        copied.avail_in = input.len() as _;
+        copied.next_out = copied_output.as_mut_ptr();
+        copied.avail_out = copied_output.len() as _;
+
+        assert_eq!(deflate(source, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        assert_eq!(deflate(copied, DeflateFlush::Finish), ReturnCode::StreamEnd);
+
+        let source_len = source.total_out as usize;
+        let copied_len = copied.total_out as usize;
+        assert_eq!(source_len, copied_len);
+        assert_eq!(&source_output[..source_len], &copied_output[..copied_len]);
+
+        assert!(end(source).is_ok());
+        assert!(end(copied).is_ok());
     }
 
     #[test]
