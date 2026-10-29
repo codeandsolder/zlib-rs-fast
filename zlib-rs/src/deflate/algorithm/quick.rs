@@ -25,9 +25,9 @@ pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState
     loop {
         if pending_needs_drain(stream.state) {
             stream.flush_pending();
-            if stream.io.avail_out == 0 {
+            if stream.output.avail_out == 0 {
                 return if last
-                    && stream.io.avail_in == 0
+                    && stream.input.avail_in == 0
                     && stream.state.bit_writer.bits_valid == 0
                     && stream.state.block_open == 0
                 {
@@ -87,7 +87,7 @@ fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> 
     }
 
     stream.flush_pending();
-    (stream.io.avail_out == 0).then_some(if last {
+    (stream.output.avail_out == 0).then_some(if last {
         BlockState::FinishStarted
     } else {
         BlockState::NeedMore

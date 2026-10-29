@@ -306,7 +306,7 @@ pub(super) fn drive_standard(
                 stream.state.encode_block(false);
                 continuation.apply(stream.state);
                 stream.flush_pending();
-                if stream.io.avail_out == 0 {
+                if stream.output.avail_out == 0 {
                     return BlockState::NeedMore;
                 }
             }
@@ -329,7 +329,7 @@ pub(super) fn finish_standard(
     if flush == DeflateFlush::Finish {
         stream.state.encode_block(true);
         stream.flush_pending();
-        return if stream.io.avail_out == 0 {
+        return if stream.output.avail_out == 0 {
             BlockState::FinishStarted
         } else {
             BlockState::FinishDone
@@ -339,7 +339,7 @@ pub(super) fn finish_standard(
     if !stream.state.sym_buf.is_empty() {
         stream.state.encode_block(false);
         stream.flush_pending();
-        if stream.io.avail_out == 0 {
+        if stream.output.avail_out == 0 {
             return BlockState::NeedMore;
         }
     }

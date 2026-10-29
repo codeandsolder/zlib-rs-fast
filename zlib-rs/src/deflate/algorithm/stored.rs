@@ -21,7 +21,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // unsigned len, left, have, last = 0;
     let mut have;
     let mut last = false;
-    let mut used = stream.io.avail_in;
+    let mut used = stream.input.avail_in;
     loop {
         // maximum deflate stored block length
         let mut len = MAX_STORED;
@@ -30,18 +30,18 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         have = ((stream.state.bit_writer.bits_valid + 42) / 8) as usize;
 
         // we need room for at least the header
-        if stream.io.avail_out < have as u32 {
+        if stream.output.avail_out < have as u32 {
             break;
         }
 
         let left = stream.state.strstart as isize - stream.state.block_start;
         let left = Ord::max(0, left) as usize;
 
-        have = stream.io.avail_out as usize - have;
+        have = stream.output.avail_out as usize - have;
 
-        if len > left + stream.io.avail_in as usize {
+        if len > left + stream.input.avail_in as usize {
             // limit len to the input
-            len = left + stream.io.avail_in as usize;
+            len = left + stream.input.avail_in as usize;
         }
 
         len = Ord::min(len, have);
@@ -53,14 +53,14 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         if len < min_block
             && ((len == 0 && flush != DeflateFlush::Finish)
                 || flush == DeflateFlush::NoFlush
-                || len != left + stream.io.avail_in as usize)
+                || len != left + stream.input.avail_in as usize)
         {
             break;
         }
 
         // Make a dummy stored block in pending to get the header bytes,
         // including any pending bits. This also updates the debugging counts.
-        last = flush == DeflateFlush::Finish && len == left + stream.io.avail_in as usize;
+        last = flush == DeflateFlush::Finish && len == left + stream.input.avail_in as usize;
         zng_tr_stored_block(stream.state, 0..0, last);
 
         /* Replace the lengths in the dummy stored block with len. */
@@ -106,7 +106,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // than s->w_size bytes were copied. Also update the number of bytes to
     // insert in the hash tables, in the event that deflateParams() switches to
     // a non-zero compression level.
-    used -= stream.io.avail_in; /* number of input bytes directly copied */
+    used -= stream.input.avail_in; /* number of input bytes directly copied */
 
     if used > 0 {
         let used = used as usize;
@@ -151,7 +151,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // If flushing and all input has been consumed, then done.
     if flush != DeflateFlush::NoFlush
         && flush != DeflateFlush::Finish
-        && stream.io.avail_in == 0
+        && stream.input.avail_in == 0
         && stream.state.strstart as isize == stream.state.block_start
     {
         return BlockState::BlockDone;
@@ -159,7 +159,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
 
     // Fill the window with any remaining input
     let mut have = stream.state.window_size - stream.state.strstart;
-    if stream.io.avail_in as usize > have
+    if stream.input.avail_in as usize > have
         && stream.state.block_start >= stream.state.w_size as isize
     {
         // slide the window down
@@ -185,7 +185,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         state.insert = Ord::min(state.insert, state.strstart);
     }
 
-    let have = Ord::min(have, stream.io.avail_in as usize);
+    let have = Ord::min(have, stream.input.avail_in as usize);
     if have > 0 {
         stream.read_buf_window(stream.state.strstart, have);
 
@@ -211,11 +211,12 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     if left >= min_block as isize
         || ((left > 0 || flush == DeflateFlush::Finish)
             && flush != DeflateFlush::NoFlush
-            && stream.io.avail_in == 0
+            && stream.input.avail_in == 0
             && left <= have as isize)
     {
         let len = Ord::min(left as usize, have); // TODO wrapping?
-        last = flush == DeflateFlush::Finish && stream.io.avail_in == 0 && len == (left as usize);
+        last =
+            flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == (left as usize);
 
         let range = state.block_start as usize..state.block_start as usize + len;
         zng_tr_stored_block(state, range, last);

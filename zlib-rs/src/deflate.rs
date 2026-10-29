@@ -51,25 +51,19 @@ pub struct DeflateStream<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CompressionIo {
+pub(crate) struct InputCursor {
     pub(crate) next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
-    pub(crate) next_out: *mut crate::c_api::Bytef,
-    pub(crate) avail_out: crate::c_api::uInt,
-    pub(crate) total_out: crate::c_api::z_size,
     pub(crate) adler: crate::c_api::z_checksum,
 }
 
-impl CompressionIo {
+impl InputCursor {
     fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             next_in: stream.next_in,
             avail_in: stream.avail_in,
             total_in: stream.total_in,
-            next_out: stream.next_out,
-            avail_out: stream.avail_out,
-            total_out: stream.total_out,
             adler: stream.adler,
         }
     }
@@ -78,30 +72,55 @@ impl CompressionIo {
         stream.next_in = self.next_in;
         stream.avail_in = self.avail_in;
         stream.total_in = self.total_in;
+        stream.adler = self.adler;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OutputCursor {
+    pub(crate) next_out: *mut crate::c_api::Bytef,
+    pub(crate) avail_out: crate::c_api::uInt,
+    pub(crate) total_out: crate::c_api::z_size,
+}
+
+impl OutputCursor {
+    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+        Self {
+            next_out: stream.next_out,
+            avail_out: stream.avail_out,
+            total_out: stream.total_out,
+        }
+    }
+
+    fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.next_out = self.next_out;
         stream.avail_out = self.avail_out;
         stream.total_out = self.total_out;
-        stream.adler = self.adler;
     }
 }
 
 /// Internal execution context for one compression call.
 ///
 /// `DeflateStream` is constrained by the public zlib ABI. Algorithms operate on this
-/// Rust-owned view instead: compression state is borrowed separately from the mutable I/O cursor,
-/// which is committed back to the ABI shell when the algorithm returns.
+/// Rust-owned view instead: compression state is borrowed separately from independent input and
+/// output cursors, which are committed back to the ABI shell when the algorithm returns.
 pub(crate) struct Compressor<'a, 'state> {
     pub(crate) state: &'a mut State<'state>,
-    pub(crate) io: CompressionIo,
+    pub(crate) input: InputCursor,
+    pub(crate) output: OutputCursor,
 }
 
 impl<'a, 'state> Compressor<'a, 'state> {
-    fn new(state: &'a mut State<'state>, io: CompressionIo) -> Self {
-        Self { state, io }
+    fn new(state: &'a mut State<'state>, input: InputCursor, output: OutputCursor) -> Self {
+        Self {
+            state,
+            input,
+            output,
+        }
     }
 
-    fn into_io(self) -> CompressionIo {
-        self.io
+    fn into_cursors(self) -> (InputCursor, OutputCursor) {
+        (self.input, self.output)
     }
 
     pub(crate) fn fill_window(&mut self) {
@@ -119,13 +138,13 @@ impl<'a, 'state> Compressor<'a, 'state> {
     /// Copy initialized history bytes to the caller's output buffer.
     pub(crate) fn copy_window_to_output(&mut self, range: core::ops::Range<usize>) {
         let len = range.len();
-        assert!(len <= self.io.avail_out as usize);
+        assert!(len <= self.output.avail_out as usize);
         let src = &self.state.window.filled()[range];
 
         // SAFETY: `src` is an initialized window slice and the caller-provided output cursor has
         // at least `len` writable bytes by the assertion above. The zlib contract requires input
         // and output buffers not to overlap for this direct stored-block path.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.io.next_out, len) };
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.output.next_out, len) };
         self.advance_output(len);
     }
 
@@ -135,29 +154,29 @@ impl<'a, 'state> Compressor<'a, 'state> {
     /// mutate input memory concurrently. We checksum the output copy, which is stable after the raw
     /// copy has completed.
     pub(crate) fn copy_input_to_output(&mut self, size: usize) -> usize {
-        let len = size.min(self.io.avail_in as usize);
-        assert!(len <= self.io.avail_out as usize);
+        let len = size.min(self.input.avail_in as usize);
+        assert!(len <= self.output.avail_out as usize);
         if len == 0 {
             return 0;
         }
 
-        let output = self.io.next_out;
+        let output = self.output.next_out;
         // SAFETY: the input cursor exposes `avail_in` readable bytes and the output cursor exposes
         // `avail_out` writable bytes. Both bounds are checked above; direct stored copies require
         // non-overlapping zlib input/output buffers.
-        unsafe { core::ptr::copy_nonoverlapping(self.io.next_in, output, len) };
+        unsafe { core::ptr::copy_nonoverlapping(self.input.next_in, output, len) };
 
         // SAFETY: the just-completed copy initialized exactly `len` output bytes.
         let copied = unsafe { core::slice::from_raw_parts(output, len) };
         match self.state.wrap {
             2 => self.state.crc_fold.fold(copied),
-            1 => self.io.adler = crate::adler32::adler32(self.io.adler as u32, copied) as _,
+            1 => self.input.adler = crate::adler32::adler32(self.input.adler as u32, copied) as _,
             _ => {}
         }
 
-        self.io.next_in = self.io.next_in.wrapping_add(len);
-        self.io.avail_in -= len as u32;
-        self.io.total_in += len as crate::c_api::z_size;
+        self.input.next_in = self.input.next_in.wrapping_add(len);
+        self.input.avail_in -= len as u32;
+        self.input.total_in += len as crate::c_api::z_size;
         self.advance_output(len);
         len
     }
@@ -170,16 +189,16 @@ impl<'a, 'state> Compressor<'a, 'state> {
     ) {
         let len = destination.len();
         assert!(len <= bytes_back);
-        let src = self.io.next_in.wrapping_sub(bytes_back);
+        let src = self.input.next_in.wrapping_sub(bytes_back);
         // SAFETY: callers only request bytes already consumed by `copy_input_to_output`, so the
         // region ending at the current input cursor remains within the caller's input allocation.
         unsafe { self.state.window.copy_and_initialize(destination, src) };
     }
 
     fn advance_output(&mut self, len: usize) {
-        self.io.next_out = self.io.next_out.wrapping_add(len);
-        self.io.avail_out -= len as u32;
-        self.io.total_out += len as crate::c_api::z_size;
+        self.output.next_out = self.output.next_out.wrapping_add(len);
+        self.output.avail_out -= len as u32;
+        self.output.total_out += len as crate::c_api::z_size;
     }
 }
 
@@ -190,14 +209,17 @@ pub(crate) fn with_compressor<'state, R>(
     // `data_type` is public z_stream metadata, so honor caller overrides at each ABI entry. The
     // encoder owns the working copy in State and publishes any lazy detection result on return.
     stream.state.data_type = stream.data_type;
-    let io = CompressionIo::from_stream(stream);
-    let (result, io, data_type) = {
-        let mut compressor = Compressor::new(&mut *stream.state, io);
+    let input = InputCursor::from_stream(stream);
+    let output = OutputCursor::from_stream(stream);
+    let (result, input, output, data_type) = {
+        let mut compressor = Compressor::new(&mut *stream.state, input, output);
         let result = f(&mut compressor);
         let data_type = compressor.state.data_type;
-        (result, compressor.into_io(), data_type)
+        let (input, output) = compressor.into_cursors();
+        (result, input, output, data_type)
     };
-    io.apply(stream);
+    input.apply(stream);
+    output.apply(stream);
     stream.data_type = data_type;
     result
 }
@@ -1877,20 +1899,20 @@ pub(crate) fn flush_pending(stream: &mut DeflateStream<'_>) {
 }
 
 fn read_buf_window_core(stream: &mut Compressor<'_, '_>, offset: usize, size: usize) -> usize {
-    let len = Ord::min(stream.io.avail_in as usize, size);
+    let len = Ord::min(stream.input.avail_in as usize, size);
 
     if len == 0 {
         return 0;
     }
 
-    stream.io.avail_in -= len as u32;
+    stream.input.avail_in -= len as u32;
 
     if stream.state.wrap == 2 {
         // we likely cannot fuse the crc32 and the copy here because the input can be changed by
         // a concurrent thread. Therefore it cannot be converted into a slice!
         let window = &mut stream.state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.io.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, stream.input.next_in) };
 
         let data = &stream.state.window.filled()[offset..][..len];
         stream.state.crc_fold.fold(data);
@@ -1899,20 +1921,23 @@ fn read_buf_window_core(stream: &mut Compressor<'_, '_>, offset: usize, size: us
         // a concurrent thread. Therefore it cannot be converted into a slice!
         let window = &mut stream.state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.io.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, stream.input.next_in) };
 
         let data = &stream.state.window.filled()[offset..][..len];
-        stream.io.adler = adler32(stream.io.adler as u32, data) as _;
+        stream.input.adler = adler32(stream.input.adler as u32, data) as _;
     } else {
         let window = &mut stream.state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.io.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, stream.input.next_in) };
     }
 
     // These can overflow, especially on windows where the integer type is u32 and input/output are
     // larger than 4GB.
-    stream.io.next_in = stream.io.next_in.wrapping_add(len);
-    stream.io.total_in = stream.io.total_in.wrapping_add(len as crate::c_api::z_size);
+    stream.input.next_in = stream.input.next_in.wrapping_add(len);
+    stream.input.total_in = stream
+        .input
+        .total_in
+        .wrapping_add(len as crate::c_api::z_size);
 
     len
 }
@@ -1997,7 +2022,7 @@ fn fill_window_core(stream: &mut Compressor<'_, '_>) {
             more += wsize;
         }
 
-        if stream.io.avail_in == 0 {
+        if stream.input.avail_in == 0 {
             break;
         }
 
@@ -2041,7 +2066,7 @@ fn fill_window_core(stream: &mut Compressor<'_, '_>) {
         // If the whole input has less than STD_MIN_MATCH bytes, ins_h is garbage,
         // but this is not important since only literal bytes will be emitted.
 
-        if !(stream.state.lookahead < MIN_LOOKAHEAD && stream.io.avail_in != 0) {
+        if !(stream.state.lookahead < MIN_LOOKAHEAD && stream.input.avail_in != 0) {
             break;
         }
     }
@@ -2997,19 +3022,19 @@ fn flush_pending_core(stream: &mut Compressor<'_, '_>) {
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();
-    let len = Ord::min(pending.len(), stream.io.avail_out as usize);
+    let len = Ord::min(pending.len(), stream.output.avail_out as usize);
 
     if len == 0 {
         return;
     }
 
     trace!("\n[FLUSH {len} bytes]");
-    // SAFETY: len is min(pending, stream.io.avail_out), so we won't overrun next_out.
-    unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), stream.io.next_out, len) };
+    // SAFETY: len is min(pending, stream.output.avail_out), so we won't overrun next_out.
+    unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), stream.output.next_out, len) };
 
-    stream.io.next_out = stream.io.next_out.wrapping_add(len);
-    stream.io.total_out += len as crate::c_api::z_size;
-    stream.io.avail_out -= len as crate::c_api::uInt;
+    stream.output.next_out = stream.output.next_out.wrapping_add(len);
+    stream.output.total_out += len as crate::c_api::z_size;
+    stream.output.avail_out -= len as crate::c_api::uInt;
 
     state.bit_writer.pending.advance(len);
 }
