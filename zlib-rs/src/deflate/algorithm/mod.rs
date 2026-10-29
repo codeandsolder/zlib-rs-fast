@@ -163,56 +163,73 @@ impl TokenProducer for StandardProducer {
     }
 }
 
+/// Whether the producer may consume a short tail below its preferred lookahead.
+///
+/// `FinalTail` is a fact supplied by orchestration after it has tried to satisfy `NeedInput` and
+/// knows the current zlib call is flushing all caller input. Keeping that fact outside `State`
+/// prevents caller-I/O policy from leaking back into the compression core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InputPhase {
+    Open,
+    FinalTail,
+}
+
 /// A scheduler-visible boundary reached while advancing one ordinary compression stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CoreEvent {
-    /// Caller input was exhausted before the producer's preferred lookahead could be restored.
-    NeedInput,
+    /// The producer needs more buffered lookahead before it can continue normally.
+    NeedInput { preferred_lookahead: usize },
     /// A complete token block is resident in `State::sym_buf` and is ready for block encoding.
     TokenBlockReady(BlockContinuation),
     /// No more input remains for this call. `insert` is the tail state needed by a later refill.
     Finished { insert: usize },
 }
 
-/// Advance one stream only until it reaches a scheduling boundary.
+/// Advance already-buffered compression state until it reaches a scheduling boundary.
 ///
-/// This function may refill the LZ window, but it never encodes a token block and never drains
-/// output. A batch scheduler can therefore collect `TokenBlockReady` events from multiple streams
-/// before choosing where and when to run the block-encoding stage.
+/// This is deliberately I/O-free: it cannot refill caller input, encode a token block, or drain
+/// pending output. A scheduler decides how to satisfy `NeedInput`, then calls this again with either
+/// more buffered data or `FinalTail` once it knows no more input belongs to the current flush.
 pub(super) fn next_core_event(
-    stream: &mut Compressor<'_, '_>,
-    flush: DeflateFlush,
+    state: &mut State<'_>,
+    input_phase: InputPhase,
     producer: &mut StandardProducer,
 ) -> CoreEvent {
-    loop {
-        let preferred_lookahead = producer.preferred_lookahead();
-        let mut allow_short_tail = false;
+    let preferred_lookahead = producer.preferred_lookahead();
 
-        if stream.state.lookahead < preferred_lookahead {
-            stream.fill_window();
-            producer.after_refill(stream.state);
+    if state.lookahead < preferred_lookahead {
+        match input_phase {
+            InputPhase::Open => {
+                return CoreEvent::NeedInput {
+                    preferred_lookahead,
+                };
+            }
+            InputPhase::FinalTail if state.lookahead == 0 => {
+                return CoreEvent::Finished {
+                    insert: producer.finish(state),
+                };
+            }
+            InputPhase::FinalTail => {}
+        }
+    }
 
-            if stream.state.lookahead < preferred_lookahead {
-                if flush == DeflateFlush::NoFlush {
-                    return CoreEvent::NeedInput;
+    let allow_short_tail = input_phase == InputPhase::FinalTail;
+    match producer.produce(state, allow_short_tail) {
+        ProduceStatus::NeedInput => {
+            debug_assert!(state.lookahead < preferred_lookahead);
+            match input_phase {
+                InputPhase::Open => CoreEvent::NeedInput {
+                    preferred_lookahead,
+                },
+                InputPhase::FinalTail => {
+                    debug_assert_eq!(state.lookahead, 0);
+                    CoreEvent::Finished {
+                        insert: producer.finish(state),
+                    }
                 }
-                if stream.state.lookahead == 0 {
-                    return CoreEvent::Finished {
-                        insert: producer.finish(stream.state),
-                    };
-                }
-                allow_short_tail = true;
             }
         }
-
-        match producer.produce(stream.state, allow_short_tail) {
-            ProduceStatus::NeedInput => {
-                debug_assert!(stream.state.lookahead < preferred_lookahead);
-            }
-            ProduceStatus::BlockReady(continuation) => {
-                return CoreEvent::TokenBlockReady(continuation);
-            }
-        }
+        ProduceStatus::BlockReady(continuation) => CoreEvent::TokenBlockReady(continuation),
     }
 }
 
@@ -226,9 +243,26 @@ pub(super) fn drive_standard(
     flush: DeflateFlush,
     producer: &mut StandardProducer,
 ) -> BlockState {
+    let mut input_phase = InputPhase::Open;
+
     loop {
-        match next_core_event(stream, flush, producer) {
-            CoreEvent::NeedInput => return BlockState::NeedMore,
+        match next_core_event(stream.state, input_phase, producer) {
+            CoreEvent::NeedInput {
+                preferred_lookahead,
+            } => {
+                debug_assert_eq!(input_phase, InputPhase::Open);
+                debug_assert!(stream.state.lookahead < preferred_lookahead);
+
+                stream.fill_window();
+                producer.after_refill(stream.state);
+
+                if stream.state.lookahead < preferred_lookahead {
+                    if flush == DeflateFlush::NoFlush {
+                        return BlockState::NeedMore;
+                    }
+                    input_phase = InputPhase::FinalTail;
+                }
+            }
             CoreEvent::TokenBlockReady(continuation) => {
                 stream.encode_block(false);
                 continuation.apply(stream.state);
