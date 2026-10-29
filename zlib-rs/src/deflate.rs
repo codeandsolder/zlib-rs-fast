@@ -759,10 +759,6 @@ pub fn copy<'a>(
     let window_bits = source.state.w_bits() as usize;
     let lit_bufsize = source.state.lit_bufsize;
 
-    // SAFETY: source and dest are both mutable references, so guaranteed not to overlap.
-    // dest being a reference to maybe uninitialized memory makes a copy of 1 DeflateStream valid.
-    unsafe { core::ptr::copy_nonoverlapping(source, dest.as_mut_ptr(), 1) };
-
     let source_state = &source.state;
     let alloc = &source.alloc;
 
@@ -839,9 +835,24 @@ pub fn copy<'a>(
     // write the cloned state into the rebound allocation
     unsafe { state_allocation.write(dest_state) };
 
-    // insert the state_ptr into `dest`
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*dest.as_mut_ptr()).state) };
-    unsafe { core::ptr::write(field_ptr as *mut *mut State, state_allocation) };
+    // Build the destination ABI shell explicitly. A raw struct copy would duplicate the source's
+    // `&mut State` value before replacing it, which is not valid Rust aliasing even though C's
+    // `z_stream.state` pointer is copyable.
+    let dest_state = unsafe { &mut *state_allocation };
+    dest.write(DeflateStream {
+        next_in: source.next_in,
+        avail_in: source.avail_in,
+        total_in: source.total_in,
+        next_out: source.next_out,
+        avail_out: source.avail_out,
+        total_out: source.total_out,
+        msg: source.msg,
+        state: dest_state,
+        alloc: source.alloc,
+        data_type: source.data_type,
+        adler: source.adler,
+        reserved: source.reserved,
+    });
 
     ReturnCode::Ok
 }
