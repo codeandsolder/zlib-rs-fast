@@ -92,6 +92,46 @@ impl TokenBlockWork {
     }
 }
 
+/// How orchestration wants to close the currently exhausted input segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EndBlockKind {
+    FlushBoundary,
+    Final,
+}
+
+/// State-only work produced when the current input segment is exhausted.
+///
+/// The producer supplies the tail insertion state; orchestration separately decides whether zlib
+/// requested a non-final flush boundary or the final DEFLATE block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EndOfInputWork {
+    insert: usize,
+}
+
+impl EndOfInputWork {
+    fn new(insert: usize) -> Self {
+        Self { insert }
+    }
+
+    /// Apply tail state and encode the required block, returning whether pending output was added.
+    pub(super) fn encode(self, state: &mut State<'_>, kind: EndBlockKind) -> bool {
+        state.insert = self.insert;
+
+        match kind {
+            EndBlockKind::Final => {
+                // A final empty block is still required when there are no resident tokens.
+                state.encode_block(true);
+                true
+            }
+            EndBlockKind::FlushBoundary if !state.sym_buf.is_empty() => {
+                state.encode_block(false);
+                true
+            }
+            EndBlockKind::FlushBoundary => false,
+        }
+    }
+}
+
 /// A resumable token producer over already-buffered compression state.
 ///
 /// Implementations may update the LZ/hash/token state, but they never refill raw caller input,
@@ -221,8 +261,8 @@ pub(super) enum CoreEvent {
     NeedInput(InputDemand),
     /// A complete resident token block is ready to run as one owned block-encoding action.
     TokenBlockReady(TokenBlockWork),
-    /// No more input remains for this call. `insert` is the tail state needed by a later refill.
-    Finished { insert: usize },
+    /// No more input remains for this call; orchestration must close this input segment.
+    EndOfInput(EndOfInputWork),
 }
 
 /// Advance already-buffered compression state until it reaches a scheduling boundary.
@@ -243,9 +283,7 @@ pub(super) fn next_core_event(
                 return CoreEvent::NeedInput(InputDemand::new(preferred_lookahead));
             }
             InputPhase::FinalTail if state.lookahead == 0 => {
-                return CoreEvent::Finished {
-                    insert: producer.finish(state),
-                };
+                return CoreEvent::EndOfInput(EndOfInputWork::new(producer.finish(state)));
             }
             InputPhase::FinalTail => {}
         }
@@ -259,9 +297,7 @@ pub(super) fn next_core_event(
                 InputPhase::Open => CoreEvent::NeedInput(InputDemand::new(preferred_lookahead)),
                 InputPhase::FinalTail => {
                     debug_assert_eq!(state.lookahead, 0);
-                    CoreEvent::Finished {
-                        insert: producer.finish(state),
-                    }
+                    CoreEvent::EndOfInput(EndOfInputWork::new(producer.finish(state)))
                 }
             }
         }
@@ -334,40 +370,26 @@ pub(super) fn drive_standard(
                     return BlockState::NeedMore;
                 }
             }
-            CoreEvent::Finished { insert } => return finish_standard(stream, flush, insert),
+            CoreEvent::EndOfInput(work) => {
+                let kind = if flush == DeflateFlush::Finish {
+                    EndBlockKind::Final
+                } else {
+                    EndBlockKind::FlushBoundary
+                };
+                let encoded = work.encode(stream.state, kind);
+                let output_full = encoded
+                    && drain_pending_output(stream.state, &mut stream.output)
+                        == DrainOutcome::OutputFull;
+
+                return match (kind, output_full) {
+                    (EndBlockKind::Final, true) => BlockState::FinishStarted,
+                    (EndBlockKind::Final, false) => BlockState::FinishDone,
+                    (EndBlockKind::FlushBoundary, true) => BlockState::NeedMore,
+                    (EndBlockKind::FlushBoundary, false) => BlockState::BlockDone,
+                };
+            }
         }
     }
-}
-
-/// Finalize the ordinary token-producing algorithms after input processing stops.
-///
-/// `insert` records how much tail state must be rebuilt when more input arrives. Stored and Quick
-/// have different block mechanics and intentionally do not use this path.
-pub(super) fn finish_standard(
-    stream: &mut Compressor<'_, '_>,
-    flush: DeflateFlush,
-    insert: usize,
-) -> BlockState {
-    stream.state.insert = insert;
-
-    if flush == DeflateFlush::Finish {
-        stream.state.encode_block(true);
-        return if drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull
-        {
-            BlockState::FinishStarted
-        } else {
-            BlockState::FinishDone
-        };
-    }
-
-    if !stream.state.sym_buf.is_empty() {
-        stream.state.encode_block(false);
-        if drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull {
-            return BlockState::NeedMore;
-        }
-    }
-
-    BlockState::BlockDone
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

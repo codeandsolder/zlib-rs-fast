@@ -4020,11 +4020,12 @@ mod test {
                     });
                     assert_eq!(outcome, DrainOutcome::Ready);
                 }
-                algorithm::CoreEvent::Finished { insert } => {
-                    let result = with_compressor(stream, |compressor| {
-                        algorithm::finish_standard(compressor, DeflateFlush::Finish, insert)
+                algorithm::CoreEvent::EndOfInput(work) => {
+                    assert!(work.encode(stream.state, algorithm::EndBlockKind::Final));
+                    let outcome = with_compressor(stream, |compressor| {
+                        drain_pending_output(compressor.state, &mut compressor.output)
                     });
-                    assert!(matches!(result, BlockState::FinishDone));
+                    assert_eq!(outcome, DrainOutcome::Ready);
                     self.done = true;
                 }
             }
