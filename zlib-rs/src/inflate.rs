@@ -2260,7 +2260,8 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
 
     let window_allocation = unsafe { buf.add(allocs.window_pos) };
-    let window = unsafe { Window::from_raw_parts(window_allocation, (1 << MAX_WBITS) + 64) };
+    let window =
+        unsafe { Window::from_uninitialized_raw_parts(window_allocation, (1 << MAX_WBITS) + 64) };
     state.window = window;
 
     let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };

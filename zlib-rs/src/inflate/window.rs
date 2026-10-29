@@ -23,12 +23,26 @@ impl<'a> Window<'a> {
         self.buf.into_raw_parts()
     }
 
+    /// Bind caller-owned raw storage without reading or initializing it.
+    ///
+    /// This is used by `inflateBack`, which writes through raw pointers and tracks the initialized
+    /// prefix explicitly before any typed reads.
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
         Self {
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, len) },
             have: 0,
             next: 0,
         }
+    }
+
+    /// Initialize an owned raw window before exposing it through typed `u8` slices.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be writable for `len` bytes and remain uniquely owned for the returned lifetime.
+    pub unsafe fn from_uninitialized_raw_parts(ptr: *mut u8, len: usize) -> Self {
+        unsafe { ptr.write_bytes(0, len) };
+        unsafe { Self::from_raw_parts(ptr, len) }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -206,6 +220,21 @@ mod test {
         window.have = 0;
         window.next = 0;
         window
+    }
+
+    #[test]
+    fn owned_raw_constructor_initializes_backing_storage() {
+        use core::mem::MaybeUninit;
+
+        let mut storage = [MaybeUninit::<u8>::uninit(); 80];
+        let mut window = unsafe {
+            Window::from_uninitialized_raw_parts(storage.as_mut_ptr().cast::<u8>(), storage.len())
+        };
+
+        // Expose the whole logical window only after the constructor has initialized it. Under
+        // Miri this also exercises the old invalid typed-read path directly.
+        unsafe { window.set_have(window.size()) };
+        assert!(window.as_slice().iter().all(|byte| *byte == 0));
     }
 
     #[test]
