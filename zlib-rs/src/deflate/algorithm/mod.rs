@@ -264,7 +264,7 @@ pub(super) fn drive_standard(
                 }
             }
             CoreEvent::TokenBlockReady(continuation) => {
-                stream.encode_block(false);
+                stream.state.encode_block(false);
                 continuation.apply(stream.state);
                 stream.flush_pending();
                 if stream.io.avail_out == 0 {
@@ -288,7 +288,7 @@ pub(super) fn finish_standard(
     stream.state.insert = insert;
 
     if flush == DeflateFlush::Finish {
-        stream.encode_block(true);
+        stream.state.encode_block(true);
         stream.flush_pending();
         return if stream.io.avail_out == 0 {
             BlockState::FinishStarted
@@ -298,7 +298,7 @@ pub(super) fn finish_standard(
     }
 
     if !stream.state.sym_buf.is_empty() {
-        stream.encode_block(false);
+        stream.state.encode_block(false);
         stream.flush_pending();
         if stream.io.avail_out == 0 {
             return BlockState::NeedMore;

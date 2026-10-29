@@ -112,11 +112,6 @@ impl<'a, 'state> Compressor<'a, 'state> {
         flush_pending_core(self);
     }
 
-    /// Encode the current token block into the pending byte buffer without touching caller output.
-    pub(crate) fn encode_block(&mut self, is_last: bool) {
-        encode_block_core(self, is_last);
-    }
-
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
         read_buf_window_core(self, offset, size)
     }
@@ -1601,6 +1596,11 @@ enum DataType {
 impl<'a> State<'a> {
     pub const BIT_BUF_SIZE: u8 = BitWriter::BIT_BUF_SIZE;
 
+    /// Encode the resident token block into pending bytes without touching caller I/O.
+    pub(crate) fn encode_block(&mut self, is_last: bool) {
+        encode_block_core(self, is_last);
+    }
+
     // log2(w_size)  (in the range MIN_WBITS..=MAX_WBITS)
     pub(crate) fn w_bits(&self) -> u32 {
         self.w_size.trailing_zeros()
@@ -2623,15 +2623,15 @@ fn zng_tr_flush_block(
     // Tracev((stderr, "\ncomprlen {}(%lu) ", s->compressed_len>>3, s->compressed_len-7*last));
 }
 
-fn encode_block_core(stream: &mut Compressor<'_, '_>, is_last: bool) {
+fn encode_block_core(state: &mut State<'_>, is_last: bool) {
     zng_tr_flush_block(
-        stream.state,
-        (stream.state.block_start >= 0).then_some(stream.state.block_start as usize),
-        (stream.state.strstart as isize - stream.state.block_start) as u32,
+        state,
+        (state.block_start >= 0).then_some(state.block_start as usize),
+        (state.strstart as isize - state.block_start) as u32,
         is_last,
     );
 
-    stream.state.block_start = stream.state.strstart as isize;
+    state.block_start = state.strstart as isize;
 }
 
 fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
