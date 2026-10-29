@@ -1170,7 +1170,8 @@ pub unsafe extern "C" fn inflateSetDictionary(
 ///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`inflateInit_`] or similar
 /// * Either
 ///     - `head` is `NULL`
-///     - `head` satisfies the requirements of `&mut *head`
+///     - `head` remains valid and exclusively writable while the stream may still populate it; the
+///       caller must not access it concurrently with such an inflate operation
 /// * If `head` is not `NULL`:
 ///     - if `head.extra` is not NULL, it must be writable for at least `head.extra_max` bytes
 ///     - if `head.name` is not NULL, it must be writable for at least `head.name_max` bytes

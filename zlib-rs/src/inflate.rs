@@ -5,6 +5,7 @@ use core::ffi::{c_char, c_int, c_long, c_ulong};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
+use core::ptr::NonNull;
 
 mod bitreader;
 mod infback;
@@ -436,8 +437,9 @@ pub(crate) struct State<'a> {
 
     error_message: Option<&'static str>,
 
-    /// place to store gzip header if needed
-    head: Option<&'a mut gz_header>,
+    /// Caller-owned gzip-header destination. zlib permits `inflateCopy()` to duplicate this
+    /// pointer, so it must not be represented as a long-lived Rust `&mut` reference.
+    head: Option<NonNull<gz_header>>,
     dmax: usize,
 
     /// table for length/literal codes
@@ -944,8 +946,10 @@ impl State<'_> {
                             break 'blk Mode::Flags;
                         }
 
-                        if let Some(header) = &mut self.head {
-                            header.done = -1;
+                        if let Some(mut header) = self.head {
+                            // SAFETY: `get_header` requires this caller-owned destination to remain
+                            // valid and exclusively writable while inflate may populate it.
+                            unsafe { header.as_mut() }.done = -1;
                         }
 
                         // check if zlib header is allowed
@@ -1003,7 +1007,9 @@ impl State<'_> {
                             break 'label self.bad("unknown header flags set\0");
                         }
 
-                        if let Some(head) = self.head.as_mut() {
+                        if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.text = ((self.bit_reader.hold() >> 8) & 1) as i32;
                         }
 
@@ -1019,7 +1025,9 @@ impl State<'_> {
                     }
                     Mode::Time => {
                         need_bits!(self, 32);
-                        if let Some(head) = self.head.as_mut() {
+                        if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.time = self.bit_reader.hold() as z_size;
                         }
 
@@ -1034,7 +1042,9 @@ impl State<'_> {
                     }
                     Mode::Os => {
                         need_bits!(self, 16);
-                        if let Some(head) = self.head.as_mut() {
+                        if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.xflags = (self.bit_reader.hold() & 0xff) as i32;
                             head.os = (self.bit_reader.hold() >> 8) as i32;
                         }
@@ -1054,7 +1064,9 @@ impl State<'_> {
 
                             // self.length (and head.extra_len) represent the length of the extra field
                             self.length = self.bit_reader.hold() as usize;
-                            if let Some(head) = self.head.as_mut() {
+                            if let Some(mut head) = self.head {
+                                // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                                let head = unsafe { head.as_mut() };
                                 head.extra_len = self.length as u32;
                             }
 
@@ -1063,7 +1075,9 @@ impl State<'_> {
                                 self.checksum = crc32(self.checksum, &bytes);
                             }
                             self.bit_reader.init_bits();
-                        } else if let Some(head) = self.head.as_mut() {
+                        } else if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.extra = core::ptr::null_mut();
                         }
 
@@ -1076,7 +1090,9 @@ impl State<'_> {
                                 Ord::min(self.length, self.bit_reader.bytes_remaining());
 
                             if extra_available > 0 {
-                                if let Some(head) = self.head.as_mut() {
+                                if let Some(mut head) = self.head {
+                                    // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                                    let head = unsafe { head.as_mut() };
                                     if !head.extra.is_null() {
                                         // at `head.extra`, the caller has reserved `head.extra_max` bytes.
                                         // in the deflated byte stream, we've found a gzip header with
@@ -1151,7 +1167,9 @@ impl State<'_> {
                             };
 
                             // if the header has space, store as much as possible in there
-                            if let Some(head) = self.head.as_mut() {
+                            if let Some(mut head) = self.head {
+                                // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                                let head = unsafe { head.as_mut() };
                                 if !head.name.is_null() {
                                     let remaining_name_bytes = (head.name_max as usize)
                                         .checked_sub(self.length)
@@ -1182,7 +1200,9 @@ impl State<'_> {
                             if !reached_end && self.bit_reader.bytes_remaining() == 0 {
                                 break 'label self.inflate_leave(ReturnCode::Ok);
                             }
-                        } else if let Some(head) = self.head.as_mut() {
+                        } else if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.name = core::ptr::null_mut();
                         }
 
@@ -1208,7 +1228,9 @@ impl State<'_> {
                             };
 
                             // if the header has space, store as much as possible in there
-                            if let Some(head) = self.head.as_mut() {
+                            if let Some(mut head) = self.head {
+                                // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                                let head = unsafe { head.as_mut() };
                                 if !head.comment.is_null() {
                                     let remaining_comm_bytes = (head.comm_max as usize)
                                         .checked_sub(self.length)
@@ -1239,7 +1261,9 @@ impl State<'_> {
                             if !reached_end && self.bit_reader.bytes_remaining() == 0 {
                                 break 'label self.inflate_leave(ReturnCode::Ok);
                             }
-                        } else if let Some(head) = self.head.as_mut() {
+                        } else if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.comment = core::ptr::null_mut();
                         }
 
@@ -1259,7 +1283,9 @@ impl State<'_> {
                             self.bit_reader.init_bits();
                         }
 
-                        if let Some(head) = self.head.as_mut() {
+                        if let Some(mut head) = self.head {
+                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
+                            let head = unsafe { head.as_mut() };
                             head.hcrc = (self.gzip_flags >> 9) & 1;
                             head.done = 1;
                         }
@@ -2627,13 +2653,14 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
 ///
 /// The caller must guarantee:
 ///
-/// * If `head` is `Some`:
+/// * If `head` is `Some`, the header remains valid and exclusively writable while this stream may
+///   still populate it; the caller must not access it concurrently with such an inflate operation.
 ///     - If `head.extra` is not NULL, it must be writable for at least `head.extra_max` bytes
 ///     - if `head.name` is not NULL, it must be writable for at least `head.name_max` bytes
 ///     - if `head.comment` is not NULL, it must be writable for at least `head.comm_max` bytes
-pub unsafe fn get_header<'a>(
-    stream: &mut InflateStream<'a>,
-    head: Option<&'a mut gz_header>,
+pub unsafe fn get_header(
+    stream: &mut InflateStream<'_>,
+    head: Option<&mut gz_header>,
 ) -> ReturnCode {
     if (stream.state.wrap & 2) == 0 {
         return ReturnCode::StreamError;
@@ -2641,7 +2668,7 @@ pub unsafe fn get_header<'a>(
 
     stream.state.head = head.map(|head| {
         head.done = 0;
-        head
+        NonNull::from(head)
     });
     ReturnCode::Ok
 }
@@ -2675,6 +2702,80 @@ pub unsafe fn get_dictionary(stream: &InflateStream<'_>, dictionary: *mut u8) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_header_destination_is_shared_safely_across_inflate_copy() {
+        // Extended gzip header with FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT set. The payload starts after
+        // the header; this test only needs both copied streams to finish parsing the header.
+        let input: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x1f, 0x44, 0x0a, 0x45, 0x65, 0x00, 0x03, 0x0e, 0x00, 0x54, 0x47,
+            0x0a, 0x00, 0x45, 0x58, 0x54, 0x52, 0x41, 0x20, 0x44, 0x41, 0x54, 0x41, 0x74, 0x65,
+            0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x00, 0x41, 0x20, 0x63, 0x6f, 0x6d, 0x6d, 0x65,
+            0x6e, 0x74, 0x00, 0x3b, 0x92,
+        ];
+        let mut extra = [0u8; 14];
+        let mut name = [0u8; 9];
+        let mut comment = [0u8; 10];
+        let mut header = gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 0,
+            extra: extra.as_mut_ptr(),
+            extra_len: 0,
+            extra_max: extra.len() as _,
+            name: name.as_mut_ptr(),
+            name_max: name.len() as _,
+            comment: comment.as_mut_ptr(),
+            comm_max: comment.len() as _,
+            hcrc: 0,
+            done: 0,
+        };
+
+        let mut source_stream = z_stream::default();
+        assert_eq!(
+            init(&mut source_stream, InflateConfig { window_bits: 47 }),
+            ReturnCode::Ok
+        );
+        let source = unsafe { InflateStream::from_stream_mut(&mut source_stream) }.unwrap();
+        assert_eq!(
+            unsafe { get_header(source, Some(&mut header)) },
+            ReturnCode::Ok
+        );
+
+        // Configure I/O before copying, but do not call inflate yet: both states must retain the
+        // same caller-owned header destination just as zlib's copied C pointer does.
+        let mut source_out = [0u8; 1];
+        source.next_in = input.as_ptr() as *mut _;
+        source.avail_in = input.len() as _;
+        source.next_out = source_out.as_mut_ptr();
+        source.avail_out = source_out.len() as _;
+
+        let mut copied = MaybeUninit::<InflateStream>::uninit();
+        assert_eq!(unsafe { copy(&mut copied, source) }, ReturnCode::Ok);
+        let copied = unsafe { copied.assume_init_mut() };
+        let mut copied_out = [0u8; 1];
+        copied.next_out = copied_out.as_mut_ptr();
+        copied.avail_out = copied_out.len() as _;
+
+        let source_ret = unsafe { inflate(source, InflateFlush::NoFlush) };
+        assert!(matches!(source_ret, ReturnCode::Ok | ReturnCode::StreamEnd));
+        assert_eq!(header.done, 1);
+        assert_eq!(header.text, 1);
+        assert_eq!(header.time, 1_699_023_428);
+        assert_eq!(header.os, 3);
+        assert_eq!(header.hcrc, 1);
+
+        let copied_ret = unsafe { inflate(copied, InflateFlush::NoFlush) };
+        assert_eq!(copied_ret, source_ret);
+        assert_eq!(header.done, 1);
+        assert_eq!(extra, *b"TG\n\0EXTRA DATA");
+        assert_eq!(&name, b"test.txt\0");
+        assert_eq!(&comment, b"A comment\0");
+
+        end(source);
+        end(copied);
+    }
 
     #[test]
     fn uncompress_buffer_overflow() {
