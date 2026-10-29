@@ -90,7 +90,11 @@ impl<'a> Window<'a> {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.buf.as_slice()[..self.have]
+        debug_assert!(self.have <= self.buf.len());
+        // SAFETY: `have` tracks exactly the initialized prefix of the backing window. In
+        // particular, inflateBack's caller-provided tail may still be uninitialized, so never
+        // materialize a typed slice over the full capacity before trimming it.
+        unsafe { core::slice::from_raw_parts(self.buf.as_ptr(), self.have) }
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -220,6 +224,22 @@ mod test {
         window.have = 0;
         window.next = 0;
         window
+    }
+
+    #[test]
+    fn raw_window_slice_exposes_only_initialized_prefix() {
+        use core::mem::MaybeUninit;
+
+        let mut storage = [MaybeUninit::<u8>::uninit(); 8];
+        storage[0].write(0x11);
+        storage[1].write(0x22);
+        storage[2].write(0x33);
+
+        let mut window =
+            unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
+        unsafe { window.set_have(3) };
+
+        assert_eq!(window.as_slice(), &[0x11, 0x22, 0x33]);
     }
 
     #[test]
