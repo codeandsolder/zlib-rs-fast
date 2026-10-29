@@ -1,13 +1,15 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
+use super::{drive_standard, ProduceStatus, TokenProducer};
 use crate::{
-    deflate::{BlockState, Compressor, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
+    deflate::{
+        BlockState, Compressor, State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
+    },
     DeflateFlush,
 };
 
 pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    let mut producer = SlowProducer::new(stream);
+    let mut producer = SlowProducer::new(stream.state);
     drive_standard(stream, flush, &mut producer)
 }
 
@@ -18,39 +20,24 @@ struct SlowProducer {
 }
 
 impl SlowProducer {
-    fn new(stream: &Compressor<'_, '_>) -> Self {
+    fn new(state: &State<'_>) -> Self {
         Self {
-            use_longest_match_slow: stream.state.max_chain_length > 1024,
-            match_available: stream.state.match_available,
+            use_longest_match_slow: state.max_chain_length > 1024,
+            match_available: state.match_available,
             deferred_match_len: None,
         }
     }
 }
 
 impl TokenProducer for SlowProducer {
-    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         debug_assert!(self.deferred_match_len.is_none());
 
         loop {
-            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-                InputStatus::Ready => {}
-                InputStatus::NeedMore => return ProduceStatus::NeedInput,
-                InputStatus::Exhausted => {
-                    assert_ne!(flush, DeflateFlush::NoFlush, "no flush?");
-                    let state = &mut stream.state;
-                    if state.match_available {
-                        let literal = state.window.filled()[state.strstart - 1];
-                        let _ = state.tally_lit(literal);
-                        state.match_available = false;
-                        self.match_available = false;
-                    }
-                    return ProduceStatus::Finished {
-                        insert: state.strstart.min(STD_MIN_MATCH - 1),
-                    };
-                }
+            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
+                return ProduceStatus::NeedInput;
             }
 
-            let state = &mut stream.state;
             let hash_head = if state.lookahead >= WANT_MIN_MATCH {
                 state.quick_insert_string(state.strstart)
             } else {
@@ -124,13 +111,23 @@ impl TokenProducer for SlowProducer {
         }
     }
 
-    fn after_block_flush(&mut self, stream: &mut Compressor<'_, '_>) {
+    fn after_block_flush(&mut self, state: &mut State<'_>) {
         let Some(match_len) = self.deferred_match_len.take() else {
             return;
         };
 
-        stream.state.prev_length = match_len as u16;
-        stream.state.strstart += 1;
-        stream.state.lookahead -= 1;
+        state.prev_length = match_len as u16;
+        state.strstart += 1;
+        state.lookahead -= 1;
+    }
+
+    fn finish(&mut self, state: &mut State<'_>) -> usize {
+        if state.match_available {
+            let literal = state.window.filled()[state.strstart - 1];
+            let _ = state.tally_lit(literal);
+            state.match_available = false;
+            self.match_available = false;
+        }
+        state.strstart.min(STD_MIN_MATCH - 1)
     }
 }

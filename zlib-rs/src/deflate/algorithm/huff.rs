@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
+use super::{drive_standard, ProduceStatus, TokenProducer};
 use crate::{
-    deflate::{BlockState, Compressor},
+    deflate::{BlockState, Compressor, State},
     DeflateFlush,
 };
 
@@ -13,15 +13,16 @@ pub fn deflate_huff(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
 struct HuffmanProducer;
 
 impl TokenProducer for HuffmanProducer {
-    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+    fn preferred_lookahead(&self) -> usize {
+        1
+    }
+
+    fn produce(&mut self, state: &mut State<'_>, _allow_short_tail: bool) -> ProduceStatus {
         loop {
-            match ensure_input(stream, 1, flush) {
-                InputStatus::Ready => {}
-                InputStatus::NeedMore => return ProduceStatus::NeedInput,
-                InputStatus::Exhausted => return ProduceStatus::Finished { insert: 0 },
+            if state.lookahead == 0 {
+                return ProduceStatus::NeedInput;
             }
 
-            let state = &mut stream.state;
             let literal = state.window.filled()[state.strstart];
             let block_ready = state.tally_lit(literal);
             state.lookahead -= 1;
@@ -30,5 +31,9 @@ impl TokenProducer for HuffmanProducer {
                 return ProduceStatus::BlockReady;
             }
         }
+    }
+
+    fn finish(&mut self, _state: &mut State<'_>) -> usize {
+        0
     }
 }

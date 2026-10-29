@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
+use super::{drive_standard, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
     deflate::{
@@ -42,30 +42,13 @@ impl MediumProducer {
 }
 
 impl TokenProducer for MediumProducer {
-    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         loop {
-            let mut hash_head;
-            let refilled = stream.state.lookahead < MIN_LOOKAHEAD;
-            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-                InputStatus::Ready => {}
-                InputStatus::NeedMore => {
-                    self.clear_saved_next(stream.state);
-                    return ProduceStatus::NeedInput;
-                }
-                InputStatus::Exhausted => {
-                    self.clear_saved_next(stream.state);
-                    return ProduceStatus::Finished {
-                        insert: stream.state.strstart.min(STD_MIN_MATCH - 1),
-                    };
-                }
-            }
-            if refilled {
-                // A cached look-ahead match was derived before the refill and cannot be carried
-                // across a possible window slide.
-                self.clear_saved_next(stream.state);
+            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
+                return ProduceStatus::NeedInput;
             }
 
-            let state = &mut stream.state;
+            let mut hash_head;
 
             // If we already have a future match from a previous round, just use that.
             if !self.early_exit && self.next_match.match_length > 0 {
@@ -158,6 +141,16 @@ impl TokenProducer for MediumProducer {
                 return ProduceStatus::BlockReady;
             }
         }
+    }
+
+    fn after_refill(&mut self, state: &mut State<'_>) {
+        // A refill may slide the window, invalidating a speculative absolute position.
+        self.clear_saved_next(state);
+    }
+
+    fn finish(&mut self, state: &mut State<'_>) -> usize {
+        self.clear_saved_next(state);
+        state.strstart.min(STD_MIN_MATCH - 1)
     }
 }
 

@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
+use super::{drive_standard, ProduceStatus, TokenProducer};
 use crate::{
     deflate::{
-        compare256::compare256_rle_slice, BlockState, Compressor, MIN_LOOKAHEAD, STD_MAX_MATCH,
-        STD_MIN_MATCH,
+        compare256::compare256_rle_slice, BlockState, Compressor, State, MIN_LOOKAHEAD,
+        STD_MAX_MATCH, STD_MIN_MATCH,
     },
     DeflateFlush,
 };
@@ -16,15 +16,12 @@ pub fn deflate_rle(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
 struct RleProducer;
 
 impl TokenProducer for RleProducer {
-    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         loop {
-            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-                InputStatus::Ready => {}
-                InputStatus::NeedMore => return ProduceStatus::NeedInput,
-                InputStatus::Exhausted => return ProduceStatus::Finished { insert: 0 },
+            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
+                return ProduceStatus::NeedInput;
             }
 
-            let state = &mut stream.state;
             let mut match_len = 0;
             if state.lookahead >= STD_MIN_MATCH && state.strstart > 0 {
                 let scan = &state.window.filled()[state.strstart - 1..][..3 + 256];
@@ -55,5 +52,9 @@ impl TokenProducer for RleProducer {
                 return ProduceStatus::BlockReady;
             }
         }
+    }
+
+    fn finish(&mut self, _state: &mut State<'_>) -> usize {
+        0
     }
 }

@@ -1,5 +1,7 @@
 use crate::{
-    deflate::{with_compressor, BlockState, Compressor, DeflateStream, Strategy},
+    deflate::{
+        with_compressor, BlockState, Compressor, DeflateStream, State, Strategy, MIN_LOOKAHEAD,
+    },
     DeflateFlush,
 };
 
@@ -47,40 +49,75 @@ pub(super) fn ensure_input(
 pub(super) enum ProduceStatus {
     NeedInput,
     BlockReady,
-    Finished { insert: usize },
 }
 
-/// A resumable token producer. It may fill `State::sym_buf`, but it never encodes or drains a
-/// DEFLATE block itself. The driver owns those orchestration boundaries.
+/// A resumable token producer over already-buffered compression state.
+///
+/// Implementations may update the LZ/hash/token state, but they never refill raw caller input,
+/// encode a DEFLATE block, or drain output. Those I/O boundaries belong to `drive_standard`.
 pub(super) trait TokenProducer {
-    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus;
+    fn preferred_lookahead(&self) -> usize {
+        MIN_LOOKAHEAD
+    }
+
+    /// Produce tokens until either the token buffer is full or more window input is required.
+    /// `allow_short_tail` means the caller is flushing, so the final bytes below the preferred
+    /// lookahead may be consumed instead of requesting another refill first.
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus;
+
+    /// A refill may slide the window, invalidating speculative positions cached by a producer.
+    fn after_refill(&mut self, _state: &mut State<'_>) {}
 
     /// Apply state changes that zlib intentionally performs after a full block has been encoded.
     /// Most algorithms have no such continuation; Slow uses it for one lazy-match transition.
-    fn after_block_flush(&mut self, _stream: &mut Compressor<'_, '_>) {}
+    fn after_block_flush(&mut self, _state: &mut State<'_>) {}
+
+    /// Finalize algorithm-local state once no buffered or caller input remains and return the tail
+    /// insertion count expected by the common block finalizer.
+    fn finish(&mut self, state: &mut State<'_>) -> usize;
 }
 
 /// Drive a token producer until the public streaming contract requires a return.
 ///
-/// Token production is deliberately separate from block encoding and output draining here. This is
-/// the scheduling seam for later multi-stream batching: producers yield at full token blocks, while
-/// the driver decides when those blocks are encoded and copied to the caller.
+/// This is the only ordinary-algorithm layer that touches raw stream I/O: it refills the window,
+/// asks the pure state producer for more tokens, and encodes/drains full token blocks. The split is
+/// the scheduling seam for later fair multi-stream CPU/GPU batching.
 pub(super) fn drive_standard<P: TokenProducer>(
     stream: &mut Compressor<'_, '_>,
     flush: DeflateFlush,
     producer: &mut P,
 ) -> BlockState {
     loop {
-        match producer.produce(stream, flush) {
-            ProduceStatus::NeedInput => return BlockState::NeedMore,
+        let preferred_lookahead = producer.preferred_lookahead();
+        let mut allow_short_tail = false;
+
+        if stream.state.lookahead < preferred_lookahead {
+            stream.fill_window();
+            producer.after_refill(stream.state);
+
+            if stream.state.lookahead < preferred_lookahead {
+                if flush == DeflateFlush::NoFlush {
+                    return BlockState::NeedMore;
+                }
+                if stream.state.lookahead == 0 {
+                    let insert = producer.finish(stream.state);
+                    return finish_standard(stream, flush, insert);
+                }
+                allow_short_tail = true;
+            }
+        }
+
+        match producer.produce(stream.state, allow_short_tail) {
+            ProduceStatus::NeedInput => {
+                debug_assert!(stream.state.lookahead < preferred_lookahead);
+            }
             ProduceStatus::BlockReady => {
                 let blocked = stream.flush_block(false);
-                producer.after_block_flush(stream);
+                producer.after_block_flush(stream.state);
                 if let Some(blocked) = blocked {
                     return blocked;
                 }
             }
-            ProduceStatus::Finished { insert } => return finish_standard(stream, flush, insert),
         }
     }
 }

@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
+use super::{drive_standard, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
-    deflate::{BlockState, Compressor, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
+    deflate::{BlockState, Compressor, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
     DeflateFlush,
 };
 
@@ -14,19 +14,12 @@ pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
 struct FastProducer;
 
 impl TokenProducer for FastProducer {
-    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         loop {
-            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-                InputStatus::Ready => {}
-                InputStatus::NeedMore => return ProduceStatus::NeedInput,
-                InputStatus::Exhausted => {
-                    return ProduceStatus::Finished {
-                        insert: stream.state.strstart.min(STD_MIN_MATCH - 1),
-                    };
-                }
+            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
+                return ProduceStatus::NeedInput;
             }
 
-            let state = &mut stream.state;
             let literal = if state.lookahead >= WANT_MIN_MATCH {
                 let value = u32::from_le_bytes(
                     state.window.filled()[state.strstart..state.strstart + 4]
@@ -80,5 +73,9 @@ impl TokenProducer for FastProducer {
                 return ProduceStatus::BlockReady;
             }
         }
+    }
+
+    fn finish(&mut self, state: &mut State<'_>) -> usize {
+        state.strstart.min(STD_MIN_MATCH - 1)
     }
 }
