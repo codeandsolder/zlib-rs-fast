@@ -3961,6 +3961,9 @@ mod test {
         done: bool,
         drain_turns: usize,
         output_full_count: usize,
+        pending_match_result: Option<crate::deflate::longest_match::MatchSearchResult>,
+        match_search_turns: usize,
+        match_result_turns: usize,
     }
 
     impl RoundRobinCore {
@@ -3984,6 +3987,9 @@ mod test {
                 done: false,
                 drain_turns: 0,
                 output_full_count: 0,
+                pending_match_result: None,
+                match_search_turns: 0,
+                match_result_turns: 0,
             }
         }
 
@@ -3991,6 +3997,15 @@ mod test {
         fn step(&mut self) {
             assert!(!self.done);
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
+
+            // Match computation and result delivery are distinct scheduler turns. This keeps the
+            // test honest: a batch scheduler may collect work from several paused streams before
+            // executing searches, then resume each producer later with its owned result.
+            if let Some(result) = self.pending_match_result.take() {
+                self.driver.complete_match_search(stream.state, result);
+                self.match_result_turns += 1;
+                return;
+            }
 
             let mut chunk = [0u8; Self::OUTPUT_CHUNK];
             stream.next_out = chunk.as_mut_ptr();
@@ -4020,6 +4035,10 @@ mod test {
 
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
+                algorithm::StandardTurnOutcome::MatchSearch(work) => {
+                    self.pending_match_result = Some(work.request(stream.state).execute());
+                    self.match_search_turns += 1;
+                }
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("Final mode with all input supplied unexpectedly requested more input")
                 }
@@ -4112,6 +4131,11 @@ mod test {
             );
         }
 
+        assert!(
+            jobs[0].match_search_turns > 0,
+            "Fast must yield detached match-search work in the scheduler regression"
+        );
+
         for (job, reference) in jobs.into_iter().zip(references) {
             assert!(
                 job.drain_turns > 1,
@@ -4121,8 +4145,79 @@ mod test {
                 job.output_full_count > 0,
                 "tiny output chunks must exercise resumable OutputFull"
             );
+            assert_eq!(
+                job.match_search_turns, job.match_result_turns,
+                "every yielded match search must resume on a later scheduler turn"
+            );
             assert_eq!(job.into_output(), reference);
         }
+    }
+
+    #[test]
+    fn standard_core_rejects_production_before_match_search_completes() {
+        let input_bytes = b"detached-match-search/".repeat(2_000);
+        let config = DeflateConfig {
+            level: 2,
+            method: Method::Deflated,
+            window_bits: crate::MAX_WBITS,
+            mem_level: 1,
+            strategy: Strategy::Default,
+        };
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        stream.next_in = input_bytes.as_ptr() as *mut u8;
+        stream.avail_in = input_bytes.len() as _;
+        let mut core =
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, stream.state)
+                .unwrap();
+
+        let search = loop {
+            match core.next_event(stream.state) {
+                algorithm::CoreEvent::NeedInput(demand) => {
+                    let mut input = InputCursor::from_stream(stream);
+                    let outcome = core.satisfy_input(
+                        stream.state,
+                        &mut input,
+                        demand,
+                        algorithm::InputCompletion::EndOfSegment,
+                    );
+                    input.apply(stream);
+                    assert!(matches!(
+                        outcome,
+                        algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
+                    ));
+                }
+                algorithm::CoreEvent::MatchSearch(work) => break work,
+                algorithm::CoreEvent::TokenBlockReady(_) => {
+                    panic!("Fast filled a token block before yielding match-search work")
+                }
+                algorithm::CoreEvent::EndOfInput(_) => {
+                    panic!("test input exhausted before yielding match-search work")
+                }
+            }
+        };
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = core.next_event(stream.state);
+        }));
+        assert!(
+            rejected.is_err(),
+            "production advanced with an outstanding match search"
+        );
+
+        let result = search.request(stream.state).execute();
+        core.complete_match_search(stream.state, result);
+        assert!(matches!(
+            core.next_event(stream.state),
+            algorithm::CoreEvent::MatchSearch(_)
+                | algorithm::CoreEvent::TokenBlockReady(_)
+                | algorithm::CoreEvent::NeedInput(_)
+                | algorithm::CoreEvent::EndOfInput(_)
+        ));
+
+        let _ = end(stream);
     }
 
     #[test]
@@ -4165,6 +4260,10 @@ mod test {
                         outcome,
                         algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
                     ));
+                }
+                algorithm::CoreEvent::MatchSearch(work) => {
+                    let result = work.request(stream.state).execute();
+                    core.complete_match_search(stream.state, result);
                 }
                 algorithm::CoreEvent::TokenBlockReady(work) => {
                     break core.encode_token_block(stream.state, work);

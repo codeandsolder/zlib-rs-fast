@@ -1,7 +1,9 @@
 use crate::{
     deflate::{
-        drain_pending_output, fill_window_core, with_compressor, BlockState, Compressor,
-        DeflateStream, DrainOutcome, InputCursor, State, Strategy, MIN_LOOKAHEAD,
+        drain_pending_output, fill_window_core,
+        longest_match::{MatchSearchResult, MatchSearchWork},
+        with_compressor, BlockState, Compressor, DeflateStream, DrainOutcome, InputCursor, State,
+        Strategy, MIN_LOOKAHEAD,
     },
     DeflateFlush,
 };
@@ -68,6 +70,7 @@ impl BlockContinuation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProduceStatus {
     NeedInput,
+    MatchSearch(MatchSearchWork),
     BlockReady(BlockContinuation),
 }
 
@@ -146,6 +149,11 @@ pub(super) trait TokenProducer {
     /// lookahead may be consumed instead of requesting another refill first.
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus;
 
+    /// Consume a scheduler-computed match-search result for a producer that yielded one.
+    fn complete_match_search(&mut self, _state: &mut State<'_>, _result: MatchSearchResult) {
+        panic!("producer received a match-search result it did not request");
+    }
+
     /// A refill may slide the window, invalidating speculative positions cached by a producer.
     fn after_refill(&mut self, _state: &mut State<'_>) {}
 
@@ -171,7 +179,7 @@ enum StandardProducerKind {
 impl StandardProducer {
     fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
         let kind = match algorithm {
-            Algorithm::Fast => StandardProducerKind::Fast(fast::FastProducer),
+            Algorithm::Fast => StandardProducerKind::Fast(fast::FastProducer::new()),
             Algorithm::Medium => StandardProducerKind::Medium(medium::MediumProducer::new(state)),
             Algorithm::Slow => StandardProducerKind::Slow(slow::SlowProducer::new(state)),
             Algorithm::Huffman => StandardProducerKind::Huffman(huff::HuffmanProducer),
@@ -200,6 +208,18 @@ impl TokenProducer for StandardProducer {
             StandardProducerKind::Slow(producer) => producer.produce(state, allow_short_tail),
             StandardProducerKind::Huffman(producer) => producer.produce(state, allow_short_tail),
             StandardProducerKind::Rle(producer) => producer.produce(state, allow_short_tail),
+        }
+    }
+
+    fn complete_match_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+        match &mut self.0 {
+            StandardProducerKind::Fast(producer) => producer.complete_match_search(state, result),
+            StandardProducerKind::Medium(producer) => producer.complete_match_search(state, result),
+            StandardProducerKind::Slow(producer) => producer.complete_match_search(state, result),
+            StandardProducerKind::Huffman(producer) => {
+                producer.complete_match_search(state, result)
+            }
+            StandardProducerKind::Rle(producer) => producer.complete_match_search(state, result),
         }
     }
 
@@ -245,6 +265,7 @@ pub(super) enum InputCompletion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StandardPhase {
     Producing,
+    NeedsMatchSearch,
     NeedsDrain,
 }
 
@@ -286,7 +307,25 @@ impl StandardCore {
 
     pub(super) fn next_event(&mut self, state: &mut State<'_>) -> CoreEvent {
         self.assert_producing();
-        next_core_event(state, self.input_phase, &mut self.producer)
+        let event = next_core_event(state, self.input_phase, &mut self.producer);
+        if matches!(&event, CoreEvent::MatchSearch(_)) {
+            self.phase = StandardPhase::NeedsMatchSearch;
+        }
+        event
+    }
+
+    pub(super) fn complete_match_search(
+        &mut self,
+        state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) {
+        assert_eq!(
+            self.phase,
+            StandardPhase::NeedsMatchSearch,
+            "match-search completion requires outstanding search work"
+        );
+        self.producer.complete_match_search(state, result);
+        self.phase = StandardPhase::Producing;
     }
 
     pub(super) fn satisfy_input(
@@ -354,7 +393,7 @@ impl StandardCore {
         assert_eq!(
             self.phase,
             StandardPhase::Producing,
-            "pending output must be drained before advancing standard compression"
+            "outstanding match search or pending output must complete before advancing standard compression"
         );
     }
 }
@@ -403,6 +442,7 @@ struct PendingDrain {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StandardTurnOutcome {
     Progress,
+    MatchSearch(MatchSearchWork),
     NeedMoreCallerInput,
     NeedMoreOutput { final_block: bool },
     SegmentDone(EndBlockKind),
@@ -451,8 +491,21 @@ impl StandardDriver {
             };
         }
 
-        match self.core.next_event(state) {
-            CoreEvent::NeedInput(demand) => {
+        enum OwnedCoreEvent {
+            NeedInput(InputDemand),
+            TokenBlockReady(TokenBlockWork),
+            EndOfInput(EndOfInputWork),
+        }
+
+        let event = match self.core.next_event(state) {
+            CoreEvent::MatchSearch(request) => return StandardTurnOutcome::MatchSearch(request),
+            CoreEvent::NeedInput(demand) => OwnedCoreEvent::NeedInput(demand),
+            CoreEvent::TokenBlockReady(work) => OwnedCoreEvent::TokenBlockReady(work),
+            CoreEvent::EndOfInput(work) => OwnedCoreEvent::EndOfInput(work),
+        };
+
+        match event {
+            OwnedCoreEvent::NeedInput(demand) => {
                 match self
                     .core
                     .satisfy_input(state, input, demand, mode.input_completion())
@@ -463,14 +516,14 @@ impl StandardDriver {
                     RefillOutcome::NeedMoreCallerInput => StandardTurnOutcome::NeedMoreCallerInput,
                 }
             }
-            CoreEvent::TokenBlockReady(work) => {
+            OwnedCoreEvent::TokenBlockReady(work) => {
                 self.pending_drain = Some(PendingDrain {
                     work: self.core.encode_token_block(state, work),
                     after: AfterDrain::ResumeProduction,
                 });
                 StandardTurnOutcome::Progress
             }
-            CoreEvent::EndOfInput(work) => {
+            OwnedCoreEvent::EndOfInput(work) => {
                 let kind = mode
                     .end_kind()
                     .expect("end-of-input requires a segment-ending scheduler mode");
@@ -486,6 +539,14 @@ impl StandardDriver {
                 }
             }
         }
+    }
+
+    pub(super) fn complete_match_search(
+        &mut self,
+        state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) {
+        self.core.complete_match_search(state, result);
     }
 }
 
@@ -512,6 +573,8 @@ impl InputDemand {
 pub(super) enum CoreEvent {
     /// The producer needs more buffered lookahead before it can continue normally.
     NeedInput(InputDemand),
+    /// The producer has paused on immutable longest-match work that may execute elsewhere.
+    MatchSearch(MatchSearchWork),
     /// A complete resident token block is ready to run as one owned block-encoding action.
     TokenBlockReady(TokenBlockWork),
     /// No more input remains for this call; orchestration must close this input segment.
@@ -543,8 +606,19 @@ fn next_core_event(
     }
 
     let allow_short_tail = input_phase == InputPhase::FinalTail;
-    match producer.produce(state, allow_short_tail) {
-        ProduceStatus::NeedInput => {
+    enum OwnedProduceStatus {
+        NeedInput,
+        BlockReady(BlockContinuation),
+    }
+
+    let status = match producer.produce(state, allow_short_tail) {
+        ProduceStatus::MatchSearch(request) => return CoreEvent::MatchSearch(request),
+        ProduceStatus::NeedInput => OwnedProduceStatus::NeedInput,
+        ProduceStatus::BlockReady(continuation) => OwnedProduceStatus::BlockReady(continuation),
+    };
+
+    match status {
+        OwnedProduceStatus::NeedInput => {
             debug_assert!(state.lookahead < preferred_lookahead);
             match input_phase {
                 InputPhase::Open => CoreEvent::NeedInput(InputDemand::new(preferred_lookahead)),
@@ -554,7 +628,7 @@ fn next_core_event(
                 }
             }
         }
-        ProduceStatus::BlockReady(continuation) => {
+        OwnedProduceStatus::BlockReady(continuation) => {
             CoreEvent::TokenBlockReady(TokenBlockWork::new(continuation))
         }
     }
@@ -615,6 +689,10 @@ pub(super) fn drive_standard(
     loop {
         match driver.step(state, input, output, mode) {
             StandardTurnOutcome::Progress => {}
+            StandardTurnOutcome::MatchSearch(work) => {
+                let result = work.request(state).execute();
+                driver.complete_match_search(state, result);
+            }
             StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
             StandardTurnOutcome::NeedMoreOutput { final_block: true } => {
                 return BlockState::FinishStarted;

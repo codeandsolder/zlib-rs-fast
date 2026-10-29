@@ -35,12 +35,32 @@ pub(crate) struct MatchSearchResult {
     pub(crate) start: Pos,
 }
 
+/// Owned scheduler token for one longest-match computation.
+///
+/// It carries no stream borrow. The scheduler may queue this token while the producer is paused,
+/// then materialize an immutable request from that stream's State when the search is dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatchSearchWork {
+    cur_match: Pos,
+    kind: MatchSearchKind,
+}
+
+impl MatchSearchWork {
+    pub(crate) fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
+        Self { cur_match, kind }
+    }
+
+    pub(crate) fn request<'a>(self, state: &'a State<'_>) -> MatchSearchRequest<'a> {
+        MatchSearchRequest::from_state(state, self.cur_match, self.kind)
+    }
+}
+
 /// Immutable description of one longest-match search.
 ///
 /// Hash insertion and all other stream mutation happen before this value is created. Execution only
 /// reads initialized window bytes and the hash-chain snapshot exposed by `State`, which makes the
 /// expensive search a detachable unit for future scoped CPU batches or device submission.
-#[derive(Clone, Copy)]
+#[derive(Debug)]
 pub(crate) struct MatchSearchRequest<'a> {
     initialized: &'a [u8],
     prev: &'a [Pos],
@@ -94,23 +114,23 @@ impl<'a> MatchSearchRequest<'a> {
     }
 
     pub(crate) fn execute(self) -> MatchSearchResult {
-        longest_match_help(self)
+        longest_match_help(&self)
     }
 
     #[inline(always)]
-    fn update_hash(self, hash: u32, value: u32) -> u32 {
+    fn update_hash(&self, hash: u32, value: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(hash, value),
             HashCalcVariant::Roll => RollHashCalc::update_hash(hash, value),
         }
     }
 
-    fn is_slow(self) -> bool {
+    fn is_slow(&self) -> bool {
         self.kind == MatchSearchKind::Slow
     }
 }
 
-fn longest_match_help(request: MatchSearchRequest<'_>) -> MatchSearchResult {
+fn longest_match_help(request: &MatchSearchRequest<'_>) -> MatchSearchResult {
     let scan = &request.initialized[request.strstart..];
     let limit_base = request.strstart.saturating_sub(request.max_dist);
 
@@ -240,7 +260,7 @@ fn longest_match_help(request: MatchSearchRequest<'_>) -> MatchSearchResult {
 }
 
 fn initial_slow_cursor(
-    request: MatchSearchRequest<'_>,
+    request: &MatchSearchRequest<'_>,
     scan: &[u8],
     best_len: usize,
     mut cursor: SearchCursor,
@@ -269,7 +289,7 @@ fn initial_slow_cursor(
 }
 
 fn next_slow_cursor(
-    request: MatchSearchRequest<'_>,
+    request: &MatchSearchRequest<'_>,
     scan: &[u8],
     candidate_start: usize,
     match_len: usize,
@@ -370,7 +390,7 @@ fn common_match_length(scan: &[u8], candidate: &[u8]) -> usize {
 }
 
 fn break_matching(
-    request: MatchSearchRequest<'_>,
+    request: &MatchSearchRequest<'_>,
     best_len: usize,
     match_start: Pos,
 ) -> MatchSearchResult {
@@ -426,9 +446,21 @@ mod tests {
         ];
         // Independent requests can coexist and be executed after collection without borrowing
         // mutable compressor state. A later scheduler/backend can batch this exact shape.
-        let expected = requests.map(MatchSearchRequest::execute);
-        let collected = requests.map(MatchSearchRequest::execute);
-        assert_eq!(collected, expected);
+        let results = requests.map(MatchSearchRequest::execute);
+        assert_eq!(
+            results[0],
+            MatchSearchResult {
+                length: 16,
+                start: 0
+            }
+        );
+        assert_eq!(
+            results[1],
+            MatchSearchResult {
+                length: 13,
+                start: 0
+            }
+        );
     }
 
     #[test]
