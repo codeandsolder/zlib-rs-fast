@@ -71,6 +71,27 @@ pub(super) enum ProduceStatus {
     BlockReady(BlockContinuation),
 }
 
+/// Owned work produced when `SymBuf` contains a complete non-final token block.
+///
+/// The post-block continuation is intentionally hidden inside this value: schedulers queue and
+/// execute one block action rather than separately remembering an algorithm-specific mutation that
+/// must occur immediately after encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TokenBlockWork {
+    continuation: BlockContinuation,
+}
+
+impl TokenBlockWork {
+    fn new(continuation: BlockContinuation) -> Self {
+        Self { continuation }
+    }
+
+    pub(super) fn encode(self, state: &mut State<'_>) {
+        state.encode_block(false);
+        self.continuation.apply(state);
+    }
+}
+
 /// A resumable token producer over already-buffered compression state.
 ///
 /// Implementations may update the LZ/hash/token state, but they never refill raw caller input,
@@ -198,8 +219,8 @@ impl InputDemand {
 pub(super) enum CoreEvent {
     /// The producer needs more buffered lookahead before it can continue normally.
     NeedInput(InputDemand),
-    /// A complete token block is resident in `State::sym_buf` and is ready for block encoding.
-    TokenBlockReady(BlockContinuation),
+    /// A complete resident token block is ready to run as one owned block-encoding action.
+    TokenBlockReady(TokenBlockWork),
     /// No more input remains for this call. `insert` is the tail state needed by a later refill.
     Finished { insert: usize },
 }
@@ -244,7 +265,9 @@ pub(super) fn next_core_event(
                 }
             }
         }
-        ProduceStatus::BlockReady(continuation) => CoreEvent::TokenBlockReady(continuation),
+        ProduceStatus::BlockReady(continuation) => {
+            CoreEvent::TokenBlockReady(TokenBlockWork::new(continuation))
+        }
     }
 }
 
@@ -303,9 +326,8 @@ pub(super) fn drive_standard(
                     RefillOutcome::FinalTail => input_phase = InputPhase::FinalTail,
                 }
             }
-            CoreEvent::TokenBlockReady(continuation) => {
-                stream.state.encode_block(false);
-                continuation.apply(stream.state);
+            CoreEvent::TokenBlockReady(work) => {
+                work.encode(stream.state);
                 if drain_pending_output(stream.state, &mut stream.output)
                     == DrainOutcome::OutputFull
                 {
