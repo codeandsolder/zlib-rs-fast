@@ -11,7 +11,7 @@ use crate::{
 };
 
 use self::{
-    algorithm::CONFIGURATION_TABLE,
+    algorithm::{change_requires_block_boundary, level_config},
     hash_calc::{HashCalcVariant, RollHashCalc, StandardHashCalc},
     pending::Pending,
     sym_buf::SymBuf,
@@ -451,14 +451,9 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 
     let level = level as i8;
 
-    let func = CONFIGURATION_TABLE[stream.state.level as usize].func;
-
     let state = &mut stream.state;
 
-    // FIXME: use fn_addr_eq when it's available in our MSRV. The comparison returning false here
-    // is not functionally incorrect, but would be inconsistent with zlib-ng.
-    #[allow(unpredictable_function_pointer_comparisons)]
-    if (strategy != state.strategy || func != CONFIGURATION_TABLE[level as usize].func)
+    if change_requires_block_boundary(state.level, state.strategy, level, strategy)
         && state.last_flush != -2
     {
         // Flush the last buffer.
@@ -805,10 +800,11 @@ fn lm_init(state: &mut State) {
 }
 
 fn lm_set_level(state: &mut State, level: i8) {
-    state.max_lazy_match = CONFIGURATION_TABLE[level as usize].max_lazy;
-    state.good_match = CONFIGURATION_TABLE[level as usize].good_length;
-    state.nice_match = CONFIGURATION_TABLE[level as usize].nice_length;
-    state.max_chain_length = CONFIGURATION_TABLE[level as usize].max_chain;
+    let config = level_config(level);
+    state.max_lazy_match = config.max_lazy;
+    state.good_match = config.good_length;
+    state.nice_match = config.nice_length;
+    state.max_chain_length = config.max_chain;
 
     state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
     state.level = level;

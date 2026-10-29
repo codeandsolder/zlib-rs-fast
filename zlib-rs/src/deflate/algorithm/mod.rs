@@ -3,8 +3,6 @@ use crate::{
     DeflateFlush,
 };
 
-use self::{huff::deflate_huff, rle::deflate_rle, stored::deflate_stored};
-
 mod fast;
 mod huff;
 mod medium;
@@ -27,56 +25,175 @@ macro_rules! flush_block {
 }
 pub(crate) use flush_block;
 
-pub fn run(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
-    match stream.state.strategy {
-        _ if stream.state.level == 0 => deflate_stored(stream, flush),
-        Strategy::HuffmanOnly => deflate_huff(stream, flush),
-        Strategy::Rle => deflate_rle(stream, flush),
-        Strategy::Default | Strategy::Filtered | Strategy::Fixed => {
-            (CONFIGURATION_TABLE[stream.state.level as usize].func)(stream, flush)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Algorithm {
+    Stored,
+    Quick,
+    Fast,
+    Medium,
+    Slow,
+    Huffman,
+    Rle,
+}
+
+impl Algorithm {
+    fn for_stream(level: i8, strategy: Strategy) -> Self {
+        if level == 0 {
+            return Self::Stored;
+        }
+
+        match strategy {
+            Strategy::HuffmanOnly => Self::Huffman,
+            Strategy::Rle => Self::Rle,
+            Strategy::Default | Strategy::Filtered | Strategy::Fixed => {
+                level_config(level).algorithm
+            }
+        }
+    }
+
+    fn run(self, stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+        match self {
+            Self::Stored => stored::deflate_stored(stream, flush),
+            Self::Quick => quick::deflate_quick(stream, flush),
+            Self::Fast => fast::deflate_fast(stream, flush),
+            Self::Medium => medium::deflate_medium(stream, flush),
+            Self::Slow => slow::deflate_slow(stream, flush),
+            Self::Huffman => huff::deflate_huff(stream, flush),
+            Self::Rle => rle::deflate_rle(stream, flush),
         }
     }
 }
 
-type CompressFunc = fn(&mut DeflateStream, flush: DeflateFlush) -> BlockState;
-
-pub struct Config {
-    pub good_length: u16, /* reduce lazy search above this match length */
-    pub max_lazy: u16,    /* do not perform lazy search above this match length */
-    pub nice_length: u16, /* quit search above this match length */
-    pub max_chain: u16,
-    pub func: CompressFunc,
+pub fn run(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+    Algorithm::for_stream(stream.state.level, stream.state.strategy).run(stream, flush)
 }
 
-impl Config {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LevelConfig {
+    pub good_length: u16,
+    pub max_lazy: u16,
+    pub nice_length: u16,
+    pub max_chain: u16,
+    pub algorithm: Algorithm,
+}
+
+impl LevelConfig {
     const fn new(
         good_length: u16,
         max_lazy: u16,
         nice_length: u16,
         max_chain: u16,
-        func: CompressFunc,
+        algorithm: Algorithm,
     ) -> Self {
         Self {
             good_length,
             max_lazy,
             nice_length,
             max_chain,
-            func,
+            algorithm,
         }
     }
 }
 
-pub static CONFIGURATION_TABLE: [Config; 10] = {
-    [
-        Config::new(0, 0, 0, 0, stored::deflate_stored), // 0 /* store only */
-        Config::new(0, 0, 0, 0, quick::deflate_quick),   // 1
-        Config::new(4, 4, 8, 4, fast::deflate_fast),     // 2 /* max speed, no lazy matches */
-        Config::new(4, 6, 16, 6, medium::deflate_medium), // 3
-        Config::new(4, 12, 32, 24, medium::deflate_medium), // 4 /* lazy matches */
-        Config::new(8, 16, 32, 32, medium::deflate_medium), // 5
-        Config::new(8, 16, 128, 128, medium::deflate_medium), // 6
-        Config::new(8, 32, 128, 256, slow::deflate_slow), // 7
-        Config::new(32, 128, 258, 1024, slow::deflate_slow), // 8
-        Config::new(32, 258, 258, 4096, slow::deflate_slow), // 9 /* max compression */
-    ]
-};
+const LEVEL_CONFIGS: [LevelConfig; 10] = [
+    LevelConfig::new(0, 0, 0, 0, Algorithm::Stored),
+    LevelConfig::new(0, 0, 0, 0, Algorithm::Quick),
+    LevelConfig::new(4, 4, 8, 4, Algorithm::Fast),
+    LevelConfig::new(4, 6, 16, 6, Algorithm::Medium),
+    LevelConfig::new(4, 12, 32, 24, Algorithm::Medium),
+    LevelConfig::new(8, 16, 32, 32, Algorithm::Medium),
+    LevelConfig::new(8, 16, 128, 128, Algorithm::Medium),
+    LevelConfig::new(8, 32, 128, 256, Algorithm::Slow),
+    LevelConfig::new(32, 128, 258, 1024, Algorithm::Slow),
+    LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
+];
+
+pub(crate) fn level_config(level: i8) -> LevelConfig {
+    LEVEL_CONFIGS[level as usize]
+}
+
+pub(crate) fn change_requires_block_boundary(
+    current_level: i8,
+    current_strategy: Strategy,
+    next_level: i8,
+    next_strategy: Strategy,
+) -> bool {
+    current_strategy != next_strategy
+        || level_config(current_level).algorithm != level_config(next_level).algorithm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_levels_have_explicit_algorithm_families() {
+        let expected = [
+            Algorithm::Stored,
+            Algorithm::Quick,
+            Algorithm::Fast,
+            Algorithm::Medium,
+            Algorithm::Medium,
+            Algorithm::Medium,
+            Algorithm::Medium,
+            Algorithm::Slow,
+            Algorithm::Slow,
+            Algorithm::Slow,
+        ];
+
+        for (level, expected) in expected.into_iter().enumerate() {
+            assert_eq!(level_config(level as i8).algorithm, expected);
+        }
+    }
+
+    #[test]
+    fn strategies_select_specialized_algorithms() {
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::Default),
+            Algorithm::Medium
+        );
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::Filtered),
+            Algorithm::Medium
+        );
+        assert_eq!(Algorithm::for_stream(6, Strategy::Fixed), Algorithm::Medium);
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::HuffmanOnly),
+            Algorithm::Huffman
+        );
+        assert_eq!(Algorithm::for_stream(6, Strategy::Rle), Algorithm::Rle);
+        assert_eq!(
+            Algorithm::for_stream(0, Strategy::HuffmanOnly),
+            Algorithm::Stored
+        );
+        assert_eq!(Algorithm::for_stream(0, Strategy::Rle), Algorithm::Stored);
+    }
+
+    #[test]
+    fn parameter_changes_flush_only_across_algorithm_or_strategy_boundaries() {
+        assert!(!change_requires_block_boundary(
+            3,
+            Strategy::Default,
+            6,
+            Strategy::Default
+        ));
+        assert!(!change_requires_block_boundary(
+            7,
+            Strategy::Default,
+            9,
+            Strategy::Default
+        ));
+        assert!(change_requires_block_boundary(
+            6,
+            Strategy::Default,
+            7,
+            Strategy::Default
+        ));
+        assert!(change_requires_block_boundary(
+            6,
+            Strategy::Default,
+            6,
+            Strategy::Fixed
+        ));
+    }
+}
