@@ -130,11 +130,27 @@ impl<'a> MatchSearchRequest<'a> {
     }
 }
 
-/// Execute a batch of independent immutable longest-match searches in request order.
+/// Backend contract for executing an ordered batch of independent immutable match searches.
 ///
-/// This scalar implementation is intentionally allocation-free. Future worker/device backends can
-/// replace the loop behind the same request/result shape once dispatch overhead is justified.
-pub(crate) fn execute_match_search_batch(
+/// Backends may parallelize or offload execution, but must preserve request/result indexing and may
+/// not mutate compressor state. Request lifetimes bound any borrowed window/hash snapshot to the
+/// dispatch scope.
+pub(crate) trait MatchSearchBackend {
+    fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]);
+}
+
+struct ScalarMatchSearchBackend;
+
+impl MatchSearchBackend for ScalarMatchSearchBackend {
+    fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]) {
+        for (request, result) in requests.iter().zip(results) {
+            *result = request.execute();
+        }
+    }
+}
+
+pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
+    backend: &B,
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
 ) {
@@ -143,9 +159,18 @@ pub(crate) fn execute_match_search_batch(
         results.len(),
         "match-search batch result count must equal request count"
     );
-    for (request, result) in requests.iter().zip(results) {
-        *result = request.execute();
-    }
+    backend.execute(requests, results);
+}
+
+/// Execute one match-search batch with the default scalar backend.
+///
+/// The default remains allocation-free and synchronous. Backend choice is deliberately outside the
+/// token producers so later CPU/device executors do not contaminate compression semantics.
+pub(crate) fn execute_match_search_batch(
+    requests: &[MatchSearchRequest<'_>],
+    results: &mut [MatchSearchResult],
+) {
+    execute_match_search_batch_with_backend(&ScalarMatchSearchBackend, requests, results);
 }
 
 fn longest_match_help(request: &MatchSearchRequest<'_>) -> MatchSearchResult {
@@ -422,6 +447,31 @@ fn break_matching(
 mod tests {
     use super::*;
 
+    struct ScopedThreadMatchSearchBackend {
+        workers: usize,
+    }
+
+    impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
+        fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]) {
+            if requests.is_empty() {
+                return;
+            }
+
+            let workers = self.workers.max(1).min(requests.len());
+            let chunk_len = requests.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                for (request_chunk, result_chunk) in requests
+                    .chunks(chunk_len)
+                    .zip(results.chunks_mut(chunk_len))
+                {
+                    scope.spawn(move || {
+                        ScalarMatchSearchBackend.execute(request_chunk, result_chunk);
+                    });
+                }
+            });
+        }
+    }
+
     #[test]
     fn requests_are_worker_safe_and_batchable() {
         fn assert_send_sync<T: Send + Sync>() {}
@@ -469,6 +519,18 @@ mod tests {
             start: 0,
         }; 2];
         execute_match_search_batch(&requests, &mut results);
+
+        let mut parallel_results = [MatchSearchResult {
+            length: 0,
+            start: 0,
+        }; 2];
+        execute_match_search_batch_with_backend(
+            &ScopedThreadMatchSearchBackend { workers: 2 },
+            &requests,
+            &mut parallel_results,
+        );
+        assert_eq!(parallel_results, results);
+
         assert_eq!(
             results[0],
             MatchSearchResult {
