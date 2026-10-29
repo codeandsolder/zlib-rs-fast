@@ -383,23 +383,21 @@ fn satisfy_input_demand(
 /// while reusing `StandardCore`, its state-only token producers, and the independent refill, encode,
 /// and drain stages unchanged.
 pub(super) fn drive_standard(
-    stream: &mut Compressor<'_, '_>,
+    state: &mut State<'_>,
+    input: &mut InputCursor,
+    output: &mut crate::deflate::OutputCursor,
     flush: DeflateFlush,
     core: &mut StandardCore,
 ) -> BlockState {
     loop {
-        match core.next_event(stream.state) {
-            CoreEvent::NeedInput(demand) => {
-                match core.satisfy_input(stream.state, &mut stream.input, demand, flush) {
-                    RefillOutcome::Ready | RefillOutcome::FinalTail => {}
-                    RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
-                }
-            }
+        match core.next_event(state) {
+            CoreEvent::NeedInput(demand) => match core.satisfy_input(state, input, demand, flush) {
+                RefillOutcome::Ready | RefillOutcome::FinalTail => {}
+                RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
+            },
             CoreEvent::TokenBlockReady(work) => {
-                work.encode(stream.state);
-                if drain_pending_output(stream.state, &mut stream.output)
-                    == DrainOutcome::OutputFull
-                {
+                work.encode(state);
+                if drain_pending_output(state, output) == DrainOutcome::OutputFull {
                     return BlockState::NeedMore;
                 }
             }
@@ -409,10 +407,9 @@ pub(super) fn drive_standard(
                 } else {
                     EndBlockKind::FlushBoundary
                 };
-                let encoded = work.encode(stream.state, kind);
-                let output_full = encoded
-                    && drain_pending_output(stream.state, &mut stream.output)
-                        == DrainOutcome::OutputFull;
+                let encoded = work.encode(state, kind);
+                let output_full =
+                    encoded && drain_pending_output(state, output) == DrainOutcome::OutputFull;
 
                 return match (kind, output_full) {
                     (EndBlockKind::Final, true) => BlockState::FinishStarted,
@@ -458,7 +455,13 @@ impl Algorithm {
             algorithm => {
                 let mut core = StandardCore::for_algorithm(algorithm, stream.state)
                     .expect("ordinary algorithm must have a token producer");
-                drive_standard(stream, flush, &mut core)
+                drive_standard(
+                    stream.state,
+                    &mut stream.input,
+                    &mut stream.output,
+                    flush,
+                    &mut core,
+                )
             }
         }
     }
