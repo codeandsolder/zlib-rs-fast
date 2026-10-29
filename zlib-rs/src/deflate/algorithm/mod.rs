@@ -1,7 +1,7 @@
 use crate::{
     deflate::{
-        drain_pending_output, with_compressor, BlockState, Compressor, DeflateStream, DrainOutcome,
-        State, Strategy, MIN_LOOKAHEAD,
+        drain_pending_output, fill_window_core, with_compressor, BlockState, Compressor,
+        DeflateStream, DrainOutcome, InputCursor, State, Strategy, MIN_LOOKAHEAD,
     },
     DeflateFlush,
 };
@@ -259,11 +259,12 @@ impl StandardCore {
 
     pub(super) fn satisfy_input(
         &mut self,
-        stream: &mut Compressor<'_, '_>,
+        state: &mut State<'_>,
+        input: &mut InputCursor,
         demand: InputDemand,
         flush: DeflateFlush,
     ) -> RefillOutcome {
-        let outcome = satisfy_input_demand(stream, &mut self.producer, demand, flush);
+        let outcome = satisfy_input_demand(state, input, &mut self.producer, demand, flush);
         if outcome == RefillOutcome::FinalTail {
             self.input_phase = InputPhase::FinalTail;
         }
@@ -356,17 +357,18 @@ pub(super) enum RefillOutcome {
 /// absolute speculative positions. No token production, block encoding, or output draining occurs
 /// here.
 fn satisfy_input_demand(
-    stream: &mut Compressor<'_, '_>,
+    state: &mut State<'_>,
+    input: &mut InputCursor,
     producer: &mut StandardProducer,
     demand: InputDemand,
     flush: DeflateFlush,
 ) -> RefillOutcome {
-    debug_assert!(!demand.is_satisfied(stream.state));
+    debug_assert!(!demand.is_satisfied(state));
 
-    stream.fill_window();
-    producer.after_refill(stream.state);
+    fill_window_core(state, input);
+    producer.after_refill(state);
 
-    if demand.is_satisfied(stream.state) {
+    if demand.is_satisfied(state) {
         RefillOutcome::Ready
     } else if flush == DeflateFlush::NoFlush {
         RefillOutcome::NeedMoreCallerInput
@@ -387,10 +389,12 @@ pub(super) fn drive_standard(
 ) -> BlockState {
     loop {
         match core.next_event(stream.state) {
-            CoreEvent::NeedInput(demand) => match core.satisfy_input(stream, demand, flush) {
-                RefillOutcome::Ready | RefillOutcome::FinalTail => {}
-                RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
-            },
+            CoreEvent::NeedInput(demand) => {
+                match core.satisfy_input(stream.state, &mut stream.input, demand, flush) {
+                    RefillOutcome::Ready | RefillOutcome::FinalTail => {}
+                    RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
+                }
+            }
             CoreEvent::TokenBlockReady(work) => {
                 work.encode(stream.state);
                 if drain_pending_output(stream.state, &mut stream.output)

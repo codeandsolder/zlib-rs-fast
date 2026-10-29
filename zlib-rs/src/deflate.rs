@@ -124,11 +124,11 @@ impl<'a, 'state> Compressor<'a, 'state> {
     }
 
     pub(crate) fn fill_window(&mut self) {
-        fill_window_core(self);
+        fill_window_core(self.state, &mut self.input);
     }
 
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
-        read_buf_window_core(self, offset, size)
+        read_buf_window_core(self.state, &mut self.input, offset, size)
     }
 
     /// Copy initialized history bytes to the caller's output buffer.
@@ -1896,46 +1896,48 @@ pub(crate) fn flush_pending(stream: &mut DeflateStream<'_>) {
     });
 }
 
-fn read_buf_window_core(stream: &mut Compressor<'_, '_>, offset: usize, size: usize) -> usize {
-    let len = Ord::min(stream.input.avail_in as usize, size);
+fn read_buf_window_core(
+    state: &mut State<'_>,
+    input: &mut InputCursor,
+    offset: usize,
+    size: usize,
+) -> usize {
+    let len = Ord::min(input.avail_in as usize, size);
 
     if len == 0 {
         return 0;
     }
 
-    stream.input.avail_in -= len as u32;
+    input.avail_in -= len as u32;
 
-    if stream.state.wrap == 2 {
+    if state.wrap == 2 {
         // we likely cannot fuse the crc32 and the copy here because the input can be changed by
         // a concurrent thread. Therefore it cannot be converted into a slice!
-        let window = &mut stream.state.window;
+        let window = &mut state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.input.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, input.next_in) };
 
-        let data = &stream.state.window.filled()[offset..][..len];
-        stream.state.crc_fold.fold(data);
-    } else if stream.state.wrap == 1 {
+        let data = &state.window.filled()[offset..][..len];
+        state.crc_fold.fold(data);
+    } else if state.wrap == 1 {
         // we likely cannot fuse the adler32 and the copy here because the input can be changed by
         // a concurrent thread. Therefore it cannot be converted into a slice!
-        let window = &mut stream.state.window;
+        let window = &mut state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.input.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, input.next_in) };
 
-        let data = &stream.state.window.filled()[offset..][..len];
-        stream.input.adler = adler32(stream.input.adler as u32, data) as _;
+        let data = &state.window.filled()[offset..][..len];
+        input.adler = adler32(input.adler as u32, data) as _;
     } else {
-        let window = &mut stream.state.window;
+        let window = &mut state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.input.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, input.next_in) };
     }
 
     // These can overflow, especially on windows where the integer type is u32 and input/output are
     // larger than 4GB.
-    stream.input.next_in = stream.input.next_in.wrapping_add(len);
-    stream.input.total_in = stream
-        .input
-        .total_in
-        .wrapping_add(len as crate::c_api::z_size);
+    input.next_in = input.next_in.wrapping_add(len);
+    input.total_in = input.total_in.wrapping_add(len as crate::c_api::z_size);
 
     len
 }
@@ -1988,13 +1990,12 @@ pub(crate) const WANT_MIN_MATCH: usize = 4;
 pub(crate) const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
 
 #[inline]
-fn fill_window_core(stream: &mut Compressor<'_, '_>) {
-    debug_assert!(stream.state.lookahead < MIN_LOOKAHEAD);
+pub(crate) fn fill_window_core(state: &mut State<'_>, input: &mut InputCursor) {
+    debug_assert!(state.lookahead < MIN_LOOKAHEAD);
 
-    let wsize = stream.state.w_size;
+    let wsize = state.w_size;
 
     loop {
-        let state = &mut *stream.state;
         let mut more = state.window_size - state.lookahead - state.strstart;
 
         // If the window is almost full and there is insufficient lookahead,
@@ -2020,7 +2021,7 @@ fn fill_window_core(stream: &mut Compressor<'_, '_>) {
             more += wsize;
         }
 
-        if stream.input.avail_in == 0 {
+        if input.avail_in == 0 {
             break;
         }
 
@@ -2036,9 +2037,8 @@ fn fill_window_core(stream: &mut Compressor<'_, '_>) {
         // If there was sliding, more >= WSIZE. So in all cases, more >= 2.
         assert!(more >= 2, "more < 2");
 
-        let n = stream.read_buf_window(stream.state.strstart + stream.state.lookahead, more);
+        let n = read_buf_window_core(state, input, state.strstart + state.lookahead, more);
 
-        let state = &mut *stream.state;
         state.lookahead += n;
 
         // Initialize the hash value now that we have some input:
@@ -2064,13 +2064,13 @@ fn fill_window_core(stream: &mut Compressor<'_, '_>) {
         // If the whole input has less than STD_MIN_MATCH bytes, ins_h is garbage,
         // but this is not important since only literal bytes will be emitted.
 
-        if !(stream.state.lookahead < MIN_LOOKAHEAD && stream.input.avail_in != 0) {
+        if !(state.lookahead < MIN_LOOKAHEAD && input.avail_in != 0) {
             break;
         }
     }
 
     assert!(
-        stream.state.strstart <= stream.state.window_size - MIN_LOOKAHEAD,
+        state.strstart <= state.window_size - MIN_LOOKAHEAD,
         "not enough room for search"
     );
 }
@@ -3992,8 +3992,12 @@ mod test {
             match self.core.next_event(stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let outcome = with_compressor(stream, |compressor| {
-                        self.core
-                            .satisfy_input(compressor, demand, DeflateFlush::Finish)
+                        self.core.satisfy_input(
+                            compressor.state,
+                            &mut compressor.input,
+                            demand,
+                            DeflateFlush::Finish,
+                        )
                     });
                     match outcome {
                         algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail => {}
