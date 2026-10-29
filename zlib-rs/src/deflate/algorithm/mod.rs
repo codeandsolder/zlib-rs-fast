@@ -235,6 +235,13 @@ enum InputPhase {
     FinalTail,
 }
 
+/// Whether orchestration expects more caller input for the current segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InputCompletion {
+    MoreMayArrive,
+    EndOfSegment,
+}
+
 /// Per-call scheduling state for the ordinary token-producing algorithms.
 ///
 /// It owns the heterogeneous producer plus the only orchestration state the core needs: whether a
@@ -262,9 +269,9 @@ impl StandardCore {
         state: &mut State<'_>,
         input: &mut InputCursor,
         demand: InputDemand,
-        flush: DeflateFlush,
+        completion: InputCompletion,
     ) -> RefillOutcome {
-        let outcome = satisfy_input_demand(state, input, &mut self.producer, demand, flush);
+        let outcome = satisfy_input_demand(state, input, &mut self.producer, demand, completion);
         if outcome == RefillOutcome::FinalTail {
             self.input_phase = InputPhase::FinalTail;
         }
@@ -361,7 +368,7 @@ fn satisfy_input_demand(
     input: &mut InputCursor,
     producer: &mut StandardProducer,
     demand: InputDemand,
-    flush: DeflateFlush,
+    completion: InputCompletion,
 ) -> RefillOutcome {
     debug_assert!(!demand.is_satisfied(state));
 
@@ -370,7 +377,7 @@ fn satisfy_input_demand(
 
     if demand.is_satisfied(state) {
         RefillOutcome::Ready
-    } else if flush == DeflateFlush::NoFlush {
+    } else if completion == InputCompletion::MoreMayArrive {
         RefillOutcome::NeedMoreCallerInput
     } else {
         RefillOutcome::FinalTail
@@ -391,10 +398,17 @@ pub(super) fn drive_standard(
 ) -> BlockState {
     loop {
         match core.next_event(state) {
-            CoreEvent::NeedInput(demand) => match core.satisfy_input(state, input, demand, flush) {
-                RefillOutcome::Ready | RefillOutcome::FinalTail => {}
-                RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
-            },
+            CoreEvent::NeedInput(demand) => {
+                let completion = if flush == DeflateFlush::NoFlush {
+                    InputCompletion::MoreMayArrive
+                } else {
+                    InputCompletion::EndOfSegment
+                };
+                match core.satisfy_input(state, input, demand, completion) {
+                    RefillOutcome::Ready | RefillOutcome::FinalTail => {}
+                    RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
+                }
+            }
             CoreEvent::TokenBlockReady(work) => {
                 work.encode(state);
                 if drain_pending_output(state, output) == DrainOutcome::OutputFull {

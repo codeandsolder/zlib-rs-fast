@@ -3996,7 +3996,7 @@ mod test {
                             compressor.state,
                             &mut compressor.input,
                             demand,
-                            DeflateFlush::Finish,
+                            algorithm::InputCompletion::EndOfSegment,
                         )
                     });
                     match outcome {
