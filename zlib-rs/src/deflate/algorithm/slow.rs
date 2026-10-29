@@ -2,14 +2,11 @@
 
 use super::flush_block;
 use crate::{
-    deflate::{
-        fill_window, flush_block_only, BlockState, DeflateStream, Strategy, MIN_LOOKAHEAD,
-        STD_MIN_MATCH, WANT_MIN_MATCH,
-    },
+    deflate::{BlockState, Compressor, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
     DeflateFlush,
 };
 
-pub fn deflate_slow(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     let mut hash_head; /* head of hash chain */
     let mut bflush; /* set if current block must be flushed */
     let mut dist;
@@ -28,7 +25,7 @@ pub fn deflate_slow(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSta
          * string following the next match.
          */
         if stream.state.lookahead < MIN_LOOKAHEAD {
-            fill_window(stream);
+            stream.fill_window();
             if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
                 return BlockState::NeedMore;
             }
@@ -116,13 +113,13 @@ pub fn deflate_slow(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSta
             let lc = state.window.filled()[state.strstart - 1];
             bflush = state.tally_lit(lc);
             if bflush {
-                flush_block_only(stream, false);
+                stream.flush_block(false);
             }
 
             stream.state.prev_length = match_len as u16;
             stream.state.strstart += 1;
             stream.state.lookahead -= 1;
-            if stream.avail_out == 0 {
+            if stream.io.avail_out == 0 {
                 return BlockState::NeedMore;
             }
         } else {

@@ -2,15 +2,15 @@
 
 use super::flush_block;
 use crate::{
-    deflate::{fill_window, BlockState, DeflateStream},
+    deflate::{BlockState, Compressor},
     DeflateFlush,
 };
 
-pub fn deflate_huff(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_huff(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     loop {
         /* Make sure that we have a literal to write. */
         if stream.state.lookahead == 0 {
-            fill_window(stream);
+            stream.fill_window();
 
             if stream.state.lookahead == 0 {
                 match flush {

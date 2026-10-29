@@ -3,13 +3,11 @@
 use super::flush_block;
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
-    deflate::{
-        fill_window, BlockState, DeflateStream, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
-    },
+    deflate::{BlockState, Compressor, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
     DeflateFlush,
 };
 
-pub fn deflate_medium(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_medium(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     let mut state = &mut stream.state;
 
     // For levels below 5, don't check the next position for a better match
@@ -37,7 +35,7 @@ pub fn deflate_medium(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
          * string following the next match.
          */
         if stream.state.lookahead < MIN_LOOKAHEAD {
-            fill_window(stream);
+            stream.fill_window();
 
             if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
                 return BlockState::NeedMore;

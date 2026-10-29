@@ -1,11 +1,9 @@
 use crate::{
-    deflate::{
-        flush_pending, read_buf_window, zng_tr_stored_block, BlockState, DeflateStream, MAX_STORED,
-    },
+    deflate::{zng_tr_stored_block, BlockState, Compressor, MAX_STORED},
     DeflateFlush,
 };
 
-pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     // Smallest worthy block size when not flushing or finishing. By default
     // this is 32K. This can be as small as 507 bytes for memLevel == 1. For
     // large input and output buffers, the stored block size will be larger.
@@ -21,7 +19,7 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
     // unsigned len, left, have, last = 0;
     let mut have;
     let mut last = false;
-    let mut used = stream.avail_in;
+    let mut used = stream.io.avail_in;
     loop {
         // maximum deflate stored block length
         let mut len = MAX_STORED;
@@ -30,18 +28,18 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
         have = ((stream.state.bit_writer.bits_valid + 42) / 8) as usize;
 
         // we need room for at least the header
-        if stream.avail_out < have as u32 {
+        if stream.io.avail_out < have as u32 {
             break;
         }
 
         let left = stream.state.strstart as isize - stream.state.block_start;
         let left = Ord::max(0, left) as usize;
 
-        have = stream.avail_out as usize - have;
+        have = stream.io.avail_out as usize - have;
 
-        if len > left + stream.avail_in as usize {
+        if len > left + stream.io.avail_in as usize {
             // limit len to the input
-            len = left + stream.avail_in as usize;
+            len = left + stream.io.avail_in as usize;
         }
 
         len = Ord::min(len, have);
@@ -53,14 +51,14 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
         if len < min_block
             && ((len == 0 && flush != DeflateFlush::Finish)
                 || flush == DeflateFlush::NoFlush
-                || len != left + stream.avail_in as usize)
+                || len != left + stream.io.avail_in as usize)
         {
             break;
         }
 
         // Make a dummy stored block in pending to get the header bytes,
         // including any pending bits. This also updates the debugging counts.
-        last = flush == DeflateFlush::Finish && len == left + stream.avail_in as usize;
+        last = flush == DeflateFlush::Finish && len == left + stream.io.avail_in as usize;
         zng_tr_stored_block(stream.state, 0..0, last);
 
         /* Replace the lengths in the dummy stored block with len. */
@@ -77,23 +75,23 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
             .extend(&(!len as u16).to_le_bytes());
 
         // Write the stored block header bytes.
-        flush_pending(stream);
+        stream.flush_pending();
 
         // Update debugging counts for the data about to be copied.
         stream.state.bit_writer.cmpr_bits_add(len << 3);
         stream.state.bit_writer.sent_bits_add(len << 3);
 
         if left > 0 {
-            // SAFETY: `len` is effectively `min(stream.avail_in, stream.avail_out)`, so any reads
+            // SAFETY: `len` is effectively `min(stream.io.avail_in, stream.io.avail_out)`, so any reads
             // of `len` won't go out of bounds on `next_out`. `left` is calculated from indices of
             // the window, so `left` reads of the window won't go out of bounds.
             let left = Ord::min(left, len);
             let src = &stream.state.window.filled()[stream.state.block_start as usize..];
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), stream.next_out, left) };
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), stream.io.next_out, left) };
 
-            stream.next_out = stream.next_out.wrapping_add(left);
-            stream.avail_out = stream.avail_out.wrapping_sub(left as _);
-            stream.total_out = stream.total_out.wrapping_add(left as _);
+            stream.io.next_out = stream.io.next_out.wrapping_add(left);
+            stream.io.avail_out = stream.io.avail_out.wrapping_sub(left as _);
+            stream.io.total_out = stream.io.total_out.wrapping_add(left as _);
             stream.state.block_start += left as isize;
             len -= left;
         }
@@ -113,7 +111,7 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
     // than s->w_size bytes were copied. Also update the number of bytes to
     // insert in the hash tables, in the event that deflateParams() switches to
     // a non-zero compression level.
-    used -= stream.avail_in; /* number of input bytes directly copied */
+    used -= stream.io.avail_in; /* number of input bytes directly copied */
 
     if used > 0 {
         let state = &mut stream.state;
@@ -124,7 +122,7 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
 
             // SAFETY: we've advanced the next_in pointer at minimum w_size bytes
             // read_buf_direct_copy(), so we are able to backtrack that number of bytes.
-            let src = stream.next_in.wrapping_sub(state.w_size);
+            let src = stream.io.next_in.wrapping_sub(state.w_size);
             unsafe { state.window.copy_and_initialize(0..state.w_size, src) };
 
             state.strstart = state.w_size;
@@ -151,7 +149,7 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
 
             // SAFETY: we've advanced the next_in pointer at least `used` bytes
             // read_buf_direct_copy(), so we are able to backtrack that number of bytes.
-            let src = stream.next_in.wrapping_sub(used as usize);
+            let src = stream.io.next_in.wrapping_sub(used as usize);
             let dst = state.strstart..state.strstart + used as usize;
             unsafe { state.window.copy_and_initialize(dst, src) };
 
@@ -170,7 +168,7 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
     // If flushing and all input has been consumed, then done.
     if flush != DeflateFlush::NoFlush
         && flush != DeflateFlush::Finish
-        && stream.avail_in == 0
+        && stream.io.avail_in == 0
         && stream.state.strstart as isize == stream.state.block_start
     {
         return BlockState::BlockDone;
@@ -178,7 +176,9 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
 
     // Fill the window with any remaining input
     let mut have = stream.state.window_size - stream.state.strstart;
-    if stream.avail_in as usize > have && stream.state.block_start >= stream.state.w_size as isize {
+    if stream.io.avail_in as usize > have
+        && stream.state.block_start >= stream.state.w_size as isize
+    {
         // slide the window down
         let state = &mut stream.state;
         state.block_start -= state.w_size as isize;
@@ -202,9 +202,9 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
         state.insert = Ord::min(state.insert, state.strstart);
     }
 
-    let have = Ord::min(have, stream.avail_in as usize);
+    let have = Ord::min(have, stream.io.avail_in as usize);
     if have > 0 {
-        read_buf_window(stream, stream.state.strstart, have);
+        stream.read_buf_window(stream.state.strstart, have);
 
         let state = &mut stream.state;
         state.strstart += have;
@@ -228,17 +228,17 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
     if left >= min_block as isize
         || ((left > 0 || flush == DeflateFlush::Finish)
             && flush != DeflateFlush::NoFlush
-            && stream.avail_in == 0
+            && stream.io.avail_in == 0
             && left <= have as isize)
     {
         let len = Ord::min(left as usize, have); // TODO wrapping?
-        last = flush == DeflateFlush::Finish && stream.avail_in == 0 && len == (left as usize);
+        last = flush == DeflateFlush::Finish && stream.io.avail_in == 0 && len == (left as usize);
 
         let range = state.block_start as usize..state.block_start as usize + len;
         zng_tr_stored_block(state, range, last);
 
         state.block_start += len as isize;
-        flush_pending(stream);
+        stream.flush_pending();
     }
 
     // We've done all we can with the available input and output.
@@ -250,43 +250,43 @@ pub fn deflate_stored(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockS
     }
 }
 
-fn read_buf_direct_copy(stream: &mut DeflateStream, size: usize) -> usize {
-    let len = Ord::min(stream.avail_in as usize, size);
-    let output = stream.next_out;
+fn read_buf_direct_copy(stream: &mut Compressor, size: usize) -> usize {
+    let len = Ord::min(stream.io.avail_in as usize, size);
+    let output = stream.io.next_out;
 
     if len == 0 {
         return 0;
     }
 
-    stream.avail_in -= len as u32;
+    stream.io.avail_in -= len as u32;
 
     // SAFETY: len is effectively bounded by next_in and next_out (via size derived in the calling
     // function), so copies are in-bounds.
     if stream.state.wrap == 2 {
         // we likely cannot fuse the crc32 and the copy here because the input can be changed by
         // a concurrent thread. Therefore it cannot be converted into a slice!
-        unsafe { core::ptr::copy_nonoverlapping(stream.next_in, output, len) }
+        unsafe { core::ptr::copy_nonoverlapping(stream.io.next_in, output, len) }
 
         let data = unsafe { core::slice::from_raw_parts(output, len) };
         stream.state.crc_fold.fold(data);
     } else if stream.state.wrap == 1 {
         // we cannot fuse the adler and the copy in our case, because adler32 takes a slice.
-        // Another process is allowed to concurrently modify stream.next_in, so we cannot turn it
+        // Another process is allowed to concurrently modify stream.io.next_in, so we cannot turn it
         // into a rust slice (violates its safety requirements)
-        unsafe { core::ptr::copy_nonoverlapping(stream.next_in, output, len) }
+        unsafe { core::ptr::copy_nonoverlapping(stream.io.next_in, output, len) }
 
         let data = unsafe { core::slice::from_raw_parts(output, len) };
-        stream.adler = crate::adler32::adler32(stream.adler as u32, data) as _;
+        stream.io.adler = crate::adler32::adler32(stream.io.adler as u32, data) as _;
     } else {
-        unsafe { core::ptr::copy_nonoverlapping(stream.next_in, output, len) }
+        unsafe { core::ptr::copy_nonoverlapping(stream.io.next_in, output, len) }
     }
 
-    stream.next_in = stream.next_in.wrapping_add(len);
-    stream.total_in += len as crate::c_api::z_size;
+    stream.io.next_in = stream.io.next_in.wrapping_add(len);
+    stream.io.total_in += len as crate::c_api::z_size;
 
-    stream.next_out = stream.next_out.wrapping_add(len as _);
-    stream.avail_out = stream.avail_out.wrapping_sub(len as _);
-    stream.total_out = stream.total_out.wrapping_add(len as _);
+    stream.io.next_out = stream.io.next_out.wrapping_add(len as _);
+    stream.io.avail_out = stream.io.avail_out.wrapping_sub(len as _);
+    stream.io.total_out = stream.io.total_out.wrapping_add(len as _);
 
     len
 }

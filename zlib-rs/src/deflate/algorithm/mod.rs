@@ -1,5 +1,5 @@
 use crate::{
-    deflate::{BlockState, DeflateStream, Strategy},
+    deflate::{with_compressor, BlockState, Compressor, DeflateStream, Strategy},
     DeflateFlush,
 };
 
@@ -13,9 +13,9 @@ mod stored;
 
 macro_rules! flush_block {
     ($stream:expr, $is_last_block:expr) => {
-        $crate::deflate::flush_block_only($stream, $is_last_block);
+        $stream.flush_block($is_last_block);
 
-        if $stream.avail_out == 0 {
+        if $stream.io.avail_out == 0 {
             return match $is_last_block {
                 true => BlockState::FinishStarted,
                 false => BlockState::NeedMore,
@@ -51,7 +51,7 @@ impl Algorithm {
         }
     }
 
-    fn run(self, stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+    fn run(self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> BlockState {
         match self {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
@@ -65,7 +65,8 @@ impl Algorithm {
 }
 
 pub fn run(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
-    Algorithm::for_stream(stream.state.level, stream.state.strategy).run(stream, flush)
+    let algorithm = Algorithm::for_stream(stream.state.level, stream.state.strategy);
+    with_compressor(stream, |compressor| algorithm.run(compressor, flush))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

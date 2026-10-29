@@ -3,13 +3,13 @@
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
     deflate::{
-        fill_window, flush_pending, BlockState, BlockType, DeflateStream, State, StaticTreeDesc,
-        MIN_LOOKAHEAD, STD_MAX_MATCH, STD_MIN_MATCH, WANT_MIN_MATCH,
+        BlockState, BlockType, Compressor, State, StaticTreeDesc, MIN_LOOKAHEAD, STD_MAX_MATCH,
+        STD_MIN_MATCH, WANT_MIN_MATCH,
     },
     DeflateFlush,
 };
 
-pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     let mut state = &mut stream.state;
 
     macro_rules! quick_end_block {
@@ -20,12 +20,12 @@ pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSt
                     .emit_end_block_and_align(&StaticTreeDesc::L.static_tree, $last);
                 state.block_open = 0;
                 state.block_start = state.strstart as isize;
-                flush_pending(stream);
+                stream.flush_pending();
                 #[allow(unused_assignments)]
                 {
                     state = &mut stream.state;
                 }
-                if stream.avail_out == 0 {
+                if stream.io.avail_out == 0 {
                     return match $last {
                         true => BlockState::FinishStarted,
                         false => BlockState::NeedMore,
@@ -60,11 +60,11 @@ pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSt
         if state.bit_writer.pending.pending + State::BIT_BUF_SIZE.div_ceil(8) as usize
             >= state.pending_buf_size()
         {
-            flush_pending(stream);
+            stream.flush_pending();
             state = &mut stream.state;
-            if stream.avail_out == 0 {
+            if stream.io.avail_out == 0 {
                 return if last
-                    && stream.avail_in == 0
+                    && stream.io.avail_in == 0
                     && state.bit_writer.bits_valid == 0
                     && state.block_open == 0
                 {
@@ -76,7 +76,7 @@ pub fn deflate_quick(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockSt
         }
 
         if state.lookahead < MIN_LOOKAHEAD {
-            fill_window(stream);
+            stream.fill_window();
             state = &mut stream.state;
 
             if state.lookahead < MIN_LOOKAHEAD && matches!(flush, DeflateFlush::NoFlush) {

@@ -50,6 +50,94 @@ pub struct DeflateStream<'a> {
     pub(crate) reserved: crate::c_api::uLong,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CompressionIo {
+    pub(crate) next_in: *mut crate::c_api::Bytef,
+    pub(crate) avail_in: crate::c_api::uInt,
+    pub(crate) total_in: crate::c_api::z_size,
+    pub(crate) next_out: *mut crate::c_api::Bytef,
+    pub(crate) avail_out: crate::c_api::uInt,
+    pub(crate) total_out: crate::c_api::z_size,
+    pub(crate) data_type: core::ffi::c_int,
+    pub(crate) adler: crate::c_api::z_checksum,
+}
+
+impl CompressionIo {
+    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+        Self {
+            next_in: stream.next_in,
+            avail_in: stream.avail_in,
+            total_in: stream.total_in,
+            next_out: stream.next_out,
+            avail_out: stream.avail_out,
+            total_out: stream.total_out,
+            data_type: stream.data_type,
+            adler: stream.adler,
+        }
+    }
+
+    fn apply(self, stream: &mut DeflateStream<'_>) {
+        stream.next_in = self.next_in;
+        stream.avail_in = self.avail_in;
+        stream.total_in = self.total_in;
+        stream.next_out = self.next_out;
+        stream.avail_out = self.avail_out;
+        stream.total_out = self.total_out;
+        stream.data_type = self.data_type;
+        stream.adler = self.adler;
+    }
+}
+
+/// Internal execution context for one compression call.
+///
+/// `DeflateStream` is constrained by the public zlib ABI. Algorithms operate on this
+/// Rust-owned view instead: compression state is borrowed separately from the mutable I/O cursor,
+/// which is committed back to the ABI shell when the algorithm returns.
+pub(crate) struct Compressor<'a, 'state> {
+    pub(crate) state: &'a mut State<'state>,
+    pub(crate) io: CompressionIo,
+}
+
+impl<'a, 'state> Compressor<'a, 'state> {
+    fn new(state: &'a mut State<'state>, io: CompressionIo) -> Self {
+        Self { state, io }
+    }
+
+    fn into_io(self) -> CompressionIo {
+        self.io
+    }
+
+    pub(crate) fn fill_window(&mut self) {
+        fill_window_core(self);
+    }
+
+    pub(crate) fn flush_pending(&mut self) {
+        flush_pending_core(self);
+    }
+
+    pub(crate) fn flush_block(&mut self, is_last: bool) {
+        flush_block_only_core(self, is_last);
+    }
+
+    pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
+        read_buf_window_core(self, offset, size)
+    }
+}
+
+pub(crate) fn with_compressor<'state, R>(
+    stream: &mut DeflateStream<'state>,
+    f: impl FnOnce(&mut Compressor<'_, 'state>) -> R,
+) -> R {
+    let io = CompressionIo::from_stream(stream);
+    let (result, io) = {
+        let mut compressor = Compressor::new(&mut *stream.state, io);
+        let result = f(&mut compressor);
+        (result, compressor.into_io())
+    };
+    io.apply(stream);
+    result
+}
+
 unsafe impl Sync for DeflateStream<'_> {}
 unsafe impl Send for DeflateStream<'_> {}
 
@@ -1680,21 +1768,29 @@ pub(crate) enum BlockState {
 // Maximum stored block length in deflate format (not including header).
 pub(crate) const MAX_STORED: usize = 65535; // so u16::max
 
-pub(crate) fn read_buf_window(stream: &mut DeflateStream, offset: usize, size: usize) -> usize {
-    let len = Ord::min(stream.avail_in as usize, size);
+pub(crate) fn fill_window(stream: &mut DeflateStream<'_>) {
+    with_compressor(stream, |compressor| compressor.fill_window());
+}
+
+pub(crate) fn flush_pending(stream: &mut DeflateStream<'_>) {
+    with_compressor(stream, |compressor| compressor.flush_pending());
+}
+
+fn read_buf_window_core(stream: &mut Compressor<'_, '_>, offset: usize, size: usize) -> usize {
+    let len = Ord::min(stream.io.avail_in as usize, size);
 
     if len == 0 {
         return 0;
     }
 
-    stream.avail_in -= len as u32;
+    stream.io.avail_in -= len as u32;
 
     if stream.state.wrap == 2 {
         // we likely cannot fuse the crc32 and the copy here because the input can be changed by
         // a concurrent thread. Therefore it cannot be converted into a slice!
         let window = &mut stream.state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, stream.io.next_in) };
 
         let data = &stream.state.window.filled()[offset..][..len];
         stream.state.crc_fold.fold(data);
@@ -1703,20 +1799,20 @@ pub(crate) fn read_buf_window(stream: &mut DeflateStream, offset: usize, size: u
         // a concurrent thread. Therefore it cannot be converted into a slice!
         let window = &mut stream.state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, stream.io.next_in) };
 
         let data = &stream.state.window.filled()[offset..][..len];
-        stream.adler = adler32(stream.adler as u32, data) as _;
+        stream.io.adler = adler32(stream.io.adler as u32, data) as _;
     } else {
         let window = &mut stream.state.window;
         // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, stream.next_in) };
+        unsafe { window.copy_and_initialize(offset..offset + len, stream.io.next_in) };
     }
 
     // These can overflow, especially on windows where the integer type is u32 and input/output are
     // larger than 4GB.
-    stream.next_in = stream.next_in.wrapping_add(len);
-    stream.total_in = stream.total_in.wrapping_add(len as crate::c_api::z_size);
+    stream.io.next_in = stream.io.next_in.wrapping_add(len);
+    stream.io.total_in = stream.io.total_in.wrapping_add(len as crate::c_api::z_size);
 
     len
 }
@@ -1769,7 +1865,7 @@ pub(crate) const WANT_MIN_MATCH: usize = 4;
 pub(crate) const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
 
 #[inline]
-pub(crate) fn fill_window(stream: &mut DeflateStream) {
+fn fill_window_core(stream: &mut Compressor<'_, '_>) {
     debug_assert!(stream.state.lookahead < MIN_LOOKAHEAD);
 
     let wsize = stream.state.w_size;
@@ -1801,7 +1897,7 @@ pub(crate) fn fill_window(stream: &mut DeflateStream) {
             more += wsize;
         }
 
-        if stream.avail_in == 0 {
+        if stream.io.avail_in == 0 {
             break;
         }
 
@@ -1817,7 +1913,7 @@ pub(crate) fn fill_window(stream: &mut DeflateStream) {
         // If there was sliding, more >= WSIZE. So in all cases, more >= 2.
         assert!(more >= 2, "more < 2");
 
-        let n = read_buf_window(stream, stream.state.strstart + stream.state.lookahead, more);
+        let n = stream.read_buf_window(stream.state.strstart + stream.state.lookahead, more);
 
         let state = &mut *stream.state;
         state.lookahead += n;
@@ -1845,7 +1941,7 @@ pub(crate) fn fill_window(stream: &mut DeflateStream) {
         // If the whole input has less than STD_MIN_MATCH bytes, ins_h is garbage,
         // but this is not important since only literal bytes will be emitted.
 
-        if !(stream.state.lookahead < MIN_LOOKAHEAD && stream.avail_in != 0) {
+        if !(stream.state.lookahead < MIN_LOOKAHEAD && stream.io.avail_in != 0) {
             break;
         }
     }
@@ -2310,7 +2406,7 @@ fn build_bl_tree(state: &mut State) -> usize {
 }
 
 fn zng_tr_flush_block(
-    stream: &mut DeflateStream,
+    stream: &mut Compressor<'_, '_>,
     window_offset: Option<usize>,
     stored_len: u32,
     last: bool,
@@ -2330,8 +2426,8 @@ fn zng_tr_flush_block(
         static_lenb = 0;
         state.static_len = 7;
     } else if state.level > 0 {
-        if stream.data_type == DataType::Unknown as i32 {
-            stream.data_type = State::detect_data_type(&state.l_desc.dyn_tree) as i32;
+        if stream.io.data_type == DataType::Unknown as i32 {
+            stream.io.data_type = State::detect_data_type(&state.l_desc.dyn_tree) as i32;
         }
 
         {
@@ -2429,7 +2525,7 @@ fn zng_tr_flush_block(
     // Tracev((stderr, "\ncomprlen {}(%lu) ", s->compressed_len>>3, s->compressed_len-7*last));
 }
 
-pub(crate) fn flush_block_only(stream: &mut DeflateStream, is_last: bool) {
+fn flush_block_only_core(stream: &mut Compressor<'_, '_>, is_last: bool) {
     zng_tr_flush_block(
         stream,
         (stream.state.block_start >= 0).then_some(stream.state.block_start as usize),
@@ -2438,7 +2534,7 @@ pub(crate) fn flush_block_only(stream: &mut DeflateStream, is_last: bool) {
     );
 
     stream.state.block_start = stream.state.strstart as isize;
-    flush_pending(stream)
+    stream.flush_pending();
 }
 
 fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
@@ -2798,25 +2894,25 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     ReturnCode::Ok
 }
 
-pub(crate) fn flush_pending(stream: &mut DeflateStream) {
+fn flush_pending_core(stream: &mut Compressor<'_, '_>) {
     let state = &mut stream.state;
 
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();
-    let len = Ord::min(pending.len(), stream.avail_out as usize);
+    let len = Ord::min(pending.len(), stream.io.avail_out as usize);
 
     if len == 0 {
         return;
     }
 
     trace!("\n[FLUSH {len} bytes]");
-    // SAFETY: len is min(pending, stream.avail_out), so we won't overrun next_out.
-    unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), stream.next_out, len) };
+    // SAFETY: len is min(pending, stream.io.avail_out), so we won't overrun next_out.
+    unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), stream.io.next_out, len) };
 
-    stream.next_out = stream.next_out.wrapping_add(len);
-    stream.total_out += len as crate::c_api::z_size;
-    stream.avail_out -= len as crate::c_api::uInt;
+    stream.io.next_out = stream.io.next_out.wrapping_add(len);
+    stream.io.total_out += len as crate::c_api::z_size;
+    stream.io.avail_out -= len as crate::c_api::uInt;
 
     state.bit_writer.pending.advance(len);
 }

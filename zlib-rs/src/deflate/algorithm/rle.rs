@@ -3,13 +3,13 @@
 use super::flush_block;
 use crate::{
     deflate::{
-        compare256::compare256_rle_slice, fill_window, BlockState, DeflateStream, MIN_LOOKAHEAD,
-        STD_MAX_MATCH, STD_MIN_MATCH,
+        compare256::compare256_rle_slice, BlockState, Compressor, MIN_LOOKAHEAD, STD_MAX_MATCH,
+        STD_MIN_MATCH,
     },
     DeflateFlush,
 };
 
-pub fn deflate_rle(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_rle(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     let mut match_len = 0;
     let mut bflush;
 
@@ -19,7 +19,7 @@ pub fn deflate_rle(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockStat
         // for the next match, plus WANT_MIN_MATCH bytes to insert the
         // string following the next match.
         if stream.state.lookahead < MIN_LOOKAHEAD {
-            fill_window(stream);
+            stream.fill_window();
             if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
                 return BlockState::NeedMore;
             }

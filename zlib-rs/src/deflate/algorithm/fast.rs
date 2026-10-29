@@ -3,20 +3,18 @@
 use super::flush_block;
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
-    deflate::{
-        fill_window, BlockState, DeflateStream, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
-    },
+    deflate::{BlockState, Compressor, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
     DeflateFlush,
 };
 
-pub fn deflate_fast(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     loop {
         // Make sure that we always have enough lookahead, except
         // at the end of the input file. We need STD_MAX_MATCH bytes
         // for the next match, plus WANT_MIN_MATCH bytes to insert the
         // string following the next match.
         if stream.state.lookahead < MIN_LOOKAHEAD {
-            fill_window(stream);
+            stream.fill_window();
             if stream.state.lookahead < MIN_LOOKAHEAD && flush == DeflateFlush::NoFlush {
                 return BlockState::NeedMore;
             }
