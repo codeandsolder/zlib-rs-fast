@@ -564,6 +564,7 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         crc_fold: Crc32Fold::new(),
         gzhead: None,
         gzindex: 0,
+        medium_next_match: MatchCandidate::EMPTY,
 
         //
         match_start: 0,
@@ -580,7 +581,7 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         _cache_line_1: (),
         _cache_line_2: (),
         _cache_line_3: (),
-        _padding_0: [0; 16],
+        _padding_0: [0; 8],
     };
 
     let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
@@ -853,13 +854,14 @@ pub fn copy<'a>(
         crc_fold: source_state.crc_fold,
         gzhead: None,
         gzindex: source_state.gzindex,
+        medium_next_match: source_state.medium_next_match,
         allocation_start,
         total_allocation_size: allocs.total_size,
         _cache_line_0: (),
         _cache_line_1: (),
         _cache_line_2: (),
         _cache_line_3: (),
-        _padding_0: source_state._padding_0,
+        _padding_0: [0; 8],
     };
 
     // write the cloned state into state_ptr
@@ -935,6 +937,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     };
 
     state.last_flush = -2;
+    state.medium_next_match = MatchCandidate::EMPTY;
 
     state.zng_tr_init();
 
@@ -962,6 +965,7 @@ fn lm_init(state: &mut State) {
 
 fn lm_set_level(state: &mut State, level: i8) {
     let config = level_config(level);
+    state.medium_next_match = MatchCandidate::EMPTY;
     state.max_insert_length = config.max_lazy;
     state.max_lazy_match = config.max_lazy;
     state.good_match = config.good_length;
@@ -980,6 +984,7 @@ pub fn tune(
     max_chain: usize,
 ) -> ReturnCode {
     stream.state.good_match = good_length as u16;
+    stream.state.medium_next_match = MatchCandidate::EMPTY;
     // zlib exposes one tuning knob for both historical uses of max_lazy. Keep the
     // public contract while representing the two internal concepts independently.
     stream.state.max_insert_length = max_lazy as u16;
@@ -1400,6 +1405,24 @@ impl<'a> BitWriter<'a> {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatchCandidate {
+    pub(crate) match_start: u16,
+    pub(crate) match_length: u16,
+    pub(crate) strstart: u16,
+    pub(crate) orgstart: u16,
+}
+
+impl MatchCandidate {
+    pub(crate) const EMPTY: Self = Self {
+        match_start: 0,
+        match_length: 0,
+        strstart: 0,
+        orgstart: 0,
+    };
+}
+
 #[repr(C, align(64))]
 pub(crate) struct State<'a> {
     status: Status,
@@ -1518,7 +1541,11 @@ pub(crate) struct State<'a> {
     gzhead: Option<&'a mut gz_header>,
     gzindex: usize,
 
-    _padding_0: [u8; 16],
+    /// Medium's speculative next match must survive an output-blocking return. Keeping it here
+    /// makes compression decisions independent of caller output chunking. It occupies bytes that
+    /// were previously explicit alignment padding, so the hand-packed cache-line layout is stable.
+    pub(crate) medium_next_match: MatchCandidate,
+    _padding_0: [u8; 8],
 
     _cache_line_3: (),
 
@@ -3830,6 +3857,81 @@ mod test {
         assert_eq!(output.len(), EXPECTED.len());
 
         assert_eq!(EXPECTED, output);
+    }
+
+    fn compress_with_output_chunks(
+        input: &[u8],
+        config: DeflateConfig,
+        chunk_size: usize,
+    ) -> Vec<u8> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        stream.next_in = input.as_ptr() as *mut u8;
+        stream.avail_in = input.len() as _;
+
+        let mut output = Vec::new();
+        loop {
+            let mut chunk = vec![0u8; chunk_size];
+            stream.next_out = chunk.as_mut_ptr();
+            stream.avail_out = chunk.len() as _;
+            let before = stream.total_out;
+            let rc = deflate(stream, DeflateFlush::Finish);
+            let produced = (stream.total_out - before) as usize;
+            output.extend_from_slice(&chunk[..produced]);
+
+            match rc {
+                ReturnCode::Ok => {}
+                ReturnCode::StreamEnd => break,
+                other => panic!("chunked deflate failed: {other:?}"),
+            }
+        }
+
+        assert_eq!(stream.avail_in, 0);
+        assert!(end(stream).is_ok());
+        output
+    }
+
+    #[test]
+    fn token_producers_are_output_chunking_independent_across_block_boundaries() {
+        let mut input = Vec::with_capacity(160_000);
+        for i in 0..4_000usize {
+            input.extend_from_slice(b"portable-simd::token-block/");
+            for _ in 0..(8 + i % 23) {
+                input.push((i % 251) as u8);
+            }
+            input.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+
+        let configurations = [
+            (2, Strategy::Default),
+            (6, Strategy::Default),
+            (9, Strategy::Default),
+            (6, Strategy::HuffmanOnly),
+            (6, Strategy::Rle),
+        ];
+
+        for (level, strategy) in configurations {
+            let config = DeflateConfig {
+                level,
+                method: Method::Deflated,
+                window_bits: crate::MAX_WBITS,
+                mem_level: 1,
+                strategy,
+            };
+            let mut reference_buf = vec![0u8; compress_bound(input.len())];
+            let (reference, rc) = compress_slice(&mut reference_buf, &input, config);
+            assert_eq!(rc, ReturnCode::Ok);
+            let reference = reference.to_vec();
+
+            for chunk_size in [1, 7, 23, 257] {
+                let chunked = compress_with_output_chunks(&input, config, chunk_size);
+                assert_eq!(
+                    chunked, reference,
+                    "output changed with {chunk_size}-byte output chunks for level {level}, strategy {strategy:?}"
+                );
+            }
+        }
     }
 
     fn fuzz_based_test(input: &[u8], config: DeflateConfig, expected: &[u8]) {

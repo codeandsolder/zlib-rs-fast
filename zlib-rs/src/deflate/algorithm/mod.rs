@@ -43,6 +43,48 @@ pub(super) fn ensure_input(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProduceStatus {
+    NeedInput,
+    BlockReady,
+    Finished { insert: usize },
+}
+
+/// A resumable token producer. It may fill `State::sym_buf`, but it never encodes or drains a
+/// DEFLATE block itself. The driver owns those orchestration boundaries.
+pub(super) trait TokenProducer {
+    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus;
+
+    /// Apply state changes that zlib intentionally performs after a full block has been encoded.
+    /// Most algorithms have no such continuation; Slow uses it for one lazy-match transition.
+    fn after_block_flush(&mut self, _stream: &mut Compressor<'_, '_>) {}
+}
+
+/// Drive a token producer until the public streaming contract requires a return.
+///
+/// Token production is deliberately separate from block encoding and output draining here. This is
+/// the scheduling seam for later multi-stream batching: producers yield at full token blocks, while
+/// the driver decides when those blocks are encoded and copied to the caller.
+pub(super) fn drive_standard<P: TokenProducer>(
+    stream: &mut Compressor<'_, '_>,
+    flush: DeflateFlush,
+    producer: &mut P,
+) -> BlockState {
+    loop {
+        match producer.produce(stream, flush) {
+            ProduceStatus::NeedInput => return BlockState::NeedMore,
+            ProduceStatus::BlockReady => {
+                let blocked = stream.flush_block(false);
+                producer.after_block_flush(stream);
+                if let Some(blocked) = blocked {
+                    return blocked;
+                }
+            }
+            ProduceStatus::Finished { insert } => return finish_standard(stream, flush, insert),
+        }
+    }
+}
+
 /// Finalize the ordinary token-producing algorithms after input processing stops.
 ///
 /// `insert` records how much tail state must be rebuilt when more input arrives. Stored and Quick

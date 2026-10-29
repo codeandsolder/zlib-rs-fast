@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{ensure_input, finish_standard, InputStatus};
+use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
 use crate::{
     deflate::{
         compare256::compare256_rle_slice, BlockState, Compressor, MIN_LOOKAHEAD, STD_MAX_MATCH,
@@ -10,58 +10,50 @@ use crate::{
 };
 
 pub fn deflate_rle(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    let mut match_len = 0;
-    let mut bflush;
+    drive_standard(stream, flush, &mut RleProducer)
+}
 
-    loop {
-        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-            InputStatus::Ready => {}
-            InputStatus::NeedMore => return BlockState::NeedMore,
-            InputStatus::Exhausted => break,
-        }
+struct RleProducer;
 
-        /* See how many times the previous byte repeats */
-        let state = &mut stream.state;
-        if state.lookahead >= STD_MIN_MATCH && state.strstart > 0 {
-            let scan = &state.window.filled()[state.strstart - 1..][..3 + 256];
-
-            {
-                if scan[0] == scan[1] && scan[1] == scan[2] {
-                    match_len = compare256_rle_slice(scan[0], &scan[3..]) + 2;
-                    match_len = Ord::min(match_len, state.lookahead);
-                    match_len = Ord::min(match_len, STD_MAX_MATCH);
-                }
+impl TokenProducer for RleProducer {
+    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+        loop {
+            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+                InputStatus::Ready => {}
+                InputStatus::NeedMore => return ProduceStatus::NeedInput,
+                InputStatus::Exhausted => return ProduceStatus::Finished { insert: 0 },
             }
 
-            assert!(
-                state.strstart - 1 + match_len < state.window_size,
-                "wild scan"
-            );
-        }
+            let state = &mut stream.state;
+            let mut match_len = 0;
+            if state.lookahead >= STD_MIN_MATCH && state.strstart > 0 {
+                let scan = &state.window.filled()[state.strstart - 1..][..3 + 256];
+                if scan[0] == scan[1] && scan[1] == scan[2] {
+                    match_len = compare256_rle_slice(scan[0], &scan[3..]) + 2;
+                    match_len = match_len.min(state.lookahead).min(STD_MAX_MATCH);
+                }
+                assert!(
+                    state.strstart - 1 + match_len < state.window_size,
+                    "wild scan"
+                );
+            }
 
-        /* Emit match if have run of STD_MIN_MATCH or longer, else emit literal */
-        if match_len >= STD_MIN_MATCH {
-            // check_match(s, s->strstart, s->strstart - 1, match_len);
+            let block_ready = if match_len >= STD_MIN_MATCH {
+                let ready = state.tally_dist(1, match_len - STD_MIN_MATCH);
+                state.lookahead -= match_len;
+                state.strstart += match_len;
+                ready
+            } else {
+                let literal = state.window.filled()[state.strstart];
+                let ready = state.tally_lit(literal);
+                state.lookahead -= 1;
+                state.strstart += 1;
+                ready
+            };
 
-            bflush = state.tally_dist(1, match_len - STD_MIN_MATCH);
-
-            state.lookahead -= match_len;
-            state.strstart += match_len;
-            match_len = 0;
-        } else {
-            /* No match, output a literal byte */
-            let lc = state.window.filled()[state.strstart];
-            bflush = state.tally_lit(lc);
-            state.lookahead -= 1;
-            state.strstart += 1;
-        }
-
-        if bflush {
-            if let Some(blocked) = stream.flush_block(false) {
-                return blocked;
+            if block_ready {
+                return ProduceStatus::BlockReady;
             }
         }
     }
-
-    finish_standard(stream, flush, 0)
 }

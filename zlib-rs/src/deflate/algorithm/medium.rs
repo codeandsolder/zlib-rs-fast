@@ -1,172 +1,164 @@
 #![forbid(unsafe_code)]
 
-use super::{ensure_input, finish_standard, InputStatus};
+use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
-    deflate::{BlockState, Compressor, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
+    deflate::{
+        BlockState, Compressor, MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH,
+    },
     DeflateFlush,
 };
 
+type Match = MatchCandidate;
+
 pub fn deflate_medium(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    let mut state = &mut stream.state;
+    let mut producer = MediumProducer::new(stream.state);
+    drive_standard(stream, flush, &mut producer)
+}
 
-    // For levels below 5, don't check the next position for a better match
-    let early_exit = state.level < 5;
+struct MediumProducer {
+    early_exit: bool,
+    current_match: Match,
+    next_match: Match,
+}
 
-    let mut current_match = Match {
-        match_start: 0,
-        match_length: 0,
-        strstart: 0,
-        orgstart: 0,
-    };
-    let mut next_match = Match {
-        match_start: 0,
-        match_length: 0,
-        strstart: 0,
-        orgstart: 0,
-    };
-
-    loop {
-        let mut hash_head;
-
-        let refilled = stream.state.lookahead < MIN_LOOKAHEAD;
-        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-            InputStatus::Ready => {}
-            InputStatus::NeedMore => return BlockState::NeedMore,
-            InputStatus::Exhausted => break,
-        }
-        if refilled {
-            // A cached look-ahead match was derived before the refill and cannot be carried across
-            // a possible window slide.
-            next_match.match_length = 0;
-        }
-
-        state = &mut stream.state;
-
-        // Insert the string window[strstart .. strstart+2] in the
-        // dictionary, and set hash_head to the head of the hash chain:
-
-        /* If we already have a future match from a previous round, just use that */
-        if !early_exit && next_match.match_length > 0 {
-            current_match = next_match;
-            next_match.match_length = 0;
-        } else {
-            hash_head = 0;
-            if state.lookahead >= WANT_MIN_MATCH {
-                hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
-            }
-
-            current_match.strstart = state.strstart as u16;
-            current_match.orgstart = current_match.strstart;
-
-            /* Find the longest match, discarding those <= prev_length.
-             * At this point we have always match_length < WANT_MIN_MATCH
-             */
-
-            let dist = state.strstart as i64 - hash_head as i64;
-            if dist <= state.max_dist() as i64 && dist > 0 && hash_head != 0 {
-                /* To simplify the code, we prevent matches with the string
-                 * of window index 0 (in particular we have to avoid a match
-                 * of the string with itself at the start of the input file).
-                 */
-                let (match_length, match_start) =
-                    crate::deflate::longest_match::longest_match(state, hash_head);
-                state.match_start = match_start;
-                current_match.match_length = match_length as u16;
-                current_match.match_start = match_start;
-                if (current_match.match_length as usize) < WANT_MIN_MATCH {
-                    current_match.match_length = 1;
-                }
-                if current_match.match_start >= current_match.strstart {
-                    /* this can happen due to some restarts */
-                    current_match.match_length = 1;
-                }
-            } else {
-                /* Set up the match to be a 1 byte literal */
-                current_match.match_start = 0;
-                current_match.match_length = 1;
-            }
-        }
-
-        insert_match(state, current_match);
-
-        /* now, look ahead one */
-        if !early_exit
-            && state.lookahead > MIN_LOOKAHEAD
-            && ((current_match.strstart + current_match.match_length) as usize)
-                < (state.window_size - MIN_LOOKAHEAD)
-        {
-            state.strstart = (current_match.strstart + current_match.match_length) as usize;
-            hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
-
-            next_match.strstart = state.strstart as u16;
-            next_match.orgstart = next_match.strstart;
-
-            /* Find the longest match, discarding those <= prev_length.
-             * At this point we have always match_length < WANT_MIN_MATCH
-             */
-
-            let dist = state.strstart as i64 - hash_head as i64;
-            if dist <= state.max_dist() as i64 && dist > 0 && hash_head != 0 {
-                /* To simplify the code, we prevent matches with the string
-                 * of window index 0 (in particular we have to avoid a match
-                 * of the string with itself at the start of the input file).
-                 */
-                let (match_length, match_start) =
-                    crate::deflate::longest_match::longest_match(state, hash_head);
-                state.match_start = match_start;
-                next_match.match_length = match_length as u16;
-                next_match.match_start = match_start;
-
-                if next_match.match_start >= next_match.strstart {
-                    /* this can happen due to some restarts */
-                    next_match.match_length = 1;
-                }
-                if (next_match.match_length as usize) < WANT_MIN_MATCH {
-                    next_match.match_length = 1;
-                } else {
-                    fizzle_matches(
-                        state.window.filled(),
-                        state.max_dist(),
-                        &mut current_match,
-                        &mut next_match,
-                    );
-                }
-            } else {
-                /* Set up the match to be a 1 byte literal */
-                next_match.match_start = 0;
-                next_match.match_length = 1;
-            }
-
-            state.strstart = current_match.strstart as usize;
-        } else {
-            next_match.match_length = 0;
-        }
-
-        /* now emit the current match */
-        let bflush = emit_match(state, current_match);
-
-        /* move the "cursor" forward */
-        state.strstart += current_match.match_length as usize;
-
-        if bflush {
-            if let Some(blocked) = stream.flush_block(false) {
-                return blocked;
-            }
+impl MediumProducer {
+    fn new(state: &State<'_>) -> Self {
+        Self {
+            early_exit: state.level < 5,
+            current_match: Match::EMPTY,
+            next_match: state.medium_next_match,
         }
     }
 
-    let insert = Ord::min(stream.state.strstart, STD_MIN_MATCH - 1);
-    finish_standard(stream, flush, insert)
+    fn clear_saved_next(&mut self, state: &mut State<'_>) {
+        self.next_match = Match::EMPTY;
+        state.medium_next_match = Match::EMPTY;
+    }
+
+    fn save_next(&self, state: &mut State<'_>) {
+        state.medium_next_match = self.next_match;
+    }
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct Match {
-    match_start: u16,
-    match_length: u16,
-    strstart: u16,
-    orgstart: u16,
+impl TokenProducer for MediumProducer {
+    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+        loop {
+            let mut hash_head;
+            let refilled = stream.state.lookahead < MIN_LOOKAHEAD;
+            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+                InputStatus::Ready => {}
+                InputStatus::NeedMore => {
+                    self.clear_saved_next(stream.state);
+                    return ProduceStatus::NeedInput;
+                }
+                InputStatus::Exhausted => {
+                    self.clear_saved_next(stream.state);
+                    return ProduceStatus::Finished {
+                        insert: stream.state.strstart.min(STD_MIN_MATCH - 1),
+                    };
+                }
+            }
+            if refilled {
+                // A cached look-ahead match was derived before the refill and cannot be carried
+                // across a possible window slide.
+                self.clear_saved_next(stream.state);
+            }
+
+            let state = &mut stream.state;
+
+            // If we already have a future match from a previous round, just use that.
+            if !self.early_exit && self.next_match.match_length > 0 {
+                self.current_match = self.next_match;
+                self.next_match.match_length = 0;
+            } else {
+                hash_head = 0;
+                if state.lookahead >= WANT_MIN_MATCH {
+                    hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
+                }
+
+                self.current_match.strstart = state.strstart as u16;
+                self.current_match.orgstart = self.current_match.strstart;
+
+                let dist = state.strstart as i64 - hash_head as i64;
+                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                    let (match_length, match_start) =
+                        crate::deflate::longest_match::longest_match(state, hash_head);
+                    state.match_start = match_start;
+                    self.current_match.match_length = match_length as u16;
+                    self.current_match.match_start = match_start;
+                    if usize::from(self.current_match.match_length) < WANT_MIN_MATCH
+                        || self.current_match.match_start >= self.current_match.strstart
+                    {
+                        self.current_match.match_length = 1;
+                    }
+                } else {
+                    self.current_match.match_start = 0;
+                    self.current_match.match_length = 1;
+                }
+            }
+
+            insert_match(state, self.current_match);
+
+            // Probe one match ahead. The candidate is saved into persistent state when a full
+            // token block is yielded, so an output-blocking return cannot change later choices.
+            let current_len = usize::from(self.current_match.match_length);
+            let future_start = usize::from(self.current_match.strstart) + current_len;
+            let future_lookahead = state.lookahead.saturating_sub(current_len);
+            if !self.early_exit
+                && state.lookahead > MIN_LOOKAHEAD
+                && future_lookahead >= WANT_MIN_MATCH
+                && future_start < state.window_size - MIN_LOOKAHEAD
+            {
+                let current_lookahead = state.lookahead;
+                state.strstart = future_start;
+                state.lookahead = future_lookahead;
+                hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
+
+                self.next_match.strstart = state.strstart as u16;
+                self.next_match.orgstart = self.next_match.strstart;
+
+                let dist = state.strstart as i64 - hash_head as i64;
+                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                    let (match_length, match_start) =
+                        crate::deflate::longest_match::longest_match(state, hash_head);
+                    state.match_start = match_start;
+                    self.next_match.match_length = match_length as u16;
+                    self.next_match.match_start = match_start;
+
+                    if self.next_match.match_start >= self.next_match.strstart {
+                        self.next_match.match_length = 1;
+                    }
+                    if usize::from(self.next_match.match_length) < WANT_MIN_MATCH {
+                        self.next_match.match_length = 1;
+                    } else {
+                        fizzle_matches(
+                            state.window.filled(),
+                            state.max_dist(),
+                            &mut self.current_match,
+                            &mut self.next_match,
+                        );
+                    }
+                } else {
+                    self.next_match.match_start = 0;
+                    self.next_match.match_length = 1;
+                }
+
+                state.lookahead = current_lookahead;
+                state.strstart = usize::from(self.current_match.strstart);
+            } else {
+                self.next_match.match_length = 0;
+            }
+
+            let block_ready = emit_match(state, self.current_match);
+            state.strstart += usize::from(self.current_match.match_length);
+
+            if block_ready {
+                self.save_next(state);
+                return ProduceStatus::BlockReady;
+            }
+        }
+    }
 }
 
 fn emit_match(state: &mut State, m: Match) -> bool {

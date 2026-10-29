@@ -1,140 +1,136 @@
 #![forbid(unsafe_code)]
 
-use super::{ensure_input, finish_standard, InputStatus};
+use super::{drive_standard, ensure_input, InputStatus, ProduceStatus, TokenProducer};
 use crate::{
     deflate::{BlockState, Compressor, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH},
     DeflateFlush,
 };
 
 pub fn deflate_slow(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
-    let mut hash_head; /* head of hash chain */
-    let mut bflush; /* set if current block must be flushed */
-    let mut dist;
-    let mut match_len;
+    let mut producer = SlowProducer::new(stream);
+    drive_standard(stream, flush, &mut producer)
+}
 
-    let use_longest_match_slow = stream.state.max_chain_length > 1024;
-    let valid_distance_range = 1..=stream.state.max_dist() as isize;
+struct SlowProducer {
+    use_longest_match_slow: bool,
+    match_available: bool,
+    deferred_match_len: Option<usize>,
+}
 
-    let mut match_available = stream.state.match_available;
-
-    /* Process the input block. */
-    loop {
-        match ensure_input(stream, MIN_LOOKAHEAD, flush) {
-            InputStatus::Ready => {}
-            InputStatus::NeedMore => return BlockState::NeedMore,
-            InputStatus::Exhausted => break,
+impl SlowProducer {
+    fn new(stream: &Compressor<'_, '_>) -> Self {
+        Self {
+            use_longest_match_slow: stream.state.max_chain_length > 1024,
+            match_available: stream.state.match_available,
+            deferred_match_len: None,
         }
+    }
+}
 
-        let state = &mut stream.state;
+impl TokenProducer for SlowProducer {
+    fn produce(&mut self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ProduceStatus {
+        debug_assert!(self.deferred_match_len.is_none());
 
-        /* Insert the string window[strstart .. strstart+2] in the
-         * dictionary, and set hash_head to the head of the hash chain:
-         */
-        hash_head = if state.lookahead >= WANT_MIN_MATCH {
-            state.quick_insert_string(state.strstart)
-        } else {
-            0
-        };
-
-        // Find the longest match, discarding those <= prev_length.
-        state.prev_match = state.match_start;
-        match_len = STD_MIN_MATCH - 1;
-        dist = state.strstart as isize - hash_head as isize;
-
-        if valid_distance_range.contains(&dist)
-            && state.prev_length < state.max_lazy_match
-            && hash_head != 0
-        {
-            // To simplify the code, we prevent matches with the string
-            // of window index 0 (in particular we have to avoid a match
-            // of the string with itself at the start of the input file).
-            (match_len, state.match_start) = if use_longest_match_slow {
-                crate::deflate::longest_match::longest_match_slow(state, hash_head)
-            } else {
-                crate::deflate::longest_match::longest_match(state, hash_head)
-            };
-
-            if match_len <= 5 && (state.strategy == Strategy::Filtered) {
-                /* If prev_match is also WANT_MIN_MATCH, match_start is garbage
-                 * but we will ignore the current match anyway.
-                 */
-                match_len = STD_MIN_MATCH - 1;
-            }
-        }
-
-        // If there was a match at the previous step and the current
-        // match is not better, output the previous match:
-        if state.prev_length as usize >= STD_MIN_MATCH && match_len <= state.prev_length as usize {
-            let max_insert = state.strstart + state.lookahead - STD_MIN_MATCH;
-            /* Do not insert strings in hash table beyond this. */
-
-            // check_match(s, state.strstart-1, state.prev_match, state.prev_length);
-
-            bflush = state.tally_dist(
-                state.strstart - 1 - state.prev_match as usize,
-                state.prev_length as usize - STD_MIN_MATCH,
-            );
-
-            /* Insert in hash table all strings up to the end of the match.
-             * strstart-1 and strstart are already inserted. If there is not
-             * enough lookahead, the last two strings are not inserted in
-             * the hash table.
-             */
-            state.prev_length -= 1;
-            state.lookahead -= state.prev_length as usize;
-
-            let mov_fwd = state.prev_length as usize - 1;
-            if max_insert > state.strstart {
-                let insert_cnt = Ord::min(mov_fwd, max_insert - state.strstart);
-                state.insert_string(state.strstart + 1, insert_cnt);
-            }
-            state.prev_length = 0;
-            state.match_available = false;
-            match_available = false;
-            state.strstart += mov_fwd + 1;
-
-            if bflush {
-                if let Some(blocked) = stream.flush_block(false) {
-                    return blocked;
+        loop {
+            match ensure_input(stream, MIN_LOOKAHEAD, flush) {
+                InputStatus::Ready => {}
+                InputStatus::NeedMore => return ProduceStatus::NeedInput,
+                InputStatus::Exhausted => {
+                    assert_ne!(flush, DeflateFlush::NoFlush, "no flush?");
+                    let state = &mut stream.state;
+                    if state.match_available {
+                        let literal = state.window.filled()[state.strstart - 1];
+                        let _ = state.tally_lit(literal);
+                        state.match_available = false;
+                        self.match_available = false;
+                    }
+                    return ProduceStatus::Finished {
+                        insert: state.strstart.min(STD_MIN_MATCH - 1),
+                    };
                 }
             }
-        } else if match_available {
-            // If there was no match at the previous position, output a
-            // single literal. If there was a match but the current match
-            // is longer, truncate the previous match to a single literal.
-            let lc = state.window.filled()[state.strstart - 1];
-            bflush = state.tally_lit(lc);
-            if bflush {
-                let _ = stream.flush_block(false);
+
+            let state = &mut stream.state;
+            let hash_head = if state.lookahead >= WANT_MIN_MATCH {
+                state.quick_insert_string(state.strstart)
+            } else {
+                0
+            };
+
+            state.prev_match = state.match_start;
+            let mut match_len = STD_MIN_MATCH - 1;
+            let distance = state.strstart as isize - hash_head as isize;
+
+            if (1..=state.max_dist() as isize).contains(&distance)
+                && state.prev_length < state.max_lazy_match
+                && hash_head != 0
+            {
+                (match_len, state.match_start) = if self.use_longest_match_slow {
+                    crate::deflate::longest_match::longest_match_slow(state, hash_head)
+                } else {
+                    crate::deflate::longest_match::longest_match(state, hash_head)
+                };
+
+                if match_len <= 5 && state.strategy == Strategy::Filtered {
+                    match_len = STD_MIN_MATCH - 1;
+                }
             }
 
-            stream.state.prev_length = match_len as u16;
-            stream.state.strstart += 1;
-            stream.state.lookahead -= 1;
-            if stream.io.avail_out == 0 {
-                return BlockState::NeedMore;
+            if usize::from(state.prev_length) >= STD_MIN_MATCH
+                && match_len <= usize::from(state.prev_length)
+            {
+                let max_insert = state.strstart + state.lookahead - STD_MIN_MATCH;
+                let block_ready = state.tally_dist(
+                    state.strstart - 1 - usize::from(state.prev_match),
+                    usize::from(state.prev_length) - STD_MIN_MATCH,
+                );
+
+                state.prev_length -= 1;
+                state.lookahead -= usize::from(state.prev_length);
+
+                let move_forward = usize::from(state.prev_length) - 1;
+                if max_insert > state.strstart {
+                    let insert_count = move_forward.min(max_insert - state.strstart);
+                    state.insert_string(state.strstart + 1, insert_count);
+                }
+                state.prev_length = 0;
+                state.match_available = false;
+                self.match_available = false;
+                state.strstart += move_forward + 1;
+
+                if block_ready {
+                    return ProduceStatus::BlockReady;
+                }
+            } else if self.match_available {
+                let literal = state.window.filled()[state.strstart - 1];
+                let block_ready = state.tally_lit(literal);
+                if block_ready {
+                    // zlib encodes this full block before advancing the lazy-match cursor. Keep that
+                    // ordering explicit so stored-block length/accounting remains bit-for-bit stable.
+                    self.deferred_match_len = Some(match_len);
+                    return ProduceStatus::BlockReady;
+                }
+
+                state.prev_length = match_len as u16;
+                state.strstart += 1;
+                state.lookahead -= 1;
+            } else {
+                state.prev_length = match_len as u16;
+                state.match_available = true;
+                self.match_available = true;
+                state.strstart += 1;
+                state.lookahead -= 1;
             }
-        } else {
-            // There is no previous match to compare with, wait for
-            // the next step to decide.
-            state.prev_length = match_len as u16;
-            state.match_available = true;
-            match_available = true;
-            state.strstart += 1;
-            state.lookahead -= 1;
         }
     }
 
-    assert_ne!(flush, DeflateFlush::NoFlush, "no flush?");
+    fn after_block_flush(&mut self, stream: &mut Compressor<'_, '_>) {
+        let Some(match_len) = self.deferred_match_len.take() else {
+            return;
+        };
 
-    let state = &mut stream.state;
-
-    if state.match_available {
-        let lc = state.window.filled()[state.strstart - 1];
-        let _ = state.tally_lit(lc);
-        state.match_available = false;
+        stream.state.prev_length = match_len as u16;
+        stream.state.strstart += 1;
+        stream.state.lookahead -= 1;
     }
-
-    let insert = Ord::min(state.strstart, STD_MIN_MATCH - 1);
-    finish_standard(stream, flush, insert)
 }
