@@ -174,11 +174,29 @@ pub(super) enum InputPhase {
     FinalTail,
 }
 
+/// A request to refill one standard compression stream to its preferred lookahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InputDemand {
+    preferred_lookahead: usize,
+}
+
+impl InputDemand {
+    fn new(preferred_lookahead: usize) -> Self {
+        Self {
+            preferred_lookahead,
+        }
+    }
+
+    fn is_satisfied(self, state: &State<'_>) -> bool {
+        state.lookahead >= self.preferred_lookahead
+    }
+}
+
 /// A scheduler-visible boundary reached while advancing one ordinary compression stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CoreEvent {
     /// The producer needs more buffered lookahead before it can continue normally.
-    NeedInput { preferred_lookahead: usize },
+    NeedInput(InputDemand),
     /// A complete token block is resident in `State::sym_buf` and is ready for block encoding.
     TokenBlockReady(BlockContinuation),
     /// No more input remains for this call. `insert` is the tail state needed by a later refill.
@@ -200,9 +218,7 @@ pub(super) fn next_core_event(
     if state.lookahead < preferred_lookahead {
         match input_phase {
             InputPhase::Open => {
-                return CoreEvent::NeedInput {
-                    preferred_lookahead,
-                };
+                return CoreEvent::NeedInput(InputDemand::new(preferred_lookahead));
             }
             InputPhase::FinalTail if state.lookahead == 0 => {
                 return CoreEvent::Finished {
@@ -218,9 +234,7 @@ pub(super) fn next_core_event(
         ProduceStatus::NeedInput => {
             debug_assert!(state.lookahead < preferred_lookahead);
             match input_phase {
-                InputPhase::Open => CoreEvent::NeedInput {
-                    preferred_lookahead,
-                },
+                InputPhase::Open => CoreEvent::NeedInput(InputDemand::new(preferred_lookahead)),
                 InputPhase::FinalTail => {
                     debug_assert_eq!(state.lookahead, 0);
                     CoreEvent::Finished {
@@ -233,11 +247,44 @@ pub(super) fn next_core_event(
     }
 }
 
+/// Result of trying to satisfy an [`InputDemand`] from the current zlib caller buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RefillOutcome {
+    Ready,
+    NeedMoreCallerInput,
+    FinalTail,
+}
+
+/// Perform only the caller-I/O refill stage for one standard compression stream.
+///
+/// The token producer is notified after every refill because the window may slide and invalidate
+/// absolute speculative positions. No token production, block encoding, or output draining occurs
+/// here.
+pub(super) fn satisfy_input_demand(
+    stream: &mut Compressor<'_, '_>,
+    producer: &mut StandardProducer,
+    demand: InputDemand,
+    flush: DeflateFlush,
+) -> RefillOutcome {
+    debug_assert!(!demand.is_satisfied(stream.state));
+
+    stream.fill_window();
+    producer.after_refill(stream.state);
+
+    if demand.is_satisfied(stream.state) {
+        RefillOutcome::Ready
+    } else if flush == DeflateFlush::NoFlush {
+        RefillOutcome::NeedMoreCallerInput
+    } else {
+        RefillOutcome::FinalTail
+    }
+}
+
 /// Compatibility driver for the ordinary zlib streaming API.
 ///
 /// It currently consumes core events immediately. Future batch scheduling can replace this loop
-/// while reusing `next_core_event`, the state-only token producers, and the independent
-/// encode/drain stages unchanged.
+/// while reusing `next_core_event`, the state-only token producers, and the independent refill,
+/// encode, and drain stages unchanged.
 pub(super) fn drive_standard(
     stream: &mut Compressor<'_, '_>,
     flush: DeflateFlush,
@@ -247,20 +294,12 @@ pub(super) fn drive_standard(
 
     loop {
         match next_core_event(stream.state, input_phase, producer) {
-            CoreEvent::NeedInput {
-                preferred_lookahead,
-            } => {
+            CoreEvent::NeedInput(demand) => {
                 debug_assert_eq!(input_phase, InputPhase::Open);
-                debug_assert!(stream.state.lookahead < preferred_lookahead);
-
-                stream.fill_window();
-                producer.after_refill(stream.state);
-
-                if stream.state.lookahead < preferred_lookahead {
-                    if flush == DeflateFlush::NoFlush {
-                        return BlockState::NeedMore;
-                    }
-                    input_phase = InputPhase::FinalTail;
+                match satisfy_input_demand(stream, producer, demand, flush) {
+                    RefillOutcome::Ready => {}
+                    RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
+                    RefillOutcome::FinalTail => input_phase = InputPhase::FinalTail,
                 }
             }
             CoreEvent::TokenBlockReady(continuation) => {
