@@ -3957,8 +3957,7 @@ mod test {
     struct RoundRobinCore {
         raw: z_stream,
         output: Vec<u8>,
-        producer: algorithm::StandardProducer,
-        input_phase: algorithm::InputPhase,
+        core: algorithm::StandardCore,
         done: bool,
     }
 
@@ -3968,20 +3967,19 @@ mod test {
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
             let mut output = vec![0u8; compress_bound(input.len()) + 64];
-            let producer = {
+            let core = {
                 let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
                 stream.next_in = input.as_ptr() as *mut u8;
                 stream.avail_in = input.len() as _;
                 stream.next_out = output.as_mut_ptr();
                 stream.avail_out = output.len() as _;
-                algorithm::StandardProducer::for_algorithm(algorithm, stream.state).unwrap()
+                algorithm::StandardCore::for_algorithm(algorithm, stream.state).unwrap()
             };
 
             Self {
                 raw,
                 output,
-                producer,
-                input_phase: algorithm::InputPhase::Open,
+                core,
                 done: false,
             }
         }
@@ -3991,21 +3989,14 @@ mod test {
             assert!(!self.done);
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
 
-            match algorithm::next_core_event(stream.state, self.input_phase, &mut self.producer) {
+            match self.core.next_event(stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let outcome = with_compressor(stream, |compressor| {
-                        algorithm::satisfy_input_demand(
-                            compressor,
-                            &mut self.producer,
-                            demand,
-                            DeflateFlush::Finish,
-                        )
+                        self.core
+                            .satisfy_input(compressor, demand, DeflateFlush::Finish)
                     });
                     match outcome {
-                        algorithm::RefillOutcome::Ready => {}
-                        algorithm::RefillOutcome::FinalTail => {
-                            self.input_phase = algorithm::InputPhase::FinalTail;
-                        }
+                        algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail => {}
                         algorithm::RefillOutcome::NeedMoreCallerInput => {
                             panic!(
                                 "Finish with all input supplied unexpectedly requested more input"

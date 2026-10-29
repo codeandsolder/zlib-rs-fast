@@ -154,12 +154,11 @@ pub(super) trait TokenProducer {
     fn finish(&mut self, state: &mut State<'_>) -> usize;
 }
 
-/// Uniform resumable state for the ordinary token-producing algorithms.
+/// Uniform producer implementation hidden behind [`StandardCore`].
 ///
-/// This value has no borrowed data or heap allocation, so a scheduler can keep one alongside each
-/// compression stream and advance heterogeneous Fast/Medium/Slow/Huffman/RLE jobs through the same
-/// `next_core_event` interface.
-pub(super) struct StandardProducer(StandardProducerKind);
+/// The concrete Fast/Medium/Slow/Huffman/RLE variants stay private so orchestration cannot depend
+/// on algorithm-specific continuation details.
+struct StandardProducer(StandardProducerKind);
 
 enum StandardProducerKind {
     Fast(fast::FastProducer),
@@ -170,7 +169,7 @@ enum StandardProducerKind {
 }
 
 impl StandardProducer {
-    pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+    fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
         let kind = match algorithm {
             Algorithm::Fast => StandardProducerKind::Fast(fast::FastProducer),
             Algorithm::Medium => StandardProducerKind::Medium(medium::MediumProducer::new(state)),
@@ -231,9 +230,45 @@ impl TokenProducer for StandardProducer {
 /// knows the current zlib call is flushing all caller input. Keeping that fact outside `State`
 /// prevents caller-I/O policy from leaking back into the compression core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InputPhase {
+enum InputPhase {
     Open,
     FinalTail,
+}
+
+/// Per-call scheduling state for the ordinary token-producing algorithms.
+///
+/// It owns the heterogeneous producer plus the only orchestration state the core needs: whether a
+/// short buffered tail has been certified final for this zlib call. It borrows no stream memory and
+/// allocates nothing, so schedulers can hold one beside each active stream.
+pub(super) struct StandardCore {
+    producer: StandardProducer,
+    input_phase: InputPhase,
+}
+
+impl StandardCore {
+    pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+        Some(Self {
+            producer: StandardProducer::for_algorithm(algorithm, state)?,
+            input_phase: InputPhase::Open,
+        })
+    }
+
+    pub(super) fn next_event(&mut self, state: &mut State<'_>) -> CoreEvent {
+        next_core_event(state, self.input_phase, &mut self.producer)
+    }
+
+    pub(super) fn satisfy_input(
+        &mut self,
+        stream: &mut Compressor<'_, '_>,
+        demand: InputDemand,
+        flush: DeflateFlush,
+    ) -> RefillOutcome {
+        let outcome = satisfy_input_demand(stream, &mut self.producer, demand, flush);
+        if outcome == RefillOutcome::FinalTail {
+            self.input_phase = InputPhase::FinalTail;
+        }
+        outcome
+    }
 }
 
 /// A request to refill one standard compression stream to its preferred lookahead.
@@ -270,7 +305,7 @@ pub(super) enum CoreEvent {
 /// This is deliberately I/O-free: it cannot refill caller input, encode a token block, or drain
 /// pending output. A scheduler decides how to satisfy `NeedInput`, then calls this again with either
 /// more buffered data or `FinalTail` once it knows no more input belongs to the current flush.
-pub(super) fn next_core_event(
+fn next_core_event(
     state: &mut State<'_>,
     input_phase: InputPhase,
     producer: &mut StandardProducer,
@@ -320,7 +355,7 @@ pub(super) enum RefillOutcome {
 /// The token producer is notified after every refill because the window may slide and invalidate
 /// absolute speculative positions. No token production, block encoding, or output draining occurs
 /// here.
-pub(super) fn satisfy_input_demand(
+fn satisfy_input_demand(
     stream: &mut Compressor<'_, '_>,
     producer: &mut StandardProducer,
     demand: InputDemand,
@@ -343,25 +378,19 @@ pub(super) fn satisfy_input_demand(
 /// Compatibility driver for the ordinary zlib streaming API.
 ///
 /// It currently consumes core events immediately. Future batch scheduling can replace this loop
-/// while reusing `next_core_event`, the state-only token producers, and the independent refill,
-/// encode, and drain stages unchanged.
+/// while reusing `StandardCore`, its state-only token producers, and the independent refill, encode,
+/// and drain stages unchanged.
 pub(super) fn drive_standard(
     stream: &mut Compressor<'_, '_>,
     flush: DeflateFlush,
-    producer: &mut StandardProducer,
+    core: &mut StandardCore,
 ) -> BlockState {
-    let mut input_phase = InputPhase::Open;
-
     loop {
-        match next_core_event(stream.state, input_phase, producer) {
-            CoreEvent::NeedInput(demand) => {
-                debug_assert_eq!(input_phase, InputPhase::Open);
-                match satisfy_input_demand(stream, producer, demand, flush) {
-                    RefillOutcome::Ready => {}
-                    RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
-                    RefillOutcome::FinalTail => input_phase = InputPhase::FinalTail,
-                }
-            }
+        match core.next_event(stream.state) {
+            CoreEvent::NeedInput(demand) => match core.satisfy_input(stream, demand, flush) {
+                RefillOutcome::Ready | RefillOutcome::FinalTail => {}
+                RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
+            },
             CoreEvent::TokenBlockReady(work) => {
                 work.encode(stream.state);
                 if drain_pending_output(stream.state, &mut stream.output)
@@ -423,9 +452,9 @@ impl Algorithm {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
             algorithm => {
-                let mut producer = StandardProducer::for_algorithm(algorithm, stream.state)
+                let mut core = StandardCore::for_algorithm(algorithm, stream.state)
                     .expect("ordinary algorithm must have a token producer");
-                drive_standard(stream, flush, &mut producer)
+                drive_standard(stream, flush, &mut core)
             }
         }
     }
