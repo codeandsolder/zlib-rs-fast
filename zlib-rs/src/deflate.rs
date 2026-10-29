@@ -4136,6 +4136,10 @@ mod test {
             "Fast must yield detached match-search work in the scheduler regression"
         );
         assert!(
+            jobs[1].match_search_turns > 0,
+            "Medium must yield detached match-search work in the scheduler regression"
+        );
+        assert!(
             jobs[2].match_search_turns > 0,
             "Slow must yield detached match-search work in the scheduler regression"
         );

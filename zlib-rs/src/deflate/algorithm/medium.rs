@@ -2,15 +2,25 @@
 
 use super::{BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchRequest};
+use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 type Match = MatchCandidate;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediumPhase {
+    Ready,
+    AwaitingCurrentSearch,
+    AfterCurrentSearch,
+    AwaitingFutureSearch { current_lookahead: usize },
+    AfterFutureSearch,
+}
 
 pub(super) struct MediumProducer {
     early_exit: bool,
     current_match: Match,
     next_match: Match,
+    phase: MediumPhase,
 }
 
 impl MediumProducer {
@@ -19,6 +29,7 @@ impl MediumProducer {
             early_exit: state.level < 5,
             current_match: Match::EMPTY,
             next_match: state.medium_next_match,
+            phase: MediumPhase::Ready,
         }
     }
 
@@ -30,118 +41,177 @@ impl MediumProducer {
     fn save_next(&self, state: &mut State<'_>) {
         state.medium_next_match = self.next_match;
     }
+
+    fn apply_current_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+        state.match_start = result.start;
+        self.current_match.match_length = result.length as u16;
+        self.current_match.match_start = result.start;
+        if usize::from(self.current_match.match_length) < WANT_MIN_MATCH
+            || self.current_match.match_start >= self.current_match.strstart
+        {
+            self.current_match.match_length = 1;
+        }
+    }
+
+    fn apply_future_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+        state.match_start = result.start;
+        self.next_match.match_length = result.length as u16;
+        self.next_match.match_start = result.start;
+
+        if self.next_match.match_start >= self.next_match.strstart {
+            self.next_match.match_length = 1;
+        }
+        if usize::from(self.next_match.match_length) < WANT_MIN_MATCH {
+            self.next_match.match_length = 1;
+        } else {
+            fizzle_matches(
+                state.window.filled(),
+                state.max_dist(),
+                &mut self.current_match,
+                &mut self.next_match,
+            );
+        }
+    }
 }
 
 impl TokenProducer for MediumProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         loop {
-            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
-                return ProduceStatus::NeedInput;
-            }
-
-            let mut hash_head;
-
-            // If we already have a future match from a previous round, just use that.
-            if !self.early_exit && self.next_match.match_length > 0 {
-                self.current_match = self.next_match;
-                self.next_match.match_length = 0;
-            } else {
-                hash_head = 0;
-                if state.lookahead >= WANT_MIN_MATCH {
-                    hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
-                }
-
-                self.current_match.strstart = state.strstart as u16;
-                self.current_match.orgstart = self.current_match.strstart;
-
-                let dist = state.strstart as i64 - hash_head as i64;
-                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
-                    let result =
-                        MatchSearchRequest::from_state(state, hash_head, MatchSearchKind::Standard)
-                            .execute();
-                    state.match_start = result.start;
-                    self.current_match.match_length = result.length as u16;
-                    self.current_match.match_start = result.start;
-                    if usize::from(self.current_match.match_length) < WANT_MIN_MATCH
-                        || self.current_match.match_start >= self.current_match.strstart
+            match self.phase {
+                MediumPhase::Ready => {
+                    if state.lookahead == 0
+                        || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD)
                     {
-                        self.current_match.match_length = 1;
+                        return ProduceStatus::NeedInput;
                     }
-                } else {
+
+                    // A future match computed in the previous round already had its hash insertion
+                    // and search performed. Reuse it directly; otherwise prepare a current search.
+                    if !self.early_exit && self.next_match.match_length > 0 {
+                        self.current_match = self.next_match;
+                        self.next_match.match_length = 0;
+                        self.phase = MediumPhase::AfterCurrentSearch;
+                        continue;
+                    }
+
+                    let hash_head = if state.lookahead >= WANT_MIN_MATCH {
+                        StandardHashCalc::quick_insert_string(state, state.strstart)
+                    } else {
+                        0
+                    };
+
+                    self.current_match.strstart = state.strstart as u16;
+                    self.current_match.orgstart = self.current_match.strstart;
+
+                    let dist = state.strstart as i64 - hash_head as i64;
+                    if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                        self.phase = MediumPhase::AwaitingCurrentSearch;
+                        return ProduceStatus::MatchSearch(MatchSearchWork::new(
+                            hash_head,
+                            MatchSearchKind::Standard,
+                        ));
+                    }
+
                     self.current_match.match_start = 0;
                     self.current_match.match_length = 1;
+                    self.phase = MediumPhase::AfterCurrentSearch;
                 }
-            }
+                MediumPhase::AwaitingCurrentSearch => {
+                    panic!(
+                        "medium producer cannot advance while current match search is outstanding"
+                    )
+                }
+                MediumPhase::AfterCurrentSearch => {
+                    insert_match(state, self.current_match);
 
-            insert_match(state, self.current_match);
+                    // Probe one match ahead. Keep the temporary future position installed while the
+                    // immutable request is outstanding; completion restores the real current view.
+                    let current_len = usize::from(self.current_match.match_length);
+                    let future_start = usize::from(self.current_match.strstart) + current_len;
+                    let future_lookahead = state.lookahead.saturating_sub(current_len);
+                    if !self.early_exit
+                        && state.lookahead > MIN_LOOKAHEAD
+                        && future_lookahead >= WANT_MIN_MATCH
+                        && future_start < state.window_size - MIN_LOOKAHEAD
+                    {
+                        let current_lookahead = state.lookahead;
+                        state.strstart = future_start;
+                        state.lookahead = future_lookahead;
+                        let hash_head =
+                            StandardHashCalc::quick_insert_string(state, state.strstart);
 
-            // Probe one match ahead. The candidate is saved into persistent state when a full
-            // token block is yielded, so an output-blocking return cannot change later choices.
-            let current_len = usize::from(self.current_match.match_length);
-            let future_start = usize::from(self.current_match.strstart) + current_len;
-            let future_lookahead = state.lookahead.saturating_sub(current_len);
-            if !self.early_exit
-                && state.lookahead > MIN_LOOKAHEAD
-                && future_lookahead >= WANT_MIN_MATCH
-                && future_start < state.window_size - MIN_LOOKAHEAD
-            {
-                let current_lookahead = state.lookahead;
-                state.strstart = future_start;
-                state.lookahead = future_lookahead;
-                hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
+                        self.next_match.strstart = state.strstart as u16;
+                        self.next_match.orgstart = self.next_match.strstart;
 
-                self.next_match.strstart = state.strstart as u16;
-                self.next_match.orgstart = self.next_match.strstart;
+                        let dist = state.strstart as i64 - hash_head as i64;
+                        if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                            self.phase = MediumPhase::AwaitingFutureSearch { current_lookahead };
+                            return ProduceStatus::MatchSearch(MatchSearchWork::new(
+                                hash_head,
+                                MatchSearchKind::Standard,
+                            ));
+                        }
 
-                let dist = state.strstart as i64 - hash_head as i64;
-                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
-                    let result =
-                        MatchSearchRequest::from_state(state, hash_head, MatchSearchKind::Standard)
-                            .execute();
-                    state.match_start = result.start;
-                    self.next_match.match_length = result.length as u16;
-                    self.next_match.match_start = result.start;
-
-                    if self.next_match.match_start >= self.next_match.strstart {
+                        self.next_match.match_start = 0;
                         self.next_match.match_length = 1;
-                    }
-                    if usize::from(self.next_match.match_length) < WANT_MIN_MATCH {
-                        self.next_match.match_length = 1;
+                        state.lookahead = current_lookahead;
+                        state.strstart = usize::from(self.current_match.strstart);
                     } else {
-                        fizzle_matches(
-                            state.window.filled(),
-                            state.max_dist(),
-                            &mut self.current_match,
-                            &mut self.next_match,
-                        );
+                        self.next_match.match_length = 0;
                     }
-                } else {
-                    self.next_match.match_start = 0;
-                    self.next_match.match_length = 1;
+                    self.phase = MediumPhase::AfterFutureSearch;
                 }
+                MediumPhase::AwaitingFutureSearch { .. } => {
+                    panic!(
+                        "medium producer cannot advance while future match search is outstanding"
+                    )
+                }
+                MediumPhase::AfterFutureSearch => {
+                    let block_ready = emit_match(state, self.current_match);
+                    state.strstart += usize::from(self.current_match.match_length);
+                    self.phase = MediumPhase::Ready;
 
-                state.lookahead = current_lookahead;
-                state.strstart = usize::from(self.current_match.strstart);
-            } else {
-                self.next_match.match_length = 0;
-            }
-
-            let block_ready = emit_match(state, self.current_match);
-            state.strstart += usize::from(self.current_match.match_length);
-
-            if block_ready {
-                self.save_next(state);
-                return ProduceStatus::BlockReady(BlockContinuation::None);
+                    if block_ready {
+                        self.save_next(state);
+                        return ProduceStatus::BlockReady(BlockContinuation::None);
+                    }
+                }
             }
         }
     }
 
+    fn complete_match_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+        match self.phase {
+            MediumPhase::AwaitingCurrentSearch => {
+                self.apply_current_search(state, result);
+                self.phase = MediumPhase::AfterCurrentSearch;
+            }
+            MediumPhase::AwaitingFutureSearch { current_lookahead } => {
+                self.apply_future_search(state, result);
+                state.lookahead = current_lookahead;
+                state.strstart = usize::from(self.current_match.strstart);
+                self.phase = MediumPhase::AfterFutureSearch;
+            }
+            _ => panic!("medium producer received a match result without an outstanding search"),
+        }
+    }
+
     fn after_refill(&mut self, state: &mut State<'_>) {
+        assert_eq!(
+            self.phase,
+            MediumPhase::Ready,
+            "medium refill cannot occur while match work is outstanding"
+        );
         // A refill may slide the window, invalidating a speculative absolute position.
         self.clear_saved_next(state);
     }
 
     fn finish(&mut self, state: &mut State<'_>) -> usize {
+        assert_eq!(
+            self.phase,
+            MediumPhase::Ready,
+            "medium producer cannot finish while match search is outstanding"
+        );
         self.clear_saved_next(state);
         state.strstart.min(STD_MIN_MATCH - 1)
     }
