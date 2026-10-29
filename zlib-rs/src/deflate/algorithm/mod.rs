@@ -359,6 +359,136 @@ impl StandardCore {
     }
 }
 
+/// Scheduler-level policy for one input segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StandardSegmentMode {
+    /// More caller input may arrive; a short lookahead must yield instead of consuming a tail.
+    Continue,
+    /// This call ends an input segment but not the DEFLATE stream.
+    FlushBoundary,
+    /// This is the final input segment and must emit the terminal DEFLATE block.
+    Final,
+}
+
+impl StandardSegmentMode {
+    fn input_completion(self) -> InputCompletion {
+        match self {
+            Self::Continue => InputCompletion::MoreMayArrive,
+            Self::FlushBoundary | Self::Final => InputCompletion::EndOfSegment,
+        }
+    }
+
+    fn end_kind(self) -> Option<EndBlockKind> {
+        match self {
+            Self::Continue => None,
+            Self::FlushBoundary => Some(EndBlockKind::FlushBoundary),
+            Self::Final => Some(EndBlockKind::Final),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterDrain {
+    ResumeProduction,
+    EndSegment(EndBlockKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingDrain {
+    work: PendingOutputWork,
+    after: AfterDrain,
+}
+
+/// Result of exactly one schedulable standard-compression stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StandardTurnOutcome {
+    Progress,
+    NeedMoreCallerInput,
+    NeedMoreOutput { final_block: bool },
+    SegmentDone(EndBlockKind),
+}
+
+/// Reusable single-stream scheduler state for the standard token-producing algorithms.
+///
+/// Each `step` performs at most one stage: refill, token production, block encoding, or pending
+/// output drain. A synchronous zlib adapter can call it in a tight loop; a batch scheduler can call
+/// it once per ready stream and rotate fairly without duplicating stage sequencing rules.
+pub(super) struct StandardDriver {
+    core: StandardCore,
+    pending_drain: Option<PendingDrain>,
+}
+
+impl StandardDriver {
+    pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+        Some(Self {
+            core: StandardCore::for_algorithm(algorithm, state)?,
+            pending_drain: None,
+        })
+    }
+
+    pub(super) fn step(
+        &mut self,
+        state: &mut State<'_>,
+        input: &mut InputCursor,
+        output: &mut crate::deflate::OutputCursor,
+        mode: StandardSegmentMode,
+    ) -> StandardTurnOutcome {
+        if let Some(pending) = self.pending_drain.take() {
+            return match self.core.drain_output(state, output, pending.work) {
+                PendingOutputOutcome::Ready => match pending.after {
+                    AfterDrain::ResumeProduction => StandardTurnOutcome::Progress,
+                    AfterDrain::EndSegment(kind) => StandardTurnOutcome::SegmentDone(kind),
+                },
+                PendingOutputOutcome::OutputFull(work) => {
+                    self.pending_drain = Some(PendingDrain {
+                        work,
+                        after: pending.after,
+                    });
+                    StandardTurnOutcome::NeedMoreOutput {
+                        final_block: pending.after == AfterDrain::EndSegment(EndBlockKind::Final),
+                    }
+                }
+            };
+        }
+
+        match self.core.next_event(state) {
+            CoreEvent::NeedInput(demand) => {
+                match self
+                    .core
+                    .satisfy_input(state, input, demand, mode.input_completion())
+                {
+                    RefillOutcome::Ready | RefillOutcome::FinalTail => {
+                        StandardTurnOutcome::Progress
+                    }
+                    RefillOutcome::NeedMoreCallerInput => StandardTurnOutcome::NeedMoreCallerInput,
+                }
+            }
+            CoreEvent::TokenBlockReady(work) => {
+                self.pending_drain = Some(PendingDrain {
+                    work: self.core.encode_token_block(state, work),
+                    after: AfterDrain::ResumeProduction,
+                });
+                StandardTurnOutcome::Progress
+            }
+            CoreEvent::EndOfInput(work) => {
+                let kind = mode
+                    .end_kind()
+                    .expect("end-of-input requires a segment-ending scheduler mode");
+                match self.core.encode_end_of_input(state, work, kind) {
+                    Some(work) => {
+                        self.pending_drain = Some(PendingDrain {
+                            work,
+                            after: AfterDrain::EndSegment(kind),
+                        });
+                        StandardTurnOutcome::Progress
+                    }
+                    None => StandardTurnOutcome::SegmentDone(kind),
+                }
+            }
+        }
+    }
+}
+
 /// A request to refill one standard compression stream to its preferred lookahead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct InputDemand {
@@ -474,50 +604,29 @@ pub(super) fn drive_standard(
     input: &mut InputCursor,
     output: &mut crate::deflate::OutputCursor,
     flush: DeflateFlush,
-    core: &mut StandardCore,
+    driver: &mut StandardDriver,
 ) -> BlockState {
-    loop {
-        match core.next_event(state) {
-            CoreEvent::NeedInput(demand) => {
-                let completion = if flush == DeflateFlush::NoFlush {
-                    InputCompletion::MoreMayArrive
-                } else {
-                    InputCompletion::EndOfSegment
-                };
-                match core.satisfy_input(state, input, demand, completion) {
-                    RefillOutcome::Ready | RefillOutcome::FinalTail => {}
-                    RefillOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
-                }
-            }
-            CoreEvent::TokenBlockReady(work) => {
-                let pending = core.encode_token_block(state, work);
-                if matches!(
-                    core.drain_output(state, output, pending),
-                    PendingOutputOutcome::OutputFull(_)
-                ) {
-                    return BlockState::NeedMore;
-                }
-            }
-            CoreEvent::EndOfInput(work) => {
-                let kind = if flush == DeflateFlush::Finish {
-                    EndBlockKind::Final
-                } else {
-                    EndBlockKind::FlushBoundary
-                };
-                let pending = core.encode_end_of_input(state, work, kind);
-                let output_full = pending.is_some_and(|pending| {
-                    matches!(
-                        core.drain_output(state, output, pending),
-                        PendingOutputOutcome::OutputFull(_)
-                    )
-                });
+    let mode = match flush {
+        DeflateFlush::NoFlush => StandardSegmentMode::Continue,
+        DeflateFlush::Finish => StandardSegmentMode::Final,
+        _ => StandardSegmentMode::FlushBoundary,
+    };
 
-                return match (kind, output_full) {
-                    (EndBlockKind::Final, true) => BlockState::FinishStarted,
-                    (EndBlockKind::Final, false) => BlockState::FinishDone,
-                    (EndBlockKind::FlushBoundary, true) => BlockState::NeedMore,
-                    (EndBlockKind::FlushBoundary, false) => BlockState::BlockDone,
-                };
+    loop {
+        match driver.step(state, input, output, mode) {
+            StandardTurnOutcome::Progress => {}
+            StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
+            StandardTurnOutcome::NeedMoreOutput { final_block: true } => {
+                return BlockState::FinishStarted;
+            }
+            StandardTurnOutcome::NeedMoreOutput { final_block: false } => {
+                return BlockState::NeedMore;
+            }
+            StandardTurnOutcome::SegmentDone(EndBlockKind::Final) => {
+                return BlockState::FinishDone;
+            }
+            StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
+                return BlockState::BlockDone;
             }
         }
     }
@@ -554,14 +663,14 @@ impl Algorithm {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
             algorithm => {
-                let mut core = StandardCore::for_algorithm(algorithm, stream.state)
+                let mut driver = StandardDriver::for_algorithm(algorithm, stream.state)
                     .expect("ordinary algorithm must have a token producer");
                 drive_standard(
                     stream.state,
                     &mut stream.input,
                     &mut stream.output,
                     flush,
-                    &mut core,
+                    &mut driver,
                 )
             }
         }

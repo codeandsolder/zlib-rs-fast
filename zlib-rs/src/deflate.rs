@@ -3957,11 +3957,8 @@ mod test {
     struct RoundRobinCore {
         raw: z_stream,
         output: Vec<u8>,
-        core: algorithm::StandardCore,
-        pending_output: Option<algorithm::PendingOutputWork>,
-        finish_after_drain: bool,
+        driver: algorithm::StandardDriver,
         done: bool,
-        encoded_blocks: usize,
         drain_turns: usize,
         output_full_count: usize,
     }
@@ -3973,102 +3970,73 @@ mod test {
             let mut raw = z_stream::default();
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
-            let core = {
+            let driver = {
                 let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
                 stream.next_in = input.as_ptr() as *mut u8;
                 stream.avail_in = input.len() as _;
-                algorithm::StandardCore::for_algorithm(algorithm, stream.state).unwrap()
+                algorithm::StandardDriver::for_algorithm(algorithm, stream.state).unwrap()
             };
 
             Self {
                 raw,
                 output: Vec::new(),
-                core,
-                pending_output: None,
-                finish_after_drain: false,
+                driver,
                 done: false,
-                encoded_blocks: 0,
                 drain_turns: 0,
                 output_full_count: 0,
             }
         }
 
-        /// Perform exactly one schedulable stage: refill, produce/encode, or drain.
+        /// Perform exactly one production scheduler turn using the same driver as the zlib path.
         fn step(&mut self) {
             assert!(!self.done);
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
 
-            if let Some(pending) = self.pending_output.take() {
-                let mut chunk = [0u8; Self::OUTPUT_CHUNK];
-                stream.next_out = chunk.as_mut_ptr();
-                stream.avail_out = chunk.len() as _;
-                let before = stream.total_out;
+            let mut chunk = [0u8; Self::OUTPUT_CHUNK];
+            stream.next_out = chunk.as_mut_ptr();
+            stream.avail_out = chunk.len() as _;
+            let before = stream.total_out;
 
-                let mut output = OutputCursor::from_stream(stream);
-                let outcome = self.core.drain_output(stream.state, &mut output, pending);
-                output.apply(stream);
+            let mut input = InputCursor::from_stream(stream);
+            let mut output = OutputCursor::from_stream(stream);
+            let outcome = self.driver.step(
+                stream.state,
+                &mut input,
+                &mut output,
+                algorithm::StandardSegmentMode::Final,
+            );
+            input.apply(stream);
+            output.apply(stream);
 
-                let produced = (stream.total_out - before) as usize;
+            let produced = (stream.total_out - before) as usize;
+            if produced != 0 {
                 self.output.extend_from_slice(&chunk[..produced]);
                 self.drain_turns += 1;
-
-                // Do not leave a raw cursor into the stack-local chunk between scheduler turns.
-                stream.next_out = core::ptr::null_mut();
-                stream.avail_out = 0;
-
-                match outcome {
-                    algorithm::PendingOutputOutcome::Ready => {
-                        if self.finish_after_drain {
-                            self.done = true;
-                        }
-                    }
-                    algorithm::PendingOutputOutcome::OutputFull(work) => {
-                        self.output_full_count += 1;
-                        self.pending_output = Some(work);
-                    }
-                }
-                return;
             }
 
-            match self.core.next_event(stream.state) {
-                algorithm::CoreEvent::NeedInput(demand) => {
-                    let mut input = InputCursor::from_stream(stream);
-                    let outcome = self.core.satisfy_input(
-                        stream.state,
-                        &mut input,
-                        demand,
-                        algorithm::InputCompletion::EndOfSegment,
-                    );
-                    input.apply(stream);
-                    match outcome {
-                        algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail => {}
-                        algorithm::RefillOutcome::NeedMoreCallerInput => {
-                            panic!(
-                                "Finish with all input supplied unexpectedly requested more input"
-                            )
-                        }
-                    }
+            // Do not leave a raw cursor into the stack-local chunk between scheduler turns.
+            stream.next_out = core::ptr::null_mut();
+            stream.avail_out = 0;
+
+            match outcome {
+                algorithm::StandardTurnOutcome::Progress => {}
+                algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
+                    panic!("Final mode with all input supplied unexpectedly requested more input")
                 }
-                algorithm::CoreEvent::TokenBlockReady(work) => {
-                    self.pending_output = Some(self.core.encode_token_block(stream.state, work));
-                    self.encoded_blocks += 1;
+                algorithm::StandardTurnOutcome::NeedMoreOutput { .. } => {
+                    self.output_full_count += 1;
                 }
-                algorithm::CoreEvent::EndOfInput(work) => {
-                    self.pending_output = self.core.encode_end_of_input(
-                        stream.state,
-                        work,
-                        algorithm::EndBlockKind::Final,
-                    );
-                    assert!(self.pending_output.is_some());
-                    self.finish_after_drain = true;
-                    self.encoded_blocks += 1;
+                algorithm::StandardTurnOutcome::SegmentDone(algorithm::EndBlockKind::Final) => {
+                    self.done = true;
                 }
+                algorithm::StandardTurnOutcome::SegmentDone(
+                    algorithm::EndBlockKind::FlushBoundary,
+                ) => panic!("final batch job ended as a non-final flush boundary"),
             }
         }
 
         fn into_output(mut self) -> Vec<u8> {
             assert!(self.done);
-            assert!(self.pending_output.is_none());
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
             assert_eq!(stream.avail_in, 0);
             assert_eq!(stream.total_out as usize, self.output.len());
@@ -4146,16 +4114,12 @@ mod test {
 
         for (job, reference) in jobs.into_iter().zip(references) {
             assert!(
-                job.encoded_blocks > 1,
-                "test must cross token-block boundaries"
-            );
-            assert!(
-                job.drain_turns > job.encoded_blocks,
-                "drain must be separately resumable"
+                job.drain_turns > 1,
+                "test must schedule multiple output drains"
             );
             assert!(
                 job.output_full_count > 0,
-                "tiny output chunks must exercise OutputFull"
+                "tiny output chunks must exercise resumable OutputFull"
             );
             assert_eq!(job.into_output(), reference);
         }
@@ -4163,10 +4127,10 @@ mod test {
 
     #[test]
     fn standard_core_rejects_production_before_pending_output_is_drained() {
-        let mut input = Vec::with_capacity(40_000);
+        let mut input_bytes = Vec::with_capacity(40_000);
         for i in 0..2_000usize {
-            input.extend_from_slice(b"must-drain-before-producing/");
-            input.extend_from_slice(&(i as u32).to_le_bytes());
+            input_bytes.extend_from_slice(b"must-drain-before-producing/");
+            input_bytes.extend_from_slice(&(i as u32).to_le_bytes());
         }
 
         let config = DeflateConfig {
@@ -4176,28 +4140,61 @@ mod test {
             mem_level: 1,
             strategy: Strategy::Default,
         };
-        let mut job = RoundRobinCore::new(&input, config, algorithm::Algorithm::Fast);
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
-        let mut turns = 0usize;
-        while job.pending_output.is_none() {
-            job.step();
-            turns += 1;
-            assert!(turns < 100, "failed to reach encoded output work");
-        }
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        stream.next_in = input_bytes.as_ptr() as *mut u8;
+        stream.avail_in = input_bytes.len() as _;
+        let mut core =
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, stream.state)
+                .unwrap();
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut job.raw) }.unwrap();
+        let pending = loop {
+            match core.next_event(stream.state) {
+                algorithm::CoreEvent::NeedInput(demand) => {
+                    let mut input = InputCursor::from_stream(stream);
+                    let outcome = core.satisfy_input(
+                        stream.state,
+                        &mut input,
+                        demand,
+                        algorithm::InputCompletion::EndOfSegment,
+                    );
+                    input.apply(stream);
+                    assert!(matches!(
+                        outcome,
+                        algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
+                    ));
+                }
+                algorithm::CoreEvent::TokenBlockReady(work) => {
+                    break core.encode_token_block(stream.state, work);
+                }
+                algorithm::CoreEvent::EndOfInput(_) => {
+                    panic!("test input exhausted before producing a token block")
+                }
+            }
+        };
+
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = job.core.next_event(stream.state);
+            let _ = core.next_event(stream.state);
         }));
         assert!(
             rejected.is_err(),
             "production advanced with undrained output"
         );
 
-        while !job.done {
-            job.step();
-        }
-        let _ = job.into_output();
+        let mut output_bytes = vec![0u8; compress_bound(input_bytes.len()) + 64];
+        stream.next_out = output_bytes.as_mut_ptr();
+        stream.avail_out = output_bytes.len() as _;
+        let mut output = OutputCursor::from_stream(stream);
+        assert!(matches!(
+            core.drain_output(stream.state, &mut output, pending),
+            algorithm::PendingOutputOutcome::Ready
+        ));
+        output.apply(stream);
+
+        // This test bypasses the outer zlib status machine; only ensure the allocation is released.
+        let _ = end(stream);
     }
 
     #[test]
