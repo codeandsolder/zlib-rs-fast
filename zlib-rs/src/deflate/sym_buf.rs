@@ -89,9 +89,15 @@ impl<'a> SymBuf<'a> {
         }
     }
 
-    pub(crate) unsafe fn clone_to(&self, ptr: *mut u8) -> Self {
+    /// Clone this symbol-buffer state into independent initialized raw storage.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for writes of `self.buf.len()` bytes, must not overlap the source, and
+    /// must remain alive and uniquely owned for the returned destination lifetime.
+    pub(crate) unsafe fn clone_to<'dst>(&self, ptr: *mut u8) -> SymBuf<'dst> {
         unsafe { ptr.copy_from_nonoverlapping(self.buf.as_ptr(), self.buf.len()) };
-        Self {
+        SymBuf {
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, self.buf.len()) },
             filled: self.filled,
         }

@@ -497,33 +497,14 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
     };
 
     let w_size = 1 << window_bits;
-    let align_offset = (allocation_start.as_ptr() as usize).next_multiple_of(64)
-        - (allocation_start.as_ptr() as usize);
-    let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
-
-    let (window, prev, head, pending, sym_buf) = unsafe {
-        let window_ptr: *mut u8 = buf.add(allocs.window_pos);
-        window_ptr.write_bytes(0u8, 2 * w_size);
-        let window = Window::from_raw_parts(window_ptr, window_bits);
-
-        // FIXME: write_bytes is stable for NonNull since 1.80.0
-        let prev_ptr = buf.add(allocs.prev_pos).cast::<Pos>();
-        prev_ptr.write_bytes(0, w_size);
-        let prev = WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size);
-
-        let head_ptr = buf.add(allocs.head_pos).cast::<[Pos; HASH_SIZE]>();
-        // Zero out the full array. `write_bytes` will write `1 * size_of<[Pos; HASH_SIZE]>` bytes.
-        head_ptr.write_bytes(0, 1);
-        let head = WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr);
-
-        let pending_ptr = buf.add(allocs.pending_pos).cast::<MaybeUninit<u8>>();
-        let pending = Pending::from_raw_parts(pending_ptr, 4 * lit_bufsize);
-
-        let sym_buf_ptr = buf.add(allocs.sym_buf_pos);
-        let sym_buf = SymBuf::from_raw_parts(sym_buf_ptr, lit_bufsize);
-
-        (window, prev, head, pending, sym_buf)
-    };
+    let DeflateAllocBuffers {
+        state_ptr: state_allocation,
+        window,
+        prev,
+        head,
+        pending,
+        sym_buf,
+    } = unsafe { allocs.initialize_buffers(allocation_start, window_bits, lit_bufsize) };
 
     let state = State {
         status: Status::Init,
@@ -596,7 +577,6 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         _padding_0: [0; 4],
     };
 
-    let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
     unsafe { state_allocation.write(state) };
 
     stream.state = state_allocation.cast::<internal_state>();
@@ -776,7 +756,6 @@ pub fn copy<'a>(
     dest: &mut MaybeUninit<DeflateStream<'a>>,
     source: &mut DeflateStream<'a>,
 ) -> ReturnCode {
-    let w_size = source.state.w_size;
     let window_bits = source.state.w_bits() as usize;
     let lit_bufsize = source.state.lit_bufsize;
 
@@ -793,34 +772,14 @@ pub fn copy<'a>(
         return ReturnCode::MemError;
     };
 
-    let align_offset = (allocation_start.as_ptr() as usize).next_multiple_of(64)
-        - (allocation_start.as_ptr() as usize);
-    let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
-
-    let (window, prev, head, pending, sym_buf) = unsafe {
-        let window_ptr: *mut u8 = buf.add(allocs.window_pos);
-        window_ptr
-            .copy_from_nonoverlapping(source_state.window.as_ptr(), source_state.window.capacity());
-        let window = Window::from_raw_parts(window_ptr, window_bits);
-
-        // FIXME: write_bytes is stable for NonNull since 1.80.0
-        let prev_ptr = buf.add(allocs.prev_pos).cast::<Pos>();
-        prev_ptr.copy_from_nonoverlapping(source_state.prev.as_ptr(), source_state.prev.len());
-        let prev = WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size);
-
-        // zero out head's first element
-        let head_ptr = buf.add(allocs.head_pos).cast::<[Pos; HASH_SIZE]>();
-        head_ptr.copy_from_nonoverlapping(source_state.head.as_ptr(), 1);
-        let head = WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr);
-
-        let pending_ptr = buf.add(allocs.pending_pos);
-        let pending = source_state.bit_writer.pending.clone_to(pending_ptr);
-
-        let sym_buf_ptr = buf.add(allocs.sym_buf_pos);
-        let sym_buf = source_state.sym_buf.clone_to(sym_buf_ptr);
-
-        (window, prev, head, pending, sym_buf)
-    };
+    let DeflateAllocBuffers {
+        state_ptr: state_allocation,
+        window,
+        prev,
+        head,
+        pending,
+        sym_buf,
+    } = unsafe { allocs.clone_buffers(allocation_start, window_bits, lit_bufsize, source_state) };
 
     let mut bit_writer = BitWriter::from_pending(pending);
     bit_writer.bit_buffer = source_state.bit_writer.bit_buffer;
@@ -877,9 +836,8 @@ pub fn copy<'a>(
         _padding_0: [0; 4],
     };
 
-    // write the cloned state into state_ptr
-    let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
-    unsafe { state_allocation.write(dest_state) }; // FIXME: write is stable for NonNull since 1.80.0
+    // write the cloned state into the rebound allocation
+    unsafe { state_allocation.write(dest_state) };
 
     // insert the state_ptr into `dest`
     let field_ptr = unsafe { core::ptr::addr_of_mut!((*dest.as_mut_ptr()).state) };
@@ -3533,6 +3491,18 @@ pub unsafe fn get_dictionary(stream: &DeflateStream<'_>, dictionary: *mut u8) ->
     len
 }
 
+const DEFLATE_ALLOC_ALIGN: usize = 64;
+const LIT_BUFS: usize = 4;
+
+struct DeflateAllocBuffers<'a> {
+    state_ptr: *mut State<'a>,
+    window: Window<'a>,
+    prev: WeakSliceMut<'a, Pos>,
+    head: WeakArrayMut<'a, Pos, HASH_SIZE>,
+    pending: Pending<'a>,
+    sym_buf: SymBuf<'a>,
+}
+
 struct DeflateAllocOffsets {
     total_size: usize,
     state_pos: usize,
@@ -3547,11 +3517,6 @@ impl DeflateAllocOffsets {
     fn new(window_bits: usize, lit_bufsize: usize) -> Self {
         use core::mem::size_of;
 
-        // 64B alignment of individual items in the alloc.
-        // Note that changing this also requires changes in 'init' and 'copy'.
-        const ALIGN_SIZE: usize = 64;
-        const LIT_BUFS: usize = 4;
-
         let mut curr_size = 0usize;
 
         /* Define sizes */
@@ -3565,27 +3530,28 @@ impl DeflateAllocOffsets {
         // let alloc_size = size_of::<DeflateAlloc>();
 
         /* Calculate relative buffer positions and paddings */
-        let state_pos = curr_size.next_multiple_of(ALIGN_SIZE);
+        let state_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = state_pos + state_size;
 
-        let window_pos = curr_size.next_multiple_of(ALIGN_SIZE);
+        let window_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = window_pos + window_size;
 
-        let prev_pos = curr_size.next_multiple_of(ALIGN_SIZE);
+        let prev_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = prev_pos + prev_size;
 
-        let head_pos = curr_size.next_multiple_of(ALIGN_SIZE);
+        let head_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = head_pos + head_size;
 
-        let pending_pos = curr_size.next_multiple_of(ALIGN_SIZE);
+        let pending_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = pending_pos + pending_size;
 
-        let sym_buf_pos = curr_size.next_multiple_of(ALIGN_SIZE);
+        let sym_buf_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = sym_buf_pos + sym_buf_size;
 
-        /* Add ALIGN_SIZE-1 to allow alignment (done in the 'init' and 'copy' functions), and round
-         * size of buffer up to next multiple of ALIGN_SIZE */
-        let total_size = (curr_size + (ALIGN_SIZE - 1)).next_multiple_of(ALIGN_SIZE);
+        /* Leave enough leading slack to align the allocation base, then round the total allocation
+         * size to the same boundary. Region rebinding is centralized below. */
+        let total_size =
+            (curr_size + (DEFLATE_ALLOC_ALIGN - 1)).next_multiple_of(DEFLATE_ALLOC_ALIGN);
 
         Self {
             total_size,
@@ -3596,6 +3562,108 @@ impl DeflateAllocOffsets {
             prev_pos,
             head_pos,
         }
+    }
+
+    /// Resolve this layout inside one raw allocator block and initialize every region whose typed
+    /// wrapper requires initialized values before constructing that wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `allocation_start` must point to a writable allocation of at least `self.total_size` bytes
+    /// that remains alive for `'a` and is not aliased by another live deflate state.
+    unsafe fn initialize_buffers<'a>(
+        &self,
+        allocation_start: NonNull<u8>,
+        window_bits: usize,
+        lit_bufsize: usize,
+    ) -> DeflateAllocBuffers<'a> {
+        let base = unsafe { self.aligned_base(allocation_start) };
+        let w_size = 1usize << window_bits;
+
+        let window_ptr = unsafe { base.add(self.window_pos) };
+        unsafe { window_ptr.write_bytes(0, 2 * w_size) };
+        let window = unsafe { Window::from_raw_parts(window_ptr, window_bits) };
+
+        let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
+        unsafe { prev_ptr.write_bytes(0, w_size) };
+        let prev = unsafe { WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size) };
+
+        let head_ptr = unsafe { base.add(self.head_pos).cast::<[Pos; HASH_SIZE]>() };
+        unsafe { head_ptr.write_bytes(0, 1) };
+        let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
+
+        let pending_ptr = unsafe { base.add(self.pending_pos).cast::<MaybeUninit<u8>>() };
+        let pending = unsafe { Pending::from_raw_parts(pending_ptr, lit_bufsize * LIT_BUFS) };
+
+        let sym_buf_ptr = unsafe { base.add(self.sym_buf_pos) };
+        let sym_buf = unsafe { SymBuf::from_raw_parts(sym_buf_ptr, lit_bufsize) };
+
+        DeflateAllocBuffers {
+            state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+        }
+    }
+
+    /// Resolve this layout inside a new raw allocation and clone the source buffer regions before
+    /// constructing typed wrappers over them.
+    ///
+    /// # Safety
+    ///
+    /// `allocation_start` must satisfy the same allocation/lifetime requirements as
+    /// [`Self::initialize_buffers`] and must not overlap any source-state allocation.
+    unsafe fn clone_buffers<'a>(
+        &self,
+        allocation_start: NonNull<u8>,
+        window_bits: usize,
+        lit_bufsize: usize,
+        source: &State<'_>,
+    ) -> DeflateAllocBuffers<'a> {
+        let base = unsafe { self.aligned_base(allocation_start) };
+        let w_size = 1usize << window_bits;
+        debug_assert_eq!(source.w_size, w_size);
+        debug_assert_eq!(source.lit_bufsize, lit_bufsize);
+
+        let window_ptr = unsafe { base.add(self.window_pos) };
+        unsafe {
+            window_ptr.copy_from_nonoverlapping(source.window.as_ptr(), source.window.capacity())
+        };
+        let window = unsafe { Window::from_raw_parts(window_ptr, window_bits) };
+
+        let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
+        unsafe { prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len()) };
+        let prev = unsafe { WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size) };
+
+        let head_ptr = unsafe { base.add(self.head_pos).cast::<[Pos; HASH_SIZE]>() };
+        unsafe { head_ptr.copy_from_nonoverlapping(source.head.as_ptr(), 1) };
+        let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
+
+        let pending = unsafe {
+            source
+                .bit_writer
+                .pending
+                .clone_to(base.add(self.pending_pos))
+        };
+        let sym_buf = unsafe { source.sym_buf.clone_to(base.add(self.sym_buf_pos)) };
+
+        DeflateAllocBuffers {
+            state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+        }
+    }
+
+    unsafe fn aligned_base(&self, allocation_start: NonNull<u8>) -> *mut u8 {
+        let raw = allocation_start.as_ptr();
+        let addr = raw as usize;
+        let align_offset = addr.next_multiple_of(DEFLATE_ALLOC_ALIGN) - addr;
+        unsafe { raw.add(align_offset) }
     }
 }
 

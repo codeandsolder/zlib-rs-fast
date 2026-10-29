@@ -88,10 +88,16 @@ impl<'a> Pending<'a> {
         }
     }
 
-    pub(crate) unsafe fn clone_to(&self, ptr: *mut u8) -> Self {
+    /// Clone this pending-buffer state into independent raw storage.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for writes of `self.buf.len()` bytes, must not overlap the source, and
+    /// must remain alive and uniquely owned for the returned destination lifetime.
+    pub(crate) unsafe fn clone_to<'dst>(&self, ptr: *mut u8) -> Pending<'dst> {
         let ptr = ptr.cast::<MaybeUninit<u8>>();
         unsafe { ptr.copy_from_nonoverlapping(self.buf.as_ptr(), self.buf.len()) };
-        Self {
+        Pending {
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, self.buf.len()) },
             out: self.out,
             pending: self.pending,
