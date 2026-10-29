@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::{
     deflate::{zng_tr_stored_block, BlockState, Compressor, MAX_STORED},
     DeflateFlush,
@@ -82,23 +84,16 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         stream.state.bit_writer.sent_bits_add(len << 3);
 
         if left > 0 {
-            // SAFETY: `len` is effectively `min(stream.io.avail_in, stream.io.avail_out)`, so any reads
-            // of `len` won't go out of bounds on `next_out`. `left` is calculated from indices of
-            // the window, so `left` reads of the window won't go out of bounds.
-            let left = Ord::min(left, len);
-            let src = &stream.state.window.filled()[stream.state.block_start as usize..];
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), stream.io.next_out, left) };
-
-            stream.io.next_out = stream.io.next_out.wrapping_add(left);
-            stream.io.avail_out = stream.io.avail_out.wrapping_sub(left as _);
-            stream.io.total_out = stream.io.total_out.wrapping_add(left as _);
+            let left = left.min(len);
+            let start = stream.state.block_start as usize;
+            stream.copy_window_to_output(start..start + left);
             stream.state.block_start += left as isize;
             len -= left;
         }
 
-        // Copy uncompressed bytes directly from next_in to next_out, updating the check value.
+        // Copy uncompressed bytes directly from input to output, updating the check value.
         if len > 0 {
-            read_buf_direct_copy(stream, len);
+            stream.copy_input_to_output(len);
         }
 
         if last {
@@ -114,49 +109,37 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     used -= stream.io.avail_in; /* number of input bytes directly copied */
 
     if used > 0 {
-        let state = &mut stream.state;
-        // If any input was used, then no unused input remains in the window, therefore s->block_start == s->strstart.
-        if used as usize >= state.w_size {
-            /* supplant the previous history */
-            state.matches = 2; /* clear hash */
-
-            // SAFETY: we've advanced the next_in pointer at minimum w_size bytes
-            // read_buf_direct_copy(), so we are able to backtrack that number of bytes.
-            let src = stream.io.next_in.wrapping_sub(state.w_size);
-            unsafe { state.window.copy_and_initialize(0..state.w_size, src) };
-
-            state.strstart = state.w_size;
-            state.insert = state.strstart;
+        let used = used as usize;
+        if used >= stream.state.w_size {
+            // Supplant the previous history with the last full window of directly copied input.
+            let w_size = stream.state.w_size;
+            stream.state.matches = 2; // clear hash on a later compressed-level transition
+            stream.copy_recent_input_to_window(0..w_size, w_size);
+            stream.state.strstart = w_size;
+            stream.state.insert = w_size;
         } else {
-            if state.window_size - state.strstart <= used as usize {
-                /* Slide the window down. */
+            if stream.state.window_size - stream.state.strstart <= used {
+                // Slide the initialized portion of the history window down.
+                let state = &mut stream.state;
                 state.strstart -= state.w_size;
-
-                // make sure we don't copy uninitialized bytes. While we discard the first lower w_size
-                // bytes, it is not guaranteed that the upper w_size bytes are all initialized
-                let copy = Ord::min(state.strstart, state.window.filled().len() - state.w_size);
-
+                let copy = state
+                    .strstart
+                    .min(state.window.filled().len() - state.w_size);
                 state
                     .window
                     .filled_mut()
                     .copy_within(state.w_size..state.w_size + copy, 0);
-
-                if state.matches < 2 {
-                    state.matches += 1; /* add a pending slide_hash() */
-                }
-                state.insert = Ord::min(state.insert, state.strstart);
+                state.matches = (state.matches + 1).min(2); // pending slide_hash
+                state.insert = state.insert.min(state.strstart);
             }
 
-            // SAFETY: we've advanced the next_in pointer at least `used` bytes
-            // read_buf_direct_copy(), so we are able to backtrack that number of bytes.
-            let src = stream.io.next_in.wrapping_sub(used as usize);
-            let dst = state.strstart..state.strstart + used as usize;
-            unsafe { state.window.copy_and_initialize(dst, src) };
-
-            state.strstart += used as usize;
-            state.insert += Ord::min(used as usize, state.w_size - state.insert);
+            let start = stream.state.strstart;
+            stream.copy_recent_input_to_window(start..start + used, used);
+            let state = &mut stream.state;
+            state.strstart += used;
+            state.insert += used.min(state.w_size - state.insert);
         }
-        state.block_start = state.strstart as isize;
+        stream.state.block_start = stream.state.strstart as isize;
     }
 
     // If the last block was written to next_out, then done.
@@ -248,45 +231,4 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     } else {
         BlockState::NeedMore
     }
-}
-
-fn read_buf_direct_copy(stream: &mut Compressor, size: usize) -> usize {
-    let len = Ord::min(stream.io.avail_in as usize, size);
-    let output = stream.io.next_out;
-
-    if len == 0 {
-        return 0;
-    }
-
-    stream.io.avail_in -= len as u32;
-
-    // SAFETY: len is effectively bounded by next_in and next_out (via size derived in the calling
-    // function), so copies are in-bounds.
-    if stream.state.wrap == 2 {
-        // we likely cannot fuse the crc32 and the copy here because the input can be changed by
-        // a concurrent thread. Therefore it cannot be converted into a slice!
-        unsafe { core::ptr::copy_nonoverlapping(stream.io.next_in, output, len) }
-
-        let data = unsafe { core::slice::from_raw_parts(output, len) };
-        stream.state.crc_fold.fold(data);
-    } else if stream.state.wrap == 1 {
-        // we cannot fuse the adler and the copy in our case, because adler32 takes a slice.
-        // Another process is allowed to concurrently modify stream.io.next_in, so we cannot turn it
-        // into a rust slice (violates its safety requirements)
-        unsafe { core::ptr::copy_nonoverlapping(stream.io.next_in, output, len) }
-
-        let data = unsafe { core::slice::from_raw_parts(output, len) };
-        stream.io.adler = crate::adler32::adler32(stream.io.adler as u32, data) as _;
-    } else {
-        unsafe { core::ptr::copy_nonoverlapping(stream.io.next_in, output, len) }
-    }
-
-    stream.io.next_in = stream.io.next_in.wrapping_add(len);
-    stream.io.total_in += len as crate::c_api::z_size;
-
-    stream.io.next_out = stream.io.next_out.wrapping_add(len as _);
-    stream.io.avail_out = stream.io.avail_out.wrapping_sub(len as _);
-    stream.io.total_out = stream.io.total_out.wrapping_add(len as _);
-
-    len
 }

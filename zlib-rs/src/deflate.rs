@@ -127,6 +127,72 @@ impl<'a, 'state> Compressor<'a, 'state> {
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
         read_buf_window_core(self, offset, size)
     }
+
+    /// Copy initialized history bytes to the caller's output buffer.
+    pub(crate) fn copy_window_to_output(&mut self, range: core::ops::Range<usize>) {
+        let len = range.len();
+        assert!(len <= self.io.avail_out as usize);
+        let src = &self.state.window.filled()[range];
+
+        // SAFETY: `src` is an initialized window slice and the caller-provided output cursor has
+        // at least `len` writable bytes by the assertion above. The zlib contract requires input
+        // and output buffers not to overlap for this direct stored-block path.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.io.next_out, len) };
+        self.advance_output(len);
+    }
+
+    /// Copy caller input directly to caller output for stored blocks while updating checksums.
+    ///
+    /// Deliberately does not construct a Rust slice over `next_in`: zlib permits the caller to
+    /// mutate input memory concurrently. We checksum the output copy, which is stable after the raw
+    /// copy has completed.
+    pub(crate) fn copy_input_to_output(&mut self, size: usize) -> usize {
+        let len = size.min(self.io.avail_in as usize);
+        assert!(len <= self.io.avail_out as usize);
+        if len == 0 {
+            return 0;
+        }
+
+        let output = self.io.next_out;
+        // SAFETY: the input cursor exposes `avail_in` readable bytes and the output cursor exposes
+        // `avail_out` writable bytes. Both bounds are checked above; direct stored copies require
+        // non-overlapping zlib input/output buffers.
+        unsafe { core::ptr::copy_nonoverlapping(self.io.next_in, output, len) };
+
+        // SAFETY: the just-completed copy initialized exactly `len` output bytes.
+        let copied = unsafe { core::slice::from_raw_parts(output, len) };
+        match self.state.wrap {
+            2 => self.state.crc_fold.fold(copied),
+            1 => self.io.adler = crate::adler32::adler32(self.io.adler as u32, copied) as _,
+            _ => {}
+        }
+
+        self.io.next_in = self.io.next_in.wrapping_add(len);
+        self.io.avail_in -= len as u32;
+        self.io.total_in += len as crate::c_api::z_size;
+        self.advance_output(len);
+        len
+    }
+
+    /// Preserve bytes that were already consumed directly from the caller's input as LZ history.
+    pub(crate) fn copy_recent_input_to_window(
+        &mut self,
+        destination: core::ops::Range<usize>,
+        bytes_back: usize,
+    ) {
+        let len = destination.len();
+        assert!(len <= bytes_back);
+        let src = self.io.next_in.wrapping_sub(bytes_back);
+        // SAFETY: callers only request bytes already consumed by `copy_input_to_output`, so the
+        // region ending at the current input cursor remains within the caller's input allocation.
+        unsafe { self.state.window.copy_and_initialize(destination, src) };
+    }
+
+    fn advance_output(&mut self, len: usize) {
+        self.io.next_out = self.io.next_out.wrapping_add(len);
+        self.io.avail_out -= len as u32;
+        self.io.total_out += len as crate::c_api::z_size;
+    }
 }
 
 pub(crate) fn with_compressor<'state, R>(
