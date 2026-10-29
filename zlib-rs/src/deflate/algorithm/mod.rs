@@ -1,6 +1,7 @@
 use crate::{
     deflate::{
-        with_compressor, BlockState, Compressor, DeflateStream, State, Strategy, MIN_LOOKAHEAD,
+        drain_pending_output, with_compressor, BlockState, Compressor, DeflateStream, DrainOutcome,
+        State, Strategy, MIN_LOOKAHEAD,
     },
     DeflateFlush,
 };
@@ -305,8 +306,9 @@ pub(super) fn drive_standard(
             CoreEvent::TokenBlockReady(continuation) => {
                 stream.state.encode_block(false);
                 continuation.apply(stream.state);
-                stream.flush_pending();
-                if stream.output.avail_out == 0 {
+                if drain_pending_output(stream.state, &mut stream.output)
+                    == DrainOutcome::OutputFull
+                {
                     return BlockState::NeedMore;
                 }
             }
@@ -328,8 +330,8 @@ pub(super) fn finish_standard(
 
     if flush == DeflateFlush::Finish {
         stream.state.encode_block(true);
-        stream.flush_pending();
-        return if stream.output.avail_out == 0 {
+        return if drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull
+        {
             BlockState::FinishStarted
         } else {
             BlockState::FinishDone
@@ -338,8 +340,7 @@ pub(super) fn finish_standard(
 
     if !stream.state.sym_buf.is_empty() {
         stream.state.encode_block(false);
-        stream.flush_pending();
-        if stream.output.avail_out == 0 {
+        if drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull {
             return BlockState::NeedMore;
         }
     }

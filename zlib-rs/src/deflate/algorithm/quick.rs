@@ -4,8 +4,8 @@ use super::{ensure_input, InputStatus};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::{
     deflate::{
-        BlockState, BlockType, Compressor, State, StaticTreeDesc, MIN_LOOKAHEAD, STD_MAX_MATCH,
-        STD_MIN_MATCH, WANT_MIN_MATCH,
+        drain_pending_output, BlockState, BlockType, Compressor, DrainOutcome, State,
+        StaticTreeDesc, MIN_LOOKAHEAD, STD_MAX_MATCH, STD_MIN_MATCH, WANT_MIN_MATCH,
     },
     DeflateFlush,
 };
@@ -24,8 +24,7 @@ pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState
 
     loop {
         if pending_needs_drain(stream.state) {
-            stream.flush_pending();
-            if stream.output.avail_out == 0 {
+            if drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull {
                 return if last
                     && stream.input.avail_in == 0
                     && stream.state.bit_writer.bits_valid == 0
@@ -86,12 +85,13 @@ fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> 
         state.block_start = state.strstart as isize;
     }
 
-    stream.flush_pending();
-    (stream.output.avail_out == 0).then_some(if last {
-        BlockState::FinishStarted
-    } else {
-        BlockState::NeedMore
-    })
+    (drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull).then_some(
+        if last {
+            BlockState::FinishStarted
+        } else {
+            BlockState::NeedMore
+        },
+    )
 }
 
 #[inline]

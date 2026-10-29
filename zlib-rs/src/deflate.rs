@@ -127,10 +127,6 @@ impl<'a, 'state> Compressor<'a, 'state> {
         fill_window_core(self);
     }
 
-    pub(crate) fn flush_pending(&mut self) {
-        flush_pending_core(self);
-    }
-
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
         read_buf_window_core(self, offset, size)
     }
@@ -1895,7 +1891,9 @@ pub(crate) fn fill_window(stream: &mut DeflateStream<'_>) {
 }
 
 pub(crate) fn flush_pending(stream: &mut DeflateStream<'_>) {
-    with_compressor(stream, |compressor| compressor.flush_pending());
+    with_compressor(stream, |compressor| {
+        let _ = drain_pending_output(compressor.state, &mut compressor.output);
+    });
 }
 
 fn read_buf_window_core(stream: &mut Compressor<'_, '_>, offset: usize, size: usize) -> usize {
@@ -3016,27 +3014,42 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     ReturnCode::Ok
 }
 
-fn flush_pending_core(stream: &mut Compressor<'_, '_>) {
-    let state = &mut stream.state;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrainOutcome {
+    Ready,
+    OutputFull,
+}
 
+/// Drain pending compressed bytes using only compression state and the caller output cursor.
+///
+/// `OutputFull` deliberately mirrors zlib's streaming boundary: callers return once the supplied
+/// output buffer reaches zero, even when that write happened to consume the final pending byte.
+pub(crate) fn drain_pending_output(
+    state: &mut State<'_>,
+    output: &mut OutputCursor,
+) -> DrainOutcome {
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();
-    let len = Ord::min(pending.len(), stream.output.avail_out as usize);
+    let len = Ord::min(pending.len(), output.avail_out as usize);
 
-    if len == 0 {
-        return;
+    if len != 0 {
+        trace!("\n[FLUSH {len} bytes]");
+        // SAFETY: len is min(pending, output.avail_out), so we won't overrun next_out.
+        unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), output.next_out, len) };
+
+        output.next_out = output.next_out.wrapping_add(len);
+        output.total_out += len as crate::c_api::z_size;
+        output.avail_out -= len as crate::c_api::uInt;
+
+        state.bit_writer.pending.advance(len);
     }
 
-    trace!("\n[FLUSH {len} bytes]");
-    // SAFETY: len is min(pending, stream.output.avail_out), so we won't overrun next_out.
-    unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), stream.output.next_out, len) };
-
-    stream.output.next_out = stream.output.next_out.wrapping_add(len);
-    stream.output.total_out += len as crate::c_api::z_size;
-    stream.output.avail_out -= len as crate::c_api::uInt;
-
-    state.bit_writer.pending.advance(len);
+    if output.avail_out == 0 {
+        DrainOutcome::OutputFull
+    } else {
+        DrainOutcome::Ready
+    }
 }
 
 /// Compresses `input` into the provided `output` buffer.

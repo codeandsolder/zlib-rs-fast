@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    deflate::{zng_tr_stored_block, BlockState, Compressor, MAX_STORED},
+    deflate::{drain_pending_output, zng_tr_stored_block, BlockState, Compressor, MAX_STORED},
     DeflateFlush,
 };
 
@@ -77,7 +77,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
             .extend(&(!len as u16).to_le_bytes());
 
         // Write the stored block header bytes.
-        stream.flush_pending();
+        let _ = drain_pending_output(stream.state, &mut stream.output);
 
         // Update debugging counts for the data about to be copied.
         stream.state.bit_writer.cmpr_bits_add(len << 3);
@@ -222,7 +222,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         zng_tr_stored_block(state, range, last);
 
         state.block_start += len as isize;
-        stream.flush_pending();
+        let _ = drain_pending_output(stream.state, &mut stream.output);
     }
 
     // We've done all we can with the available input and output.
