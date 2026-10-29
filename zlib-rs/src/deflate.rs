@@ -3958,47 +3958,88 @@ mod test {
         raw: z_stream,
         output: Vec<u8>,
         core: algorithm::StandardCore,
+        pending_output: Option<algorithm::PendingOutputWork>,
+        finish_after_drain: bool,
         done: bool,
+        encoded_blocks: usize,
+        drain_turns: usize,
+        output_full_count: usize,
     }
 
     impl RoundRobinCore {
+        const OUTPUT_CHUNK: usize = 17;
+
         fn new(input: &[u8], config: DeflateConfig, algorithm: algorithm::Algorithm) -> Self {
             let mut raw = z_stream::default();
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
-            let mut output = vec![0u8; compress_bound(input.len()) + 64];
             let core = {
                 let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
                 stream.next_in = input.as_ptr() as *mut u8;
                 stream.avail_in = input.len() as _;
-                stream.next_out = output.as_mut_ptr();
-                stream.avail_out = output.len() as _;
                 algorithm::StandardCore::for_algorithm(algorithm, stream.state).unwrap()
             };
 
             Self {
                 raw,
-                output,
+                output: Vec::new(),
                 core,
+                pending_output: None,
+                finish_after_drain: false,
                 done: false,
+                encoded_blocks: 0,
+                drain_turns: 0,
+                output_full_count: 0,
             }
         }
 
-        /// Advance exactly one scheduler-visible core event and perform only the work it requests.
+        /// Perform exactly one schedulable stage: refill, produce/encode, or drain.
         fn step(&mut self) {
             assert!(!self.done);
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
 
+            if let Some(pending) = self.pending_output.take() {
+                let mut chunk = [0u8; Self::OUTPUT_CHUNK];
+                stream.next_out = chunk.as_mut_ptr();
+                stream.avail_out = chunk.len() as _;
+                let before = stream.total_out;
+
+                let mut output = OutputCursor::from_stream(stream);
+                let outcome = self.core.drain_output(stream.state, &mut output, pending);
+                output.apply(stream);
+
+                let produced = (stream.total_out - before) as usize;
+                self.output.extend_from_slice(&chunk[..produced]);
+                self.drain_turns += 1;
+
+                // Do not leave a raw cursor into the stack-local chunk between scheduler turns.
+                stream.next_out = core::ptr::null_mut();
+                stream.avail_out = 0;
+
+                match outcome {
+                    algorithm::PendingOutputOutcome::Ready => {
+                        if self.finish_after_drain {
+                            self.done = true;
+                        }
+                    }
+                    algorithm::PendingOutputOutcome::OutputFull(work) => {
+                        self.output_full_count += 1;
+                        self.pending_output = Some(work);
+                    }
+                }
+                return;
+            }
+
             match self.core.next_event(stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
-                    let outcome = with_compressor(stream, |compressor| {
-                        self.core.satisfy_input(
-                            compressor.state,
-                            &mut compressor.input,
-                            demand,
-                            algorithm::InputCompletion::EndOfSegment,
-                        )
-                    });
+                    let mut input = InputCursor::from_stream(stream);
+                    let outcome = self.core.satisfy_input(
+                        stream.state,
+                        &mut input,
+                        demand,
+                        algorithm::InputCompletion::EndOfSegment,
+                    );
+                    input.apply(stream);
                     match outcome {
                         algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail => {}
                         algorithm::RefillOutcome::NeedMoreCallerInput => {
@@ -4009,30 +4050,29 @@ mod test {
                     }
                 }
                 algorithm::CoreEvent::TokenBlockReady(work) => {
-                    work.encode(stream.state);
-                    let outcome = with_compressor(stream, |compressor| {
-                        drain_pending_output(compressor.state, &mut compressor.output)
-                    });
-                    assert_eq!(outcome, DrainOutcome::Ready);
+                    self.pending_output = Some(self.core.encode_token_block(stream.state, work));
+                    self.encoded_blocks += 1;
                 }
                 algorithm::CoreEvent::EndOfInput(work) => {
-                    assert!(work.encode(stream.state, algorithm::EndBlockKind::Final));
-                    let outcome = with_compressor(stream, |compressor| {
-                        drain_pending_output(compressor.state, &mut compressor.output)
-                    });
-                    assert_eq!(outcome, DrainOutcome::Ready);
-                    self.done = true;
+                    self.pending_output = self.core.encode_end_of_input(
+                        stream.state,
+                        work,
+                        algorithm::EndBlockKind::Final,
+                    );
+                    assert!(self.pending_output.is_some());
+                    self.finish_after_drain = true;
+                    self.encoded_blocks += 1;
                 }
             }
         }
 
         fn into_output(mut self) -> Vec<u8> {
             assert!(self.done);
+            assert!(self.pending_output.is_none());
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
-            let len = stream.total_out as usize;
             assert_eq!(stream.avail_in, 0);
+            assert_eq!(stream.total_out as usize, self.output.len());
             assert!(end(stream).is_ok());
-            self.output.truncate(len);
             self.output
         }
     }
@@ -4061,58 +4101,103 @@ mod test {
 
     #[test]
     fn standard_core_events_can_be_round_robin_scheduled_across_streams() {
-        let mut medium_input = Vec::with_capacity(120_000);
-        let mut slow_input = Vec::with_capacity(120_000);
-        for i in 0..3_000usize {
-            medium_input.extend_from_slice(b"medium-round-robin/");
-            medium_input.extend_from_slice(&(i as u32).to_le_bytes());
-            medium_input.extend(core::iter::repeat_n((i % 239) as u8, 4 + i % 29));
-
-            slow_input.extend_from_slice(b"slow-round-robin/");
-            slow_input.extend(core::iter::repeat_n(((i * 17) % 251) as u8, 12 + i % 41));
-            slow_input.extend_from_slice(&(i as u32).rotate_left(11).to_le_bytes());
+        let mut input = Vec::with_capacity(160_000);
+        for i in 0..4_000usize {
+            input.extend_from_slice(b"round-robin-standard-core/");
+            input.extend_from_slice(&(i as u32).rotate_left(7).to_le_bytes());
+            input.extend(core::iter::repeat_n(((i * 17) % 251) as u8, 5 + i % 37));
         }
 
-        let medium_config = DeflateConfig {
-            level: 6,
+        let cases = [
+            (algorithm::Algorithm::Fast, 2, Strategy::Default),
+            (algorithm::Algorithm::Medium, 6, Strategy::Default),
+            (algorithm::Algorithm::Slow, 9, Strategy::Default),
+            (algorithm::Algorithm::Huffman, 6, Strategy::HuffmanOnly),
+            (algorithm::Algorithm::Rle, 6, Strategy::Rle),
+        ];
+
+        let mut jobs = Vec::new();
+        let mut references = Vec::new();
+        for (algorithm, level, strategy) in cases {
+            let config = || DeflateConfig {
+                level,
+                method: Method::Deflated,
+                window_bits: crate::MAX_WBITS,
+                mem_level: 1,
+                strategy,
+            };
+            references.push(direct_algorithm_output(&input, config()));
+            jobs.push(RoundRobinCore::new(&input, config(), algorithm));
+        }
+
+        let mut scheduler_turns = 0usize;
+        while jobs.iter().any(|job| !job.done) {
+            for job in &mut jobs {
+                if !job.done {
+                    job.step();
+                    scheduler_turns += 1;
+                }
+            }
+            assert!(
+                scheduler_turns < 100_000,
+                "round-robin scheduler failed to make progress"
+            );
+        }
+
+        for (job, reference) in jobs.into_iter().zip(references) {
+            assert!(
+                job.encoded_blocks > 1,
+                "test must cross token-block boundaries"
+            );
+            assert!(
+                job.drain_turns > job.encoded_blocks,
+                "drain must be separately resumable"
+            );
+            assert!(
+                job.output_full_count > 0,
+                "tiny output chunks must exercise OutputFull"
+            );
+            assert_eq!(job.into_output(), reference);
+        }
+    }
+
+    #[test]
+    fn standard_core_rejects_production_before_pending_output_is_drained() {
+        let mut input = Vec::with_capacity(40_000);
+        for i in 0..2_000usize {
+            input.extend_from_slice(b"must-drain-before-producing/");
+            input.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+
+        let config = DeflateConfig {
+            level: 2,
             method: Method::Deflated,
             window_bits: crate::MAX_WBITS,
             mem_level: 1,
             strategy: Strategy::Default,
         };
-        let slow_config = DeflateConfig {
-            level: 9,
-            ..medium_config
-        };
-
-        let medium_reference = direct_algorithm_output(&medium_input, medium_config);
-        let slow_reference = direct_algorithm_output(&slow_input, slow_config);
-
-        let mut medium =
-            RoundRobinCore::new(&medium_input, medium_config, algorithm::Algorithm::Medium);
-        let mut slow = RoundRobinCore::new(&slow_input, slow_config, algorithm::Algorithm::Slow);
+        let mut job = RoundRobinCore::new(&input, config, algorithm::Algorithm::Fast);
 
         let mut turns = 0usize;
-        while !medium.done || !slow.done {
-            if !medium.done {
-                medium.step();
-            }
-            if !slow.done {
-                slow.step();
-            }
+        while job.pending_output.is_none() {
+            job.step();
             turns += 1;
-            assert!(
-                turns < 10_000,
-                "round-robin scheduler failed to make progress"
-            );
+            assert!(turns < 100, "failed to reach encoded output work");
         }
 
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut job.raw) }.unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = job.core.next_event(stream.state);
+        }));
         assert!(
-            turns > 2,
-            "test inputs should cross multiple scheduling boundaries"
+            rejected.is_err(),
+            "production advanced with undrained output"
         );
-        assert_eq!(medium.into_output(), medium_reference);
-        assert_eq!(slow.into_output(), slow_reference);
+
+        while !job.done {
+            job.step();
+        }
+        let _ = job.into_output();
     }
 
     #[test]

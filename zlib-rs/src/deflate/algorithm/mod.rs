@@ -242,14 +242,37 @@ pub(super) enum InputCompletion {
     EndOfSegment,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandardPhase {
+    Producing,
+    NeedsDrain,
+}
+
+/// A resumable request to drain bytes produced by block encoding.
+///
+/// `OutputFull` returns this token unchanged so a persistent scheduler can resume the same drain
+/// before advancing token production again.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingOutputWork;
+
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingOutputOutcome {
+    Ready,
+    OutputFull(PendingOutputWork),
+}
+
 /// Per-call scheduling state for the ordinary token-producing algorithms.
 ///
-/// It owns the heterogeneous producer plus the only orchestration state the core needs: whether a
-/// short buffered tail has been certified final for this zlib call. It borrows no stream memory and
-/// allocates nothing, so schedulers can hold one beside each active stream.
+/// It owns the heterogeneous producer plus the orchestration state needed between scheduler turns:
+/// whether a short buffered tail is final and whether encoded output must be drained before token
+/// production may resume. It borrows no stream memory and allocates nothing, so schedulers can hold
+/// one beside each active stream.
 pub(super) struct StandardCore {
     producer: StandardProducer,
     input_phase: InputPhase,
+    phase: StandardPhase,
 }
 
 impl StandardCore {
@@ -257,10 +280,12 @@ impl StandardCore {
         Some(Self {
             producer: StandardProducer::for_algorithm(algorithm, state)?,
             input_phase: InputPhase::Open,
+            phase: StandardPhase::Producing,
         })
     }
 
     pub(super) fn next_event(&mut self, state: &mut State<'_>) -> CoreEvent {
+        self.assert_producing();
         next_core_event(state, self.input_phase, &mut self.producer)
     }
 
@@ -276,6 +301,61 @@ impl StandardCore {
             self.input_phase = InputPhase::FinalTail;
         }
         outcome
+    }
+
+    pub(super) fn encode_token_block(
+        &mut self,
+        state: &mut State<'_>,
+        work: TokenBlockWork,
+    ) -> PendingOutputWork {
+        self.assert_producing();
+        work.encode(state);
+        self.phase = StandardPhase::NeedsDrain;
+        PendingOutputWork
+    }
+
+    pub(super) fn encode_end_of_input(
+        &mut self,
+        state: &mut State<'_>,
+        work: EndOfInputWork,
+        kind: EndBlockKind,
+    ) -> Option<PendingOutputWork> {
+        self.assert_producing();
+        if work.encode(state, kind) {
+            self.phase = StandardPhase::NeedsDrain;
+            Some(PendingOutputWork)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn drain_output(
+        &mut self,
+        state: &mut State<'_>,
+        output: &mut crate::deflate::OutputCursor,
+        work: PendingOutputWork,
+    ) -> PendingOutputOutcome {
+        assert_eq!(
+            self.phase,
+            StandardPhase::NeedsDrain,
+            "drain work requires an encoded block"
+        );
+
+        match drain_pending_output(state, output) {
+            DrainOutcome::Ready => {
+                self.phase = StandardPhase::Producing;
+                PendingOutputOutcome::Ready
+            }
+            DrainOutcome::OutputFull => PendingOutputOutcome::OutputFull(work),
+        }
+    }
+
+    fn assert_producing(&self) {
+        assert_eq!(
+            self.phase,
+            StandardPhase::Producing,
+            "pending output must be drained before advancing standard compression"
+        );
     }
 }
 
@@ -410,8 +490,11 @@ pub(super) fn drive_standard(
                 }
             }
             CoreEvent::TokenBlockReady(work) => {
-                work.encode(state);
-                if drain_pending_output(state, output) == DrainOutcome::OutputFull {
+                let pending = core.encode_token_block(state, work);
+                if matches!(
+                    core.drain_output(state, output, pending),
+                    PendingOutputOutcome::OutputFull(_)
+                ) {
                     return BlockState::NeedMore;
                 }
             }
@@ -421,9 +504,13 @@ pub(super) fn drive_standard(
                 } else {
                     EndBlockKind::FlushBoundary
                 };
-                let encoded = work.encode(state, kind);
-                let output_full =
-                    encoded && drain_pending_output(state, output) == DrainOutcome::OutputFull;
+                let pending = core.encode_end_of_input(state, work, kind);
+                let output_full = pending.is_some_and(|pending| {
+                    matches!(
+                        core.drain_output(state, output, pending),
+                        PendingOutputOutcome::OutputFull(_)
+                    )
+                });
 
                 return match (kind, output_full) {
                     (EndBlockKind::Final, true) => BlockState::FinishStarted,
