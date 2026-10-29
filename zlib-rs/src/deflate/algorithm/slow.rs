@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use crate::deflate::longest_match::{MatchSearchKind, MatchSearchRequest};
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 pub(super) struct SlowProducer {
@@ -38,11 +39,14 @@ impl TokenProducer for SlowProducer {
                 && state.prev_length < state.max_lazy_match
                 && hash_head != 0
             {
-                (match_len, state.match_start) = if self.use_longest_match_slow {
-                    crate::deflate::longest_match::longest_match_slow(state, hash_head)
+                let kind = if self.use_longest_match_slow {
+                    MatchSearchKind::Slow
                 } else {
-                    crate::deflate::longest_match::longest_match(state, hash_head)
+                    MatchSearchKind::Standard
                 };
+                let result = MatchSearchRequest::from_state(state, hash_head, kind).execute();
+                match_len = result.length;
+                state.match_start = result.start;
 
                 if match_len <= 5 && state.strategy == Strategy::Filtered {
                     match_len = STD_MIN_MATCH - 1;

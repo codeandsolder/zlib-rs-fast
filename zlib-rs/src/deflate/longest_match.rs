@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use crate::deflate::{Pos, State, STD_MAX_MATCH, STD_MIN_MATCH};
+use crate::deflate::{
+    hash_calc::{HashCalcVariant, RollHashCalc, StandardHashCalc},
+    Pos, State, STD_MAX_MATCH, STD_MIN_MATCH,
+};
 
 const EARLY_EXIT_TRIGGER_LEVEL: i8 = 5;
 
@@ -19,89 +22,160 @@ impl SearchCursor {
     }
 }
 
-/// Find the (length, offset) in the window of the longest match for the string
-/// at offset `cur_match`.
-pub fn longest_match(state: &State, cur_match: u16) -> (usize, u16) {
-    longest_match_help::<false>(state, cur_match)
+/// Which chain-walking heuristic to use for one immutable match search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatchSearchKind {
+    Standard,
+    Slow,
 }
 
-pub fn longest_match_slow(state: &State, cur_match: u16) -> (usize, u16) {
-    longest_match_help::<true>(state, cur_match)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatchSearchResult {
+    pub(crate) length: usize,
+    pub(crate) start: Pos,
 }
 
-fn longest_match_help<const SLOW: bool>(state: &State, cur_match: Pos) -> (usize, Pos) {
-    let strstart = state.strstart;
-    let lookahead = state.lookahead;
-    let initialized_end = strstart
-        .checked_add(lookahead)
-        .expect("deflate window position overflow");
-    let window = state.window.filled();
-    let initialized = window
-        .get(..initialized_end)
-        .expect("lookahead extends beyond the deflate window");
-    let scan = &initialized[strstart..];
-    let prev = &state.prev.as_slice()[..=state.w_mask()];
-    let wmask = state.w_mask();
-    let limit_base = strstart.saturating_sub(state.max_dist());
+/// Immutable description of one longest-match search.
+///
+/// Hash insertion and all other stream mutation happen before this value is created. Execution only
+/// reads initialized window bytes and the hash-chain snapshot exposed by `State`, which makes the
+/// expensive search a detachable unit for future scoped CPU batches or device submission.
+#[derive(Clone, Copy)]
+pub(crate) struct MatchSearchRequest<'a> {
+    initialized: &'a [u8],
+    prev: &'a [Pos],
+    head: &'a [Pos],
+    cur_match: Pos,
+    strstart: usize,
+    lookahead: usize,
+    wmask: usize,
+    max_dist: usize,
+    prev_length: u16,
+    match_start: Pos,
+    max_chain_length: u16,
+    good_match: u16,
+    nice_match: u16,
+    level: i8,
+    hash_calc_variant: HashCalcVariant,
+    kind: MatchSearchKind,
+}
 
-    let mut best_len = if state.prev_length > 0 {
-        usize::from(state.prev_length)
+impl<'a> MatchSearchRequest<'a> {
+    pub(crate) fn from_state(state: &'a State<'_>, cur_match: Pos, kind: MatchSearchKind) -> Self {
+        let initialized_end = state
+            .strstart
+            .checked_add(state.lookahead)
+            .expect("deflate window position overflow");
+        let initialized = state
+            .window
+            .filled()
+            .get(..initialized_end)
+            .expect("lookahead extends beyond the deflate window");
+        let wmask = state.w_mask();
+
+        Self {
+            initialized,
+            prev: &state.prev.as_slice()[..=wmask],
+            head: state.head.as_slice(),
+            cur_match,
+            strstart: state.strstart,
+            lookahead: state.lookahead,
+            wmask,
+            max_dist: state.max_dist(),
+            prev_length: state.prev_length,
+            match_start: state.match_start,
+            max_chain_length: state.max_chain_length,
+            good_match: state.good_match,
+            nice_match: state.nice_match,
+            level: state.level,
+            hash_calc_variant: state.hash_calc_variant,
+            kind,
+        }
+    }
+
+    pub(crate) fn execute(self) -> MatchSearchResult {
+        longest_match_help(self)
+    }
+
+    #[inline(always)]
+    fn update_hash(self, hash: u32, value: u32) -> u32 {
+        match self.hash_calc_variant {
+            HashCalcVariant::Standard => StandardHashCalc::update_hash(hash, value),
+            HashCalcVariant::Roll => RollHashCalc::update_hash(hash, value),
+        }
+    }
+
+    fn is_slow(self) -> bool {
+        self.kind == MatchSearchKind::Slow
+    }
+}
+
+fn longest_match_help(request: MatchSearchRequest<'_>) -> MatchSearchResult {
+    let scan = &request.initialized[request.strstart..];
+    let limit_base = request.strstart.saturating_sub(request.max_dist);
+
+    let mut best_len = if request.prev_length > 0 {
+        usize::from(request.prev_length)
     } else {
         STD_MIN_MATCH - 1
     };
-    let mut match_start = state.match_start;
+    let mut match_start = request.match_start;
 
     // A previous lazy match can be longer than the input remaining at end of
     // stream. There is then no candidate that can improve it.
-    if best_len >= lookahead {
-        return (lookahead, match_start);
+    if best_len >= request.lookahead {
+        return MatchSearchResult {
+            length: request.lookahead,
+            start: match_start,
+        };
     }
 
-    let mut chain_remaining = state.max_chain_length;
-    if best_len >= usize::from(state.good_match) {
+    let mut chain_remaining = request.max_chain_length;
+    if best_len >= usize::from(request.good_match) {
         chain_remaining >>= 2;
     }
     if chain_remaining == 0 {
-        return break_matching(state, best_len, match_start);
+        return break_matching(request, best_len, match_start);
     }
 
     let mut cursor = SearchCursor {
-        hash_pos: cur_match,
+        hash_pos: request.cur_match,
         offset: 0,
     };
 
-    if SLOW && best_len >= STD_MIN_MATCH {
-        let Some(next) = initial_slow_cursor(state, scan, best_len, cursor, limit_base) else {
-            return break_matching(state, best_len, match_start);
+    if request.is_slow() && best_len >= STD_MIN_MATCH {
+        let Some(next) = initial_slow_cursor(request, scan, best_len, cursor, limit_base) else {
+            return break_matching(request, best_len, match_start);
         };
         cursor = next;
     }
 
-    let early_exit = !SLOW && state.level < EARLY_EXIT_TRIGGER_LEVEL;
+    let early_exit = !request.is_slow() && request.level < EARLY_EXIT_TRIGGER_LEVEL;
 
     loop {
         let Some(candidate_start) = cursor.candidate_start() else {
             break;
         };
-        if candidate_start >= strstart {
+        if candidate_start >= request.strstart {
             break;
         }
 
-        let max_len = lookahead.min(STD_MAX_MATCH);
+        let max_len = request.lookahead.min(STD_MAX_MATCH);
         if best_len >= max_len {
             break;
         }
 
-        let candidate = &initialized[candidate_start..candidate_start + max_len];
+        let candidate = &request.initialized[candidate_start..candidate_start + max_len];
         let scan = &scan[..max_len];
 
-        // Reject candidates that provably cannot improve the current best
-        // before doing the full prefix comparison. The probes are entirely
-        // inside initialized input; unlike the old pointer path they never
-        // depend on bytes beyond lookahead.
         if !could_beat_best(scan, candidate, best_len) {
-            let Some(next) = next_in_chain(cursor, prev, wmask, limit_base, &mut chain_remaining)
-            else {
+            let Some(next) = next_in_chain(
+                cursor,
+                request.prev,
+                request.wmask,
+                limit_base,
+                &mut chain_remaining,
+            ) else {
                 break;
             };
             cursor = next;
@@ -113,24 +187,32 @@ fn longest_match_help<const SLOW: bool>(state: &State, cur_match: Pos) -> (usize
         if len > best_len {
             match_start = candidate_start as Pos;
 
-            if len >= lookahead {
-                return (lookahead, match_start);
+            if len >= request.lookahead {
+                return MatchSearchResult {
+                    length: request.lookahead,
+                    start: match_start,
+                };
             }
 
             best_len = len;
-            if best_len >= usize::from(state.nice_match) {
-                return (best_len, match_start);
+            if best_len >= usize::from(request.nice_match) {
+                return MatchSearchResult {
+                    length: best_len,
+                    start: match_start,
+                };
             }
 
-            // The high-compression search can jump into a more distant chain
-            // rooted at an interior substring of the match. Keep that heuristic,
-            // but represent the rebasing explicitly instead of manufacturing
-            // pointers before the window allocation.
-            if SLOW && len > STD_MIN_MATCH && candidate_start + len < strstart {
-                let Some(next) =
-                    next_slow_cursor(state, scan, candidate_start, len, limit_base, wmask)
-                else {
-                    return break_matching(state, best_len, match_start);
+            if request.is_slow() && len > STD_MIN_MATCH && candidate_start + len < request.strstart
+            {
+                let Some(next) = next_slow_cursor(
+                    request,
+                    scan,
+                    candidate_start,
+                    len,
+                    limit_base,
+                    request.wmask,
+                ) else {
+                    return break_matching(request, best_len, match_start);
                 };
                 cursor = next;
                 continue;
@@ -139,18 +221,26 @@ fn longest_match_help<const SLOW: bool>(state: &State, cur_match: Pos) -> (usize
             break;
         }
 
-        let Some(next) = next_in_chain(cursor, prev, wmask, limit_base, &mut chain_remaining)
-        else {
+        let Some(next) = next_in_chain(
+            cursor,
+            request.prev,
+            request.wmask,
+            limit_base,
+            &mut chain_remaining,
+        ) else {
             break;
         };
         cursor = next;
     }
 
-    (best_len, match_start)
+    MatchSearchResult {
+        length: best_len,
+        start: match_start,
+    }
 }
 
 fn initial_slow_cursor(
-    state: &State,
+    request: MatchSearchRequest<'_>,
     scan: &[u8],
     best_len: usize,
     mut cursor: SearchCursor,
@@ -158,15 +248,15 @@ fn initial_slow_cursor(
 ) -> Option<SearchCursor> {
     let probe = scan.get(..best_len + 1)?;
     let mut hash = 0;
-    hash = state.update_hash(hash, u32::from(probe[1]));
-    hash = state.update_hash(hash, u32::from(probe[2]));
+    hash = request.update_hash(hash, u32::from(probe[1]));
+    hash = request.update_hash(hash, u32::from(probe[2]));
 
     // Each update below hashes the next three-byte substring beginning at
     // offsets 1..=best_len-2. Prefer a more distant chain exactly as the old
     // slow matcher did.
     for (index, byte) in probe[3..].iter().enumerate() {
-        hash = state.update_hash(hash, u32::from(*byte));
-        let hash_pos = state.head.as_slice()[hash as usize];
+        hash = request.update_hash(hash, u32::from(*byte));
+        let hash_pos = request.head[hash as usize];
         if hash_pos < cursor.hash_pos {
             cursor = SearchCursor {
                 hash_pos,
@@ -179,14 +269,14 @@ fn initial_slow_cursor(
 }
 
 fn next_slow_cursor(
-    state: &State,
+    request: MatchSearchRequest<'_>,
     scan: &[u8],
     candidate_start: usize,
     match_len: usize,
     limit_base: usize,
     wmask: usize,
 ) -> Option<SearchCursor> {
-    let prev = state.prev.as_slice();
+    let prev = request.prev;
     let mut next = SearchCursor {
         hash_pos: candidate_start as Pos,
         offset: 0,
@@ -208,9 +298,9 @@ fn next_slow_cursor(
     let bytes = scan.get(offset..offset + STD_MIN_MATCH)?;
     let mut hash = 0;
     for byte in bytes {
-        hash = state.update_hash(hash, u32::from(*byte));
+        hash = request.update_hash(hash, u32::from(*byte));
     }
-    let hash_pos = state.head.as_slice()[hash as usize];
+    let hash_pos = request.head[hash as usize];
     if hash_pos < next.hash_pos {
         if usize::from(hash_pos) <= limit_base + offset {
             return None;
@@ -279,13 +369,67 @@ fn common_match_length(scan: &[u8], candidate: &[u8]) -> usize {
         .unwrap_or(scan.len())
 }
 
-fn break_matching(state: &State, best_len: usize, match_start: Pos) -> (usize, Pos) {
-    (best_len.min(state.lookahead), match_start)
+fn break_matching(
+    request: MatchSearchRequest<'_>,
+    best_len: usize,
+    match_start: Pos,
+) -> MatchSearchResult {
+    MatchSearchResult {
+        length: best_len.min(request.lookahead),
+        start: match_start,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_are_worker_safe_and_batchable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MatchSearchRequest<'static>>();
+
+        let initialized_a = [b'a'; 32];
+        let mut initialized_b = [b'b'; 32];
+        initialized_b[13] = b'c';
+        let prev = [0u16; 32];
+        let head = [0u16; 1];
+
+        fn request<'a>(
+            initialized: &'a [u8],
+            prev: &'a [Pos],
+            head: &'a [Pos],
+        ) -> MatchSearchRequest<'a> {
+            MatchSearchRequest {
+                initialized,
+                prev,
+                head,
+                cur_match: 0,
+                strstart: 16,
+                lookahead: 16,
+                wmask: 31,
+                max_dist: 16,
+                prev_length: 0,
+                match_start: 0,
+                max_chain_length: 1,
+                good_match: 4,
+                nice_match: 16,
+                level: 6,
+                hash_calc_variant: HashCalcVariant::Standard,
+                kind: MatchSearchKind::Standard,
+            }
+        }
+
+        let requests = [
+            request(&initialized_a, &prev, &head),
+            request(&initialized_b, &prev, &head),
+        ];
+        // Independent requests can coexist and be executed after collection without borrowing
+        // mutable compressor state. A later scheduler/backend can batch this exact shape.
+        let expected = requests.map(MatchSearchRequest::execute);
+        let collected = requests.map(MatchSearchRequest::execute);
+        assert_eq!(collected, expected);
+    }
 
     #[test]
     fn common_match_length_finds_every_mismatch_position() {

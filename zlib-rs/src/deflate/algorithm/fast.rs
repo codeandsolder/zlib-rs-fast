@@ -2,6 +2,7 @@
 
 use super::{BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
+use crate::deflate::longest_match::{MatchSearchKind, MatchSearchRequest};
 use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 pub(super) struct FastProducer;
@@ -23,8 +24,11 @@ impl TokenProducer for FastProducer {
                 let distance = state.strstart as isize - hash_head as isize;
 
                 if (1..=state.max_dist() as isize).contains(&distance) && hash_head != 0 {
-                    let (mut match_len, match_start) =
-                        crate::deflate::longest_match::longest_match(state, hash_head);
+                    let result =
+                        MatchSearchRequest::from_state(state, hash_head, MatchSearchKind::Standard)
+                            .execute();
+                    let mut match_len = result.length;
+                    let match_start = result.start;
                     state.match_start = match_start;
                     if match_len >= WANT_MIN_MATCH {
                         let block_ready = state.tally_dist(

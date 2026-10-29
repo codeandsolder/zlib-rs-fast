@@ -2,6 +2,7 @@
 
 use super::{BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
+use crate::deflate::longest_match::{MatchSearchKind, MatchSearchRequest};
 use crate::deflate::{MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 type Match = MatchCandidate;
@@ -55,11 +56,12 @@ impl TokenProducer for MediumProducer {
 
                 let dist = state.strstart as i64 - hash_head as i64;
                 if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
-                    let (match_length, match_start) =
-                        crate::deflate::longest_match::longest_match(state, hash_head);
-                    state.match_start = match_start;
-                    self.current_match.match_length = match_length as u16;
-                    self.current_match.match_start = match_start;
+                    let result =
+                        MatchSearchRequest::from_state(state, hash_head, MatchSearchKind::Standard)
+                            .execute();
+                    state.match_start = result.start;
+                    self.current_match.match_length = result.length as u16;
+                    self.current_match.match_start = result.start;
                     if usize::from(self.current_match.match_length) < WANT_MIN_MATCH
                         || self.current_match.match_start >= self.current_match.strstart
                     {
@@ -93,11 +95,12 @@ impl TokenProducer for MediumProducer {
 
                 let dist = state.strstart as i64 - hash_head as i64;
                 if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
-                    let (match_length, match_start) =
-                        crate::deflate::longest_match::longest_match(state, hash_head);
-                    state.match_start = match_start;
-                    self.next_match.match_length = match_length as u16;
-                    self.next_match.match_start = match_start;
+                    let result =
+                        MatchSearchRequest::from_state(state, hash_head, MatchSearchKind::Standard)
+                            .execute();
+                    state.match_start = result.start;
+                    self.next_match.match_length = result.length as u16;
+                    self.next_match.match_start = result.start;
 
                     if self.next_match.match_start >= self.next_match.strstart {
                         self.next_match.match_length = 1;
