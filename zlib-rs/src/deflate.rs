@@ -479,6 +479,7 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         lookahead: 0,
         ins_h: 0,
         max_chain_length: 0,
+        max_insert_length: 0,
         max_lazy_match: 0,
         good_match: 0,
         nice_match: 0,
@@ -760,6 +761,7 @@ pub fn copy<'a>(
         match_start: source_state.match_start,
         prev_length: source_state.prev_length,
         max_chain_length: source_state.max_chain_length,
+        max_insert_length: source_state.max_insert_length,
         max_lazy_match: source_state.max_lazy_match,
         block_start: source_state.block_start,
         block_open: source_state.block_open,
@@ -889,6 +891,7 @@ fn lm_init(state: &mut State) {
 
 fn lm_set_level(state: &mut State, level: i8) {
     let config = level_config(level);
+    state.max_insert_length = config.max_lazy;
     state.max_lazy_match = config.max_lazy;
     state.good_match = config.good_length;
     state.nice_match = config.nice_length;
@@ -906,6 +909,9 @@ pub fn tune(
     max_chain: usize,
 ) -> ReturnCode {
     stream.state.good_match = good_length as u16;
+    // zlib exposes one tuning knob for both historical uses of max_lazy. Keep the
+    // public contract while representing the two internal concepts independently.
+    stream.state.max_insert_length = max_lazy as u16;
     stream.state.max_lazy_match = max_lazy as u16;
     stream.state.nice_match = nice_length as u16;
     stream.state.max_chain_length = max_chain as u16;
@@ -1378,16 +1384,9 @@ pub(crate) struct State<'a> {
     /// A higher limit improves compression ratio but degrades the speed.
     pub(crate) max_chain_length: u16,
 
-    // TODO untangle this mess! zlib uses the same field differently based on compression level
-    // we should just have 2 fields for clarity!
-    //
-    // Insert new strings in the hash table only if the match length is not
-    // greater than this length. This saves time but degrades compression.
-    // max_insert_length is used only for compression levels <= 6.
-    // define max_insert_length  max_lazy_match
-    /// Attempt to find a better match only when the current match is strictly smaller
-    /// than this value. This mechanism is used only for compression levels >= 4.
-    pub(crate) max_lazy_match: u16,
+    /// Insert new strings in the hash table only when the current match is no longer than this.
+    /// This saves work at lower compression levels at the cost of some compression ratio.
+    pub(crate) max_insert_length: u16,
 
     /// number of string matches in current block
     /// NOTE: this is a saturating 8-bit counter, to help keep the struct compact. The code that
@@ -1439,6 +1438,11 @@ pub(crate) struct State<'a> {
 
     ///  hash index of string to be inserted
     pub(crate) ins_h: u32,
+
+    /// Attempt to find a better lazy match only while the current match is shorter than this.
+    /// Slow compression uses this less frequently than the hot insertion limit above, so keep it
+    /// in the colder state line rather than perturbing the hand-packed match-search cache line.
+    pub(crate) max_lazy_match: u16,
 
     gzhead: Option<&'a mut gz_header>,
     gzindex: usize,
@@ -1506,12 +1510,6 @@ impl<'a> State<'a> {
 
     pub(crate) fn max_dist(&self) -> usize {
         self.w_size - MIN_LOOKAHEAD
-    }
-
-    // TODO untangle this mess! zlib uses the same field differently based on compression level
-    // we should just have 2 fields for clarity!
-    pub(crate) fn max_insert_length(&self) -> usize {
-        self.max_lazy_match as usize
     }
 
     /// Total size of the pending buf. But because `pending` shares memory with `sym_buf`, this is

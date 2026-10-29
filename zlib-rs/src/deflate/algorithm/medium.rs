@@ -227,7 +227,7 @@ fn insert_match(state: &mut State, mut m: Match) {
 
     // Insert new strings in the hash table only if the match length
     // is not too large. This saves time but degrades compression.
-    if usize::from(m.match_length) <= 16 * state.max_insert_length()
+    if usize::from(m.match_length) <= 16 * usize::from(state.max_insert_length)
         && state.lookahead >= WANT_MIN_MATCH
     {
         m.match_length -= 1; /* string at strstart already in table */

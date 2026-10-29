@@ -57,7 +57,9 @@ pub fn deflate_fast(stream: &mut Compressor, flush: DeflateFlush) -> BlockState 
                     /* Insert new strings in the hash table only if the match length
                      * is not too large. This saves time but degrades compression.
                      */
-                    if match_len <= state.max_insert_length() && state.lookahead >= WANT_MIN_MATCH {
+                    if match_len <= usize::from(state.max_insert_length)
+                        && state.lookahead >= WANT_MIN_MATCH
+                    {
                         match_len -= 1; /* string at strstart already in table */
                         state.strstart += 1;
 
