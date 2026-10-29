@@ -3994,7 +3994,7 @@ mod test {
         }
 
         /// Perform exactly one production scheduler turn using the same driver as the zlib path.
-        fn step(&mut self) {
+        fn step(&mut self) -> Option<crate::deflate::longest_match::MatchSearchWork> {
             assert!(!self.done);
             let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
 
@@ -4004,7 +4004,7 @@ mod test {
             if let Some(result) = self.pending_match_result.take() {
                 self.driver.complete_match_search(stream.state, result);
                 self.match_result_turns += 1;
-                return;
+                return None;
             }
 
             let mut chunk = [0u8; Self::OUTPUT_CHUNK];
@@ -4036,8 +4036,8 @@ mod test {
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
                 algorithm::StandardTurnOutcome::MatchSearch(work) => {
-                    self.pending_match_result = Some(work.request(stream.state).execute());
                     self.match_search_turns += 1;
+                    return Some(work);
                 }
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("Final mode with all input supplied unexpectedly requested more input")
@@ -4052,6 +4052,15 @@ mod test {
                     algorithm::EndBlockKind::FlushBoundary,
                 ) => panic!("final batch job ended as a non-final flush boundary"),
             }
+            None
+        }
+
+        fn match_request(
+            &self,
+            work: crate::deflate::longest_match::MatchSearchWork,
+        ) -> crate::deflate::longest_match::MatchSearchRequest<'_> {
+            let stream = unsafe { DeflateStream::from_stream_ref(&self.raw) }.unwrap();
+            work.request(stream.state)
         }
 
         fn into_output(mut self) -> Vec<u8> {
@@ -4118,18 +4127,55 @@ mod test {
         }
 
         let mut scheduler_turns = 0usize;
+        let mut match_batch_count = 0usize;
+        let mut max_match_batch = 0usize;
         while jobs.iter().any(|job| !job.done) {
-            for job in &mut jobs {
+            let mut match_work = Vec::new();
+            for (index, job) in jobs.iter_mut().enumerate() {
                 if !job.done {
-                    job.step();
+                    if let Some(work) = job.step() {
+                        match_work.push((index, work));
+                    }
                     scheduler_turns += 1;
                 }
             }
+
+            if !match_work.is_empty() {
+                let requests = match_work
+                    .iter()
+                    .map(|(index, work)| jobs[*index].match_request(*work))
+                    .collect::<Vec<_>>();
+                let mut results = vec![
+                    crate::deflate::longest_match::MatchSearchResult {
+                        length: 0,
+                        start: 0,
+                    };
+                    requests.len()
+                ];
+                crate::deflate::longest_match::execute_match_search_batch(&requests, &mut results);
+                drop(requests);
+
+                match_batch_count += 1;
+                max_match_batch = max_match_batch.max(results.len());
+                for ((index, _), result) in match_work.into_iter().zip(results) {
+                    assert!(jobs[index].pending_match_result.replace(result).is_none());
+                }
+            }
+
             assert!(
                 scheduler_turns < 100_000,
                 "round-robin scheduler failed to make progress"
             );
         }
+
+        assert!(
+            match_batch_count > 0,
+            "scheduler must dispatch match-search batches"
+        );
+        assert!(
+            max_match_batch >= 2,
+            "scheduler regression must batch match searches from multiple paused streams"
+        );
 
         assert!(
             jobs[0].match_search_turns > 0,

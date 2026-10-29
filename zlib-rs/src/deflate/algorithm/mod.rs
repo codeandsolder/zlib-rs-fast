@@ -1,7 +1,7 @@
 use crate::{
     deflate::{
         drain_pending_output, fill_window_core,
-        longest_match::{MatchSearchResult, MatchSearchWork},
+        longest_match::{execute_match_search_batch, MatchSearchResult, MatchSearchWork},
         with_compressor, BlockState, Compressor, DeflateStream, DrainOutcome, InputCursor, State,
         Strategy, MIN_LOOKAHEAD,
     },
@@ -690,8 +690,13 @@ pub(super) fn drive_standard(
         match driver.step(state, input, output, mode) {
             StandardTurnOutcome::Progress => {}
             StandardTurnOutcome::MatchSearch(work) => {
-                let result = work.request(state).execute();
-                driver.complete_match_search(state, result);
+                let request = work.request(state);
+                let mut results = [MatchSearchResult {
+                    length: 0,
+                    start: 0,
+                }];
+                execute_match_search_batch(core::slice::from_ref(&request), &mut results);
+                driver.complete_match_search(state, results[0]);
             }
             StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
             StandardTurnOutcome::NeedMoreOutput { final_block: true } => {

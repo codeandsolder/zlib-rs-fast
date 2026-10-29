@@ -113,8 +113,8 @@ impl<'a> MatchSearchRequest<'a> {
         }
     }
 
-    pub(crate) fn execute(self) -> MatchSearchResult {
-        longest_match_help(&self)
+    pub(crate) fn execute(&self) -> MatchSearchResult {
+        longest_match_help(self)
     }
 
     #[inline(always)]
@@ -127,6 +127,24 @@ impl<'a> MatchSearchRequest<'a> {
 
     fn is_slow(&self) -> bool {
         self.kind == MatchSearchKind::Slow
+    }
+}
+
+/// Execute a batch of independent immutable longest-match searches in request order.
+///
+/// This scalar implementation is intentionally allocation-free. Future worker/device backends can
+/// replace the loop behind the same request/result shape once dispatch overhead is justified.
+pub(crate) fn execute_match_search_batch(
+    requests: &[MatchSearchRequest<'_>],
+    results: &mut [MatchSearchResult],
+) {
+    assert_eq!(
+        requests.len(),
+        results.len(),
+        "match-search batch result count must equal request count"
+    );
+    for (request, result) in requests.iter().zip(results) {
+        *result = request.execute();
     }
 }
 
@@ -444,9 +462,13 @@ mod tests {
             request(&initialized_a, &prev, &head),
             request(&initialized_b, &prev, &head),
         ];
-        // Independent requests can coexist and be executed after collection without borrowing
-        // mutable compressor state. A later scheduler/backend can batch this exact shape.
-        let results = requests.map(MatchSearchRequest::execute);
+        // Independent requests can coexist and execute as one batch without borrowing mutable
+        // compressor state.
+        let mut results = [MatchSearchResult {
+            length: 0,
+            start: 0,
+        }; 2];
+        execute_match_search_batch(&requests, &mut results);
         assert_eq!(
             results[0],
             MatchSearchResult {
