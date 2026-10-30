@@ -385,6 +385,141 @@ pub(crate) enum InflateStateKind {
     Back,
 }
 
+/// Writable caller-owned gzip-header destination bound by `get_header`.
+///
+/// This deliberately stores only a raw handle rather than a long-lived `&mut gz_header`:
+/// `inflateCopy()` shallow-copies the destination exactly like zlib. Each parser operation creates
+/// only the short mutable access it needs, and all nested extra/name/comment pointer writes are
+/// confined here.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct GzipHeaderOutput(NonNull<gz_header>);
+
+impl GzipHeaderOutput {
+    /// # Safety
+    ///
+    /// `head` and its non-null nested output buffers must satisfy the complete contract documented
+    /// on `get_header` for as long as any stream (including `inflateCopy` clones) may populate it.
+    unsafe fn new(head: &mut gz_header) -> Self {
+        Self(NonNull::from(head))
+    }
+
+    fn with_header_mut<R>(&mut self, f: impl FnOnce(&mut gz_header) -> R) -> R {
+        // SAFETY: established by `new`. The callback shape keeps the mutable reference scoped to
+        // this operation even though the raw handle itself is intentionally copyable for
+        // `inflateCopy` compatibility.
+        f(unsafe { self.0.as_mut() })
+    }
+
+    fn set_done(&mut self, done: i32) {
+        self.with_header_mut(|head| head.done = done);
+    }
+
+    fn set_text(&mut self, text: i32) {
+        self.with_header_mut(|head| head.text = text);
+    }
+
+    fn set_time(&mut self, time: z_size) {
+        self.with_header_mut(|head| head.time = time);
+    }
+
+    fn set_os(&mut self, xflags: i32, os: i32) {
+        self.with_header_mut(|head| {
+            head.xflags = xflags;
+            head.os = os;
+        });
+    }
+
+    fn set_extra_len(&mut self, len: usize) {
+        self.with_header_mut(|head| head.extra_len = len as u32);
+    }
+
+    fn clear_extra(&mut self) {
+        self.with_header_mut(|head| head.extra = core::ptr::null_mut());
+    }
+
+    fn clear_name(&mut self) {
+        self.with_header_mut(|head| head.name = core::ptr::null_mut());
+    }
+
+    fn clear_comment(&mut self) {
+        self.with_header_mut(|head| head.comment = core::ptr::null_mut());
+    }
+
+    fn finish(&mut self, hcrc: i32) {
+        self.with_header_mut(|head| {
+            head.hcrc = hcrc;
+            head.done = 1;
+        });
+    }
+
+    fn write_extra(&mut self, remaining_before: usize, bytes: &[u8]) {
+        self.with_header_mut(|head| {
+            if head.extra.is_null() {
+                return;
+            }
+
+            let written = (head.extra_len as usize)
+                .checked_sub(remaining_before)
+                .expect("extra-field progress stays within declared length");
+            let capacity = head.extra_max as usize;
+            let count = Ord::min(bytes.len(), capacity.saturating_sub(written));
+            if count == 0 {
+                return;
+            }
+            let offset = Ord::min(written, capacity);
+
+            // SAFETY: `get_header` requires `extra` to be writable for `extra_max` bytes. `offset`
+            // and `count` are bounded to that capacity and `bytes` is readable for `count` bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.extra.add(offset), count)
+            };
+        });
+    }
+
+    fn write_name(&mut self, offset: usize, bytes: &[u8]) -> usize {
+        self.with_header_mut(|head| {
+            if head.name.is_null() {
+                return 0;
+            }
+
+            let remaining = (head.name_max as usize)
+                .checked_sub(offset)
+                .expect("name output offset stays within capacity");
+            let count = Ord::min(bytes.len(), remaining);
+            if count != 0 {
+                // SAFETY: `get_header` requires `name` writable for `name_max` bytes, and the
+                // checked offset plus bounded count stays within that allocation.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.name.add(offset), count)
+                };
+            }
+            count
+        })
+    }
+
+    fn write_comment(&mut self, offset: usize, bytes: &[u8]) -> usize {
+        self.with_header_mut(|head| {
+            if head.comment.is_null() {
+                return 0;
+            }
+
+            let remaining = (head.comm_max as usize)
+                .checked_sub(offset)
+                .expect("comment output offset stays within capacity");
+            let count = Ord::min(bytes.len(), remaining);
+            if count != 0 {
+                // SAFETY: `get_header` requires `comment` writable for `comm_max` bytes, and the
+                // checked offset plus bounded count stays within that allocation.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.comment.add(offset), count)
+                };
+            }
+            count
+        })
+    }
+}
+
 #[repr(C, align(64))]
 pub(crate) struct State<'a> {
     kind: InflateStateKind,
@@ -445,8 +580,8 @@ pub(crate) struct State<'a> {
     error_message: Option<&'static str>,
 
     /// Caller-owned gzip-header destination. zlib permits `inflateCopy()` to duplicate this
-    /// pointer, so it must not be represented as a long-lived Rust `&mut` reference.
-    head: Option<NonNull<gz_header>>,
+    /// handle, so it must not be represented as a long-lived Rust `&mut` reference.
+    head: Option<GzipHeaderOutput>,
     dmax: usize,
 
     /// table for length/literal codes
@@ -1094,9 +1229,7 @@ impl State<'_> {
                         }
 
                         if let Some(mut header) = self.head {
-                            // SAFETY: `get_header` requires this caller-owned destination to remain
-                            // valid and exclusively writable while inflate may populate it.
-                            unsafe { header.as_mut() }.done = -1;
+                            header.set_done(-1);
                         }
 
                         // check if zlib header is allowed
@@ -1154,9 +1287,7 @@ impl State<'_> {
                         }
 
                         if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.text = ((bit_reader.hold() >> 8) & 1) as i32;
+                            head.set_text(((bit_reader.hold() >> 8) & 1) as i32);
                         }
 
                         if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
@@ -1172,9 +1303,7 @@ impl State<'_> {
                     Mode::Time => {
                         need_bits_for_mode(bit_reader, 32, mode)?;
                         if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.time = bit_reader.hold() as z_size;
+                            head.set_time(bit_reader.hold() as z_size);
                         }
 
                         if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
@@ -1189,10 +1318,10 @@ impl State<'_> {
                     Mode::Os => {
                         need_bits_for_mode(bit_reader, 16, mode)?;
                         if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.xflags = (bit_reader.hold() & 0xff) as i32;
-                            head.os = (bit_reader.hold() >> 8) as i32;
+                            head.set_os(
+                                (bit_reader.hold() & 0xff) as i32,
+                                (bit_reader.hold() >> 8) as i32,
+                            );
                         }
 
                         if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
@@ -1211,9 +1340,7 @@ impl State<'_> {
                             // self.length (and head.extra_len) represent the length of the extra field
                             self.length = bit_reader.hold() as usize;
                             if let Some(mut head) = self.head {
-                                // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                                let head = unsafe { head.as_mut() };
-                                head.extra_len = self.length as u32;
+                                head.set_extra_len(self.length);
                             }
 
                             if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
@@ -1222,9 +1349,7 @@ impl State<'_> {
                             }
                             bit_reader.init_bits();
                         } else if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.extra = core::ptr::null_mut();
+                            head.clear_extra();
                         }
 
                         break 'blk Mode::Extra;
@@ -1237,40 +1362,10 @@ impl State<'_> {
 
                             if extra_available > 0 {
                                 if let Some(mut head) = self.head {
-                                    // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                                    let head = unsafe { head.as_mut() };
-                                    if !head.extra.is_null() {
-                                        // at `head.extra`, the caller has reserved `head.extra_max` bytes.
-                                        // in the deflated byte stream, we've found a gzip header with
-                                        // `head.extra_len` bytes of data. We must be careful because
-                                        // `head.extra_len` may be larger than `head.extra_max`.
-
-                                        // how many bytes we've already written into `head.extra`
-                                        let written_so_far = head.extra_len as usize - self.length;
-
-                                        // min of number of bytes available at dst and at src
-                                        let count = Ord::min(
-                                            (head.extra_max as usize)
-                                                .saturating_sub(written_so_far),
-                                            extra_available,
-                                        );
-
-                                        // SAFETY: location where we'll write: this saturates at the
-                                        // `head.extra.add(head.extra.max)` to prevent UB
-                                        let next_write_offset =
-                                            Ord::min(written_so_far, head.extra_max as usize);
-
-                                        unsafe {
-                                            // SAFETY: count is effectively bounded by head.extra_max
-                                            // and bit_reader.bytes_remaining(), so the count won't
-                                            // go out of bounds.
-                                            core::ptr::copy_nonoverlapping(
-                                                bit_reader.as_slice().as_ptr(),
-                                                head.extra.add(next_write_offset),
-                                                count,
-                                            );
-                                        }
-                                    }
+                                    head.write_extra(
+                                        self.length,
+                                        &bit_reader.as_slice()[..extra_available],
+                                    );
                                 }
 
                                 // Checksum
@@ -1312,26 +1407,7 @@ impl State<'_> {
 
                             // if the header has space, store as much as possible in there
                             if let Some(mut head) = self.head {
-                                // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                                let head = unsafe { head.as_mut() };
-                                if !head.name.is_null() {
-                                    let remaining_name_bytes = (head.name_max as usize)
-                                        .checked_sub(self.length)
-                                        .expect("name out of bounds");
-                                    let copy = Ord::min(name_slice.len(), remaining_name_bytes);
-
-                                    unsafe {
-                                        // SAFETY: copy is effectively bound by the name length and
-                                        // head.name_max, so this won't go out of bounds.
-                                        core::ptr::copy_nonoverlapping(
-                                            name_slice.as_ptr(),
-                                            head.name.add(self.length),
-                                            copy,
-                                        )
-                                    };
-
-                                    self.length += copy;
-                                }
+                                self.length += head.write_name(self.length, name_slice);
                             }
 
                             if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
@@ -1345,9 +1421,7 @@ impl State<'_> {
                                 break 'label ReturnCode::Ok;
                             }
                         } else if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.name = core::ptr::null_mut();
+                            head.clear_name();
                         }
 
                         self.length = 0;
@@ -1373,26 +1447,7 @@ impl State<'_> {
 
                             // if the header has space, store as much as possible in there
                             if let Some(mut head) = self.head {
-                                // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                                let head = unsafe { head.as_mut() };
-                                if !head.comment.is_null() {
-                                    let remaining_comm_bytes = (head.comm_max as usize)
-                                        .checked_sub(self.length)
-                                        .expect("comm out of bounds");
-                                    let copy = Ord::min(comment_slice.len(), remaining_comm_bytes);
-
-                                    unsafe {
-                                        // SAFETY: copy is effectively bound by the comment length and
-                                        // head.comm_max, so this won't go out of bounds.
-                                        core::ptr::copy_nonoverlapping(
-                                            comment_slice.as_ptr(),
-                                            head.comment.add(self.length),
-                                            copy,
-                                        )
-                                    };
-
-                                    self.length += copy;
-                                }
+                                self.length += head.write_comment(self.length, comment_slice);
                             }
 
                             if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
@@ -1406,9 +1461,7 @@ impl State<'_> {
                                 break 'label ReturnCode::Ok;
                             }
                         } else if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.comment = core::ptr::null_mut();
+                            head.clear_comment();
                         }
 
                         break 'blk Mode::HCrc;
@@ -1428,10 +1481,7 @@ impl State<'_> {
                         }
 
                         if let Some(mut head) = self.head {
-                            // SAFETY: see `get_header`; this borrow is limited to this parser stage.
-                            let head = unsafe { head.as_mut() };
-                            head.hcrc = (self.gzip_flags >> 9) & 1;
-                            head.done = 1;
+                            head.finish((self.gzip_flags >> 9) & 1);
                         }
 
                         // compute crc32 checksum if not in raw mode
@@ -2832,8 +2882,10 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
 ///
 /// The caller must guarantee:
 ///
-/// * If `head` is `Some`, the header remains valid and exclusively writable while this stream may
-///   still populate it; the caller must not access it concurrently with such an inflate operation.
+/// * If `head` is `Some`, the header remains valid and exclusively writable while this stream or
+///   any `inflateCopy` clone may still populate it. The caller must not access the destination
+///   concurrently with such an inflate operation, and copied streams sharing it must not inflate
+///   concurrently with each other.
 ///     - If `head.extra` is not NULL, it must be writable for at least `head.extra_max` bytes
 ///     - if `head.name` is not NULL, it must be writable for at least `head.name_max` bytes
 ///     - if `head.comment` is not NULL, it must be writable for at least `head.comm_max` bytes
@@ -2847,7 +2899,8 @@ pub unsafe fn get_header(
 
     stream.state.head = head.map(|head| {
         head.done = 0;
-        NonNull::from(head)
+        // SAFETY: this function's contract establishes the header and nested-buffer invariants.
+        unsafe { GzipHeaderOutput::new(head) }
     });
     ReturnCode::Ok
 }
