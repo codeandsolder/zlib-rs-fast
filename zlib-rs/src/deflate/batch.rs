@@ -70,6 +70,61 @@ pub fn compress_slices_batch(
     compress_slices_batch_with_backend(jobs, config, BatchMatchSearchBackend::Scalar)
 }
 
+/// Compress independent buffers concurrently on Rayon's persistent global worker pool.
+///
+/// This is the CPU-oriented batch path. Unlike the fine-grained match-search scheduler, each worker
+/// drives complete compression jobs, preserving per-stream cache locality and making every scheduled
+/// unit large enough to amortize pool dispatch. Output bytes and return codes match independent
+/// [`super::compress_slice`] calls job-for-job.
+///
+/// The function is available only with the optional `parallel` feature. It uses Rayon's global pool
+/// and does not create threads per compression job or per match search. Applications that need to
+/// configure that pool can do so before its first use.
+#[cfg(feature = "parallel")]
+pub fn compress_slices_batch_parallel(
+    jobs: &mut [BatchCompressJob<'_>],
+    config: DeflateConfig,
+) -> Vec<BatchCompressResult> {
+    let mut results = vec![
+        BatchCompressResult {
+            written: 0,
+            code: ReturnCode::StreamError,
+        };
+        jobs.len()
+    ];
+    if jobs.is_empty() {
+        return results;
+    }
+    if jobs.len() == 1 {
+        return compress_synchronously(jobs, config);
+    }
+
+    let workers = rayon_core::current_num_threads().max(1).min(jobs.len());
+    if workers == 1 {
+        return compress_synchronously(jobs, config);
+    }
+
+    let chunk_len = jobs.len().div_ceil(workers);
+    rayon_core::scope(|scope| {
+        for (job_chunk, result_chunk) in jobs
+            .chunks_mut(chunk_len)
+            .zip(results.chunks_mut(chunk_len))
+        {
+            scope.spawn(move |_| {
+                for (job, result) in job_chunk.iter_mut().zip(result_chunk) {
+                    let (output, code) = compress_slice(&mut *job.output, job.input, config);
+                    *result = BatchCompressResult {
+                        written: output.len(),
+                        code,
+                    };
+                }
+            });
+        }
+    });
+
+    results
+}
+
 /// Variant of [`compress_slices_batch`] with an explicit match-search executor.
 pub fn compress_slices_batch_with_backend(
     jobs: &mut [BatchCompressJob<'_>],
@@ -594,6 +649,72 @@ mod tests {
                     &threaded_outputs[index][..result.written],
                     &scalar_outputs[index][..result.written],
                     "scoped-thread backend changed job {index} with workers={workers}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_streams_match_independent_compression() {
+        let inputs = [
+            b"parallel-alpha/".repeat(8_000),
+            (0..180_000)
+                .map(|i| ((i * 73 + i / 19) % 251) as u8)
+                .collect(),
+            b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".repeat(5_000),
+            Vec::new(),
+        ];
+        let configs = [
+            DeflateConfig::new(0),
+            DeflateConfig::new(1),
+            DeflateConfig::new(6),
+            DeflateConfig::new(9),
+            DeflateConfig {
+                level: 6,
+                method: Method::Deflated,
+                window_bits: -crate::MAX_WBITS,
+                mem_level: 1,
+                strategy: Strategy::Default,
+            },
+            DeflateConfig {
+                level: 6,
+                method: Method::Deflated,
+                window_bits: 16 + crate::MAX_WBITS,
+                mem_level: 1,
+                strategy: Strategy::Default,
+            },
+        ];
+
+        for config in configs {
+            let references = inputs
+                .iter()
+                .map(|input| independent(input, config, compress_bound(input.len()) + 64))
+                .collect::<Vec<_>>();
+            let mut outputs = inputs
+                .iter()
+                .map(|input| vec![0u8; compress_bound(input.len()) + 64])
+                .collect::<Vec<_>>();
+            let mut jobs = inputs
+                .iter()
+                .zip(outputs.iter_mut())
+                .map(|(input, output)| BatchCompressJob::new(input, output))
+                .collect::<Vec<_>>();
+
+            let results = compress_slices_batch_parallel(&mut jobs, config);
+            drop(jobs);
+
+            for (index, result) in results.into_iter().enumerate() {
+                let (reference, code) = &references[index];
+                assert_eq!(
+                    result.code, *code,
+                    "code changed for job {index}, {config:?}"
+                );
+                assert_eq!(result.written, reference.len());
+                assert_eq!(
+                    &outputs[index][..result.written],
+                    reference,
+                    "parallel output changed for job {index}, {config:?}"
                 );
             }
         }

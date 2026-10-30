@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "parallel")]
+use zlib_rs::compress_slices_batch_parallel;
 use zlib_rs::{
     compress_bound, compress_slice, compress_slices_batch, compress_slices_batch_with_backend,
     BatchCompressJob, BatchMatchSearchBackend, DeflateConfig, ReturnCode,
@@ -37,6 +39,8 @@ enum Mode {
     Independent,
     BatchScalar,
     Threads(usize),
+    #[cfg(feature = "parallel")]
+    ParallelStreams,
 }
 
 impl Mode {
@@ -45,6 +49,8 @@ impl Mode {
             Self::Independent => "independent".into(),
             Self::BatchScalar => "batch-scalar".into(),
             Self::Threads(workers) => format!("threads-{workers}"),
+            #[cfg(feature = "parallel")]
+            Self::ParallelStreams => "parallel-streams".into(),
         }
     }
 }
@@ -52,7 +58,7 @@ impl Mode {
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     let full = args.iter().any(|arg| arg == "--full");
-    let include_threads = full || args.iter().any(|arg| arg == "--threads");
+    let include_threads = args.iter().any(|arg| arg == "--threads");
     let cases = if full { full_cases() } else { quick_cases() };
 
     println!("zlib-rs batch scheduler benchmark");
@@ -185,19 +191,16 @@ fn run_case(case: Case, full: bool, include_threads: bool) {
         total_output as f64 / total_input.max(1) as f64
     );
 
-    let modes = if full {
-        vec![
-            Mode::Independent,
-            Mode::BatchScalar,
-            Mode::Threads(2),
-            Mode::Threads(4),
-            Mode::Threads(8),
-        ]
-    } else if include_threads {
-        vec![Mode::Independent, Mode::BatchScalar, Mode::Threads(4)]
-    } else {
-        vec![Mode::Independent, Mode::BatchScalar]
-    };
+    let mut modes = vec![Mode::Independent, Mode::BatchScalar];
+    if include_threads {
+        if full {
+            modes.extend([Mode::Threads(2), Mode::Threads(4), Mode::Threads(8)]);
+        } else {
+            modes.push(Mode::Threads(4));
+        }
+    }
+    #[cfg(feature = "parallel")]
+    modes.push(Mode::ParallelStreams);
     let mut rows = Vec::new();
     for mode in modes {
         rows.push((
@@ -274,7 +277,7 @@ fn bench_mode(
             black_box(&outputs);
             stats
         }
-        Mode::BatchScalar | Mode::Threads(_) => {
+        _ => {
             let mut jobs = inputs
                 .iter()
                 .zip(outputs.iter_mut())
@@ -288,6 +291,8 @@ fn bench_mode(
                         config,
                         BatchMatchSearchBackend::ScopedThreads { workers },
                     ),
+                    #[cfg(feature = "parallel")]
+                    Mode::ParallelStreams => compress_slices_batch_parallel(&mut jobs, config),
                     Mode::Independent => unreachable!(),
                 };
                 results.into_iter().fold(0usize, |sink, result| {
@@ -316,6 +321,8 @@ fn bench_mode(
                         config,
                         BatchMatchSearchBackend::ScopedThreads { workers },
                     ),
+                    #[cfg(feature = "parallel")]
+                    Mode::ParallelStreams => compress_slices_batch_parallel(&mut jobs, config),
                     Mode::Independent => unreachable!(),
                 };
                 results.into_iter().fold(0usize, |sink, result| {
