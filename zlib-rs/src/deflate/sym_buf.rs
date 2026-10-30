@@ -30,20 +30,15 @@ impl<'a> SymBuf<'a> {
         self.filled == 0
     }
 
-    /// Clears the buffer, resetting the filled region to empty.
-    ///
-    /// The number of initialized bytes is not changed, and the contents of the buffer are not modified.
+    /// Clears the logical token buffer without touching its initialized backing storage.
     #[inline]
     pub fn clear(&mut self) {
-        self.buf.as_mut_slice().fill(0);
         self.filled = 0;
     }
 
     #[inline(always)]
     pub fn push_lit(&mut self, byte: u8) {
-        // NOTE: we rely on the buffer being zeroed here!
-        self.buf.as_mut_slice()[self.filled + 2] = byte;
-
+        self.buf.as_mut_slice()[self.filled..][..3].copy_from_slice(&[0, 0, byte]);
         self.filled += 3;
     }
 
@@ -108,6 +103,21 @@ impl<'a> SymBuf<'a> {
 mod tests {
     use super::*;
     use core::mem::MaybeUninit;
+
+    #[test]
+    fn clear_reuses_storage_without_leaking_stale_distance_into_literals() {
+        const LIT_BUFSIZE: usize = 4;
+        let mut storage = [MaybeUninit::<u8>::uninit(); LIT_BUFSIZE * 3];
+        let mut sym_buf =
+            unsafe { SymBuf::from_raw_parts(storage.as_mut_ptr().cast::<u8>(), LIT_BUFSIZE) };
+
+        sym_buf.push_dist(0x1234, 7);
+        sym_buf.clear();
+        sym_buf.push_lit(0xa5);
+
+        assert_eq!(sym_buf.iter().collect::<Vec<_>>(), vec![(0, 0xa5)]);
+        assert_eq!(&sym_buf.buf.as_slice()[..3], &[0, 0, 0xa5]);
+    }
 
     #[test]
     fn raw_constructor_initializes_symbol_storage() {
