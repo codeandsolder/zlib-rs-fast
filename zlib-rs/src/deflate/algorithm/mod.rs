@@ -473,6 +473,17 @@ impl StandardDriver {
         output: &mut crate::deflate::OutputCursor,
         mode: StandardSegmentMode,
     ) -> StandardTurnOutcome {
+        self.step_inner(state, input, output, mode)
+    }
+
+    #[inline(always)]
+    fn step_inner(
+        &mut self,
+        state: &mut State<'_>,
+        input: &mut InputCursor,
+        output: &mut crate::deflate::OutputCursor,
+        mode: StandardSegmentMode,
+    ) -> StandardTurnOutcome {
         if let Some(pending) = self.pending_drain.take() {
             return match self.core.drain_output(state, output, pending.work) {
                 PendingOutputOutcome::Ready => match pending.after {
@@ -687,7 +698,7 @@ pub(super) fn drive_standard(
     };
 
     loop {
-        match driver.step(state, input, output, mode) {
+        match driver.step_inner(state, input, output, mode) {
             StandardTurnOutcome::Progress => {}
             StandardTurnOutcome::MatchSearch(work) => {
                 let request = work.request(state);

@@ -142,12 +142,29 @@ impl<'a> MatchSearchRequest<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn execute(&self) -> MatchSearchResult {
         match self.params.kind {
-            MatchSearchKind::Standard => longest_match_help::<false>(self.resources, self.params),
-            MatchSearchKind::Slow => longest_match_help::<true>(self.resources, self.params),
+            MatchSearchKind::Standard => execute_standard(self.resources, self.params),
+            MatchSearchKind::Slow => execute_slow(self.resources, self.params),
         }
     }
+}
+
+#[inline(never)]
+fn execute_standard(
+    resources: MatchSearchResources<'_>,
+    params: MatchSearchParams,
+) -> MatchSearchResult {
+    longest_match_help::<false>(resources, params)
+}
+
+#[inline(never)]
+fn execute_slow(
+    resources: MatchSearchResources<'_>,
+    params: MatchSearchParams,
+) -> MatchSearchResult {
+    longest_match_help::<true>(resources, params)
 }
 
 /// Backend contract for executing an ordered batch of independent immutable match searches.
