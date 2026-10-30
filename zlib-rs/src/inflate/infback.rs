@@ -40,7 +40,7 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new(&[]);
+    let mut state = State::new();
 
     // TODO this can change depending on the used/supported SIMD instructions
     state.chunksize = 32;
@@ -456,8 +456,8 @@ pub unsafe fn back(
             }
             Mode::Len => {
                 if (have as usize) >= INFLATE_FAST_MIN_HAVE && left >= INFLATE_FAST_MIN_LEFT {
-                    let mut bit_reader = BitReader::new(&[]);
-                    unsafe { bit_reader.update_slice(next, have as usize) };
+                    let mut bit_reader = BitReader::new();
+                    unsafe { bit_reader.attach_input(next, have as usize) };
                     bit_reader.prime(bits, hold);
 
                     let mut writer = unsafe {
@@ -724,7 +724,7 @@ pub unsafe fn back(
 #[inline(always)]
 unsafe fn inflate_fast_back(
     state: &mut State,
-    bit_reader: &mut BitReader<'_>,
+    bit_reader: &mut BitReader,
     writer: &mut Writer<'_>,
 ) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);

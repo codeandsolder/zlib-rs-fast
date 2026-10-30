@@ -406,7 +406,7 @@ pub(crate) struct State<'a> {
     next: usize, // represented as an index, don't want a self-referential structure here
 
     // Input bit-buffer state persists across calls (e.g. inflatePrime). Output is call-local.
-    bit_reader: BitReader<'a>,
+    bit_reader: BitReader,
 
     total: usize,
 
@@ -459,7 +459,7 @@ pub(crate) struct State<'a> {
 }
 
 impl<'a> State<'a> {
-    fn new(reader: &'a [u8]) -> Self {
+    fn new() -> Self {
         Self {
             flush: InflateFlush::NoFlush,
 
@@ -478,7 +478,7 @@ impl<'a> State<'a> {
             was: 0,
             chunksize: 0,
 
-            bit_reader: BitReader::new(reader),
+            bit_reader: BitReader::new(),
 
             total: 0,
 
@@ -1964,7 +1964,7 @@ unsafe fn inflate_fast_help(state: &mut State, output: &mut InflateOutput<'_>, s
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
 #[inline(always)]
 unsafe fn inflate_fast_help_impl(state: &mut State, output: &mut InflateOutput<'_>, _start: usize) {
-    let mut bit_reader = BitReader::new(&[]);
+    let mut bit_reader = BitReader::new();
     core::mem::swap(&mut bit_reader, &mut state.bit_reader);
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
@@ -2285,7 +2285,7 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new(&[]);
+    let mut state = State::new();
 
     // TODO this can change depending on the used/supported SIMD instructions
     state.chunksize = 32;
@@ -2394,7 +2394,7 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
     state.gzip_flags = -1;
     state.dmax = 32768;
     state.head = None;
-    state.bit_reader = BitReader::new(&[]);
+    state.bit_reader = BitReader::new();
 
     state.next = 0;
     state.len_table = Table::default();
@@ -2426,7 +2426,7 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     unsafe {
         state
             .bit_reader
-            .update_slice(stream.next_in, stream.avail_in as usize)
+            .attach_input(stream.next_in, stream.avail_in as usize)
     };
     // Safety: `stream.next_out` is non-null and points to at least `stream.avail_out` bytes.
     let mut output =
@@ -2434,15 +2434,18 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
 
     let err = state.dispatch(&mut output);
 
-    let in_read = state.bit_reader.as_ptr() as usize - stream.next_in as usize;
+    let next_in = state.bit_reader.as_ptr();
+    let avail_in = state.bit_reader.bytes_remaining();
+    let in_read = stream.avail_in as usize - avail_in;
     let out_written = output.written_since_accounted();
 
     stream.total_in += in_read as z_size;
     state.total = state.total.wrapping_add(out_written);
     stream.total_out = state.total as _;
 
-    stream.avail_in = state.bit_reader.bytes_remaining() as u32;
-    stream.next_in = state.bit_reader.as_ptr() as *mut u8;
+    stream.avail_in = avail_in as u32;
+    stream.next_in = next_in as *mut u8;
+    state.bit_reader.detach_input();
 
     stream.avail_out = output.remaining() as u32;
     stream.next_out = output.next_out() as *mut u8;

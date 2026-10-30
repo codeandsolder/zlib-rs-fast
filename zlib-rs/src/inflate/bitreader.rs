@@ -1,43 +1,55 @@
-use core::marker::PhantomData;
+use core::ptr::NonNull;
 
 use crate::ReturnCode;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BitReader<'a> {
+pub(crate) struct BitReader {
     ptr: *const u8,
     end: *const u8,
     bit_buffer: u64,
     bits_used: u8,
-    _marker: PhantomData<&'a [u8]>,
 }
 
-impl<'a> BitReader<'a> {
-    pub fn new(slice: &'a [u8]) -> Self {
-        let range = slice.as_ptr_range();
-
+impl BitReader {
+    /// Construct a reader with no caller input attached.
+    pub fn new() -> Self {
+        let ptr = Self::detached_ptr();
         Self {
-            ptr: range.start,
-            end: range.end,
+            ptr,
+            end: ptr,
             bit_buffer: 0,
             bits_used: 0,
-            _marker: PhantomData,
         }
     }
 
+    #[inline(always)]
+    fn detached_ptr() -> *const u8 {
+        NonNull::<u8>::dangling().as_ptr().cast_const()
+    }
+
+    /// Attach caller input while preserving the persistent bit buffer.
+    ///
     /// # Safety
     ///
-    /// ptr and len must satisfy the requirements of [`core::slice::from_raw_parts`].
+    /// If `len` is non-zero, `ptr` and `len` must satisfy the requirements of
+    /// [`core::slice::from_raw_parts`] for the duration of all reads performed before
+    /// [`Self::detach_input`]. A zero-length input may use a null pointer, as zlib permits.
     #[inline(always)]
-    pub unsafe fn update_slice(&mut self, ptr: *const u8, len: usize) {
-        let end = ptr.wrapping_add(len);
+    pub unsafe fn attach_input(&mut self, ptr: *const u8, len: usize) {
+        if len == 0 {
+            self.detach_input();
+        } else {
+            self.ptr = ptr;
+            self.end = ptr.wrapping_add(len);
+        }
+    }
 
-        *self = Self {
-            ptr,
-            end,
-            bit_buffer: self.bit_buffer,
-            bits_used: self.bits_used,
-            _marker: PhantomData,
-        };
+    /// Drop the caller-input cursor while preserving buffered bits across inflate calls.
+    #[inline(always)]
+    pub fn detach_input(&mut self) {
+        let ptr = Self::detached_ptr();
+        self.ptr = ptr;
+        self.end = ptr;
     }
 
     #[inline(always)]
@@ -192,7 +204,7 @@ impl<'a> BitReader<'a> {
 }
 
 #[cfg(feature = "std")]
-impl std::io::Read for BitReader<'_> {
+impl std::io::Read for BitReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         assert_eq!(self.bits_used, 0, "bit buffer not cleared before read");
 
@@ -204,5 +216,34 @@ impl std::io::Read for BitReader<'_> {
 
         self.ptr = unsafe { self.ptr.add(number_of_bytes) };
         Ok(number_of_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BitReader;
+
+    #[test]
+    fn detach_input_preserves_bits_but_not_caller_slice() {
+        let input = [0xabu8, 0xcd];
+        let mut reader = BitReader::new();
+        reader.prime(3, 0b101);
+
+        unsafe { reader.attach_input(input.as_ptr(), input.len()) };
+        assert_eq!(reader.bytes_remaining(), 2);
+        assert_eq!(reader.bits_in_buffer(), 3);
+        assert_eq!(reader.hold() & 0b111, 0b101);
+
+        reader.detach_input();
+
+        assert_eq!(reader.bytes_remaining(), 0);
+        assert!(reader.as_slice().is_empty());
+        assert_eq!(reader.bits_in_buffer(), 3);
+        assert_eq!(reader.hold() & 0b111, 0b101);
+
+        unsafe { reader.attach_input(core::ptr::null(), 0) };
+        assert_eq!(reader.bytes_remaining(), 0);
+        assert!(reader.as_slice().is_empty());
+        assert_eq!(reader.bits_in_buffer(), 3);
     }
 }
