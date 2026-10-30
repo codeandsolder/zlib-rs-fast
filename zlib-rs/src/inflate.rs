@@ -652,6 +652,128 @@ fn pull_byte_for_mode(reader: &mut BitReader<'_>, mode: Mode) -> Result<u8, Disp
         .map_err(|code| DispatchExit { mode, code })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DistanceDecodeError {
+    Input(ReturnCode),
+    InvalidCode,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedDistance {
+    offset: usize,
+    extra: usize,
+    back_bits: usize,
+}
+
+#[inline(always)]
+fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
+    if output.is_full() {
+        return false;
+    }
+    output.push(literal);
+    true
+}
+
+#[inline(always)]
+fn consume_extra_bits(
+    reader: &mut BitReader<'_>,
+    extra: usize,
+    value: &mut usize,
+    back: &mut usize,
+) -> Result<(), ReturnCode> {
+    if extra != 0 {
+        reader.need_bits(extra)?;
+        *value += reader.bits(extra) as usize;
+        reader.drop_bits(extra as u8);
+        *back += extra;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn decode_distance_code(
+    reader: &mut BitReader<'_>,
+    table: &[Code],
+    table_bits: usize,
+) -> Result<DecodedDistance, DistanceDecodeError> {
+    let mut here;
+    loop {
+        here = table[reader.bits(table_bits) as usize];
+        if here.bits <= reader.bits_in_buffer() {
+            break;
+        }
+        reader.pull_byte().map_err(DistanceDecodeError::Input)?;
+    }
+
+    let mut back_bits = 0;
+    if here.op & 0xf0 == 0 {
+        let last = here;
+        loop {
+            let bits = reader.bits((last.bits + last.op) as usize) as usize;
+            here = table[last.val as usize + (bits >> last.bits)];
+            if last.bits + here.bits <= reader.bits_in_buffer() {
+                break;
+            }
+            reader.pull_byte().map_err(DistanceDecodeError::Input)?;
+        }
+        reader.drop_bits(last.bits);
+        back_bits = last.bits as usize;
+    }
+
+    reader.drop_bits(here.bits);
+    if here.op & 64 != 0 {
+        return Err(DistanceDecodeError::InvalidCode);
+    }
+
+    Ok(DecodedDistance {
+        offset: here.val as usize,
+        extra: (here.op & MAX_BITS) as usize,
+        back_bits,
+    })
+}
+
+#[inline(always)]
+fn copy_match_bytes(
+    window: &Window<'_>,
+    sane: bool,
+    offset: usize,
+    length: &mut usize,
+    output: &mut InflateOutput<'_>,
+) -> Result<bool, &'static str> {
+    let left = output.remaining();
+    let output_len = output.len();
+
+    let copied = if offset > output_len {
+        let mut from_end = offset - output_len;
+        if from_end > window.have() {
+            if sane {
+                return Err("invalid distance too far back\0");
+            }
+            panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+        }
+
+        let wnext = window.next();
+        let wsize = window.size();
+        let from = if from_end > wnext {
+            from_end -= wnext;
+            wsize - from_end
+        } else {
+            wnext - from_end
+        };
+
+        let copied = Ord::min(Ord::min(from_end, *length), left);
+        output.extend_from_window(window, from..from + copied);
+        copied
+    } else {
+        let copied = Ord::min(*length, left);
+        output.copy_match(offset, copied);
+        copied
+    };
+
+    *length -= copied;
+    Ok(*length == 0)
+}
+
 impl State<'_> {
     // This logic is split into its own function for two reasons
     //
@@ -660,8 +782,9 @@ impl State<'_> {
     // - The `-Cllvm-args=-enable-dfa-jump-thread` llvm arg is able to optimize this function, but
     //      not the entirity of `dispatch`. We get a massive boost from that pass.
     //
-    // It unfortunately does duplicate the code for some of the states; deduplicating it by having
-    // more of the states call this function is slower.
+    // Resumed substates still enter directly through `dispatch`: routing all of them back through
+    // this function measurably regresses tiny-chunk inflate. Shared inline primitives below this
+    // boundary remove the duplicated decode/copy mechanics without changing that call shape.
     fn len_and_friends(
         &mut self,
         reader: &mut BitReader<'_>,
@@ -798,192 +921,103 @@ impl State<'_> {
                         }
                     }
                     Mode::Lit => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
-                        if output.is_full() {
+                        if !emit_literal(output, self.length as u8) {
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
-                            return LenDecodeOutcome::break_with(mode, bit_reader, ReturnCode::Ok);
+                            return LenDecodeOutcome::break_with(
+                                Mode::Lit,
+                                bit_reader,
+                                ReturnCode::Ok,
+                            );
                         }
-
-                        output.push(self.length as u8);
-
                         break 'top Mode::Len;
                     }
                     Mode::LenExt => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
-                        let extra = self.extra;
-
-                        // get extra bits, if any
-                        if extra != 0 {
-                            match bit_reader.need_bits(extra) {
-                                Err(return_code) => {
-                                    return LenDecodeOutcome::break_with(
-                                        mode,
-                                        bit_reader,
-                                        return_code,
-                                    );
-                                }
-                                Ok(v) => v,
-                            };
-                            self.length += bit_reader.bits(extra) as usize;
-                            bit_reader.drop_bits(extra as u8);
-                            self.back += extra;
+                        if let Err(code) = consume_extra_bits(
+                            &mut bit_reader,
+                            self.extra,
+                            &mut self.length,
+                            &mut self.back,
+                        ) {
+                            return LenDecodeOutcome::break_with(Mode::LenExt, bit_reader, code);
                         }
-
                         traceln!("inflate: length {}", self.length);
-
                         self.was = self.length;
-
                         break 'top Mode::Dist;
                     }
                     Mode::Dist => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
-
-                        // get distance code
-                        let mut here;
-                        loop {
-                            let bits = bit_reader.bits(self.dist_table.bits) as usize;
-                            here = dist_table[bits];
-                            if here.bits <= bit_reader.bits_in_buffer() {
-                                break;
+                        match decode_distance_code(
+                            &mut bit_reader,
+                            dist_table,
+                            self.dist_table.bits,
+                        ) {
+                            Ok(decoded) => {
+                                self.back += decoded.back_bits;
+                                self.offset = decoded.offset;
+                                self.extra = decoded.extra;
+                                break 'top Mode::DistExt;
                             }
-
-                            if let Err(return_code) = bit_reader.pull_byte() {
-                                return LenDecodeOutcome::break_with(mode, bit_reader, return_code);
-                            };
-                        }
-
-                        if here.op & 0xf0 == 0 {
-                            let last = here;
-
-                            loop {
-                                let bits = bit_reader.bits((last.bits + last.op) as usize);
-                                here =
-                                    dist_table[last.val as usize + ((bits as usize) >> last.bits)];
-
-                                if last.bits + here.bits <= bit_reader.bits_in_buffer() {
-                                    break;
-                                }
-
-                                if let Err(return_code) = bit_reader.pull_byte() {
-                                    return LenDecodeOutcome::break_with(
-                                        mode,
-                                        bit_reader,
-                                        return_code,
-                                    );
-                                };
+                            Err(DistanceDecodeError::Input(code)) => {
+                                return LenDecodeOutcome::break_with(Mode::Dist, bit_reader, code);
                             }
-
-                            bit_reader.drop_bits(last.bits);
-                            self.back += last.bits as usize;
+                            Err(DistanceDecodeError::InvalidCode) => {
+                                self.error_message = Some("invalid distance code\0");
+                                return LenDecodeOutcome::break_with(
+                                    Mode::Bad,
+                                    bit_reader,
+                                    ReturnCode::DataError,
+                                );
+                            }
                         }
-
-                        bit_reader.drop_bits(here.bits);
-
-                        if here.op & 64 != 0 {
-                            mode = Mode::Bad;
-                            self.mode = mode;
-                            let code = self.bad("invalid distance code\0");
-                            return LenDecodeOutcome::break_with(mode, bit_reader, code);
-                        }
-
-                        self.offset = here.val as usize;
-
-                        self.extra = (here.op & MAX_BITS) as usize;
-
-                        break 'top Mode::DistExt;
                     }
                     Mode::DistExt => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
-                        let extra = self.extra;
-
-                        if extra > 0 {
-                            match bit_reader.need_bits(extra) {
-                                Err(return_code) => {
-                                    return LenDecodeOutcome::break_with(
-                                        mode,
-                                        bit_reader,
-                                        return_code,
-                                    );
-                                }
-                                Ok(v) => v,
-                            };
-                            self.offset += bit_reader.bits(extra) as usize;
-                            bit_reader.drop_bits(extra as u8);
-                            self.back += extra;
+                        if let Err(code) = consume_extra_bits(
+                            &mut bit_reader,
+                            self.extra,
+                            &mut self.offset,
+                            &mut self.back,
+                        ) {
+                            return LenDecodeOutcome::break_with(Mode::DistExt, bit_reader, code);
                         }
-
                         if INFLATE_STRICT && self.offset > self.dmax {
-                            mode = Mode::Bad;
-                            self.mode = mode;
-                            let code = self.bad("invalid distance code too far back\0");
-                            return LenDecodeOutcome::break_with(mode, bit_reader, code);
+                            self.error_message = Some("invalid distance code too far back\0");
+                            return LenDecodeOutcome::break_with(
+                                Mode::Bad,
+                                bit_reader,
+                                ReturnCode::DataError,
+                            );
                         }
-
                         traceln!("inflate: distance {}", self.offset);
-
                         break 'top Mode::Match;
                     }
                     Mode::Match => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
                         if output.is_full() {
                             traceln!(
                                 "BufError: writer is full ({} bytes)",
                                 output.writer.capacity()
                             );
-                            return LenDecodeOutcome::break_with(mode, bit_reader, ReturnCode::Ok);
+                            return LenDecodeOutcome::break_with(
+                                Mode::Match,
+                                bit_reader,
+                                ReturnCode::Ok,
+                            );
                         }
-
-                        let left = output.remaining();
-                        let copy = output.len();
-
-                        let copy = if self.offset > copy {
-                            // copy from window to output
-
-                            let mut copy = self.offset - copy;
-
-                            if copy > self.window.have() {
-                                if self.flags.contains(Flags::SANE) {
-                                    mode = Mode::Bad;
-                                    self.mode = mode;
-                                    let code = self.bad("invalid distance too far back\0");
-                                    return LenDecodeOutcome::break_with(mode, bit_reader, code);
-                                }
-
-                                // TODO INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR
-                                panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+                        match copy_match_bytes(
+                            &self.window,
+                            self.flags.contains(Flags::SANE),
+                            self.offset,
+                            &mut self.length,
+                            output,
+                        ) {
+                            Ok(true) => break 'top Mode::Len,
+                            Ok(false) => break 'top Mode::Match,
+                            Err(msg) => {
+                                self.error_message = Some(msg);
+                                return LenDecodeOutcome::break_with(
+                                    Mode::Bad,
+                                    bit_reader,
+                                    ReturnCode::DataError,
+                                );
                             }
-
-                            let wnext = self.window.next();
-                            let wsize = self.window.size();
-
-                            let from = if copy > wnext {
-                                copy -= wnext;
-                                wsize - copy
-                            } else {
-                                wnext - copy
-                            };
-
-                            copy = Ord::min(copy, self.length);
-                            copy = Ord::min(copy, left);
-
-                            output.extend_from_window(&self.window, from..from + copy);
-
-                            copy
-                        } else {
-                            let copy = Ord::min(self.length, left);
-                            output.copy_match(self.offset, copy);
-
-                            copy
-                        };
-
-                        self.length -= copy;
-
-                        if self.length == 0 {
-                            break 'top Mode::Len;
-                        } else {
-                            // otherwise it seems to recurse?
-                            // self.match_()
-                            break 'top Mode::Match;
                         }
                     }
                     other => unreachable!("len decoder entered non-literal/match state: {other:?}"),
@@ -1559,165 +1593,94 @@ impl State<'_> {
                         }
                     }
                     Mode::LenExt => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
-                        let extra = self.extra;
-
-                        // get extra bits, if any
-                        if extra != 0 {
-                            need_bits_for_mode(bit_reader, extra, mode)?;
-                            self.length += bit_reader.bits(extra) as usize;
-                            bit_reader.drop_bits(extra as u8);
-                            self.back += extra;
+                        if let Err(code) = consume_extra_bits(
+                            bit_reader,
+                            self.extra,
+                            &mut self.length,
+                            &mut self.back,
+                        ) {
+                            return Err(DispatchExit {
+                                mode: Mode::LenExt,
+                                code,
+                            });
                         }
-
                         traceln!("inflate: length {}", self.length);
-
                         self.was = self.length;
-
                         break 'blk Mode::Dist;
                     }
                     Mode::Lit => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
-                        if output.is_full() {
+                        if !emit_literal(output, self.length as u8) {
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
                             break 'label ReturnCode::Ok;
                         }
-
-                        output.push(self.length as u8);
-
                         break 'blk Mode::Len;
                     }
                     Mode::Dist => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
-
-                        // get distance code
-                        let mut here;
-                        loop {
-                            let bits = bit_reader.bits(self.dist_table.bits) as usize;
-                            here = self.dist_table_get(bits);
-                            if here.bits <= bit_reader.bits_in_buffer() {
-                                break;
+                        let decoded = {
+                            let table = self.dist_table_ref();
+                            decode_distance_code(bit_reader, table, self.dist_table.bits)
+                        };
+                        match decoded {
+                            Ok(decoded) => {
+                                self.back += decoded.back_bits;
+                                self.offset = decoded.offset;
+                                self.extra = decoded.extra;
+                                break 'blk Mode::DistExt;
                             }
-
-                            pull_byte_for_mode(bit_reader, mode)?;
-                        }
-
-                        if here.op & 0xf0 == 0 {
-                            let last = here;
-
-                            loop {
-                                let bits = bit_reader.bits((last.bits + last.op) as usize);
-                                here = self.dist_table_get(
-                                    last.val as usize + ((bits as usize) >> last.bits),
-                                );
-
-                                if last.bits + here.bits <= bit_reader.bits_in_buffer() {
-                                    break;
-                                }
-
-                                pull_byte_for_mode(bit_reader, mode)?;
+                            Err(DistanceDecodeError::Input(code)) => {
+                                return Err(DispatchExit {
+                                    mode: Mode::Dist,
+                                    code,
+                                });
                             }
-
-                            bit_reader.drop_bits(last.bits);
-                            self.back += last.bits as usize;
+                            Err(DistanceDecodeError::InvalidCode) => {
+                                mode = Mode::Bad;
+                                break 'label self.bad("invalid distance code\0");
+                            }
                         }
-
-                        bit_reader.drop_bits(here.bits);
-
-                        if here.op & 64 != 0 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid distance code\0");
-                        }
-
-                        self.offset = here.val as usize;
-
-                        self.extra = (here.op & MAX_BITS) as usize;
-
-                        break 'blk Mode::DistExt;
                     }
                     Mode::DistExt => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
-                        let extra = self.extra;
-
-                        if extra > 0 {
-                            need_bits_for_mode(bit_reader, extra, mode)?;
-                            self.offset += bit_reader.bits(extra) as usize;
-                            bit_reader.drop_bits(extra as u8);
-                            self.back += extra;
+                        if let Err(code) = consume_extra_bits(
+                            bit_reader,
+                            self.extra,
+                            &mut self.offset,
+                            &mut self.back,
+                        ) {
+                            return Err(DispatchExit {
+                                mode: Mode::DistExt,
+                                code,
+                            });
                         }
-
                         if INFLATE_STRICT && self.offset > self.dmax {
                             mode = Mode::Bad;
                             break 'label self.bad("invalid distance code too far back\0");
                         }
-
                         traceln!("inflate: distance {}", self.offset);
-
                         break 'blk Mode::Match;
                     }
-                    Mode::Match => {
-                        // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
-
-                        'match_: loop {
-                            if output.is_full() {
-                                traceln!(
-                                    "BufError: writer is full ({} bytes)",
-                                    output.writer.capacity()
-                                );
-                                break 'label ReturnCode::Ok;
-                            }
-
-                            let left = output.remaining();
-                            let copy = output.len();
-
-                            let copy = if self.offset > copy {
-                                // copy from window to output
-
-                                let mut copy = self.offset - copy;
-
-                                if copy > self.window.have() {
-                                    if self.flags.contains(Flags::SANE) {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid distance too far back\0");
-                                    }
-
-                                    // TODO INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR
-                                    panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
-                                }
-
-                                let wnext = self.window.next();
-                                let wsize = self.window.size();
-
-                                let from = if copy > wnext {
-                                    copy -= wnext;
-                                    wsize - copy
-                                } else {
-                                    wnext - copy
-                                };
-
-                                copy = Ord::min(copy, self.length);
-                                copy = Ord::min(copy, left);
-
-                                output.extend_from_window(&self.window, from..from + copy);
-
-                                copy
-                            } else {
-                                let copy = Ord::min(self.length, left);
-                                output.copy_match(self.offset, copy);
-
-                                copy
-                            };
-
-                            self.length -= copy;
-
-                            if self.length == 0 {
-                                break 'blk Mode::Len;
-                            } else {
-                                // otherwise it seems to recurse?
-                                continue 'match_;
+                    Mode::Match => 'match_: loop {
+                        if output.is_full() {
+                            traceln!(
+                                "BufError: writer is full ({} bytes)",
+                                output.writer.capacity()
+                            );
+                            break 'label ReturnCode::Ok;
+                        }
+                        match copy_match_bytes(
+                            &self.window,
+                            self.flags.contains(Flags::SANE),
+                            self.offset,
+                            &mut self.length,
+                            output,
+                        ) {
+                            Ok(true) => break 'blk Mode::Len,
+                            Ok(false) => continue 'match_,
+                            Err(msg) => {
+                                mode = Mode::Bad;
+                                break 'label self.bad(msg);
                             }
                         }
-                    }
+                    },
                     Mode::Table => {
                         need_bits_for_mode(bit_reader, 14, mode)?;
                         self.nlen = bit_reader.bits(5) as usize + 257;
