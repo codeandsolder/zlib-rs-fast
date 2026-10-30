@@ -103,10 +103,6 @@ impl MatchSearchParams {
             HashCalcVariant::Roll => RollHashCalc::update_hash(hash, value),
         }
     }
-
-    fn is_slow(self) -> bool {
-        self.kind == MatchSearchKind::Slow
-    }
 }
 
 impl<'a> MatchSearchRequest<'a> {
@@ -147,7 +143,10 @@ impl<'a> MatchSearchRequest<'a> {
     }
 
     pub(crate) fn execute(&self) -> MatchSearchResult {
-        longest_match_help(self.resources, self.params)
+        match self.params.kind {
+            MatchSearchKind::Standard => longest_match_help::<false>(self.resources, self.params),
+            MatchSearchKind::Slow => longest_match_help::<true>(self.resources, self.params),
+        }
     }
 }
 
@@ -233,7 +232,7 @@ pub(crate) fn execute_match_search_batch(
     execute_match_search_batch_with_backend(&ScalarMatchSearchBackend, requests, results);
 }
 
-fn longest_match_help(
+fn longest_match_help<const SLOW: bool>(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
 ) -> MatchSearchResult {
@@ -269,7 +268,7 @@ fn longest_match_help(
         offset: 0,
     };
 
-    if params.is_slow() && best_len >= STD_MIN_MATCH {
+    if SLOW && best_len >= STD_MIN_MATCH {
         let Some(next) = initial_slow_cursor(resources, params, scan, best_len, cursor, limit_base)
         else {
             return break_matching(params, best_len, match_start);
@@ -277,7 +276,7 @@ fn longest_match_help(
         cursor = next;
     }
 
-    let early_exit = !params.is_slow() && params.level < EARLY_EXIT_TRIGGER_LEVEL;
+    let early_exit = !SLOW && params.level < EARLY_EXIT_TRIGGER_LEVEL;
 
     loop {
         let Some(candidate_start) = cursor.candidate_start() else {
@@ -295,21 +294,25 @@ fn longest_match_help(
         let candidate = &resources.initialized[candidate_start..candidate_start + max_len];
         let scan = &scan[..max_len];
 
-        if !could_beat_best(scan, candidate, best_len) {
-            let Some(next) = next_in_chain(
-                cursor,
-                resources.prev,
-                params.wmask,
-                limit_base,
-                &mut chain_remaining,
-            ) else {
-                break;
-            };
-            cursor = next;
-            continue;
-        }
-
-        let len = common_match_length(scan, candidate);
+        let len = match probe_candidate(scan, candidate, best_len) {
+            CandidateProbe::Reject => {
+                let Some(next) = next_in_chain(
+                    cursor,
+                    resources.prev,
+                    params.wmask,
+                    limit_base,
+                    &mut chain_remaining,
+                ) else {
+                    break;
+                };
+                cursor = next;
+                continue;
+            }
+            CandidateProbe::Exact(len) => len,
+            CandidateProbe::CompareFrom(prefix) => {
+                prefix + common_match_length(&scan[prefix..], &candidate[prefix..])
+            }
+        };
 
         if len > best_len {
             match_start = candidate_start as Pos;
@@ -329,7 +332,7 @@ fn longest_match_help(
                 };
             }
 
-            if params.is_slow() && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
+            if SLOW && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
                 let Some(next) = next_slow_cursor(
                     resources,
                     params,
@@ -457,24 +460,64 @@ fn next_in_chain(
         .then_some(SearchCursor { hash_pos, ..cursor })
 }
 
-#[inline]
-fn could_beat_best(scan: &[u8], candidate: &[u8], best_len: usize) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateProbe {
+    Reject,
+    /// The first-word mismatch gives the exact match length, so no wider compare is needed.
+    Exact(usize),
+    /// The prefix up to this offset is already known equal; continue comparing after it.
+    CompareFrom(usize),
+}
+
+#[inline(always)]
+fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateProbe {
     debug_assert_eq!(scan.len(), candidate.len());
     debug_assert!(best_len < scan.len());
 
-    let prefix_len = (best_len + 1).min(8);
-    if scan[..prefix_len] != candidate[..prefix_len] {
-        return false;
+    // The old matcher used fixed-width word probes to reject almost every hash-chain candidate
+    // before entering the full prefix comparison. Keep that shape, but only after proving eight
+    // initialized bytes are available: no raw pointers, over-read, or uninitialized-byte access.
+    if scan.len() < 8 {
+        return CandidateProbe::CompareFrom(0);
     }
 
-    if best_len + 1 > prefix_len {
-        let tail_start = (best_len + 1).saturating_sub(8);
-        if scan[tail_start..=best_len] != candidate[tail_start..=best_len] {
-            return false;
+    let first_diff = load_u64_le(scan, 0) ^ load_u64_le(candidate, 0);
+
+    if best_len < 8 {
+        if first_diff == 0 {
+            return CandidateProbe::CompareFrom(8);
         }
+
+        let mismatch = first_diff.trailing_zeros() as usize / 8;
+        return if mismatch > best_len {
+            CandidateProbe::Exact(mismatch)
+        } else {
+            CandidateProbe::Reject
+        };
     }
 
-    true
+    if first_diff != 0 {
+        return CandidateProbe::Reject;
+    }
+
+    // To improve on best_len, bytes through best_len inclusive must match. Probe the last eight of
+    // those bytes as one word, just as the historical hot loop did, then let the exact SIMD matcher
+    // cover the gap between the known-equal first word and this tail probe.
+    let tail_start = best_len + 1 - 8;
+    if load_u64_le(scan, tail_start) != load_u64_le(candidate, tail_start) {
+        return CandidateProbe::Reject;
+    }
+
+    CandidateProbe::CompareFrom(8)
+}
+
+#[inline(always)]
+fn load_u64_le(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("candidate probe requires eight initialized bytes"),
+    )
 }
 
 #[inline]
@@ -579,6 +622,73 @@ mod tests {
     }
 
     #[test]
+    fn candidate_probe_rejects_non_improving_first_word_mismatch() {
+        let scan = *b"abcdefghijklmnop";
+        let mut candidate = scan;
+        candidate[3] = b'X';
+
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 4),
+            CandidateProbe::Reject
+        );
+    }
+
+    #[test]
+    fn candidate_probe_returns_exact_short_improvement() {
+        let scan = *b"abcdefghijklmnop";
+        let mut candidate = scan;
+        candidate[5] = b'X';
+
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 2),
+            CandidateProbe::Exact(5)
+        );
+    }
+
+    #[test]
+    fn candidate_probe_skips_known_equal_first_word() {
+        let scan = *b"abcdefghijklmnop";
+        let mut candidate = scan;
+        candidate[12] = b'X';
+
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 4),
+            CandidateProbe::CompareFrom(8)
+        );
+    }
+
+    #[test]
+    fn candidate_probe_checks_best_match_tail_word() {
+        let scan = [b'a'; 32];
+        let mut candidate = scan;
+        candidate[12] = b'b';
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 12),
+            CandidateProbe::Reject
+        );
+
+        candidate[12] = b'a';
+        candidate[20] = b'b';
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 12),
+            CandidateProbe::CompareFrom(8)
+        );
+    }
+
+    #[test]
+    fn candidate_probe_keeps_short_logical_inputs_exact() {
+        let scan = *b"abcdefg";
+        let mut candidate = scan;
+        candidate[5] = b'X';
+
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 2),
+            CandidateProbe::CompareFrom(0)
+        );
+        assert_eq!(common_match_length(&scan, &candidate), 5);
+    }
+
+    #[test]
     fn common_match_length_finds_every_mismatch_position() {
         let scan = [b'a'; STD_MAX_MATCH];
         let mut candidate = scan;
@@ -622,38 +732,55 @@ mod tests {
     }
 
     #[test]
-    fn quick_rejection_never_discards_an_improving_match() {
+    fn candidate_probe_never_discards_an_improving_match() {
         let scan = [b'a'; 32];
         let mut candidate = scan;
 
         for best_len in 0..scan.len() {
-            assert!(could_beat_best(&scan, &candidate, best_len));
+            assert_ne!(
+                probe_candidate(&scan, &candidate, best_len),
+                CandidateProbe::Reject
+            );
 
             for mismatch in 0..scan.len() {
                 candidate[mismatch] = b'b';
                 let actual_len = common_match_length(&scan, &candidate);
+                let probe = probe_candidate(&scan, &candidate, best_len);
                 if actual_len > best_len {
-                    assert!(
-                        could_beat_best(&scan, &candidate, best_len),
+                    assert_ne!(
+                        probe,
+                        CandidateProbe::Reject,
                         "rejected improving match: best_len={best_len}, mismatch={mismatch}"
                     );
+                    if let CandidateProbe::Exact(length) = probe {
+                        assert_eq!(length, actual_len);
+                    }
                 }
                 candidate[mismatch] = b'a';
             }
         }
 
         candidate[0] = b'b';
-        assert!(!could_beat_best(&scan, &candidate, 15));
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 15),
+            CandidateProbe::Reject
+        );
         candidate[0] = b'a';
 
         candidate[15] = b'b';
-        assert!(!could_beat_best(&scan, &candidate, 15));
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 15),
+            CandidateProbe::Reject
+        );
         candidate[15] = b'a';
 
         // For a longer known match the first and last eight bytes leave an
         // unprobed middle. False positives there are intentional: the full
         // prefix comparison decides the actual length.
         candidate[12] = b'b';
-        assert!(could_beat_best(&scan, &candidate, 23));
+        assert_eq!(
+            probe_candidate(&scan, &candidate, 23),
+            CandidateProbe::CompareFrom(8)
+        );
     }
 }
