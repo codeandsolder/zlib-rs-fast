@@ -427,8 +427,6 @@ pub(crate) struct State<'a> {
     /// size of memory copying chunk
     chunksize: usize,
 
-    in_available: usize,
-
     gzip_flags: i32,
 
     checksum: u32,
@@ -462,8 +460,6 @@ pub(crate) struct State<'a> {
 
 impl<'a> State<'a> {
     fn new(reader: &'a [u8]) -> Self {
-        let in_available = reader.len();
-
         Self {
             flush: InflateFlush::NoFlush,
 
@@ -481,7 +477,6 @@ impl<'a> State<'a> {
             back: 0,
             was: 0,
             chunksize: 0,
-            in_available,
 
             bit_reader: BitReader::new(reader),
 
@@ -1192,7 +1187,6 @@ impl State<'_> {
                                     self.checksum = crc32(self.checksum, extra_slice)
                                 }
 
-                                self.in_available -= extra_available;
                                 self.bit_reader.advance(extra_available);
                                 self.length -= extra_available;
                             }
@@ -1209,7 +1203,7 @@ impl State<'_> {
                     }
                     Mode::Name => {
                         if (self.gzip_flags & 0x0800) != 0 {
-                            if self.in_available == 0 {
+                            if self.bit_reader.bytes_remaining() == 0 {
                                 break 'label self.inflate_leave(ReturnCode::Ok);
                             }
 
@@ -1270,7 +1264,7 @@ impl State<'_> {
                     }
                     Mode::Comment => {
                         if (self.gzip_flags & 0x01000) != 0 {
-                            if self.in_available == 0 {
+                            if self.bit_reader.bytes_remaining() == 0 {
                                 break 'label self.inflate_leave(ReturnCode::Ok);
                             }
 
@@ -2437,8 +2431,6 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     // Safety: `stream.next_out` is non-null and points to at least `stream.avail_out` bytes.
     let mut output =
         unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
-
-    state.in_available = stream.avail_in as _;
 
     let err = state.dispatch(&mut output);
 
