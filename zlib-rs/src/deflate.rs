@@ -767,86 +767,13 @@ pub fn copy<'a>(
     dest: &mut MaybeUninit<DeflateStream<'a>>,
     source: &mut DeflateStream<'a>,
 ) -> ReturnCode {
-    let window_bits = source.state.w_bits() as usize;
-    let lit_bufsize = source.state.lit_bufsize;
-
     let source_state = &*source.state;
-    let alloc = &source.alloc;
-
-    let allocs = DeflateAllocOffsets::new(window_bits, lit_bufsize);
-
-    let Some(allocation_start) = alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
+    let allocs = DeflateAllocOffsets::new(source_state.w_bits() as usize, source_state.lit_bufsize);
+    let Some(state_allocation) = allocs.clone_state(&source.alloc, source_state) else {
         return ReturnCode::MemError;
     };
 
-    let DeflateAllocBuffers {
-        state_ptr: state_allocation,
-        window,
-        prev,
-        head,
-        pending,
-        sym_buf,
-    } = unsafe { allocs.clone_buffers(allocation_start, window_bits, lit_bufsize, source_state) };
-
-    let mut bit_writer = BitWriter::from_pending(pending);
-    bit_writer.bit_buffer = source_state.bit_writer.bit_buffer;
-    bit_writer.bits_valid = source_state.bit_writer.bits_valid;
-    bit_writer.bits_used = source_state.bit_writer.bits_used;
-
-    let dest_state = State {
-        status: source_state.status,
-        bit_writer,
-        last_flush: source_state.last_flush,
-        wrap: source_state.wrap,
-        strategy: source_state.strategy,
-        level: source_state.level,
-        good_match: source_state.good_match,
-        nice_match: source_state.nice_match,
-        l_desc: source_state.l_desc.clone(),
-        d_desc: source_state.d_desc.clone(),
-        bl_desc: source_state.bl_desc.clone(),
-        prev_match: source_state.prev_match,
-        match_available: source_state.match_available,
-        strstart: source_state.strstart,
-        match_start: source_state.match_start,
-        prev_length: source_state.prev_length,
-        max_chain_length: source_state.max_chain_length,
-        max_insert_length: source_state.max_insert_length,
-        max_lazy_match: source_state.max_lazy_match,
-        block_start: source_state.block_start,
-        block_open: source_state.block_open,
-        window,
-        sym_buf,
-        lit_bufsize: source_state.lit_bufsize,
-        window_size: source_state.window_size,
-        matches: source_state.matches,
-        opt_len: source_state.opt_len,
-        static_len: source_state.static_len,
-        insert: source_state.insert,
-        w_size: source_state.w_size,
-        lookahead: source_state.lookahead,
-        prev,
-        head,
-        ins_h: source_state.ins_h,
-        hash_calc_variant: source_state.hash_calc_variant,
-        crc_fold: source_state.crc_fold,
-        gzhead: source_state.gzhead,
-        gzindex: source_state.gzindex,
-        medium_next_match: source_state.medium_next_match,
-        data_type: source_state.data_type,
-        allocation_start,
-        total_allocation_size: allocs.total_size,
-        _cache_line_0: (),
-        _cache_line_1: (),
-        _cache_line_2: (),
-        _cache_line_3: (),
-        _padding_0: [0; 4],
-    };
-
-    // write the cloned state into the rebound allocation
-    unsafe { state_allocation.write(dest_state) };
-
-    // Build the destination ABI shell explicitly around the cloned raw state pointer.
+    // Build the destination ABI shell explicitly around the independently cloned state allocation.
     dest.write(DeflateStream {
         next_in: source.next_in,
         avail_in: source.avail_in,
@@ -855,7 +782,7 @@ pub fn copy<'a>(
         avail_out: source.avail_out,
         total_out: source.total_out,
         msg: source.msg,
-        state: unsafe { StatePtr::from_raw(state_allocation) },
+        state: unsafe { StatePtr::from_raw(state_allocation.as_ptr()) },
         alloc: source.alloc,
         data_type: source.data_type,
         adler: source.adler,
@@ -1558,6 +1485,11 @@ pub(crate) struct State<'a> {
     d_desc: TreeDesc<{ 2 * D_CODES + 1 }>,   /* distance tree */
     bl_desc: TreeDesc<{ 2 * BL_CODES + 1 }>, /* Huffman tree for bit lengths */
 }
+
+const _: () = assert!(
+    !core::mem::needs_drop::<State<'static>>(),
+    "deflateCopy raw state cloning requires State to have no drop glue"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[cfg_attr(feature = "__internal-fuzz", derive(arbitrary::Arbitrary))]
@@ -3697,6 +3629,51 @@ impl DeflateAllocOffsets {
         }
     }
 
+    /// Clone a complete deflate state into one independent allocation and rebind every view that
+    /// points into the allocation. Caller-owned ABI pointers (for example `gzhead`) intentionally
+    /// retain zlib's shallow-copy semantics.
+    fn clone_state<'a>(
+        &self,
+        alloc: &Allocator<'_>,
+        source: &State<'a>,
+    ) -> Option<NonNull<State<'a>>> {
+        let window_bits = source.w_bits() as usize;
+        let lit_bufsize = source.lit_bufsize;
+        assert_eq!(self.total_size, source.total_allocation_size);
+
+        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
+
+        // SAFETY: `allocation_start` is a fresh allocation of exactly this layout. The cloned
+        // buffer views below are the only destination views, and `State` is asserted to have no
+        // drop glue, so a byte-for-byte state copy followed by rebinding its allocation-owned
+        // fields cannot duplicate an owning destructor.
+        let DeflateAllocBuffers {
+            state_ptr,
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+        } = unsafe { self.clone_buffers(allocation_start, window_bits, lit_bufsize, source) };
+
+        // SAFETY: `state_ptr` is aligned and in-bounds in the fresh allocation. After copying the
+        // no-drop state, immediately replace every field whose pointer must refer to destination
+        // storage before the state can escape this function.
+        unsafe {
+            core::ptr::copy_nonoverlapping(source as *const State<'_>, state_ptr, 1);
+            core::ptr::addr_of_mut!((*state_ptr).window).write(window);
+            core::ptr::addr_of_mut!((*state_ptr).prev).write(prev);
+            core::ptr::addr_of_mut!((*state_ptr).head).write(head);
+            core::ptr::addr_of_mut!((*state_ptr).bit_writer.pending).write(pending);
+            core::ptr::addr_of_mut!((*state_ptr).sym_buf).write(sym_buf);
+            core::ptr::addr_of_mut!((*state_ptr).allocation_start).write(allocation_start);
+            core::ptr::addr_of_mut!((*state_ptr).total_allocation_size).write(self.total_size);
+        }
+
+        // SAFETY: `state_ptr` comes from the aligned state region inside a live non-null allocation.
+        Some(unsafe { NonNull::new_unchecked(state_ptr) })
+    }
+
     unsafe fn aligned_base(&self, allocation_start: NonNull<u8>) -> *mut u8 {
         let raw = allocation_start.as_ptr();
         let addr = raw as usize;
@@ -3827,7 +3804,7 @@ mod test {
         stream.zalloc = Some(fail_nth_allocation::<1>);
         stream.zfree = Some(crate::allocate::C.zfree);
 
-        // init performs 6 allocations; we don't want those to fail
+        // Init consumes the first state allocation; fail the second allocation used by copy.
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
 
         let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
@@ -4971,6 +4948,57 @@ mod test {
         let output_rs = &mut output[..n];
 
         assert_eq!(output_rs.len(), 500 + 99);
+    }
+
+    #[test]
+    fn deflate_copy_owns_independent_state_and_buffer_storage() {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let source = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        source.state.window.filled_mut()[0] = 0x11;
+        source.state.prev.as_mut_slice()[0] = 0x1234;
+        source.state.head.as_mut_slice()[0] = 0x2345;
+        source.state.bit_writer.pending.extend(&[1, 2, 3]);
+        source.state.sym_buf.push_lit(0xa5);
+
+        let source_state = source.state.as_ptr();
+        let source_window = source.state.window.as_ptr();
+        let source_prev = source.state.prev.as_ptr();
+        let source_head = source.state.head.as_ptr();
+
+        let mut copied = MaybeUninit::<DeflateStream>::uninit();
+        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
+        let copied = unsafe { copied.assume_init_mut() };
+
+        assert_ne!(source_state, copied.state.as_ptr());
+        assert_ne!(source_window, copied.state.window.as_ptr());
+        assert_ne!(source_prev, copied.state.prev.as_ptr());
+        assert_ne!(source_head, copied.state.head.as_ptr());
+        assert_eq!(
+            source.state.total_allocation_size,
+            copied.state.total_allocation_size
+        );
+
+        source.state.window.filled_mut()[0] = 0x99;
+        source.state.prev.as_mut_slice()[0] = 0x3456;
+        source.state.head.as_mut_slice()[0] = 0x4567;
+        source.state.bit_writer.pending.advance(3);
+        source.state.bit_writer.pending.extend(&[9, 9, 9]);
+        source.state.sym_buf.clear();
+
+        assert_eq!(copied.state.window.filled()[0], 0x11);
+        assert_eq!(copied.state.prev.as_slice()[0], 0x1234);
+        assert_eq!(copied.state.head.as_slice()[0], 0x2345);
+        assert_eq!(copied.state.bit_writer.pending.pending(), &[1, 2, 3]);
+        {
+            let mut copied_symbols = copied.state.sym_buf.iter();
+            assert_eq!(copied_symbols.next(), Some((0, 0xa5)));
+            assert_eq!(copied_symbols.next(), None);
+        }
+
+        assert!(end(source).is_ok());
+        assert!(end(copied).is_ok());
     }
 
     #[test]
