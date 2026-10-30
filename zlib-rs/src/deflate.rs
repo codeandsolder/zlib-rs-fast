@@ -1266,6 +1266,20 @@ impl<'a> BitWriter<'a> {
         }
     }
 
+    fn clone_with_pending(&self, pending: Pending<'a>) -> Self {
+        Self {
+            pending,
+            bit_buffer: self.bit_buffer,
+            bits_valid: self.bits_valid,
+            bits_used: self.bits_used,
+
+            #[cfg(feature = "ZLIB_DEBUG")]
+            compressed_len: self.compressed_len,
+            #[cfg(feature = "ZLIB_DEBUG")]
+            bits_sent: self.bits_sent,
+        }
+    }
+
     fn flush_bits(&mut self) {
         debug_assert!(self.bits_valid <= 64);
         let removed = self.bits_valid.saturating_sub(7).next_multiple_of(8);
@@ -1681,11 +1695,6 @@ pub(crate) struct State<'a> {
     bl_desc: TreeDesc<{ 2 * BL_CODES + 1 }>, /* Huffman tree for bit lengths */
 }
 
-const _: () = assert!(
-    !core::mem::needs_drop::<State<'static>>(),
-    "deflateCopy raw state cloning requires State to have no drop glue"
-);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[cfg_attr(feature = "__internal-fuzz", derive(arbitrary::Arbitrary))]
 pub enum Strategy {
@@ -1721,6 +1730,71 @@ enum DataType {
 
 impl<'a> State<'a> {
     pub const BIT_BUF_SIZE: u8 = BitWriter::BIT_BUF_SIZE;
+
+    /// Clone stream state while rebinding every view that belongs to the destination allocation.
+    ///
+    /// Keeping this as an explicit field-wise construction makes new state fields a compile-time
+    /// clone-policy decision instead of silently including them in a byte-for-byte state copy.
+    fn clone_rebound(
+        &self,
+        window: Window<'a>,
+        prev: WeakSliceMut<'a, Pos>,
+        head: WeakArrayMut<'a, Pos, HASH_SIZE>,
+        pending: Pending<'a>,
+        sym_buf: SymBuf<'a>,
+        allocation_start: NonNull<u8>,
+        total_allocation_size: usize,
+    ) -> Self {
+        Self {
+            status: self.status,
+            last_flush: self.last_flush,
+            wrap: self.wrap,
+            strategy: self.strategy,
+            level: self.level,
+            block_open: self.block_open,
+            hash_calc_variant: self.hash_calc_variant,
+            match_available: self.match_available,
+            good_match: self.good_match,
+            nice_match: self.nice_match,
+            match_start: self.match_start,
+            prev_match: self.prev_match,
+            strstart: self.strstart,
+            window,
+            w_size: self.w_size,
+            lookahead: self.lookahead,
+            _cache_line_0: (),
+            prev,
+            head,
+            prev_length: self.prev_length,
+            max_chain_length: self.max_chain_length,
+            max_insert_length: self.max_insert_length,
+            matches: self.matches,
+            block_start: self.block_start,
+            sym_buf,
+            _cache_line_1: (),
+            lit_bufsize: self.lit_bufsize,
+            window_size: self.window_size,
+            bit_writer: self.bit_writer.clone_with_pending(pending),
+            _cache_line_2: (),
+            opt_len: self.opt_len,
+            static_len: self.static_len,
+            insert: self.insert,
+            ins_h: self.ins_h,
+            max_lazy_match: self.max_lazy_match,
+            gzhead: self.gzhead,
+            gzindex: self.gzindex,
+            medium_next_match: self.medium_next_match,
+            data_type: self.data_type,
+            _padding_0: self._padding_0,
+            _cache_line_3: (),
+            crc_fold: self.crc_fold,
+            allocation_start,
+            total_allocation_size,
+            l_desc: self.l_desc.clone(),
+            d_desc: self.d_desc.clone(),
+            bl_desc: self.bl_desc.clone(),
+        }
+    }
 
     /// Encode the resident token block into pending bytes without touching caller I/O.
     pub(crate) fn encode_block(&mut self, is_last: bool) {
@@ -3847,10 +3921,8 @@ impl DeflateAllocOffsets {
 
         let (allocation_start, aligned) = self.allocate_storage(alloc)?;
 
-        // SAFETY: `aligned` is a fresh layout base. The cloned buffer views below are the only
-        // destination views, and `State` is asserted to have no drop glue, so a byte-for-byte
-        // state copy followed by rebinding its allocation-owned fields cannot duplicate an owning
-        // destructor.
+        // SAFETY: `aligned` is a fresh layout base and the cloned buffer views below are the only
+        // destination views over their respective allocation regions.
         let DeflateAllocBuffers {
             state_ptr,
             window,
@@ -3860,22 +3932,20 @@ impl DeflateAllocOffsets {
             sym_buf,
         } = unsafe { self.clone_buffers(aligned, source) };
 
-        // SAFETY: `state_ptr` is aligned and in-bounds in the fresh allocation. After copying the
-        // no-drop state, immediately replace every field whose pointer must refer to destination
-        // storage before the state can escape this function.
-        unsafe {
-            core::ptr::copy_nonoverlapping(source as *const State<'_>, state_ptr, 1);
-            core::ptr::addr_of_mut!((*state_ptr).window).write(window);
-            core::ptr::addr_of_mut!((*state_ptr).prev).write(prev);
-            core::ptr::addr_of_mut!((*state_ptr).head).write(head);
-            core::ptr::addr_of_mut!((*state_ptr).bit_writer.pending).write(pending);
-            core::ptr::addr_of_mut!((*state_ptr).sym_buf).write(sym_buf);
-            core::ptr::addr_of_mut!((*state_ptr).allocation_start).write(allocation_start);
-            core::ptr::addr_of_mut!((*state_ptr).total_allocation_size).write(self.total_size);
-        }
+        let state = source.clone_rebound(
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+            allocation_start,
+            self.total_size,
+        );
 
-        // SAFETY: `state_ptr` comes from the aligned state region inside a live non-null allocation.
-        Some(unsafe { NonNull::new_unchecked(state_ptr) })
+        // SAFETY: `state_ptr` is the aligned State region in this fresh allocation and no State
+        // has previously been materialized there.
+        unsafe { state_ptr.write(state) };
+        NonNull::new(state_ptr)
     }
 }
 
