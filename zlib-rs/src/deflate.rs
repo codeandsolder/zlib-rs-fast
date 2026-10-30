@@ -89,7 +89,7 @@ impl InputCursor {
 
 #[derive(Clone, Copy)]
 pub(crate) struct OutputCursor {
-    pub(crate) next_out: *mut crate::c_api::Bytef,
+    next_out: *mut crate::c_api::Bytef,
     pub(crate) avail_out: crate::c_api::uInt,
     pub(crate) total_out: crate::c_api::z_size,
 }
@@ -107,6 +107,52 @@ impl OutputCursor {
         stream.next_out = self.next_out;
         stream.avail_out = self.avail_out;
         stream.total_out = self.total_out;
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        assert!(len <= self.avail_out as usize);
+        if len == 0 {
+            return;
+        }
+
+        // SAFETY: the cursor represents `avail_out` caller-provided writable bytes, and `len` is
+        // checked above. Compression state/pending storage must not overlap the caller output.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.next_out, len) };
+        self.advance(len);
+    }
+
+    fn write_some(&mut self, bytes: &[u8]) -> usize {
+        let len = Ord::min(bytes.len(), self.avail_out as usize);
+        self.write_all(&bytes[..len]);
+        len
+    }
+
+    /// Copy caller input into output and expose exactly the bytes just initialized.
+    ///
+    /// # Safety
+    /// `source` must be readable for `len` bytes and must not overlap the cursor's writable output.
+    unsafe fn copy_from_raw<'a>(&'a mut self, source: *const u8, len: usize) -> &'a [u8] {
+        assert!(len <= self.avail_out as usize);
+        if len == 0 {
+            return &[];
+        }
+
+        let destination = self.next_out;
+        // SAFETY: guaranteed by the caller contract plus the output bound asserted above.
+        unsafe { core::ptr::copy_nonoverlapping(source, destination, len) };
+        self.advance(len);
+
+        // SAFETY: the copy above initialized exactly this output range, which remains valid for the
+        // duration of the cursor borrow.
+        unsafe { core::slice::from_raw_parts(destination, len) }
+    }
+
+    fn advance(&mut self, len: usize) {
+        debug_assert!(len <= self.avail_out as usize);
+        self.next_out = self.next_out.wrapping_add(len);
+        self.avail_out -= len as crate::c_api::uInt;
+        self.total_out += len as crate::c_api::z_size;
     }
 }
 
@@ -152,11 +198,7 @@ impl<'a, 'state> Compressor<'a, 'state> {
         assert!(len <= self.output.avail_out as usize);
         let src = &self.state.window.filled()[range];
 
-        // SAFETY: `src` is an initialized window slice and the caller-provided output cursor has
-        // at least `len` writable bytes by the assertion above. The zlib contract requires input
-        // and output buffers not to overlap for this direct stored-block path.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.output.next_out, len) };
-        self.advance_output(len);
+        self.output.write_all(src);
     }
 
     /// Copy caller input directly to caller output for stored blocks while updating checksums.
@@ -171,14 +213,10 @@ impl<'a, 'state> Compressor<'a, 'state> {
             return 0;
         }
 
-        let output = self.output.next_out;
-        // SAFETY: the input cursor exposes `avail_in` readable bytes and the output cursor exposes
-        // `avail_out` writable bytes. Both bounds are checked above; direct stored copies require
-        // non-overlapping zlib input/output buffers.
-        unsafe { core::ptr::copy_nonoverlapping(self.input.next_in, output, len) };
-
-        // SAFETY: the just-completed copy initialized exactly `len` output bytes.
-        let copied = unsafe { core::slice::from_raw_parts(output, len) };
+        // SAFETY: the input cursor exposes `avail_in` readable bytes and zlib's direct stored-copy
+        // contract requires the caller input/output spans not to overlap. Output bounds are checked
+        // by `copy_from_raw`.
+        let copied = unsafe { self.output.copy_from_raw(self.input.next_in, len) };
         match self.state.wrap {
             2 => self.state.crc_fold.fold(copied),
             1 => self.input.adler = crate::adler32::adler32(self.input.adler as u32, copied) as _,
@@ -188,7 +226,6 @@ impl<'a, 'state> Compressor<'a, 'state> {
         self.input.next_in = self.input.next_in.wrapping_add(len);
         self.input.avail_in -= len as u32;
         self.input.total_in += len as crate::c_api::z_size;
-        self.advance_output(len);
         len
     }
 
@@ -204,12 +241,6 @@ impl<'a, 'state> Compressor<'a, 'state> {
         // SAFETY: callers only request bytes already consumed by `copy_input_to_output`, so the
         // region ending at the current input cursor remains within the caller's input allocation.
         unsafe { self.state.window.copy_and_initialize(destination, src) };
-    }
-
-    fn advance_output(&mut self, len: usize) {
-        self.output.next_out = self.output.next_out.wrapping_add(len);
-        self.output.avail_out -= len as u32;
-        self.output.total_out += len as crate::c_api::z_size;
     }
 }
 
@@ -2870,17 +2901,10 @@ pub(crate) fn drain_pending_output(
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();
-    let len = Ord::min(pending.len(), output.avail_out as usize);
+    let len = output.write_some(pending);
 
     if len != 0 {
         trace!("\n[FLUSH {len} bytes]");
-        // SAFETY: len is min(pending, output.avail_out), so we won't overrun next_out.
-        unsafe { core::ptr::copy_nonoverlapping(pending.as_ptr(), output.next_out, len) };
-
-        output.next_out = output.next_out.wrapping_add(len);
-        output.total_out += len as crate::c_api::z_size;
-        output.avail_out -= len as crate::c_api::uInt;
-
         state.bit_writer.pending.advance(len);
     }
 
