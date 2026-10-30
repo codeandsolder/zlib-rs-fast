@@ -836,6 +836,29 @@ mod null {
     }
 
     #[test]
+    fn inflate_empty_input_preserves_null_next_in() {
+        assert_eq_rs_ng!({
+            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let init = inflateInit_(
+                strm.as_mut_ptr(),
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as _,
+            );
+            let strm = unsafe { strm.assume_init_mut() };
+            let mut output = [0u8; 1];
+            strm.next_in = core::ptr::null_mut();
+            strm.avail_in = 0;
+            strm.next_out = output.as_mut_ptr();
+            strm.avail_out = output.len() as _;
+            let inflate = inflate(strm, Z_NO_FLUSH);
+            let input_stayed_null = strm.next_in.is_null();
+            let remaining = strm.avail_in;
+            let end = inflateEnd(strm);
+            (init, inflate, input_stayed_null, remaining, end)
+        });
+    }
+
+    #[test]
     fn inflate_sync() {
         assert_eq_rs_ng!({ inflateSync(core::ptr::null_mut()) });
     }

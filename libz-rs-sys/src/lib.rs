@@ -633,6 +633,8 @@ pub unsafe extern "C" fn uncompress2(
 /// * Either
 ///     - `strm.next_in` is `NULL`
 ///     - `strm.next_in` and `strm.avail_in` satisfy the requirements of [`core::slice::from_raw_parts::<u8>`]
+/// * Any non-empty input/output spans must not overlap each other, `strm`, or the live inflate
+///   state allocation referenced by `strm.state`.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflate))]
 pub unsafe extern "C" fn inflate(strm: *mut z_stream, flush: i32) -> i32 {
     if let Some(stream) = InflateStream::from_stream_mut(strm) {

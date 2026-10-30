@@ -2505,16 +2505,16 @@ pub fn codes_used(stream: &InflateStream) -> usize {
     stream.state.next
 }
 
+/// Bind one zlib ABI input/output pair and run ordinary inflate.
+///
+/// # Safety
+/// Any non-null input span must be readable for `avail_in` bytes and any non-null output span must
+/// be uniquely writable for `avail_out` bytes. The input/output spans must not overlap each other
+/// or the live stream/state objects. Null input with zero length is valid; null output is rejected
+/// before it is dereferenced.
 pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> ReturnCode {
     if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
         return ReturnCode::StreamError;
-    }
-
-    let state = &mut *stream.state;
-
-    // skip check
-    if let Mode::Type = state.mode {
-        state.mode = Mode::TypeDo;
     }
 
     let input = if stream.avail_in == 0 {
@@ -2524,16 +2524,39 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
         // call-local and cannot survive this invocation.
         unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
     };
-    let mut bit_reader = BitReader::from_buffer(state.bit_buffer, input);
-    // Safety: `stream.next_out` is non-null and points to at least `stream.avail_out` bytes.
-    let mut output =
+    // SAFETY: `stream.next_out` is non-null and points to at least `stream.avail_out` writable bytes.
+    let output =
         unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
 
+    inflate_bound_io(stream, input, output, flush)
+}
+
+/// Safe per-call inflate core after the caller's raw input/output spans have been bound to typed
+/// cursors. No raw caller buffer is dereferenced or materialized below this boundary.
+fn inflate_bound_io(
+    stream: &mut InflateStream,
+    input: &[u8],
+    mut output: InflateOutput<'_>,
+    flush: InflateFlush,
+) -> ReturnCode {
+    debug_assert_eq!(stream.avail_in as usize, input.len());
+    let initial_avail_in = input.len();
+    let state = &mut *stream.state;
+
+    // skip check
+    if let Mode::Type = state.mode {
+        state.mode = Mode::TypeDo;
+    }
+
+    let mut bit_reader = BitReader::from_buffer(state.bit_buffer, input);
     let err = state.dispatch(&mut bit_reader, &mut output, flush);
 
-    let next_in = bit_reader.next_input_ptr();
     let avail_in = bit_reader.bytes_remaining();
-    let in_read = stream.avail_in as usize - avail_in;
+    let in_read = initial_avail_in - avail_in;
+    // Preserve the exact caller pointer when no input was consumed. This matters for zlib's legal
+    // NULL + zero-length input representation; Rust's canonical empty slice has a non-null sentinel
+    // pointer that must not leak back through the C ABI.
+    let next_in = (in_read != 0).then(|| bit_reader.next_input_ptr());
     let out_written = output.written_since_accounted();
 
     stream.total_in += in_read as z_size;
@@ -2541,7 +2564,9 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     stream.total_out = state.total as _;
 
     stream.avail_in = avail_in as u32;
-    stream.next_in = next_in as *mut u8;
+    if let Some(next_in) = next_in {
+        stream.next_in = next_in as *mut u8;
+    }
     state.bit_buffer = bit_reader.into_buffer();
 
     stream.avail_out = output.remaining() as u32;
