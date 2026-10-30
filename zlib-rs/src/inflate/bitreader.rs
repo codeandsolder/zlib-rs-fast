@@ -1,4 +1,4 @@
-use core::ptr::NonNull;
+#![forbid(unsafe_code)]
 
 use crate::ReturnCode;
 
@@ -46,78 +46,48 @@ impl BitBuffer {
     }
 }
 
+/// A call-local cursor over one borrowed input buffer plus the DEFLATE bit reservoir.
+///
+/// Only [`BitBuffer`] is persisted in `State`; the input slice and cursor position die at the end
+/// of each public inflate call. This keeps caller-buffer lifetime and pointer arithmetic out of the
+/// decoder state machine.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BitReader {
-    ptr: *const u8,
-    end: *const u8,
+pub(crate) struct BitReader<'input> {
+    input: &'input [u8],
+    position: usize,
     bits: BitBuffer,
 }
 
-impl BitReader {
-    /// Construct a reader with no caller input and an empty bit buffer.
-    pub fn new() -> Self {
-        Self::from_buffer(BitBuffer::default())
+impl<'input> BitReader<'input> {
+    pub fn new(input: &'input [u8]) -> Self {
+        Self::from_buffer(BitBuffer::default(), input)
     }
 
-    /// Construct a call-local reader from persistent buffered bits.
-    pub fn from_buffer(bits: BitBuffer) -> Self {
-        let ptr = Self::detached_ptr();
+    pub fn from_buffer(bits: BitBuffer, input: &'input [u8]) -> Self {
         Self {
-            ptr,
-            end: ptr,
+            input,
+            position: 0,
             bits,
         }
     }
 
-    /// Return only the state that is valid to persist across caller input buffers.
     pub fn into_buffer(self) -> BitBuffer {
         self.bits
     }
 
     #[inline(always)]
-    fn detached_ptr() -> *const u8 {
-        NonNull::<u8>::dangling().as_ptr().cast_const()
-    }
-
-    /// Attach caller input while preserving the persistent bit buffer.
-    ///
-    /// # Safety
-    ///
-    /// If `len` is non-zero, `ptr` and `len` must satisfy the requirements of
-    /// [`core::slice::from_raw_parts`] for every read performed through this reader. A zero-length
-    /// input may use a null pointer, as zlib permits.
-    #[inline(always)]
-    pub unsafe fn attach_input(&mut self, ptr: *const u8, len: usize) {
-        if len == 0 {
-            let ptr = Self::detached_ptr();
-            self.ptr = ptr;
-            self.end = ptr;
-        } else {
-            self.ptr = ptr;
-            self.end = ptr.wrapping_add(len);
-        }
-    }
-
-    #[inline(always)]
     pub fn advance(&mut self, bytes: usize) {
-        self.ptr = Ord::min(self.ptr.wrapping_add(bytes), self.end);
+        self.position = self.position.saturating_add(bytes).min(self.input.len());
     }
 
     #[inline(always)]
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr
-    }
-
-    #[inline(always)]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr as *mut u8
+    pub fn next_input_ptr(&self) -> *const u8 {
+        self.input.as_ptr().wrapping_add(self.position)
     }
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
-        let len = self.bytes_remaining();
-        // SAFETY: condition of constructing this struct.
-        unsafe { core::slice::from_raw_parts(self.ptr, len) }
+        &self.input[self.position..]
     }
 
     #[inline(always)]
@@ -132,12 +102,12 @@ impl BitReader {
 
     #[inline(always)]
     pub fn bytes_remaining(&self) -> usize {
-        self.end as usize - self.ptr as usize
+        self.input.len() - self.position
     }
 
     #[inline(always)]
     pub fn bytes_remaining_including_buffer(&self) -> usize {
-        (self.end as usize - self.ptr as usize) + (self.bits.bits_used as usize >> 3)
+        self.bytes_remaining() + (self.bits.bits_used as usize >> 3)
     }
 
     #[inline(always)]
@@ -145,11 +115,9 @@ impl BitReader {
         while (self.bits.bits_used as usize) < n {
             self.pull_byte()?;
         }
-
         Ok(())
     }
 
-    /// Remove zero to seven bits as needed to go to a byte boundary
     #[inline(always)]
     pub fn next_byte_boundary(&mut self) {
         self.bits.bit_buffer >>= self.bits.bits_used & 0b0111;
@@ -158,43 +126,38 @@ impl BitReader {
 
     #[inline(always)]
     pub fn pull_byte(&mut self) -> Result<u8, ReturnCode> {
-        // SAFETY: bounds checking.
-        if self.ptr == self.end {
+        let Some(&byte) = self.input.get(self.position) else {
             return Err(ReturnCode::Ok);
-        }
-        let byte = unsafe { *self.ptr };
-        self.ptr = unsafe { self.ptr.add(1) };
-
+        };
+        self.position += 1;
         self.bits.bit_buffer |= (byte as u64) << self.bits.bits_used;
         self.bits.bits_used += 8;
-
         Ok(byte)
     }
 
+    /// Refill the hot decoder reservoir from eight readable bytes.
+    ///
+    /// The fast decoder may load one byte beyond the logically consumed prefix; `position` advances
+    /// only by the whole bytes that actually become valid reservoir bits, and
+    /// [`Self::return_unused_bytes`] gives any remaining whole bytes back before the call returns.
     #[inline(always)]
-    /// Copy enough bytes from the BitReader's underlying slice to fill the internal
-    /// bit buffer with 7 bytes of data.
-    ///
-    /// Safety:
-    ///
-    /// `self.ptr` must point to at least 8 readable bytes, as indicated by `bytes_remaining()`
-    pub unsafe fn refill(&mut self) {
-        debug_assert!(self.bytes_remaining() >= 8);
-
-        // SAFETY: caller ensures we have 8 bytes to read for a u64.
-        let read = unsafe { core::ptr::read_unaligned(self.ptr.cast::<u64>()) }.to_le();
+    pub fn refill(&mut self) {
+        assert!(
+            self.bytes_remaining() >= 8,
+            "bit-reader refill requires eight input bytes"
+        );
+        let bytes: [u8; 8] = self.as_slice()[..8]
+            .try_into()
+            .expect("refill length was checked above");
+        let read = u64::from_le_bytes(bytes);
         self.bits.bit_buffer |= read << self.bits.bits_used;
-        // this xor was previously a subtraction but was changed for performance reasons.
-        // for bits_used between 0 and 63 (inclusive), it will always have the same behavior.
         let increment = (63 ^ self.bits.bits_used) >> 3;
-        self.ptr = self.ptr.wrapping_add(increment as usize);
+        self.position += increment as usize;
         self.bits.bits_used |= 56;
     }
 
     #[inline(always)]
-    pub fn bits(&mut self, n: usize) -> u64 {
-        // debug_assert!( n <= self.bits.bits_used, "{n} bits requested, but only {} avaliable", self.bits.bits_used);
-
+    pub fn bits(&self, n: usize) -> u64 {
         let lowest_n_bits = (1 << n) - 1;
         self.bits.bit_buffer & lowest_n_bits
     }
@@ -217,30 +180,25 @@ impl BitReader {
 
     #[inline(always)]
     pub fn return_unused_bytes(&mut self) {
-        let len = self.bits.bits_used >> 3;
-        // SAFETY: ptr is advanced whenever bits_used is incremented by 8, so this sub is always
-        // in bounds.
-        self.ptr = unsafe { self.ptr.sub(len as usize) };
-        self.bits.bits_used -= len << 3;
+        let bytes = usize::from(self.bits.bits_used >> 3);
+        self.position = self
+            .position
+            .checked_sub(bytes)
+            .expect("buffered whole bytes came from this input cursor");
+        self.bits.bits_used -= (bytes as u8) << 3;
         self.bits.bit_buffer &= (1u64 << self.bits.bits_used) - 1u64;
-
         assert!(self.bits.bits_used <= 32);
     }
 }
 
 #[cfg(feature = "std")]
-impl std::io::Read for BitReader {
+impl std::io::Read for BitReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         assert_eq!(self.bits.bits_used, 0, "bit buffer not cleared before read");
-
-        let number_of_bytes = Ord::min(buf.len(), self.bytes_remaining());
-
-        // SAFETY: `buf` is a mutable (exclusive) reference, so it cannot overlap the memory that
-        // the reader contains
-        unsafe { core::ptr::copy_nonoverlapping(self.ptr, buf.as_mut_ptr(), number_of_bytes) }
-
-        self.ptr = unsafe { self.ptr.add(number_of_bytes) };
-        Ok(number_of_bytes)
+        let count = Ord::min(buf.len(), self.bytes_remaining());
+        buf[..count].copy_from_slice(&self.as_slice()[..count]);
+        self.position += count;
+        Ok(count)
     }
 }
 
@@ -253,9 +211,7 @@ mod tests {
         let input = [0xabu8, 0xcd];
         let mut bits = BitBuffer::default();
         bits.prime(3, 0b101);
-        let mut reader = BitReader::from_buffer(bits);
-
-        unsafe { reader.attach_input(input.as_ptr(), input.len()) };
+        let reader = BitReader::from_buffer(bits, &input);
         assert_eq!(reader.bytes_remaining(), 2);
         assert_eq!(reader.bits_in_buffer(), 3);
         assert_eq!(reader.hold() & 0b111, 0b101);
@@ -264,10 +220,37 @@ mod tests {
         assert_eq!(bits.bits_in_buffer(), 3);
         assert_eq!(bits.bit_buffer & 0b111, 0b101);
 
-        let mut reader = BitReader::from_buffer(bits);
-        unsafe { reader.attach_input(core::ptr::null(), 0) };
+        let reader = BitReader::from_buffer(bits, &[]);
         assert_eq!(reader.bytes_remaining(), 0);
         assert!(reader.as_slice().is_empty());
         assert_eq!(reader.bits_in_buffer(), 3);
+    }
+
+    #[test]
+    fn cursor_never_advances_past_its_input() {
+        let input = [1u8, 2, 3];
+        let mut reader = BitReader::new(&input);
+        reader.advance(2);
+        assert_eq!(reader.as_slice(), &[3]);
+        reader.advance(usize::MAX);
+        assert!(reader.as_slice().is_empty());
+        assert_eq!(reader.bytes_remaining(), 0);
+    }
+
+    #[test]
+    fn refill_and_rewind_preserve_the_unconsumed_input() {
+        let input = [0x10u8, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98];
+        let mut reader = BitReader::new(&input);
+        reader.refill();
+        assert_eq!(reader.bits_in_buffer(), 56);
+        assert_eq!(reader.bytes_remaining(), 2);
+        assert_eq!(
+            reader.hold(),
+            u64::from_le_bytes(input[..8].try_into().unwrap())
+        );
+
+        reader.return_unused_bytes();
+        assert_eq!(reader.bits_in_buffer(), 0);
+        assert_eq!(reader.as_slice(), &input);
     }
 }

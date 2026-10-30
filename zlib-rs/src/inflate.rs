@@ -615,7 +615,7 @@ impl State<'_> {
     // more of the states call this function is slower.
     fn len_and_friends(
         &mut self,
-        reader: &mut BitReader,
+        reader: &mut BitReader<'_>,
         output: &mut InflateOutput<'_>,
     ) -> ControlFlow<ReturnCode, ()> {
         let avail_in = reader.bytes_remaining();
@@ -944,7 +944,7 @@ impl State<'_> {
 
     fn dispatch(
         &mut self,
-        bit_reader: &mut BitReader,
+        bit_reader: &mut BitReader<'_>,
         output: &mut InflateOutput<'_>,
         flush: InflateFlush,
     ) -> ReturnCode {
@@ -1171,7 +1171,7 @@ impl State<'_> {
                                             // and bit_reader.bytes_remaining(), so the count won't
                                             // go out of bounds.
                                             core::ptr::copy_nonoverlapping(
-                                                bit_reader.as_mut_ptr(),
+                                                bit_reader.as_slice().as_ptr(),
                                                 head.extra.add(next_write_offset),
                                                 count,
                                             );
@@ -1952,7 +1952,7 @@ impl State<'_> {
 /// `bit_reader.bytes_remaining() >= 15`.
 unsafe fn inflate_fast_help(
     state: &mut State,
-    bit_reader: &mut BitReader,
+    bit_reader: &mut BitReader<'_>,
     output: &mut InflateOutput<'_>,
     start: usize,
 ) {
@@ -1967,7 +1967,7 @@ unsafe fn inflate_fast_help(
 #[inline(always)]
 unsafe fn inflate_fast_help_impl(
     state: &mut State,
-    bit_reader: &mut BitReader,
+    bit_reader: &mut BitReader<'_>,
     output: &mut InflateOutput<'_>,
     _start: usize,
 ) {
@@ -1989,8 +1989,8 @@ unsafe fn inflate_fast_help_impl(
 
     if bit_reader.bits_in_buffer() < 10 {
         debug_assert!(bit_reader.bytes_remaining() >= 15);
-        // Safety: Caller ensured that bit_reader has >= 15 bytes available; refill only needs 8.
-        unsafe { bit_reader.refill() };
+        // The fast-path entry invariant guarantees at least eight bytes remain for `refill`.
+        bit_reader.refill();
     }
     // We had at least 15 bytes in the slice, plus whatever was in the buffer. After filling the
     // buffer from the slice, we now have at least 8 bytes remaining in the slice, plus a full buffer.
@@ -2015,11 +2015,11 @@ unsafe fn inflate_fast_help_impl(
 
             // Safety: As described in the comments for the debug_assert at the start of
             // the `outer` loop, it is guaranteed that `bit_reader.bytes_remaining() >= 8` here,
-            // which satisfies the safety precondition for `refill`. And, because the total
+            // which satisfies `refill`'s eight-byte requirement. And, because the total
             // number of bytes in `bit_reader`'s buffer plus its slice is at least 15, and
             // `refill` moves at most 7 bytes from the slice to the buffer, the slice will still
             // contain at least 8 bytes after this `refill` call.
-            unsafe { bit_reader.refill() };
+            bit_reader.refill();
             // After the refill, there will be at least 8 bytes left in the bit_reader's slice.
             debug_assert!(bit_reader.bytes_remaining() >= 8);
 
@@ -2064,10 +2064,10 @@ unsafe fn inflate_fast_help_impl(
                     // Safety: On the first iteration of the `dolen` loop, we can rely on the
                     // invariant documented for the previous `refill` call above: after that
                     // operation, `bit_reader.bytes_remining >= 8`, which satisfies the safety
-                    // precondition for this call. For subsequent iterations, this invariant
+                    // requirement for this call. For subsequent iterations, this invariant
                     // remains true because nothing else within the `dolen` loop consumes data
                     // from the slice.
-                    unsafe { bit_reader.refill() };
+                    bit_reader.refill();
                 }
 
                 'dodist: loop {
@@ -2421,15 +2421,21 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
         state.mode = Mode::TypeDo;
     }
 
-    let mut bit_reader = BitReader::from_buffer(state.bit_buffer);
-    unsafe { bit_reader.attach_input(stream.next_in, stream.avail_in as usize) };
+    let input = if stream.avail_in == 0 {
+        &[][..]
+    } else {
+        // SAFETY: `inflate` requires `next_in` to address `avail_in` readable bytes. The slice is
+        // call-local and cannot survive this invocation.
+        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
+    };
+    let mut bit_reader = BitReader::from_buffer(state.bit_buffer, input);
     // Safety: `stream.next_out` is non-null and points to at least `stream.avail_out` bytes.
     let mut output =
         unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
 
     let err = state.dispatch(&mut bit_reader, &mut output, flush);
 
-    let next_in = bit_reader.as_ptr();
+    let next_in = bit_reader.next_input_ptr();
     let avail_in = bit_reader.bytes_remaining();
     let in_read = stream.avail_in as usize - avail_in;
     let out_written = output.written_since_accounted();

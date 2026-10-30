@@ -453,8 +453,11 @@ pub unsafe fn back(
             }
             Mode::Len => {
                 if (have as usize) >= INFLATE_FAST_MIN_HAVE && left >= INFLATE_FAST_MIN_LEFT {
-                    let mut bit_reader = BitReader::new();
-                    unsafe { bit_reader.attach_input(next, have as usize) };
+                    // SAFETY: `next`/`have` are the current input span supplied by the caller or
+                    // inflateBack input callback, and this branch already proved at least
+                    // `INFLATE_FAST_MIN_HAVE` readable bytes remain.
+                    let input = unsafe { core::slice::from_raw_parts(next, have as usize) };
+                    let mut bit_reader = BitReader::new(input);
                     bit_reader.prime(bits, hold);
 
                     let mut writer = unsafe {
@@ -474,7 +477,7 @@ pub unsafe fn back(
                     hold = bit_reader.hold();
                     bits = bit_reader.bits_in_buffer();
 
-                    next = bit_reader.as_ptr();
+                    next = bit_reader.next_input_ptr();
                     have = bit_reader.bytes_remaining() as u32;
 
                     put = writer.next_out().cast();
@@ -721,7 +724,7 @@ pub unsafe fn back(
 #[inline(always)]
 unsafe fn inflate_fast_back(
     state: &mut State,
-    bit_reader: &mut BitReader,
+    bit_reader: &mut BitReader<'_>,
     writer: &mut Writer<'_>,
 ) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
@@ -742,8 +745,8 @@ unsafe fn inflate_fast_back(
 
     if bit_reader.bits_in_buffer() < 10 {
         debug_assert!(bit_reader.bytes_remaining() >= 15);
-        // Safety: Caller ensured that bit_reader has >= 15 bytes available; refill only needs 8.
-        unsafe { bit_reader.refill() };
+        // The fast-path entry invariant guarantees at least eight bytes remain for `refill`.
+        bit_reader.refill();
     }
     // We had at least 15 bytes in the slice, plus whatever was in the buffer. After filling the
     // buffer from the slice, we now have at least 8 bytes remaining in the slice, plus a full buffer.
@@ -768,11 +771,11 @@ unsafe fn inflate_fast_back(
 
             // Safety: As described in the comments for the debug_assert at the start of
             // the `outer` loop, it is guaranteed that `bit_reader.bytes_remaining() >= 8` here,
-            // which satisfies the safety precondition for `refill`. And, because the total
+            // which satisfies `refill`'s eight-byte requirement. And, because the total
             // number of bytes in `bit_reader`'s buffer plus its slice is at least 15, and
             // `refill` moves at most 7 bytes from the slice to the buffer, the slice will still
             // contain at least 8 bytes after this `refill` call.
-            unsafe { bit_reader.refill() };
+            bit_reader.refill();
             // After the refill, there will be at least 8 bytes left in the bit_reader's slice.
             debug_assert!(bit_reader.bytes_remaining() >= 8);
 
@@ -817,10 +820,10 @@ unsafe fn inflate_fast_back(
                     // Safety: On the first iteration of the `dolen` loop, we can rely on the
                     // invariant documented for the previous `refill` call above: after that
                     // operation, `bit_reader.bytes_remining >= 8`, which satisfies the safety
-                    // precondition for this call. For subsequent iterations, this invariant
+                    // requirement for this call. For subsequent iterations, this invariant
                     // remains true because nothing else within the `dolen` loop consumes data
                     // from the slice.
-                    unsafe { bit_reader.refill() };
+                    bit_reader.refill();
                 }
 
                 'dodist: loop {
