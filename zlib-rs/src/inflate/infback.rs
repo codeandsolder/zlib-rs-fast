@@ -40,7 +40,7 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new(&[], Writer::new(&mut []));
+    let mut state = State::new(&[]);
 
     // TODO this can change depending on the used/supported SIMD instructions
     state.chunksize = 32;
@@ -460,8 +460,7 @@ pub unsafe fn back(
                     unsafe { bit_reader.update_slice(next, have as usize) };
                     bit_reader.prime(bits, hold);
 
-                    state.bit_reader = bit_reader;
-                    state.writer = unsafe {
+                    let mut writer = unsafe {
                         Writer::new_uninit_raw(
                             put.wrapping_sub(state.window.buffer_size() - left),
                             state.window.buffer_size() - left,
@@ -473,16 +472,16 @@ pub unsafe fn back(
                         unsafe { state.window.set_have(state.window.buffer_size() - left) };
                     }
 
-                    unsafe { inflate_fast_back(state) };
+                    unsafe { inflate_fast_back(state, &mut bit_reader, &mut writer) };
 
-                    hold = state.bit_reader.hold();
-                    bits = state.bit_reader.bits_in_buffer();
+                    hold = bit_reader.hold();
+                    bits = bit_reader.bits_in_buffer();
 
-                    next = state.bit_reader.as_ptr();
-                    have = state.bit_reader.bytes_remaining() as u32;
+                    next = bit_reader.as_ptr();
+                    have = bit_reader.bytes_remaining() as u32;
 
-                    put = state.writer.next_out().cast();
-                    left = state.writer.remaining();
+                    put = writer.next_out().cast();
+                    left = writer.remaining();
 
                     continue 'inf_leave;
                 }
@@ -723,13 +722,12 @@ pub unsafe fn back(
 }
 
 #[inline(always)]
-unsafe fn inflate_fast_back(state: &mut State) {
-    let mut bit_reader = BitReader::new(&[]);
-    core::mem::swap(&mut bit_reader, &mut state.bit_reader);
+unsafe fn inflate_fast_back(
+    state: &mut State,
+    bit_reader: &mut BitReader<'_>,
+    writer: &mut Writer<'_>,
+) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
-
-    let mut writer = Writer::new(&mut []);
-    core::mem::swap(&mut writer, &mut state.writer);
 
     let lcode = state.len_table_ref();
     let dcode = state.dist_table_ref();
@@ -946,9 +944,6 @@ unsafe fn inflate_fast_back(state: &mut State) {
 
     // return unused bytes (on entry, bits < 8, so in won't go too far back)
     bit_reader.return_unused_bytes();
-
-    state.bit_reader = bit_reader;
-    state.writer = writer;
 
     if let Some(error_message) = bad {
         debug_assert!(matches!(state.mode, Mode::Bad));

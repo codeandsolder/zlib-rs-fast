@@ -405,10 +405,9 @@ pub(crate) struct State<'a> {
     /// next available space in codes[]
     next: usize, // represented as an index, don't want a self-referential structure here
 
-    // IO
+    // Input bit-buffer state persists across calls (e.g. inflatePrime). Output is call-local.
     bit_reader: BitReader<'a>,
 
-    writer: Writer<'a>,
     total: usize,
 
     /// length of a block to copy
@@ -429,7 +428,6 @@ pub(crate) struct State<'a> {
     chunksize: usize,
 
     in_available: usize,
-    out_available: usize,
 
     gzip_flags: i32,
 
@@ -463,9 +461,8 @@ pub(crate) struct State<'a> {
 }
 
 impl<'a> State<'a> {
-    fn new(reader: &'a [u8], writer: Writer<'a>) -> Self {
+    fn new(reader: &'a [u8]) -> Self {
         let in_available = reader.len();
-        let out_available = writer.capacity();
 
         Self {
             flush: InflateFlush::NoFlush,
@@ -485,11 +482,9 @@ impl<'a> State<'a> {
             was: 0,
             chunksize: 0,
             in_available,
-            out_available,
 
             bit_reader: BitReader::new(reader),
 
-            writer,
             total: 0,
 
             window: Window::empty(),
@@ -556,6 +551,71 @@ const fn zswap32(q: u32) -> u32 {
 const INFLATE_FAST_MIN_HAVE: usize = 15;
 const INFLATE_FAST_MIN_LEFT: usize = 260;
 
+/// Caller-output cursor for one ordinary inflate call.
+///
+/// The writer points into `z_stream.next_out` and therefore must not live in persistent `State`.
+/// `accounted_remaining` preserves zlib's trailer bookkeeping: when checksum processing folds
+/// bytes already produced in this call into `State::total`, later return accounting starts from
+/// that checkpoint instead of counting those bytes twice.
+struct InflateOutput<'a> {
+    writer: Writer<'a>,
+    accounted_remaining: usize,
+}
+
+impl<'a> InflateOutput<'a> {
+    unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            writer: unsafe { Writer::new_uninit(ptr, len) },
+            accounted_remaining: len,
+        }
+    }
+
+    #[inline]
+    fn mark_accounted(&mut self) {
+        self.accounted_remaining = self.writer.remaining();
+    }
+    #[inline]
+    fn written_since_accounted(&self) -> usize {
+        self.accounted_remaining - self.writer.remaining()
+    }
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.writer.remaining()
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.writer.len()
+    }
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.writer.is_full()
+    }
+    #[inline]
+    fn filled(&self) -> &[u8] {
+        self.writer.filled()
+    }
+    #[inline]
+    fn next_out(&mut self) -> *mut core::mem::MaybeUninit<u8> {
+        self.writer.next_out()
+    }
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        self.writer.push(byte)
+    }
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) {
+        self.writer.extend(bytes)
+    }
+    #[inline]
+    fn extend_from_window(&mut self, window: &Window<'_>, range: core::ops::Range<usize>) {
+        self.writer.extend_from_window(window, range)
+    }
+    #[inline]
+    fn copy_match(&mut self, offset_from_end: usize, length: usize) {
+        self.writer.copy_match(offset_from_end, length)
+    }
+}
+
 impl State<'_> {
     // This logic is split into its own function for two reasons
     //
@@ -566,13 +626,13 @@ impl State<'_> {
     //
     // It unfortunately does duplicate the code for some of the states; deduplicating it by having
     // more of the states call this function is slower.
-    fn len_and_friends(&mut self) -> ControlFlow<ReturnCode, ()> {
+    fn len_and_friends(&mut self, output: &mut InflateOutput<'_>) -> ControlFlow<ReturnCode, ()> {
         let avail_in = self.bit_reader.bytes_remaining();
-        let avail_out = self.writer.remaining();
+        let avail_out = output.remaining();
 
         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
             // SAFETY: INFLATE_FAST_MIN_HAVE is enough bytes remaining to satisfy the precondition.
-            unsafe { inflate_fast_help(self, 0) };
+            unsafe { inflate_fast_help(self, output, 0) };
             match self.mode {
                 Mode::Len => {}
                 _ => return ControlFlow::Continue(()),
@@ -580,13 +640,11 @@ impl State<'_> {
         }
 
         let mut mode;
-        let mut writer;
         let mut bit_reader;
 
         macro_rules! load {
             () => {
                 mode = self.mode;
-                writer = core::mem::replace(&mut self.writer, Writer::new(&mut []));
                 bit_reader = self.bit_reader;
             };
         }
@@ -594,7 +652,6 @@ impl State<'_> {
         macro_rules! restore {
             () => {
                 self.mode = mode;
-                self.writer = writer;
                 self.bit_reader = bit_reader;
             };
         }
@@ -620,7 +677,7 @@ impl State<'_> {
                 match mode {
                     Mode::Len => {
                         let avail_in = bit_reader.bytes_remaining();
-                        let avail_out = writer.remaining();
+                        let avail_out = output.remaining();
 
                         // INFLATE_FAST_MIN_LEFT is important. It makes sure there is at least 32 bytes of free
                         // space available. This means for many SIMD operations we don't need to process a
@@ -631,7 +688,7 @@ impl State<'_> {
                             // SAFETY: INFLATE_FAST_MIN_HAVE >= 15.
                             // Note that the restore macro does not do anything that would
                             // reduce the number of bytes available.
-                            unsafe { inflate_fast_help(self, 0) };
+                            unsafe { inflate_fast_help(self, output, 0) };
                             return ControlFlow::Continue(());
                         }
 
@@ -707,13 +764,13 @@ impl State<'_> {
                     }
                     Mode::Lit => {
                         // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
-                        if writer.is_full() {
+                        if output.is_full() {
                             restore!();
-                            traceln!("Ok: writer is full ({} bytes)", self.writer.capacity());
+                            traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
                             return ControlFlow::Break(ReturnCode::Ok);
                         }
 
-                        writer.push(self.length as u8);
+                        output.push(self.length as u8);
 
                         break 'top Mode::Len;
                     }
@@ -826,17 +883,17 @@ impl State<'_> {
                     }
                     Mode::Match => {
                         // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
-                        if writer.is_full() {
+                        if output.is_full() {
                             restore!();
                             traceln!(
                                 "BufError: writer is full ({} bytes)",
-                                self.writer.capacity()
+                                output.writer.capacity()
                             );
                             return ControlFlow::Break(ReturnCode::Ok);
                         }
 
-                        let left = writer.remaining();
-                        let copy = writer.len();
+                        let left = output.remaining();
+                        let copy = output.len();
 
                         let copy = if self.offset > copy {
                             // copy from window to output
@@ -869,12 +926,12 @@ impl State<'_> {
                             copy = Ord::min(copy, self.length);
                             copy = Ord::min(copy, left);
 
-                            writer.extend_from_window(&self.window, from..from + copy);
+                            output.extend_from_window(&self.window, from..from + copy);
 
                             copy
                         } else {
                             let copy = Ord::min(self.length, left);
-                            writer.copy_match(self.offset, copy);
+                            output.copy_match(self.offset, copy);
 
                             copy
                         };
@@ -895,7 +952,7 @@ impl State<'_> {
         }
     }
 
-    fn dispatch(&mut self) -> ReturnCode {
+    fn dispatch(&mut self, output: &mut InflateOutput<'_>) -> ReturnCode {
         // Note: All early returns must save mode into self.mode again.
         let mut mode = self.mode;
 
@@ -1406,14 +1463,14 @@ impl State<'_> {
                                 break;
                             }
 
-                            copy = Ord::min(copy, self.writer.remaining());
+                            copy = Ord::min(copy, output.remaining());
                             copy = Ord::min(copy, self.bit_reader.bytes_remaining());
 
                             if copy == 0 {
                                 break 'label self.inflate_leave(ReturnCode::Ok);
                             }
 
-                            self.writer.extend(&self.bit_reader.as_slice()[..copy]);
+                            output.extend(&self.bit_reader.as_slice()[..copy]);
                             self.bit_reader.advance(copy);
 
                             self.length -= copy;
@@ -1425,14 +1482,14 @@ impl State<'_> {
                         if !cfg!(feature = "__internal-fuzz-disable-checksum") && self.wrap != 0 {
                             need_bits!(self, 32);
 
-                            self.total += self.writer.len();
+                            self.total += output.len();
 
                             if self.wrap & 4 != 0 {
                                 if self.gzip_flags != 0 {
-                                    self.crc_fold.fold(self.writer.filled());
+                                    self.crc_fold.fold(output.filled());
                                     self.checksum = self.crc_fold.finish();
                                 } else {
-                                    self.checksum = adler32(self.checksum, self.writer.filled());
+                                    self.checksum = adler32(self.checksum, output.filled());
                                 }
                             }
 
@@ -1442,7 +1499,7 @@ impl State<'_> {
                                 zswap32(self.bit_reader.hold() as u32)
                             };
 
-                            self.out_available = self.writer.capacity() - self.writer.len();
+                            output.mark_accounted();
 
                             if self.wrap & 4 != 0 && given_checksum != self.checksum {
                                 mode = Mode::Bad;
@@ -1459,7 +1516,7 @@ impl State<'_> {
                     }
                     Mode::Len => {
                         self.mode = mode;
-                        let val = self.len_and_friends();
+                        let val = self.len_and_friends(output);
                         mode = self.mode;
                         match val {
                             ControlFlow::Break(return_code) => break 'label return_code,
@@ -1486,12 +1543,12 @@ impl State<'_> {
                     }
                     Mode::Lit => {
                         // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
-                        if self.writer.is_full() {
-                            traceln!("Ok: writer is full ({} bytes)", self.writer.capacity());
+                        if output.is_full() {
+                            traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
                             break 'label self.inflate_leave(ReturnCode::Ok);
                         }
 
-                        self.writer.push(self.length as u8);
+                        output.push(self.length as u8);
 
                         break 'blk Mode::Len;
                     }
@@ -1567,16 +1624,16 @@ impl State<'_> {
                         // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
 
                         'match_: loop {
-                            if self.writer.is_full() {
+                            if output.is_full() {
                                 traceln!(
                                     "BufError: writer is full ({} bytes)",
-                                    self.writer.capacity()
+                                    output.writer.capacity()
                                 );
                                 break 'label self.inflate_leave(ReturnCode::Ok);
                             }
 
-                            let left = self.writer.remaining();
-                            let copy = self.writer.len();
+                            let left = output.remaining();
+                            let copy = output.len();
 
                             let copy = if self.offset > copy {
                                 // copy from window to output
@@ -1606,13 +1663,12 @@ impl State<'_> {
                                 copy = Ord::min(copy, self.length);
                                 copy = Ord::min(copy, left);
 
-                                self.writer
-                                    .extend_from_window(&self.window, from..from + copy);
+                                output.extend_from_window(&self.window, from..from + copy);
 
                                 copy
                             } else {
                                 let copy = Ord::min(self.length, left);
-                                self.writer.copy_match(self.offset, copy);
+                                output.copy_match(self.offset, copy);
 
                                 copy
                             };
@@ -1903,9 +1959,9 @@ impl State<'_> {
 ///
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
-unsafe fn inflate_fast_help(state: &mut State, start: usize) {
+unsafe fn inflate_fast_help(state: &mut State, output: &mut InflateOutput<'_>, start: usize) {
     // SAFETY: The caller ensured enough bytes remain for the fast decoder.
-    unsafe { inflate_fast_help_impl(state, start) };
+    unsafe { inflate_fast_help_impl(state, output, start) };
 }
 
 /// # Safety
@@ -1913,13 +1969,10 @@ unsafe fn inflate_fast_help(state: &mut State, start: usize) {
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
 #[inline(always)]
-unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
+unsafe fn inflate_fast_help_impl(state: &mut State, output: &mut InflateOutput<'_>, _start: usize) {
     let mut bit_reader = BitReader::new(&[]);
     core::mem::swap(&mut bit_reader, &mut state.bit_reader);
     debug_assert!(bit_reader.bytes_remaining() >= 15);
-
-    let mut writer = Writer::new(&mut []);
-    core::mem::swap(&mut writer, &mut state.writer);
 
     let lcode = state.len_table_ref();
     let dcode = state.dist_table_ref();
@@ -1981,12 +2034,12 @@ unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
         };
 
         if here.op == 0 {
-            writer.push(here.val as u8);
+            output.push(here.val as u8);
             bit_reader.drop_bits(here.bits);
             here = lcode[(bit_reader.hold() & lmask) as usize];
 
             if here.op == 0 {
-                writer.push(here.val as u8);
+                output.push(here.val as u8);
                 bit_reader.drop_bits(here.bits);
                 here = lcode[(bit_reader.hold() & lmask) as usize];
             }
@@ -1997,7 +2050,7 @@ unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
             let op = here.op;
 
             if op == 0 {
-                writer.push(here.val as u8);
+                output.push(here.val as u8);
             } else if op & 16 != 0 {
                 let op = op & MAX_BITS;
                 let mut len = here.val + bit_reader.bits(op as usize) as u16;
@@ -2035,7 +2088,7 @@ unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
                         bit_reader.drop_bits(op);
 
                         // max distance in output
-                        let written = writer.len();
+                        let written = output.len();
 
                         if dist as usize > written {
                             // copy fropm the window
@@ -2078,23 +2131,23 @@ unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
                                     // window, and part of it has wrapped around to the start. Copy
                                     // the end section here, the start section will be copied below.
                                     len -= op as u16;
-                                    writer.extend_from_window(&state.window, from..from + op);
+                                    output.extend_from_window(&state.window, from..from + op);
                                     from = 0;
                                     op = window_next;
                                 }
                             }
 
                             let copy = Ord::min(op, len as usize);
-                            writer.extend_from_window(&state.window, from..from + copy);
+                            output.extend_from_window(&state.window, from..from + copy);
 
                             if op < len as usize {
                                 // here we need some bytes from the output itself
-                                writer.copy_match(dist as usize, len as usize - op);
+                                output.copy_match(dist as usize, len as usize - op);
                             }
                         } else if extra_safe {
                             todo!()
                         } else {
-                            writer.copy_match(dist as usize, len as usize)
+                            output.copy_match(dist as usize, len as usize)
                         }
                     } else if (op & 64) == 0 {
                         // 2nd level distance code
@@ -2127,7 +2180,7 @@ unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
 
         // For normal `inflate`, include the bits in the bit_reader buffer in the count of available bytes.
         let remaining = bit_reader.bytes_remaining_including_buffer();
-        if remaining >= INFLATE_FAST_MIN_HAVE && writer.remaining() >= INFLATE_FAST_MIN_LEFT {
+        if remaining >= INFLATE_FAST_MIN_HAVE && output.remaining() >= INFLATE_FAST_MIN_LEFT {
             continue;
         }
 
@@ -2138,7 +2191,6 @@ unsafe fn inflate_fast_help_impl(state: &mut State, _start: usize) {
     bit_reader.return_unused_bytes();
 
     state.bit_reader = bit_reader;
-    state.writer = writer;
 
     if let Some(error_message) = bad {
         debug_assert!(matches!(state.mode, Mode::Bad));
@@ -2239,7 +2291,7 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new(&[], Writer::new(&mut []));
+    let mut state = State::new(&[]);
 
     // TODO this can change depending on the used/supported SIMD instructions
     state.chunksize = 32;
@@ -2383,15 +2435,15 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
             .update_slice(stream.next_in, stream.avail_in as usize)
     };
     // Safety: `stream.next_out` is non-null and points to at least `stream.avail_out` bytes.
-    state.writer = unsafe { Writer::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
+    let mut output =
+        unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
 
     state.in_available = stream.avail_in as _;
-    state.out_available = stream.avail_out as _;
 
-    let err = state.dispatch();
+    let err = state.dispatch(&mut output);
 
     let in_read = state.bit_reader.as_ptr() as usize - stream.next_in as usize;
-    let out_written = state.out_available - (state.writer.capacity() - state.writer.len());
+    let out_written = output.written_since_accounted();
 
     stream.total_in += in_read as z_size;
     state.total = state.total.wrapping_add(out_written);
@@ -2400,8 +2452,8 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     stream.avail_in = state.bit_reader.bytes_remaining() as u32;
     stream.next_in = state.bit_reader.as_ptr() as *mut u8;
 
-    stream.avail_out = (state.writer.capacity() - state.writer.len()) as u32;
-    stream.next_out = state.writer.next_out() as *mut u8;
+    stream.avail_out = output.remaining() as u32;
+    stream.next_out = output.next_out() as *mut u8;
 
     stream.adler = state.checksum as z_checksum;
 
@@ -2422,7 +2474,7 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
 
     if must_update_window {
         state.window.extend(
-            &state.writer.filled()[..out_written],
+            &output.filled()[..out_written],
             state.gzip_flags,
             update_checksum,
             &mut state.checksum,

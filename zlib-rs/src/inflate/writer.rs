@@ -10,24 +10,6 @@ pub struct Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
-    /// Creates a new `Writer` from a fully initialized buffer.
-    #[inline]
-    pub fn new(buf: &'a mut [u8]) -> Writer<'a> {
-        // SAFETY: Because buf is a slice, most of the preconditions for
-        // core::slice::from_raw_parts_mut are satisfied:
-        // * buf.as_mut_ptr() is non-null.
-        // * The memory range is within a single allocated object.
-        // * buf is mutable, so the range is valid for both reads
-        //   and writes of up to buf.len() * size_of::<u8>() bytes.
-        // * The contents of the slice are initialized.
-        // * buf.as_mut_ptr() + buf.len() does not wrap around
-        //   the end of the address space.
-        // The remaining precondition is enforced by the borrow checker when this function is called:
-        // * The memory range cannot be accessed through any other pointer for the
-        //   duration of lifetime 'a.
-        unsafe { Self::new_uninit(buf.as_mut_ptr(), buf.len()) }
-    }
-
     /// Creates a new `Writer` from an uninitialized buffer.
     ///
     /// # Safety
