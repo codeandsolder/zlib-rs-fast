@@ -603,6 +603,55 @@ impl<'a> InflateOutput<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DispatchExit {
+    mode: Mode,
+    code: ReturnCode,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LenDecodeOutcome<'input> {
+    mode: Mode,
+    reader: BitReader<'input>,
+    flow: ControlFlow<ReturnCode, ()>,
+}
+
+impl<'input> LenDecodeOutcome<'input> {
+    fn continue_with(mode: Mode, reader: BitReader<'input>) -> Self {
+        Self {
+            mode,
+            reader,
+            flow: ControlFlow::Continue(()),
+        }
+    }
+
+    fn break_with(mode: Mode, reader: BitReader<'input>, code: ReturnCode) -> Self {
+        Self {
+            mode,
+            reader,
+            flow: ControlFlow::Break(code),
+        }
+    }
+}
+
+#[inline(always)]
+fn need_bits_for_mode(
+    reader: &mut BitReader<'_>,
+    count: usize,
+    mode: Mode,
+) -> Result<(), DispatchExit> {
+    reader
+        .need_bits(count)
+        .map_err(|code| DispatchExit { mode, code })
+}
+
+#[inline(always)]
+fn pull_byte_for_mode(reader: &mut BitReader<'_>, mode: Mode) -> Result<u8, DispatchExit> {
+    reader
+        .pull_byte()
+        .map_err(|code| DispatchExit { mode, code })
+}
+
 impl State<'_> {
     // This logic is split into its own function for two reasons
     //
@@ -630,23 +679,18 @@ impl State<'_> {
             }
         }
 
-        let mut mode;
-        let mut bit_reader = *reader;
+        let outcome = self.len_and_friends_inner(*reader, output);
+        self.mode = outcome.mode;
+        *reader = outcome.reader;
+        outcome.flow
+    }
 
-        macro_rules! load {
-            () => {
-                mode = self.mode;
-            };
-        }
-
-        macro_rules! restore {
-            () => {
-                self.mode = mode;
-                *reader = bit_reader;
-            };
-        }
-
-        load!();
+    fn len_and_friends_inner<'input>(
+        &mut self,
+        mut bit_reader: BitReader<'input>,
+        output: &mut InflateOutput<'_>,
+    ) -> LenDecodeOutcome<'input> {
+        let mut mode = self.mode;
 
         let len_table = match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
@@ -674,12 +718,10 @@ impl State<'_> {
                         // remainder; we just copy blindly, and a later operation will overwrite the extra copied
                         // bytes
                         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
-                            restore!();
+                            self.mode = mode;
                             // SAFETY: INFLATE_FAST_MIN_HAVE >= 15.
-                            // Note that the restore macro does not do anything that would
-                            // reduce the number of bytes available.
-                            unsafe { inflate_fast_help(self, reader, output, 0) };
-                            return ControlFlow::Continue(());
+                            unsafe { inflate_fast_help(self, &mut bit_reader, output, 0) };
+                            return LenDecodeOutcome::continue_with(self.mode, bit_reader);
                         }
 
                         self.back = 0;
@@ -695,8 +737,7 @@ impl State<'_> {
                             }
 
                             if let Err(return_code) = bit_reader.pull_byte() {
-                                restore!();
-                                return ControlFlow::Break(return_code);
+                                return LenDecodeOutcome::break_with(mode, bit_reader, return_code);
                             };
                         }
 
@@ -710,8 +751,11 @@ impl State<'_> {
                                 }
 
                                 if let Err(return_code) = bit_reader.pull_byte() {
-                                    restore!();
-                                    return ControlFlow::Break(return_code);
+                                    return LenDecodeOutcome::break_with(
+                                        mode,
+                                        bit_reader,
+                                        return_code,
+                                    );
                                 };
                             }
 
@@ -733,18 +777,19 @@ impl State<'_> {
                             self.back = usize::MAX;
                             mode = Mode::Type;
 
-                            restore!();
-                            return ControlFlow::Continue(());
+                            return LenDecodeOutcome::continue_with(mode, bit_reader);
                         } else if here.op & 64 != 0 {
                             mode = Mode::Bad;
                             {
-                                restore!();
-                                let this = &mut *self;
                                 let msg: &'static str = "invalid literal/length code\0";
                                 #[cfg(all(feature = "std", test))]
                                 dbg!(msg);
-                                this.error_message = Some(msg);
-                                return ControlFlow::Break(ReturnCode::DataError);
+                                self.error_message = Some(msg);
+                                return LenDecodeOutcome::break_with(
+                                    mode,
+                                    bit_reader,
+                                    ReturnCode::DataError,
+                                );
                             }
                         } else {
                             // length code
@@ -755,9 +800,8 @@ impl State<'_> {
                     Mode::Lit => {
                         // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
                         if output.is_full() {
-                            restore!();
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
-                            return ControlFlow::Break(ReturnCode::Ok);
+                            return LenDecodeOutcome::break_with(mode, bit_reader, ReturnCode::Ok);
                         }
 
                         output.push(self.length as u8);
@@ -772,8 +816,11 @@ impl State<'_> {
                         if extra != 0 {
                             match bit_reader.need_bits(extra) {
                                 Err(return_code) => {
-                                    restore!();
-                                    return ControlFlow::Break(return_code);
+                                    return LenDecodeOutcome::break_with(
+                                        mode,
+                                        bit_reader,
+                                        return_code,
+                                    );
                                 }
                                 Ok(v) => v,
                             };
@@ -801,8 +848,7 @@ impl State<'_> {
                             }
 
                             if let Err(return_code) = bit_reader.pull_byte() {
-                                restore!();
-                                return ControlFlow::Break(return_code);
+                                return LenDecodeOutcome::break_with(mode, bit_reader, return_code);
                             };
                         }
 
@@ -819,8 +865,11 @@ impl State<'_> {
                                 }
 
                                 if let Err(return_code) = bit_reader.pull_byte() {
-                                    restore!();
-                                    return ControlFlow::Break(return_code);
+                                    return LenDecodeOutcome::break_with(
+                                        mode,
+                                        bit_reader,
+                                        return_code,
+                                    );
                                 };
                             }
 
@@ -831,9 +880,10 @@ impl State<'_> {
                         bit_reader.drop_bits(here.bits);
 
                         if here.op & 64 != 0 {
-                            restore!();
-                            self.mode = Mode::Bad;
-                            return ControlFlow::Break(self.bad("invalid distance code\0"));
+                            mode = Mode::Bad;
+                            self.mode = mode;
+                            let code = self.bad("invalid distance code\0");
+                            return LenDecodeOutcome::break_with(mode, bit_reader, code);
                         }
 
                         self.offset = here.val as usize;
@@ -849,8 +899,11 @@ impl State<'_> {
                         if extra > 0 {
                             match bit_reader.need_bits(extra) {
                                 Err(return_code) => {
-                                    restore!();
-                                    return ControlFlow::Break(return_code);
+                                    return LenDecodeOutcome::break_with(
+                                        mode,
+                                        bit_reader,
+                                        return_code,
+                                    );
                                 }
                                 Ok(v) => v,
                             };
@@ -860,11 +913,10 @@ impl State<'_> {
                         }
 
                         if INFLATE_STRICT && self.offset > self.dmax {
-                            restore!();
-                            self.mode = Mode::Bad;
-                            return ControlFlow::Break(
-                                self.bad("invalid distance code too far back\0"),
-                            );
+                            mode = Mode::Bad;
+                            self.mode = mode;
+                            let code = self.bad("invalid distance code too far back\0");
+                            return LenDecodeOutcome::break_with(mode, bit_reader, code);
                         }
 
                         traceln!("inflate: distance {}", self.offset);
@@ -874,12 +926,11 @@ impl State<'_> {
                     Mode::Match => {
                         // NOTE: this branch must be kept in sync with its counterpart in `dispatch`
                         if output.is_full() {
-                            restore!();
                             traceln!(
                                 "BufError: writer is full ({} bytes)",
                                 output.writer.capacity()
                             );
-                            return ControlFlow::Break(ReturnCode::Ok);
+                            return LenDecodeOutcome::break_with(mode, bit_reader, ReturnCode::Ok);
                         }
 
                         let left = output.remaining();
@@ -892,11 +943,10 @@ impl State<'_> {
 
                             if copy > self.window.have() {
                                 if self.flags.contains(Flags::SANE) {
-                                    restore!();
-                                    self.mode = Mode::Bad;
-                                    return ControlFlow::Break(
-                                        self.bad("invalid distance too far back\0"),
-                                    );
+                                    mode = Mode::Bad;
+                                    self.mode = mode;
+                                    let code = self.bad("invalid distance too far back\0");
+                                    return LenDecodeOutcome::break_with(mode, bit_reader, code);
                                 }
 
                                 // TODO INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR
@@ -936,7 +986,7 @@ impl State<'_> {
                             break 'top Mode::Match;
                         }
                     }
-                    _ => unsafe { core::hint::unreachable_unchecked() },
+                    other => unreachable!("len decoder entered non-literal/match state: {other:?}"),
                 }
             }
         }
@@ -948,33 +998,26 @@ impl State<'_> {
         output: &mut InflateOutput<'_>,
         flush: InflateFlush,
     ) -> ReturnCode {
-        // Note: All early returns must save mode into self.mode again.
-        let mut mode = self.mode;
-
-        macro_rules! pull_byte {
-            ($self:expr) => {
-                match bit_reader.pull_byte() {
-                    Err(return_code) => {
-                        self.mode = mode;
-                        return $self.inflate_leave(return_code);
-                    }
-                    Ok(_) => (),
-                }
-            };
+        let mode = self.mode;
+        match self.dispatch_inner(bit_reader, output, flush, mode) {
+            Ok((mode, code)) => {
+                self.mode = mode;
+                code
+            }
+            Err(DispatchExit { mode, code }) => {
+                self.mode = mode;
+                code
+            }
         }
+    }
 
-        macro_rules! need_bits {
-            ($self:expr, $n:expr) => {
-                match bit_reader.need_bits($n) {
-                    Err(return_code) => {
-                        self.mode = mode;
-                        return $self.inflate_leave(return_code);
-                    }
-                    Ok(v) => v,
-                }
-            };
-        }
-
+    fn dispatch_inner(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+        output: &mut InflateOutput<'_>,
+        flush: InflateFlush,
+        mut mode: Mode,
+    ) -> Result<(Mode, ReturnCode), DispatchExit> {
         let ret = 'label: loop {
             mode = 'blk: {
                 match mode {
@@ -983,7 +1026,7 @@ impl State<'_> {
                             break 'blk Mode::TypeDo;
                         }
 
-                        need_bits!(self, 16);
+                        need_bits_for_mode(bit_reader, 16, mode)?;
 
                         // Gzip
                         if (self.wrap & 2) != 0 && bit_reader.hold() == 0x8b1f {
@@ -1045,7 +1088,7 @@ impl State<'_> {
                         }
                     }
                     Mode::Flags => {
-                        need_bits!(self, 16);
+                        need_bits_for_mode(bit_reader, 16, mode)?;
                         self.gzip_flags = bit_reader.hold() as i32;
 
                         // Z_DEFLATED = 8 is the only supported method
@@ -1076,7 +1119,7 @@ impl State<'_> {
                         break 'blk Mode::Time;
                     }
                     Mode::Time => {
-                        need_bits!(self, 32);
+                        need_bits_for_mode(bit_reader, 32, mode)?;
                         if let Some(mut head) = self.head {
                             // SAFETY: see `get_header`; this borrow is limited to this parser stage.
                             let head = unsafe { head.as_mut() };
@@ -1093,7 +1136,7 @@ impl State<'_> {
                         break 'blk Mode::Os;
                     }
                     Mode::Os => {
-                        need_bits!(self, 16);
+                        need_bits_for_mode(bit_reader, 16, mode)?;
                         if let Some(mut head) = self.head {
                             // SAFETY: see `get_header`; this borrow is limited to this parser stage.
                             let head = unsafe { head.as_mut() };
@@ -1112,7 +1155,7 @@ impl State<'_> {
                     }
                     Mode::ExLen => {
                         if (self.gzip_flags & 0x0400) != 0 {
-                            need_bits!(self, 16);
+                            need_bits_for_mode(bit_reader, 16, mode)?;
 
                             // self.length (and head.extra_len) represent the length of the extra field
                             self.length = bit_reader.hold() as usize;
@@ -1191,7 +1234,7 @@ impl State<'_> {
 
                             // Checks for errors occur after returning
                             if self.length != 0 {
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
                         }
 
@@ -1202,7 +1245,7 @@ impl State<'_> {
                     Mode::Name => {
                         if (self.gzip_flags & 0x0800) != 0 {
                             if bit_reader.bytes_remaining() == 0 {
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
 
                             // the name string will always be null-terminated, but might be longer than we have
@@ -1248,7 +1291,7 @@ impl State<'_> {
                             bit_reader.advance(name_slice.len());
 
                             if !reached_end && bit_reader.bytes_remaining() == 0 {
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
                         } else if let Some(mut head) = self.head {
                             // SAFETY: see `get_header`; this borrow is limited to this parser stage.
@@ -1263,7 +1306,7 @@ impl State<'_> {
                     Mode::Comment => {
                         if (self.gzip_flags & 0x01000) != 0 {
                             if bit_reader.bytes_remaining() == 0 {
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
 
                             // the comment string will always be null-terminated, but might be longer than we have
@@ -1309,7 +1352,7 @@ impl State<'_> {
                             bit_reader.advance(comment_slice.len());
 
                             if !reached_end && bit_reader.bytes_remaining() == 0 {
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
                         } else if let Some(mut head) = self.head {
                             // SAFETY: see `get_header`; this borrow is limited to this parser stage.
@@ -1321,7 +1364,7 @@ impl State<'_> {
                     }
                     Mode::HCrc => {
                         if (self.gzip_flags & 0x0200) != 0 {
-                            need_bits!(self, 16);
+                            need_bits_for_mode(bit_reader, 16, mode)?;
 
                             if (self.wrap & 4) != 0
                                 && bit_reader.hold() as u32 != (self.checksum & 0xffff)
@@ -1365,7 +1408,7 @@ impl State<'_> {
                             break 'blk Mode::Check;
                         }
 
-                        need_bits!(self, 3);
+                        need_bits_for_mode(bit_reader, 3, mode)?;
                         let last = bit_reader.bits(1) != 0;
                         self.flags.update(Flags::IS_LAST_BLOCK, last);
                         bit_reader.drop_bits(1);
@@ -1396,7 +1439,7 @@ impl State<'_> {
                                 bit_reader.drop_bits(2);
 
                                 if let InflateFlush::Trees = flush {
-                                    break 'label self.inflate_leave(ReturnCode::Ok);
+                                    break 'label ReturnCode::Ok;
                                 } else {
                                     break 'blk Mode::Len_;
                                 }
@@ -1425,7 +1468,7 @@ impl State<'_> {
                     Mode::Stored => {
                         bit_reader.next_byte_boundary();
 
-                        need_bits!(self, 32);
+                        need_bits_for_mode(bit_reader, 32, mode)?;
 
                         let hold = bit_reader.bits(32) as u32;
 
@@ -1442,7 +1485,7 @@ impl State<'_> {
                         bit_reader.init_bits();
 
                         if let InflateFlush::Trees = flush {
-                            break 'label self.inflate_leave(ReturnCode::Ok);
+                            break 'label ReturnCode::Ok;
                         } else {
                             break 'blk Mode::CopyBlock;
                         }
@@ -1459,7 +1502,7 @@ impl State<'_> {
                             copy = Ord::min(copy, bit_reader.bytes_remaining());
 
                             if copy == 0 {
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
 
                             output.extend(&bit_reader.as_slice()[..copy]);
@@ -1472,7 +1515,7 @@ impl State<'_> {
                     }
                     Mode::Check => {
                         if !cfg!(feature = "__internal-fuzz-disable-checksum") && self.wrap != 0 {
-                            need_bits!(self, 32);
+                            need_bits_for_mode(bit_reader, 32, mode)?;
 
                             self.total += output.len();
 
@@ -1521,7 +1564,7 @@ impl State<'_> {
 
                         // get extra bits, if any
                         if extra != 0 {
-                            need_bits!(self, extra);
+                            need_bits_for_mode(bit_reader, extra, mode)?;
                             self.length += bit_reader.bits(extra) as usize;
                             bit_reader.drop_bits(extra as u8);
                             self.back += extra;
@@ -1537,7 +1580,7 @@ impl State<'_> {
                         // NOTE: this branch must be kept in sync with its counterpart in `len_and_friends`
                         if output.is_full() {
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
-                            break 'label self.inflate_leave(ReturnCode::Ok);
+                            break 'label ReturnCode::Ok;
                         }
 
                         output.push(self.length as u8);
@@ -1556,7 +1599,7 @@ impl State<'_> {
                                 break;
                             }
 
-                            pull_byte!(self);
+                            pull_byte_for_mode(bit_reader, mode)?;
                         }
 
                         if here.op & 0xf0 == 0 {
@@ -1572,7 +1615,7 @@ impl State<'_> {
                                     break;
                                 }
 
-                                pull_byte!(self);
+                                pull_byte_for_mode(bit_reader, mode)?;
                             }
 
                             bit_reader.drop_bits(last.bits);
@@ -1597,7 +1640,7 @@ impl State<'_> {
                         let extra = self.extra;
 
                         if extra > 0 {
-                            need_bits!(self, extra);
+                            need_bits_for_mode(bit_reader, extra, mode)?;
                             self.offset += bit_reader.bits(extra) as usize;
                             bit_reader.drop_bits(extra as u8);
                             self.back += extra;
@@ -1621,7 +1664,7 @@ impl State<'_> {
                                     "BufError: writer is full ({} bytes)",
                                     output.writer.capacity()
                                 );
-                                break 'label self.inflate_leave(ReturnCode::Ok);
+                                break 'label ReturnCode::Ok;
                             }
 
                             let left = output.remaining();
@@ -1676,7 +1719,7 @@ impl State<'_> {
                         }
                     }
                     Mode::Table => {
-                        need_bits!(self, 14);
+                        need_bits_for_mode(bit_reader, 14, mode)?;
                         self.nlen = bit_reader.bits(5) as usize + 257;
                         bit_reader.drop_bits(5);
                         self.ndist = bit_reader.bits(5) as usize + 1;
@@ -1701,7 +1744,7 @@ impl State<'_> {
                         ];
 
                         while self.have < self.ncode {
-                            need_bits!(self, 3);
+                            need_bits_for_mode(bit_reader, 3, mode)?;
                             self.lens[usize::from(ORDER[self.have])] = bit_reader.bits(3) as u16;
                             self.have += 1;
                             bit_reader.drop_bits(3);
@@ -1740,7 +1783,7 @@ impl State<'_> {
                                     break here;
                                 }
 
-                                pull_byte!(self);
+                                pull_byte_for_mode(bit_reader, mode)?;
                             };
 
                             let here_bits = here.bits;
@@ -1752,7 +1795,11 @@ impl State<'_> {
                                     self.have += 1;
                                 }
                                 16 => {
-                                    need_bits!(self, usize::from(here_bits) + 2);
+                                    need_bits_for_mode(
+                                        bit_reader,
+                                        usize::from(here_bits) + 2,
+                                        mode,
+                                    )?;
                                     bit_reader.drop_bits(here_bits);
                                     if self.have == 0 {
                                         mode = Mode::Bad;
@@ -1772,7 +1819,11 @@ impl State<'_> {
                                     self.have += copy;
                                 }
                                 17 => {
-                                    need_bits!(self, usize::from(here_bits) + 3);
+                                    need_bits_for_mode(
+                                        bit_reader,
+                                        usize::from(here_bits) + 3,
+                                        mode,
+                                    )?;
                                     bit_reader.drop_bits(here_bits);
                                     let copy = 3 + bit_reader.bits(3) as usize;
                                     bit_reader.drop_bits(3);
@@ -1786,7 +1837,11 @@ impl State<'_> {
                                     self.have += copy;
                                 }
                                 18.. => {
-                                    need_bits!(self, usize::from(here_bits) + 7);
+                                    need_bits_for_mode(
+                                        bit_reader,
+                                        usize::from(here_bits) + 7,
+                                        mode,
+                                    )?;
                                     bit_reader.drop_bits(here_bits);
                                     let copy = 11 + bit_reader.bits(7) as usize;
                                     bit_reader.drop_bits(7);
@@ -1843,14 +1898,14 @@ impl State<'_> {
                         mode = Mode::Len_;
 
                         if matches!(flush, InflateFlush::Trees) {
-                            break 'label self.inflate_leave(ReturnCode::Ok);
+                            break 'label ReturnCode::Ok;
                         }
 
                         break 'blk Mode::Len_;
                     }
                     Mode::Dict => {
                         if !self.flags.contains(Flags::HAVE_DICT) {
-                            break 'label self.inflate_leave(ReturnCode::NeedDict);
+                            break 'label ReturnCode::NeedDict;
                         }
 
                         self.checksum = crate::ADLER32_INITIAL_VALUE as _;
@@ -1858,7 +1913,7 @@ impl State<'_> {
                         break 'blk Mode::Type;
                     }
                     Mode::DictId => {
-                        need_bits!(self, 32);
+                        need_bits_for_mode(bit_reader, 32, mode)?;
 
                         self.checksum = zswap32(bit_reader.hold() as u32);
 
@@ -1887,7 +1942,7 @@ impl State<'_> {
                     Mode::Length => {
                         // for gzip, last bytes contain LENGTH
                         if self.wrap != 0 && self.gzip_flags != 0 {
-                            need_bits!(self, 32);
+                            need_bits_for_mode(bit_reader, 32, mode)?;
                             if (self.wrap & 0b100) != 0
                                 && bit_reader.hold() as u32 != self.total as u32
                             {
@@ -1906,23 +1961,14 @@ impl State<'_> {
             }
         };
 
-        self.mode = mode;
-
-        ret
+        Ok((mode, ret))
     }
 
     fn bad(&mut self, msg: &'static str) -> ReturnCode {
         #[cfg(all(feature = "std", test))]
         dbg!(msg);
         self.error_message = Some(msg);
-        self.inflate_leave(ReturnCode::DataError)
-    }
-
-    // NOTE: it is crucial for the internal bookkeeping that this is the only route for actually
-    // leaving the inflate function call chain
-    fn inflate_leave(&mut self, return_code: ReturnCode) -> ReturnCode {
-        // actual logic is in `inflate` itself
-        return_code
+        ReturnCode::DataError
     }
 
     /// Stored in the `z_stream.data_type` field
@@ -2849,6 +2895,75 @@ mod tests {
 
         end(source);
         end(copied);
+    }
+
+    fn inflate_fragmented(
+        compressed: &[u8],
+        expected: &[u8],
+        input_chunk: usize,
+        output_chunk: usize,
+    ) {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        let mut output = vec![0u8; expected.len() + output_chunk];
+        let mut next_input = 0usize;
+        let mut next_output = 0usize;
+
+        loop {
+            if stream.avail_in == 0 && next_input < compressed.len() {
+                let len = input_chunk.min(compressed.len() - next_input);
+                stream.next_in = compressed[next_input..].as_ptr() as *mut u8;
+                stream.avail_in = len as u32;
+                next_input += len;
+            }
+
+            if stream.avail_out == 0 {
+                let len = output_chunk.min(output.len() - next_output);
+                assert!(
+                    len > 0,
+                    "fragmented inflate exhausted its output allocation"
+                );
+                stream.next_out = output[next_output..].as_mut_ptr();
+                stream.avail_out = len as u32;
+                next_output += len;
+            }
+
+            match unsafe { inflate(stream, InflateFlush::NoFlush) } {
+                ReturnCode::Ok => {}
+                ReturnCode::StreamEnd => break,
+                code => panic!("fragmented inflate returned {code:?}"),
+            }
+        }
+
+        let written = stream.total_out as usize;
+        assert_eq!(written, expected.len());
+        assert_eq!(&output[..written], expected);
+        end(stream);
+    }
+
+    #[test]
+    fn inflate_resumes_across_fragmented_input_and_output() {
+        const PATTERN: &[u8] =
+            b"the quick brown fox jumps over the lazy dog | 0123456789 | DEFLATE!";
+        let input: Vec<u8> = (0..16 * 1024)
+            .map(|i| PATTERN[(i * 17 + i / 97) % PATTERN.len()])
+            .collect();
+        let mut compressed_storage = vec![0u8; crate::compress_bound(input.len())];
+        let (compressed, code) = crate::compress_slice(
+            &mut compressed_storage,
+            &input,
+            crate::DeflateConfig::default(),
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        let compressed = compressed.to_vec();
+
+        for input_chunk in [1, 2, 3, 5, 7, 13] {
+            for output_chunk in [1, 3, 7, 31] {
+                inflate_fragmented(&compressed, &input, input_chunk, output_chunk);
+            }
+        }
     }
 
     #[test]
