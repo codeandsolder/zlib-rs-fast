@@ -181,6 +181,86 @@ impl StreamChecksum {
     }
 }
 
+/// Shared caller-owned gzip header bound by `set_header`.
+///
+/// The constructor captures the public API's unsafe lifetime/readability contract once. Header
+/// emission and `deflateBound` can then inspect the header and its nested buffers without repeated
+/// raw-pointer dereferences.
+#[derive(Clone, Copy)]
+struct GzipHeaderRef<'a> {
+    ptr: NonNull<gz_header>,
+    _lifetime: PhantomData<&'a gz_header>,
+}
+
+impl<'a> GzipHeaderRef<'a> {
+    /// # Safety
+    ///
+    /// `head` and its non-null `extra`, `name`, and `comment` pointers must satisfy the complete
+    /// contract documented on `set_header` for `'a`.
+    unsafe fn new(head: &'a mut gz_header) -> Self {
+        Self {
+            ptr: NonNull::from(head),
+            _lifetime: PhantomData,
+        }
+    }
+
+    fn header(&self) -> &gz_header {
+        // SAFETY: guaranteed once by `new`. The returned reference is deliberately tied to this
+        // short borrow, so callers may still mutate the C header between compression operations.
+        unsafe { self.ptr.as_ref() }
+    }
+
+    fn flags(&self) -> u8 {
+        self.header().flags()
+    }
+
+    fn time(&self) -> u32 {
+        self.header().time as u32
+    }
+
+    fn os(&self) -> u8 {
+        self.header().os as u8
+    }
+
+    fn hcrc(&self) -> bool {
+        self.header().hcrc != 0
+    }
+
+    fn extra(&self) -> Option<&[u8]> {
+        let header = self.header();
+        if header.extra.is_null() {
+            return None;
+        }
+
+        // SAFETY: `new` requires `extra` to be readable for `extra_len` bytes.
+        Some(unsafe { core::slice::from_raw_parts(header.extra, header.extra_len as usize) })
+    }
+
+    fn encoded_extra(&self) -> Option<&[u8]> {
+        self.extra().map(|extra| &extra[..extra.len() & 0xffff])
+    }
+
+    fn name(&self) -> Option<&CStr> {
+        let name = self.header().name;
+        if name.is_null() {
+            None
+        } else {
+            // SAFETY: `new` requires non-null `name` to satisfy `CStr::from_ptr`.
+            Some(unsafe { CStr::from_ptr(name.cast()) })
+        }
+    }
+
+    fn comment(&self) -> Option<&CStr> {
+        let comment = self.header().comment;
+        if comment.is_null() {
+            None
+        } else {
+            // SAFETY: `new` requires non-null `comment` to satisfy `CStr::from_ptr`.
+            Some(unsafe { CStr::from_ptr(comment.cast()) })
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct OutputCursor {
     next_out: *mut crate::c_api::Bytef,
@@ -1520,7 +1600,7 @@ pub(crate) struct State<'a> {
 
     /// Caller-owned gzip header. zlib permits `deflateCopy()` to duplicate this pointer, so this
     /// must not be represented as a long-lived Rust `&mut` reference.
-    gzhead: Option<NonNull<gz_header>>,
+    gzhead: Option<GzipHeaderRef<'a>>,
     gzindex: usize,
 
     /// Medium's speculative next match must survive an output-blocking return. Keeping it here
@@ -2763,24 +2843,24 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
                 }
             }
             Some(gzhead) => {
-                // SAFETY: `set_header` requires the caller-owned header to remain valid while the
-                // stream can use it. Deflate only reads the header.
-                let gzhead = unsafe { gzhead.as_ref() };
                 stream.state.bit_writer.pending.extend(&[gzhead.flags()]);
-                let bytes = (gzhead.time as u32).to_le_bytes();
-                stream.state.bit_writer.pending.extend(&bytes);
                 stream
                     .state
                     .bit_writer
                     .pending
-                    .extend(&[extra_flags, gzhead.os as u8]);
+                    .extend(&gzhead.time().to_le_bytes());
+                stream
+                    .state
+                    .bit_writer
+                    .pending
+                    .extend(&[extra_flags, gzhead.os()]);
 
-                if !gzhead.extra.is_null() {
-                    let bytes = (gzhead.extra_len as u16).to_le_bytes();
+                if let Some(extra) = gzhead.encoded_extra() {
+                    let bytes = (extra.len() as u16).to_le_bytes();
                     stream.state.bit_writer.pending.extend(&bytes);
                 }
 
-                if gzhead.hcrc != 0 {
+                if gzhead.hcrc() {
                     stream
                         .checksum
                         .update_crc(stream.state.bit_writer.pending.pending());
@@ -2794,21 +2874,9 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
     if stream.state.status == Status::Extra {
         if let Some(gzhead) = stream.state.gzhead {
-            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
-            let gzhead = unsafe { gzhead.as_ref() };
-            if !gzhead.extra.is_null() {
-                let gzhead_extra = gzhead.extra;
-
-                let extra = unsafe {
-                    core::slice::from_raw_parts(
-                        // SAFETY: gzindex is always less than extra_len, and the user
-                        // guarantees the pointer is valid for extra_len.
-                        gzhead_extra.add(stream.state.gzindex),
-                        (gzhead.extra_len & 0xffff) as usize - stream.state.gzindex,
-                    )
-                };
-
-                if let ControlFlow::Break(err) = flush_bytes(stream, extra) {
+            if let Some(extra) = gzhead.encoded_extra() {
+                if let ControlFlow::Break(err) = flush_bytes(stream, &extra[stream.state.gzindex..])
+                {
                     return err;
                 }
             }
@@ -2818,13 +2886,8 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
     if stream.state.status == Status::Name {
         if let Some(gzhead) = stream.state.gzhead {
-            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
-            let gzhead = unsafe { gzhead.as_ref() };
-            if !gzhead.name.is_null() {
-                // SAFETY: user satisfies precondition that gzhead.name is a C string.
-                let gzhead_name = unsafe { CStr::from_ptr(gzhead.name.cast()) };
-                let bytes = gzhead_name.to_bytes_with_nul();
-                if let ControlFlow::Break(err) = flush_bytes(stream, bytes) {
+            if let Some(name) = gzhead.name() {
+                if let ControlFlow::Break(err) = flush_bytes(stream, name.to_bytes_with_nul()) {
                     return err;
                 }
             }
@@ -2834,13 +2897,8 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
     if stream.state.status == Status::Comment {
         if let Some(gzhead) = stream.state.gzhead {
-            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
-            let gzhead = unsafe { gzhead.as_ref() };
-            if !gzhead.comment.is_null() {
-                // SAFETY: user satisfies precondition that gzhead.name is a C string.
-                let gzhead_comment = unsafe { CStr::from_ptr(gzhead.comment.cast()) };
-                let bytes = gzhead_comment.to_bytes_with_nul();
-                if let ControlFlow::Break(err) = flush_bytes(stream, bytes) {
+            if let Some(comment) = gzhead.comment() {
+                if let ControlFlow::Break(err) = flush_bytes(stream, comment.to_bytes_with_nul()) {
                     return err;
                 }
             }
@@ -2850,9 +2908,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
     if stream.state.status == Status::Hcrc {
         if let Some(gzhead) = stream.state.gzhead {
-            // SAFETY: see `set_header`; this stage only reads the caller-owned header.
-            let gzhead = unsafe { gzhead.as_ref() };
-            if gzhead.hcrc != 0 {
+            if gzhead.hcrc() {
                 let bytes = (stream.checksum.value() as u16).to_le_bytes();
                 if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
                     return err;
@@ -3332,7 +3388,10 @@ pub unsafe fn set_header<'a>(
     if stream.state.wrap != 2 {
         ReturnCode::StreamError
     } else {
-        stream.state.gzhead = head.map(NonNull::from);
+        stream.state.gzhead = head.map(|head| {
+            // SAFETY: this function's contract establishes all invariants required by the view.
+            unsafe { GzipHeaderRef::new(head) }
+        });
         ReturnCode::Ok
     }
 }
@@ -3407,42 +3466,16 @@ pub fn bound(stream: Option<&mut DeflateStream>, source_len: usize) -> usize {
             let mut gz_wrap_len = GZIP_WRAPLEN;
 
             if let Some(header) = stream.state.gzhead {
-                // SAFETY: `set_header` requires the header and nested pointers to remain valid
-                // while the stream can use them. `bound` only reads them.
-                let header = unsafe { header.as_ref() };
-                if !header.extra.is_null() {
-                    gz_wrap_len += 2 + header.extra_len as usize;
+                if let Some(extra) = header.extra() {
+                    gz_wrap_len += 2 + extra.len();
                 }
-
-                let mut c_string = header.name;
-                if !c_string.is_null() {
-                    loop {
-                        gz_wrap_len += 1;
-                        // SAFETY: user guarantees header.name is a valid C string.
-                        unsafe {
-                            if *c_string == 0 {
-                                break;
-                            }
-                            c_string = c_string.add(1);
-                        }
-                    }
+                if let Some(name) = header.name() {
+                    gz_wrap_len += name.to_bytes_with_nul().len();
                 }
-
-                let mut c_string = header.comment;
-                if !c_string.is_null() {
-                    loop {
-                        gz_wrap_len += 1;
-                        // SAFETY: user guarantees header.comment is a valid C string.
-                        unsafe {
-                            if *c_string == 0 {
-                                break;
-                            }
-                            c_string = c_string.add(1);
-                        }
-                    }
+                if let Some(comment) = header.comment() {
+                    gz_wrap_len += comment.to_bytes_with_nul().len();
                 }
-
-                if header.hcrc != 0 {
+                if header.hcrc() {
                     gz_wrap_len += 2;
                 }
             }
