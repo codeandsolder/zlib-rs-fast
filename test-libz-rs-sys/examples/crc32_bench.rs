@@ -11,7 +11,7 @@ pub fn main() {
             let input = std::fs::read(path).unwrap();
 
             let mut state = zlib_rs::crc32::Crc32Fold::new();
-            state.fold(&input, 0);
+            state.fold(&input);
             println!("{:#x}", state.finish());
         }
 
@@ -31,7 +31,7 @@ pub fn main() {
             let mut state = zlib_rs::crc32::Crc32Fold::new();
 
             for c in input.chunks(32) {
-                state.fold(c, 0);
+                state.fold(c);
             }
             println!("{:#x}", state.finish());
         }
