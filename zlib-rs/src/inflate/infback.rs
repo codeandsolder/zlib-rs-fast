@@ -436,7 +436,13 @@ pub unsafe fn back(
     strm.msg = core::ptr::null_mut();
     strm.state.mode = Mode::Type;
     strm.state.flags.update(Flags::IS_LAST_BLOCK, false);
-    strm.state.window.clear();
+
+    // Detach the caller-owned output/history window from `State` for the whole decode. Temporary
+    // `Writer` views can then never alias a window still reachable through the simultaneously
+    // borrowed `&mut State`. The single exit path below restores it before returning.
+    let state = &mut *strm.state;
+    let mut window = core::mem::replace(&mut state.window, Window::empty());
+    window.clear();
 
     // SAFETY: `inflateBack` requires the caller-provided initial span to be valid for `avail_in`.
     let mut input =
@@ -444,8 +450,6 @@ pub unsafe fn back(
     // SAFETY: `back` inherits zlib's callback contract from its caller for the duration of this
     // invocation.
     let mut output = unsafe { BackOutput::new(out, out_desc) };
-
-    let state = &mut *strm.state;
 
     'inf_leave: loop {
         match state.mode {
@@ -537,14 +541,14 @@ pub unsafe fn back(
                         ret = code;
                         break 'inf_leave;
                     }
-                    if let Err(code) = output.flush_if_full(&mut state.window) {
+                    if let Err(code) = output.flush_if_full(&mut window) {
                         ret = code;
                         break 'inf_leave;
                     }
 
                     copy = Ord::min(copy, input.available());
-                    copy = Ord::min(copy, output.remaining(&state.window));
-                    output.extend(&mut state.window, &input.as_slice()[..copy]);
+                    copy = Ord::min(copy, output.remaining(&window));
+                    output.extend(&mut window, &input.as_slice()[..copy]);
                     input.advance(copy);
                     state.length -= copy;
                 }
@@ -744,25 +748,25 @@ pub unsafe fn back(
             }
             Mode::Len => {
                 if input.available() >= INFLATE_FAST_MIN_HAVE
-                    && output.remaining(&state.window) >= INFLATE_FAST_MIN_LEFT
+                    && output.remaining(&window) >= INFLATE_FAST_MIN_LEFT
                 {
                     let input_len = input.available();
                     let mut bit_reader =
                         BitReader::from_buffer(input.bit_buffer(), input.as_slice());
-                    let capacity = state.window.buffer_size();
+                    let capacity = window.buffer_size();
                     // SAFETY: BackOutput guarantees its initialized prefix is in-bounds; the
                     // writer is call-local and dropped before the output cursor or callback is used.
                     let mut writer = unsafe {
-                        Writer::new_uninit_raw(state.window.as_mut_ptr(), output.len(), capacity)
+                        Writer::new_uninit_raw(window.as_mut_ptr(), output.len(), capacity)
                     };
 
-                    inflate_fast_back(state, &mut bit_reader, &mut writer);
+                    inflate_fast_back(state, &window, &mut bit_reader, &mut writer);
 
                     let remaining = bit_reader.bytes_remaining();
                     let bits = bit_reader.into_buffer();
                     input.advance(input_len - remaining);
                     input.set_bit_buffer(bits);
-                    output.set_len(writer.len(), &state.window);
+                    output.set_len(writer.len(), &window);
 
                     continue 'inf_leave;
                 }
@@ -818,11 +822,11 @@ pub unsafe fn back(
                     } else {
                         traceln!("inflate:         literal {:#04x}", here.val);
                     }
-                    if let Err(code) = output.flush_if_full(&mut state.window) {
+                    if let Err(code) = output.flush_if_full(&mut window) {
                         ret = code;
                         break 'inf_leave;
                     }
-                    output.push(&mut state.window, state.length as u8);
+                    output.push(&mut window, state.length as u8);
 
                     state.mode = Mode::Len;
                     continue;
@@ -915,7 +919,7 @@ pub unsafe fn back(
                     input.drop_bits(extra as u8);
                 }
 
-                if INFLATE_STRICT && state.offset > output.history_available(&state.window) {
+                if INFLATE_STRICT && state.offset > output.history_available(&window) {
                     state.mode = Mode::Bad;
                     state.bad("invalid distance too far back\0");
                     continue 'inf_leave;
@@ -924,19 +928,19 @@ pub unsafe fn back(
                 traceln!("inflate:         distance {}", state.offset);
 
                 loop {
-                    if let Err(code) = output.flush_if_full(&mut state.window) {
+                    if let Err(code) = output.flush_if_full(&mut window) {
                         ret = code;
                         break 'inf_leave;
                     }
-                    let copy = Ord::min(state.length, output.remaining(&state.window));
-                    let capacity = state.window.buffer_size();
+                    let copy = Ord::min(state.length, output.remaining(&window));
+                    let capacity = window.buffer_size();
                     // SAFETY: BackOutput owns the initialized-prefix length and `copy` is bounded
                     // by the remaining window capacity.
                     let mut writer = unsafe {
-                        Writer::new_uninit_raw(state.window.as_mut_ptr(), output.len(), capacity)
+                        Writer::new_uninit_raw(window.as_mut_ptr(), output.len(), capacity)
                     };
                     if let Err(msg) = copy_back_match(
-                        &state.window,
+                        &window,
                         state.flags.contains(Flags::SANE),
                         &mut writer,
                         state.offset,
@@ -946,7 +950,7 @@ pub unsafe fn back(
                         state.bad(msg);
                         continue 'inf_leave;
                     }
-                    output.set_len(writer.len(), &state.window);
+                    output.set_len(writer.len(), &window);
                     state.length -= copy;
                     if state.length == 0 {
                         break;
@@ -996,18 +1000,24 @@ pub unsafe fn back(
         }
     }
 
-    if output.flush_remaining(&mut state.window).is_err() && ret == ReturnCode::StreamEnd {
+    if output.flush_remaining(&mut window).is_err() && ret == ReturnCode::StreamEnd {
         ret = ReturnCode::BufError;
     }
 
     strm.next_in = input.next_ptr().cast_mut();
     strm.avail_in = input.available() as u32;
+    state.window = window;
 
     ret
 }
 
 #[inline(always)]
-fn inflate_fast_back(state: &mut State, bit_reader: &mut BitReader<'_>, writer: &mut Writer<'_>) {
+fn inflate_fast_back(
+    state: &mut State,
+    window: &Window<'_>,
+    bit_reader: &mut BitReader<'_>,
+    writer: &mut Writer<'_>,
+) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
     let lcode = state.len_table_ref();
@@ -1119,7 +1129,7 @@ fn inflate_fast_back(state: &mut State, bit_reader: &mut BitReader<'_>, writer: 
                         bit_reader.drop_bits(op);
 
                         if let Err(msg) = copy_back_match(
-                            &state.window,
+                            window,
                             state.flags.contains(Flags::SANE),
                             writer,
                             dist as usize,
