@@ -109,13 +109,15 @@ fn emit_next(state: &mut State<'_>) {
         if (1..=state.max_dist() as isize).contains(&distance) {
             let match_start = &state.window.filled()[usize::from(hash_head)..];
             if str_val == first_four_bytes(match_start) {
-                let mut match_len = crate::deflate::compare256::compare256_slice(
-                    &state.window.filled()[state.strstart + 2..],
-                    &match_start[2..],
-                ) + 2;
+                let max_len = state.lookahead.min(STD_MAX_MATCH);
+                let match_len = WANT_MIN_MATCH
+                    + crate::deflate::match_compare::common_prefix_len(
+                        &state.window.filled()
+                            [state.strstart + WANT_MIN_MATCH..state.strstart + max_len],
+                        &match_start[WANT_MIN_MATCH..max_len],
+                    );
 
                 if match_len >= WANT_MIN_MATCH {
-                    match_len = match_len.min(state.lookahead).min(STD_MAX_MATCH);
                     let distance = u16::try_from(distance)
                         .expect("DEFLATE window distances always fit in 16 bits");
                     state

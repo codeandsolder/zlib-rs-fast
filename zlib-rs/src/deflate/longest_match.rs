@@ -442,7 +442,7 @@ fn could_beat_best(scan: &[u8], candidate: &[u8], best_len: usize) -> bool {
 fn common_match_length(scan: &[u8], candidate: &[u8]) -> usize {
     debug_assert_eq!(scan.len(), candidate.len());
     debug_assert!(scan.len() <= STD_MAX_MATCH);
-    crate::deflate::compare256::common_prefix_len(scan, candidate)
+    crate::deflate::match_compare::common_prefix_len(scan, candidate)
 }
 
 fn break_matching(

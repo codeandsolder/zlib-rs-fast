@@ -21,9 +21,9 @@ use self::{
 };
 
 mod algorithm;
-mod compare256;
 mod hash_calc;
 mod longest_match;
+mod match_compare;
 mod pending;
 mod slide_hash;
 mod sym_buf;

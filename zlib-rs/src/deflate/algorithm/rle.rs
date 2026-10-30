@@ -2,7 +2,7 @@
 
 use super::{BlockContinuation, ProduceStatus, TokenProducer};
 use crate::deflate::{
-    compare256::compare256_rle_slice, State, MIN_LOOKAHEAD, STD_MAX_MATCH, STD_MIN_MATCH,
+    match_compare::repeated_prefix_len, State, MIN_LOOKAHEAD, STD_MAX_MATCH, STD_MIN_MATCH,
 };
 
 pub(super) struct RleProducer;
@@ -16,10 +16,10 @@ impl TokenProducer for RleProducer {
 
             let mut match_len = 0;
             if state.lookahead >= STD_MIN_MATCH && state.strstart > 0 {
-                let scan = &state.window.filled()[state.strstart - 1..][..3 + 256];
+                let max_len = state.lookahead.min(STD_MAX_MATCH);
+                let scan = &state.window.filled()[state.strstart - 1..state.strstart + max_len];
                 if scan[0] == scan[1] && scan[1] == scan[2] {
-                    match_len = compare256_rle_slice(scan[0], &scan[3..]) + 2;
-                    match_len = match_len.min(state.lookahead).min(STD_MAX_MATCH);
+                    match_len = repeated_prefix_len(scan[0], &scan[3..max_len + 1]) + 2;
                 }
                 assert!(
                     state.strstart - 1 + match_len < state.window_size,
