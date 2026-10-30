@@ -2803,7 +2803,7 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
   block. When decompressing, PPP checks that at the end of input packet,
   inflate is waiting for these length bytes.
 */
-pub fn sync_point(stream: &mut InflateStream) -> bool {
+pub fn sync_point(stream: &InflateStream) -> bool {
     matches!(stream.state.mode, Mode::Stored) && stream.state.bit_buffer.bits_in_buffer() == 0
 }
 

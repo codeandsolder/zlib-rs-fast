@@ -960,7 +960,7 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
 
 pub fn copy<'a>(
     dest: &mut MaybeUninit<DeflateStream<'a>>,
-    source: &mut DeflateStream<'a>,
+    source: &DeflateStream<'a>,
 ) -> ReturnCode {
     let source_state = &*source.state;
     let allocs = DeflateAllocOffsets::new(source_state.w_bits() as usize, source_state.lit_bufsize);
@@ -3517,7 +3517,7 @@ const fn deflate_quick_overhead(x: usize) -> usize {
 /// every combination of windowBits and memLevel.  But even the conservative
 /// upper bound of about 14% expansion does not seem onerous for output buffer
 /// allocation.
-pub fn bound(stream: Option<&mut DeflateStream>, source_len: usize) -> usize {
+pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
     // on windows, c_ulong is only a 32-bit integer
     let mask = core::ffi::c_ulong::MAX as usize;
 

@@ -906,10 +906,10 @@ pub unsafe extern "C" fn inflateSync(strm: *mut z_stream) -> i32 {
 ///
 /// * Either
 ///     - `strm` is `NULL`
-///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`inflateInit_`] or similar
+///     - `strm` satisfies the requirements of `&*strm` and was initialized with [`inflateInit_`] or similar
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateSyncPoint))]
 pub unsafe extern "C" fn inflateSyncPoint(strm: *mut z_stream) -> i32 {
-    if let Some(stream) = InflateStream::from_stream_mut(strm) {
+    if let Some(stream) = InflateStream::from_stream_ref(strm.cast_const()) {
         zlib_rs::inflate::sync_point(stream) as i32
     } else {
         ReturnCode::StreamError as _
@@ -1251,17 +1251,17 @@ pub unsafe extern "C" fn inflateResetKeep(strm: *mut z_stream) -> c_int {
 
 // undocumented but exposed function
 #[doc(hidden)]
-/// Returns the number of codes used
+/// Returns the number of codes used.
 ///
 /// # Safety
 ///
 /// The caller must guarantee that either:
 ///
-/// - `buf` is `NULL`
-/// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
+/// - `strm` is `NULL`, or
+/// - `strm` satisfies the requirements of `&*strm` and was initialized with [`inflateInit_`] or similar.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateCodesUsed))]
 pub unsafe extern "C" fn inflateCodesUsed(strm: *mut z_stream) -> c_ulong {
-    match InflateStream::from_stream_mut(strm) {
+    match InflateStream::from_stream_ref(strm.cast_const()) {
         Some(stream) => zlib_rs::inflate::codes_used(stream) as c_ulong,
         None => c_ulong::MAX,
     }
@@ -1352,10 +1352,10 @@ pub unsafe extern "C" fn deflateSetHeader(strm: *mut z_stream, head: gz_headerp)
 ///
 /// * Either
 ///     - `strm` is `NULL`
-///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`deflateInit_`] or similar
+///     - `strm` satisfies the requirements of `&*strm` and was initialized with [`deflateInit_`] or similar
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(deflateBound_z))]
 pub unsafe extern "C" fn deflateBound_z(strm: *mut z_stream, sourceLen: usize) -> usize {
-    zlib_rs::deflate::bound(DeflateStream::from_stream_mut(strm), sourceLen)
+    zlib_rs::deflate::bound(DeflateStream::from_stream_ref(strm.cast_const()), sourceLen)
 }
 
 /// Returns an upper bound on the compressed size after deflation of `sourceLen` bytes.
@@ -1372,10 +1372,13 @@ pub unsafe extern "C" fn deflateBound_z(strm: *mut z_stream, sourceLen: usize) -
 ///
 /// * Either
 ///     - `strm` is `NULL`
-///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`deflateInit_`] or similar
+///     - `strm` satisfies the requirements of `&*strm` and was initialized with [`deflateInit_`] or similar
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(deflateBound))]
 pub unsafe extern "C" fn deflateBound(strm: *mut z_stream, sourceLen: c_ulong) -> c_ulong {
-    zlib_rs::deflate::bound(DeflateStream::from_stream_mut(strm), sourceLen as usize) as c_ulong
+    zlib_rs::deflate::bound(
+        DeflateStream::from_stream_ref(strm.cast_const()),
+        sourceLen as usize,
+    ) as c_ulong
 }
 
 /// Like [`compress`] but takes a `usize` instead.
@@ -1758,10 +1761,10 @@ pub unsafe extern "C" fn deflatePrime(strm: z_streamp, bits: c_int, value: c_int
 ///
 /// * Either
 ///     - `strm` is `NULL`
-///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`deflateInit_`] or similar
+///     - `strm` satisfies the requirements of `&*strm` and was initialized with [`deflateInit_`] or similar
 /// * Either
 ///     - `pending` is `NULL`
-///     - `pending` satisfies the requirements of [`core::ptr::write::<c_int>`]
+///     - `pending` satisfies the requirements of [`core::ptr::write::<c_uint>`]
 /// * Either
 ///     - `bits` is `NULL`
 ///     - `bits` satisfies the requirements of [`core::ptr::write::<c_int>`]
@@ -1771,7 +1774,7 @@ pub unsafe extern "C" fn deflatePending(
     pending: *mut c_uint,
     bits: *mut c_int,
 ) -> c_int {
-    let Some(stream) = (unsafe { DeflateStream::from_stream_mut(strm) }) else {
+    let Some(stream) = (unsafe { DeflateStream::from_stream_ref(strm.cast_const()) }) else {
         return ReturnCode::StreamError as _;
     };
 
@@ -1804,13 +1807,13 @@ pub unsafe extern "C" fn deflatePending(
 ///
 /// * Either
 ///     - `strm` is `NULL`
-///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`deflateInit_`] or similar
+///     - `strm` satisfies the requirements of `&*strm` and was initialized with [`deflateInit_`] or similar
 /// * Either
 ///     - `bits` is `NULL`
 ///     - `bits` satisfies the requirements of [`core::ptr::write::<c_int>`]
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(deflateUsed))]
 pub unsafe extern "C" fn deflateUsed(strm: z_streamp, bits: *mut c_int) -> c_int {
-    let Some(stream) = (unsafe { DeflateStream::from_stream_mut(strm) }) else {
+    let Some(stream) = (unsafe { DeflateStream::from_stream_ref(strm.cast_const()) }) else {
         return ReturnCode::StreamError as _;
     };
 
@@ -1844,14 +1847,14 @@ pub unsafe extern "C" fn deflateUsed(strm: z_streamp, bits: *mut c_int) -> c_int
 ///     - `dest` satisfies the requirements of `&mut *(dest as *mut MaybeUninit<z_stream>)`
 /// * Either
 ///     - `source` is `NULL`
-///     - `source` satisfies the requirements of `&mut *strm` and was initialized with [`deflateInit_`] or similar
+///     - `source` satisfies the requirements of `&*source` and was initialized with [`deflateInit_`] or similar
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(deflateCopy))]
 pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_int {
     let Some(dest) = (unsafe { dest.cast::<MaybeUninit<DeflateStream>>().as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
-    let Some(source) = (unsafe { DeflateStream::from_stream_mut(source) }) else {
+    let Some(source) = (unsafe { DeflateStream::from_stream_ref(source.cast_const()) }) else {
         return ReturnCode::StreamError as _;
     };
 
