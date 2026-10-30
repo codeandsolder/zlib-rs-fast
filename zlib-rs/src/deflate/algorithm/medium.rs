@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use super::{BlockContinuation, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
@@ -105,11 +105,15 @@ impl TokenProducer for MediumProducer {
 
                     let dist = state.strstart as i64 - hash_head as i64;
                     if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                        let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
+                        if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                            let result = work.request(state).execute();
+                            self.apply_current_search(state, result);
+                            self.phase = MediumPhase::AfterCurrentSearch;
+                            continue;
+                        }
                         self.phase = MediumPhase::AwaitingCurrentSearch;
-                        return ProduceStatus::MatchSearch(MatchSearchWork::new(
-                            hash_head,
-                            MatchSearchKind::Standard,
-                        ));
+                        return ProduceStatus::MatchSearch(work);
                     }
 
                     self.current_match.match_start = 0;
@@ -145,11 +149,17 @@ impl TokenProducer for MediumProducer {
 
                         let dist = state.strstart as i64 - hash_head as i64;
                         if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                            let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
+                            if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                                let result = work.request(state).execute();
+                                self.apply_future_search(state, result);
+                                state.lookahead = current_lookahead;
+                                state.strstart = usize::from(self.current_match.strstart);
+                                self.phase = MediumPhase::AfterFutureSearch;
+                                continue;
+                            }
                             self.phase = MediumPhase::AwaitingFutureSearch { current_lookahead };
-                            return ProduceStatus::MatchSearch(MatchSearchWork::new(
-                                hash_head,
-                                MatchSearchKind::Standard,
-                            ));
+                            return ProduceStatus::MatchSearch(work);
                         }
 
                         self.next_match.match_start = 0;

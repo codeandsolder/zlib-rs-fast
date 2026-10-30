@@ -4352,6 +4352,7 @@ mod test {
 
         let cases = [
             (algorithm::Algorithm::Fast, 2, Strategy::Default),
+            (algorithm::Algorithm::Medium, 3, Strategy::Default),
             (algorithm::Algorithm::Medium, 6, Strategy::Default),
             (algorithm::Algorithm::Slow, 9, Strategy::Default),
             (algorithm::Algorithm::Huffman, 6, Strategy::HuffmanOnly),
@@ -4423,17 +4424,21 @@ mod test {
             "scheduler regression must batch match searches from multiple paused streams"
         );
 
-        assert!(
-            jobs[0].match_search_turns > 0,
-            "Fast must yield detached match-search work in the scheduler regression"
+        assert_eq!(
+            jobs[0].match_search_turns, 0,
+            "Fast's tiny searches should stay local instead of paying a scheduler handoff"
         );
-        assert!(
-            jobs[1].match_search_turns > 0,
-            "Medium must yield detached match-search work in the scheduler regression"
+        assert_eq!(
+            jobs[1].match_search_turns, 0,
+            "low-chain Medium searches should stay local instead of paying a scheduler handoff"
         );
         assert!(
             jobs[2].match_search_turns > 0,
-            "Slow must yield detached match-search work in the scheduler regression"
+            "level-6 Medium must still yield detached match-search work"
+        );
+        assert!(
+            jobs[3].match_search_turns > 0,
+            "Slow must still yield detached match-search work"
         );
 
         for (job, reference) in jobs.into_iter().zip(references) {
@@ -4457,7 +4462,7 @@ mod test {
     fn standard_core_rejects_production_before_match_search_completes() {
         let input_bytes = b"detached-match-search/".repeat(2_000);
         let config = DeflateConfig {
-            level: 2,
+            level: 6,
             method: Method::Deflated,
             window_bits: crate::MAX_WBITS,
             mem_level: 1,
@@ -4470,7 +4475,7 @@ mod test {
         stream.next_in = input_bytes.as_ptr() as *mut u8;
         stream.avail_in = input_bytes.len() as _;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &*stream.state)
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &*stream.state)
                 .unwrap();
 
         let search = loop {
@@ -4491,7 +4496,7 @@ mod test {
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
                 algorithm::CoreEvent::TokenBlockReady(_) => {
-                    panic!("Fast filled a token block before yielding match-search work")
+                    panic!("Medium filled a token block before yielding match-search work")
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
                     panic!("test input exhausted before yielding match-search work")

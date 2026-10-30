@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use super::{BlockContinuation, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
@@ -94,13 +94,19 @@ impl TokenProducer for FastProducer {
                 let distance = state.strstart as isize - hash_head as isize;
 
                 if (1..=state.max_dist() as isize).contains(&distance) && hash_head != 0 {
+                    let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
+                    if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                        let result = work.request(state).execute();
+                        self.phase = FastPhase::SearchReady {
+                            literal: value as u8,
+                            result,
+                        };
+                        continue;
+                    }
                     self.phase = FastPhase::AwaitingSearch {
                         literal: value as u8,
                     };
-                    return ProduceStatus::MatchSearch(MatchSearchWork::new(
-                        hash_head,
-                        MatchSearchKind::Standard,
-                    ));
+                    return ProduceStatus::MatchSearch(work);
                 }
                 value as u8
             } else {
