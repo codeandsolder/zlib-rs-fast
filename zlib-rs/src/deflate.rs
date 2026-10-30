@@ -63,7 +63,7 @@ pub struct DeflateStream<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct InputCursor {
-    pub(crate) next_in: *mut crate::c_api::Bytef,
+    next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
     pub(crate) adler: crate::c_api::z_checksum,
@@ -84,6 +84,69 @@ impl InputCursor {
         stream.avail_in = self.avail_in;
         stream.total_in = self.total_in;
         stream.adler = self.adler;
+    }
+
+    fn from_slice(
+        bytes: &[u8],
+        total_in: crate::c_api::z_size,
+        adler: crate::c_api::z_checksum,
+    ) -> Self {
+        Self {
+            next_in: bytes.as_ptr() as *mut u8,
+            avail_in: bytes.len() as crate::c_api::uInt,
+            total_in,
+            adler,
+        }
+    }
+
+    /// Copy live caller input into initialized window storage and consume it.
+    fn copy_to_window(&mut self, window: &mut Window<'_>, range: core::ops::Range<usize>) {
+        let len = range.len();
+        assert!(len <= self.avail_in as usize);
+        if len == 0 {
+            return;
+        }
+
+        // SAFETY: the ABI contract guarantees `next_in` is readable for `avail_in` bytes, and the
+        // requested copy is bounded by that count. `Window` checks the destination range.
+        unsafe { window.copy_and_initialize(range, self.next_in) };
+        self.consume(len);
+    }
+
+    /// Copy live caller input directly to output and consume it.
+    ///
+    /// # Safety
+    /// The current caller input span must not overlap the output cursor's writable span.
+    unsafe fn copy_to_output<'a>(&mut self, output: &'a mut OutputCursor, len: usize) -> &'a [u8] {
+        assert!(len <= self.avail_in as usize);
+        // SAFETY: input readability follows from the cursor invariant; non-overlap is required from
+        // this method's caller and output bounds are checked by `copy_from_raw`.
+        let copied = unsafe { output.copy_from_raw(self.next_in, len) };
+        self.consume(len);
+        copied
+    }
+
+    /// Copy bytes immediately preceding the current input cursor into the LZ history window.
+    ///
+    /// # Safety
+    /// `bytes_back` must not reach before the beginning of the caller input allocation.
+    unsafe fn copy_recent_to_window(
+        &self,
+        window: &mut Window<'_>,
+        destination: core::ops::Range<usize>,
+        bytes_back: usize,
+    ) {
+        assert!(destination.len() <= bytes_back);
+        let source = self.next_in.wrapping_sub(bytes_back);
+        // SAFETY: required by this method's caller; `Window` validates the destination range.
+        unsafe { window.copy_and_initialize(destination, source) };
+    }
+
+    fn consume(&mut self, len: usize) {
+        debug_assert!(len <= self.avail_in as usize);
+        self.next_in = self.next_in.wrapping_add(len);
+        self.avail_in -= len as crate::c_api::uInt;
+        self.total_in = self.total_in.wrapping_add(len as crate::c_api::z_size);
     }
 }
 
@@ -213,19 +276,15 @@ impl<'a, 'state> Compressor<'a, 'state> {
             return 0;
         }
 
-        // SAFETY: the input cursor exposes `avail_in` readable bytes and zlib's direct stored-copy
-        // contract requires the caller input/output spans not to overlap. Output bounds are checked
-        // by `copy_from_raw`.
-        let copied = unsafe { self.output.copy_from_raw(self.input.next_in, len) };
+        // SAFETY: zlib's direct stored-copy contract requires the caller input/output spans not to
+        // overlap. Input/output bounds and cursor accounting are confined to the cursor methods.
+        let copied = unsafe { self.input.copy_to_output(&mut self.output, len) };
         match self.state.wrap {
             2 => self.state.crc_fold.fold(copied),
             1 => self.input.adler = crate::adler32::adler32(self.input.adler as u32, copied) as _,
             _ => {}
         }
 
-        self.input.next_in = self.input.next_in.wrapping_add(len);
-        self.input.avail_in -= len as u32;
-        self.input.total_in += len as crate::c_api::z_size;
         len
     }
 
@@ -235,12 +294,12 @@ impl<'a, 'state> Compressor<'a, 'state> {
         destination: core::ops::Range<usize>,
         bytes_back: usize,
     ) {
-        let len = destination.len();
-        assert!(len <= bytes_back);
-        let src = self.input.next_in.wrapping_sub(bytes_back);
         // SAFETY: callers only request bytes already consumed by `copy_input_to_output`, so the
         // region ending at the current input cursor remains within the caller's input allocation.
-        unsafe { self.state.window.copy_and_initialize(destination, src) };
+        unsafe {
+            self.input
+                .copy_recent_to_window(&mut self.state.window, destination, bytes_back)
+        };
     }
 }
 
@@ -649,12 +708,7 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     // Feed the dictionary through the ordinary window-refill core without impersonating caller
     // input in the public z_stream. zlib counts retained dictionary bytes in total_in, but next_in
     // and avail_in remain exactly the caller's values across deflateSetDictionary.
-    let mut dictionary_input = InputCursor {
-        next_in: dictionary.as_ptr() as *mut u8,
-        avail_in: dictionary.len() as _,
-        total_in: stream.total_in,
-        adler: stream.adler,
-    };
+    let mut dictionary_input = InputCursor::from_slice(dictionary, stream.total_in, stream.adler);
     fill_window_core(state, &mut dictionary_input);
 
     while state.lookahead >= STD_MIN_MATCH {
@@ -1767,36 +1821,16 @@ fn read_buf_window_core(
         return 0;
     }
 
-    input.avail_in -= len as u32;
+    // Copy first, then checksum the stable window bytes. We intentionally never construct a slice
+    // over live caller input because zlib permits it to be concurrently mutated.
+    input.copy_to_window(&mut state.window, offset..offset + len);
+    let data = &state.window.filled()[offset..][..len];
 
     if state.wrap == 2 {
-        // we likely cannot fuse the crc32 and the copy here because the input can be changed by
-        // a concurrent thread. Therefore it cannot be converted into a slice!
-        let window = &mut state.window;
-        // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, input.next_in) };
-
-        let data = &state.window.filled()[offset..][..len];
         state.crc_fold.fold(data);
     } else if state.wrap == 1 {
-        // we likely cannot fuse the adler32 and the copy here because the input can be changed by
-        // a concurrent thread. Therefore it cannot be converted into a slice!
-        let window = &mut state.window;
-        // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, input.next_in) };
-
-        let data = &state.window.filled()[offset..][..len];
         input.adler = adler32(input.adler as u32, data) as _;
-    } else {
-        let window = &mut state.window;
-        // SAFETY: len is bounded by avail_in, so this copy is in bounds.
-        unsafe { window.copy_and_initialize(offset..offset + len, input.next_in) };
     }
-
-    // These can overflow, especially on windows where the integer type is u32 and input/output are
-    // larger than 4GB.
-    input.next_in = input.next_in.wrapping_add(len);
-    input.total_in = input.total_in.wrapping_add(len as crate::c_api::z_size);
 
     len
 }
