@@ -42,9 +42,6 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
 
     let mut state = State::new();
 
-    // TODO this can change depending on the used/supported SIMD instructions
-    state.chunksize = 32;
-
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
         zfree: stream.zfree.unwrap(),

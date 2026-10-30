@@ -388,8 +388,6 @@ pub(crate) struct State<'a> {
     /// - bit 2 true to validate check value
     wrap: u8,
 
-    flush: InflateFlush,
-
     // allocated window if needed (capacity == 0 if unused)
     window: Window<'a>,
 
@@ -423,9 +421,6 @@ pub(crate) struct State<'a> {
 
     /// initial length of match
     was: usize,
-
-    /// size of memory copying chunk
-    chunksize: usize,
 
     gzip_flags: i32,
 
@@ -461,8 +456,6 @@ pub(crate) struct State<'a> {
 impl<'a> State<'a> {
     fn new() -> Self {
         Self {
-            flush: InflateFlush::NoFlush,
-
             flags: Flags::default(),
             wrap: 0,
             mode: Mode::Head,
@@ -476,7 +469,6 @@ impl<'a> State<'a> {
             extra: 0,
             back: 0,
             was: 0,
-            chunksize: 0,
 
             bit_reader: BitReader::new(),
 
@@ -947,7 +939,7 @@ impl State<'_> {
         }
     }
 
-    fn dispatch(&mut self, output: &mut InflateOutput<'_>) -> ReturnCode {
+    fn dispatch(&mut self, output: &mut InflateOutput<'_>, flush: InflateFlush) -> ReturnCode {
         // Note: All early returns must save mode into self.mode again.
         let mut mode = self.mode;
 
@@ -1353,7 +1345,7 @@ impl State<'_> {
                     Mode::Type => {
                         use InflateFlush::*;
 
-                        match self.flush {
+                        match flush {
                             Block | Trees => break 'label ReturnCode::Ok,
                             NoFlush | SyncFlush | Finish => {
                                 // NOTE: this is slightly different to what zlib-rs does!
@@ -1397,7 +1389,7 @@ impl State<'_> {
 
                                 self.bit_reader.drop_bits(2);
 
-                                if let InflateFlush::Trees = self.flush {
+                                if let InflateFlush::Trees = flush {
                                     break 'label self.inflate_leave(ReturnCode::Ok);
                                 } else {
                                     break 'blk Mode::Len_;
@@ -1443,7 +1435,7 @@ impl State<'_> {
 
                         self.bit_reader.init_bits();
 
-                        if let InflateFlush::Trees = self.flush {
+                        if let InflateFlush::Trees = flush {
                             break 'label self.inflate_leave(ReturnCode::Ok);
                         } else {
                             break 'blk Mode::CopyBlock;
@@ -1845,7 +1837,7 @@ impl State<'_> {
 
                         mode = Mode::Len_;
 
-                        if matches!(self.flush, InflateFlush::Trees) {
+                        if matches!(flush, InflateFlush::Trees) {
                             break 'label self.inflate_leave(ReturnCode::Ok);
                         }
 
@@ -2287,9 +2279,6 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
 
     let mut state = State::new();
 
-    // TODO this can change depending on the used/supported SIMD instructions
-    state.chunksize = 32;
-
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
         zfree: stream.zfree.unwrap(),
@@ -2421,8 +2410,6 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
         state.mode = Mode::TypeDo;
     }
 
-    state.flush = flush;
-
     unsafe {
         state
             .bit_reader
@@ -2432,7 +2419,7 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     let mut output =
         unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
 
-    let err = state.dispatch(&mut output);
+    let err = state.dispatch(&mut output, flush);
 
     let next_in = state.bit_reader.as_ptr();
     let avail_in = state.bit_reader.bytes_remaining();
@@ -2463,7 +2450,7 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     let must_update_window = state.window.size() != 0
         || (out_written != 0
             && valid_mode(state.mode)
-            && (not_done(state.mode) || !matches!(state.flush, InflateFlush::Finish)));
+            && (not_done(state.mode) || !matches!(flush, InflateFlush::Finish)));
 
     let update_checksum = state.wrap & 4 != 0;
 
