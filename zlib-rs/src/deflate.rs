@@ -501,96 +501,18 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
 
     let lit_bufsize = 1 << (mem_level + 6); // 16K elements by default
     let allocs = DeflateAllocOffsets::new(window_bits, lit_bufsize);
-
-    // FIXME: pointer methods on NonNull are stable since 1.80.0
-    let Some(allocation_start) = alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
+    let Some(state_allocation) = allocs.allocate_state(
+        &alloc,
+        DeflateStateInit {
+            level: level as i8,
+            strategy,
+            wrap,
+        },
+    ) else {
         return ReturnCode::MemError;
     };
 
-    let w_size = 1 << window_bits;
-    let DeflateAllocBuffers {
-        state_ptr: state_allocation,
-        window,
-        prev,
-        head,
-        pending,
-        sym_buf,
-    } = unsafe { allocs.initialize_buffers(allocation_start, window_bits, lit_bufsize) };
-
-    let state = State {
-        status: Status::Init,
-
-        // window
-        w_size,
-
-        // allocated values
-        window,
-        prev,
-        head,
-        bit_writer: BitWriter::from_pending(pending),
-
-        //
-        lit_bufsize,
-
-        //
-        sym_buf,
-
-        //
-        level: level as i8, // set to zero again for testing?
-        strategy,
-
-        // these fields are not set explicitly at this point
-        last_flush: 0,
-        wrap,
-        strstart: 0,
-        block_start: 0,
-        block_open: 0,
-        window_size: 0,
-        insert: 0,
-        matches: 0,
-        opt_len: 0,
-        static_len: 0,
-        lookahead: 0,
-        ins_h: 0,
-        max_chain_length: 0,
-        max_insert_length: 0,
-        max_lazy_match: 0,
-        good_match: 0,
-        nice_match: 0,
-
-        //
-        l_desc: TreeDesc::EMPTY,
-        d_desc: TreeDesc::EMPTY,
-        bl_desc: TreeDesc::EMPTY,
-
-        //
-        crc_fold: Crc32Fold::new(),
-        gzhead: None,
-        gzindex: 0,
-        medium_next_match: MatchCandidate::EMPTY,
-        data_type: crate::c_api::Z_UNKNOWN,
-
-        //
-        match_start: 0,
-        prev_match: 0,
-        match_available: false,
-        prev_length: 0,
-
-        allocation_start,
-        total_allocation_size: allocs.total_size,
-
-        // just provide a valid default; gets set properly later
-        hash_calc_variant: HashCalcVariant::Standard,
-        _cache_line_0: (),
-        _cache_line_1: (),
-        _cache_line_2: (),
-        _cache_line_3: (),
-        _padding_0: [0; 4],
-    };
-
-    unsafe { state_allocation.write(state) };
-
-    stream.state = state_allocation.cast::<internal_state>();
+    stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
     let Some(stream) = (unsafe { DeflateStream::from_stream_mut(stream) }) else {
         if cfg!(debug_assertions) {
@@ -3464,6 +3386,13 @@ pub unsafe fn get_dictionary(stream: &DeflateStream<'_>, dictionary: *mut u8) ->
 const DEFLATE_ALLOC_ALIGN: usize = 64;
 const LIT_BUFS: usize = 4;
 
+#[derive(Clone, Copy)]
+struct DeflateStateInit {
+    level: i8,
+    strategy: Strategy,
+    wrap: i8,
+}
+
 struct DeflateAllocBuffers<'a> {
     state_ptr: *mut State<'a>,
     window: Window<'a>,
@@ -3474,6 +3403,8 @@ struct DeflateAllocBuffers<'a> {
 }
 
 struct DeflateAllocOffsets {
+    window_bits: usize,
+    lit_bufsize: usize,
     total_size: usize,
     state_pos: usize,
     window_pos: usize,
@@ -3524,6 +3455,8 @@ impl DeflateAllocOffsets {
             (curr_size + (DEFLATE_ALLOC_ALIGN - 1)).next_multiple_of(DEFLATE_ALLOC_ALIGN);
 
         Self {
+            window_bits,
+            lit_bufsize,
             total_size,
             state_pos,
             window_pos,
@@ -3534,25 +3467,109 @@ impl DeflateAllocOffsets {
         }
     }
 
+    /// Allocate raw storage and resolve the 64-byte-aligned interior base used by this layout.
+    fn allocate_storage<'a>(&self, alloc: &Allocator<'a>) -> Option<(NonNull<u8>, NonNull<u8>)> {
+        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
+        let address = allocation_start.as_ptr() as usize;
+        let align_offset = address.next_multiple_of(DEFLATE_ALLOC_ALIGN) - address;
+        // SAFETY: `total_size` reserves `DEFLATE_ALLOC_ALIGN - 1` bytes of leading alignment
+        // headroom, and offsetting a non-null pointer within its allocation cannot produce null.
+        let aligned =
+            unsafe { NonNull::new_unchecked(allocation_start.as_ptr().add(align_offset)) };
+        Some((allocation_start, aligned))
+    }
+
+    /// Allocate, initialize, and place one fresh deflate state using this layout.
+    ///
+    /// Raw allocation alignment, allocation-backed buffer construction, state placement, and
+    /// deallocation metadata are all established here before the state pointer can escape.
+    fn allocate_state<'a>(
+        &self,
+        alloc: &Allocator<'a>,
+        init: DeflateStateInit,
+    ) -> Option<NonNull<State<'a>>> {
+        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        // SAFETY: `aligned` is the fresh layout base returned by `allocate_storage` and remains
+        // owned by the state until `end` releases `allocation_start` through the same allocator.
+        let DeflateAllocBuffers {
+            state_ptr,
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+        } = unsafe { self.initialize_buffers(aligned) };
+
+        let state = State {
+            status: Status::Init,
+            last_flush: 0,
+            wrap: init.wrap,
+            strategy: init.strategy,
+            level: init.level,
+            block_open: 0,
+            hash_calc_variant: HashCalcVariant::Standard,
+            match_available: false,
+            good_match: 0,
+            nice_match: 0,
+            match_start: 0,
+            prev_match: 0,
+            strstart: 0,
+            window,
+            w_size: 1 << self.window_bits,
+            lookahead: 0,
+            _cache_line_0: (),
+            prev,
+            head,
+            prev_length: 0,
+            max_chain_length: 0,
+            max_insert_length: 0,
+            matches: 0,
+            block_start: 0,
+            sym_buf,
+            _cache_line_1: (),
+            lit_bufsize: self.lit_bufsize,
+            window_size: 0,
+            bit_writer: BitWriter::from_pending(pending),
+            _cache_line_2: (),
+            opt_len: 0,
+            static_len: 0,
+            insert: 0,
+            ins_h: 0,
+            max_lazy_match: 0,
+            gzhead: None,
+            gzindex: 0,
+            medium_next_match: MatchCandidate::EMPTY,
+            data_type: crate::c_api::Z_UNKNOWN,
+            _padding_0: [0; 4],
+            _cache_line_3: (),
+            crc_fold: Crc32Fold::new(),
+            allocation_start,
+            total_allocation_size: self.total_size,
+            l_desc: TreeDesc::EMPTY,
+            d_desc: TreeDesc::EMPTY,
+            bl_desc: TreeDesc::EMPTY,
+        };
+
+        // SAFETY: `state_ptr` is the aligned State region in this fresh allocation and no State
+        // has previously been materialized there.
+        unsafe { state_ptr.write(state) };
+        NonNull::new(state_ptr)
+    }
+
     /// Resolve this layout inside one raw allocator block and initialize every region whose typed
     /// wrapper requires initialized values before constructing that wrapper.
     ///
     /// # Safety
     ///
-    /// `allocation_start` must point to a writable allocation of at least `self.total_size` bytes
-    /// that remains alive for `'a` and is not aliased by another live deflate state.
-    unsafe fn initialize_buffers<'a>(
-        &self,
-        allocation_start: NonNull<u8>,
-        window_bits: usize,
-        lit_bufsize: usize,
-    ) -> DeflateAllocBuffers<'a> {
-        let base = unsafe { self.aligned_base(allocation_start) };
-        let w_size = 1usize << window_bits;
+    /// `aligned` must be the aligned interior base of a writable allocation described by this
+    /// layout, remain alive for `'a`, and not be aliased by another live deflate state.
+    unsafe fn initialize_buffers<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocBuffers<'a> {
+        let base = aligned.as_ptr();
+        let w_size = 1usize << self.window_bits;
 
         let window_ptr = unsafe { base.add(self.window_pos) };
         unsafe { window_ptr.write_bytes(0, 2 * w_size) };
-        let window = unsafe { Window::from_raw_parts(window_ptr, window_bits) };
+        let window = unsafe { Window::from_raw_parts(window_ptr, self.window_bits) };
 
         let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
         unsafe { prev_ptr.write_bytes(0, w_size) };
@@ -3563,10 +3580,10 @@ impl DeflateAllocOffsets {
         let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
 
         let pending_ptr = unsafe { base.add(self.pending_pos).cast::<MaybeUninit<u8>>() };
-        let pending = unsafe { Pending::from_raw_parts(pending_ptr, lit_bufsize * LIT_BUFS) };
+        let pending = unsafe { Pending::from_raw_parts(pending_ptr, self.lit_bufsize * LIT_BUFS) };
 
         let sym_buf_ptr = unsafe { base.add(self.sym_buf_pos) };
-        let sym_buf = unsafe { SymBuf::from_raw_parts(sym_buf_ptr, lit_bufsize) };
+        let sym_buf = unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize) };
 
         DeflateAllocBuffers {
             state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
@@ -3583,25 +3600,23 @@ impl DeflateAllocOffsets {
     ///
     /// # Safety
     ///
-    /// `allocation_start` must satisfy the same allocation/lifetime requirements as
+    /// `aligned` must satisfy the same allocation/lifetime requirements as
     /// [`Self::initialize_buffers`] and must not overlap any source-state allocation.
     unsafe fn clone_buffers<'a>(
         &self,
-        allocation_start: NonNull<u8>,
-        window_bits: usize,
-        lit_bufsize: usize,
+        aligned: NonNull<u8>,
         source: &State<'_>,
     ) -> DeflateAllocBuffers<'a> {
-        let base = unsafe { self.aligned_base(allocation_start) };
-        let w_size = 1usize << window_bits;
+        let base = aligned.as_ptr();
+        let w_size = 1usize << self.window_bits;
         debug_assert_eq!(source.w_size, w_size);
-        debug_assert_eq!(source.lit_bufsize, lit_bufsize);
+        debug_assert_eq!(source.lit_bufsize, self.lit_bufsize);
 
         let window_ptr = unsafe { base.add(self.window_pos) };
         unsafe {
             window_ptr.copy_from_nonoverlapping(source.window.as_ptr(), source.window.capacity())
         };
-        let window = unsafe { Window::from_raw_parts(window_ptr, window_bits) };
+        let window = unsafe { Window::from_raw_parts(window_ptr, self.window_bits) };
 
         let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
         unsafe { prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len()) };
@@ -3637,16 +3652,23 @@ impl DeflateAllocOffsets {
         alloc: &Allocator<'_>,
         source: &State<'a>,
     ) -> Option<NonNull<State<'a>>> {
-        let window_bits = source.w_bits() as usize;
-        let lit_bufsize = source.lit_bufsize;
+        assert_eq!(
+            self.window_bits,
+            source.w_bits() as usize,
+            "deflate clone layout must match source window geometry"
+        );
+        assert_eq!(
+            self.lit_bufsize, source.lit_bufsize,
+            "deflate clone layout must match source symbol-buffer geometry"
+        );
         assert_eq!(self.total_size, source.total_allocation_size);
 
-        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
+        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
 
-        // SAFETY: `allocation_start` is a fresh allocation of exactly this layout. The cloned
-        // buffer views below are the only destination views, and `State` is asserted to have no
-        // drop glue, so a byte-for-byte state copy followed by rebinding its allocation-owned
-        // fields cannot duplicate an owning destructor.
+        // SAFETY: `aligned` is a fresh layout base. The cloned buffer views below are the only
+        // destination views, and `State` is asserted to have no drop glue, so a byte-for-byte
+        // state copy followed by rebinding its allocation-owned fields cannot duplicate an owning
+        // destructor.
         let DeflateAllocBuffers {
             state_ptr,
             window,
@@ -3654,7 +3676,7 @@ impl DeflateAllocOffsets {
             head,
             pending,
             sym_buf,
-        } = unsafe { self.clone_buffers(allocation_start, window_bits, lit_bufsize, source) };
+        } = unsafe { self.clone_buffers(aligned, source) };
 
         // SAFETY: `state_ptr` is aligned and in-bounds in the fresh allocation. After copying the
         // no-drop state, immediately replace every field whose pointer must refer to destination
@@ -3672,13 +3694,6 @@ impl DeflateAllocOffsets {
 
         // SAFETY: `state_ptr` comes from the aligned state region inside a live non-null allocation.
         Some(unsafe { NonNull::new_unchecked(state_ptr) })
-    }
-
-    unsafe fn aligned_base(&self, allocation_start: NonNull<u8>) -> *mut u8 {
-        let raw = allocation_start.as_ptr();
-        let addr = raw as usize;
-        let align_offset = addr.next_multiple_of(DEFLATE_ALLOC_ALIGN) - addr;
-        unsafe { raw.add(align_offset) }
     }
 }
 
@@ -3791,6 +3806,43 @@ mod test {
                 init(&mut stream, DeflateConfig::default()),
                 ReturnCode::MemError
             );
+        }
+    }
+
+    #[test]
+    fn init_allocation_geometry_matches_config() {
+        for (window_bits, mem_level) in [(MIN_WBITS, 1), (MAX_WBITS, MAX_MEM_LEVEL)] {
+            let mut raw = z_stream::default();
+            let config = DeflateConfig {
+                window_bits,
+                mem_level,
+                ..Default::default()
+            };
+            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+            let effective_window_bits = if window_bits == 8 { 9 } else { window_bits };
+            let w_size = 1usize << effective_window_bits;
+            let lit_bufsize = 1usize << (mem_level + 6);
+            let layout = DeflateAllocOffsets::new(effective_window_bits as usize, lit_bufsize);
+
+            assert_eq!(stream.state.w_size, w_size);
+            assert_eq!(stream.state.window.capacity(), 2 * w_size);
+            assert_eq!(stream.state.prev.len(), w_size);
+            assert_eq!(stream.state.head.as_slice().len(), HASH_SIZE);
+            assert_eq!(
+                stream.state.bit_writer.pending.capacity(),
+                lit_bufsize * LIT_BUFS
+            );
+            assert!(stream.state.sym_buf.is_empty());
+            assert_eq!(stream.state.total_allocation_size, layout.total_size);
+            assert_eq!(
+                stream.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
+                0,
+                "State placement must retain its cache-line alignment"
+            );
+
+            assert!(end(stream).is_ok());
         }
     }
 
