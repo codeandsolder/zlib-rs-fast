@@ -841,6 +841,25 @@ mod null {
     }
 
     #[test]
+    fn inflate_sync_allows_null_for_empty_input_with_buffered_bits() {
+        assert_eq_rs_ng!({
+            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let init = inflateInit_(
+                strm.as_mut_ptr(),
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as _,
+            );
+            let strm = unsafe { strm.assume_init_mut() };
+            let prime = inflatePrime(strm, 16, 0);
+            strm.next_in = core::ptr::null_mut();
+            strm.avail_in = 0;
+            let sync = inflateSync(strm);
+            let end = inflateEnd(strm);
+            (init, prime, sync, end)
+        });
+    }
+
+    #[test]
     fn inflate_undocumented() {
         // public but undocumented
         assert_eq!(

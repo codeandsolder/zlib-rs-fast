@@ -886,6 +886,8 @@ pub unsafe extern "C" fn inflateMark(strm: *const z_stream) -> c_long {
 /// * Either
 ///     - `strm` is `NULL`
 ///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`inflateInit_`] or similar
+/// * If `strm` is non-null and `strm.avail_in != 0`, `strm.next_in` must point to a readable span
+///   of at least `strm.avail_in` bytes.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateSync))]
 pub unsafe extern "C" fn inflateSync(strm: *mut z_stream) -> i32 {
     if let Some(stream) = InflateStream::from_stream_mut(strm) {

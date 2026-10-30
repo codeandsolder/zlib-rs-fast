@@ -2611,6 +2611,9 @@ fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
 pub fn sync(stream: &mut InflateStream) -> ReturnCode {
     let state = &mut *stream.state;
 
+    if stream.next_in.is_null() && stream.avail_in != 0 {
+        return ReturnCode::StreamError;
+    }
     if stream.avail_in == 0 && state.bit_buffer.bits_in_buffer() < 8 {
         return ReturnCode::BufError;
     }
@@ -2623,14 +2626,24 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
         (state.have, _) = syncsearch(0, &buf[..len]);
     }
 
-    // search available input
-    // SAFETY: user guarantees that pointer and length are valid.
-    let slice = unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) };
+    // Search available input. A zlib caller may legitimately provide NULL when `avail_in == 0`;
+    // Rust slices still require a non-null pointer even at length zero, so represent that case with
+    // the canonical empty slice instead of materializing `from_raw_parts(NULL, 0)`.
+    let slice = if stream.avail_in == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the public FFI contract requires the non-null input span to be readable for
+        // `avail_in` bytes, and the null/nonzero case was rejected above.
+        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
+    };
 
     let len;
     (state.have, len) = syncsearch(state.have, slice);
-    // SAFETY: syncsearch() returns an index that is in-bounds of the slice.
-    stream.next_in = unsafe { stream.next_in.add(len) };
+    if len != 0 {
+        // SAFETY: `syncsearch` returns an in-bounds consumed prefix; `len != 0` also proves the
+        // source pointer came from the non-empty, non-null branch above.
+        stream.next_in = unsafe { stream.next_in.add(len) };
+    }
     stream.avail_in -= len as u32;
     stream.total_in += len as z_size;
 
