@@ -72,10 +72,124 @@ impl MediumProducer {
             );
         }
     }
+
+    /// Stock Medium levels never need scheduler suspension: their longest hash chain is 128.
+    /// Keep their hot-loop match state local so LLVM can retain it in registers, while the
+    /// resumable path below remains available for streams tuned beyond the local-search limit.
+    fn produce_local(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        debug_assert_eq!(self.phase, MediumPhase::Ready);
+        debug_assert!(state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN);
+
+        let mut current_match = Match::EMPTY;
+        let mut next_match = self.next_match;
+
+        loop {
+            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
+                self.next_match = next_match;
+                return ProduceStatus::NeedInput;
+            }
+
+            if !self.early_exit && next_match.match_length > 0 {
+                current_match = next_match;
+                next_match.match_length = 0;
+            } else {
+                let hash_head = if state.lookahead >= WANT_MIN_MATCH {
+                    StandardHashCalc::quick_insert_string(state, state.strstart)
+                } else {
+                    0
+                };
+
+                current_match.strstart = state.strstart as u16;
+                current_match.orgstart = current_match.strstart;
+
+                let dist = state.strstart as i64 - i64::from(hash_head);
+                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                    let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
+                        .request(state)
+                        .execute();
+                    state.match_start = result.start;
+                    current_match.match_length = result.length as u16;
+                    current_match.match_start = result.start;
+                    if usize::from(current_match.match_length) < WANT_MIN_MATCH
+                        || current_match.match_start >= current_match.strstart
+                    {
+                        current_match.match_length = 1;
+                    }
+                } else {
+                    current_match.match_start = 0;
+                    current_match.match_length = 1;
+                }
+            }
+
+            insert_match(state, current_match);
+
+            let current_len = usize::from(current_match.match_length);
+            let future_start = usize::from(current_match.strstart) + current_len;
+            let future_lookahead = state.lookahead.saturating_sub(current_len);
+            if !self.early_exit
+                && state.lookahead > MIN_LOOKAHEAD
+                && future_lookahead >= WANT_MIN_MATCH
+                && future_start < state.window_size - MIN_LOOKAHEAD
+            {
+                let current_lookahead = state.lookahead;
+                state.strstart = future_start;
+                state.lookahead = future_lookahead;
+                let hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
+
+                next_match.strstart = state.strstart as u16;
+                next_match.orgstart = next_match.strstart;
+
+                let dist = state.strstart as i64 - i64::from(hash_head);
+                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                    let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
+                        .request(state)
+                        .execute();
+                    state.match_start = result.start;
+                    next_match.match_length = result.length as u16;
+                    next_match.match_start = result.start;
+                    if next_match.match_start >= next_match.strstart
+                        || usize::from(next_match.match_length) < WANT_MIN_MATCH
+                    {
+                        next_match.match_length = 1;
+                    } else {
+                        fizzle_matches(
+                            state.window.filled(),
+                            state.max_dist(),
+                            &mut current_match,
+                            &mut next_match,
+                        );
+                    }
+                } else {
+                    next_match.match_start = 0;
+                    next_match.match_length = 1;
+                }
+
+                state.lookahead = current_lookahead;
+                state.strstart = usize::from(current_match.strstart);
+            } else {
+                next_match.match_length = 0;
+            }
+
+            let block_ready = emit_match(state, current_match);
+            state.strstart += usize::from(current_match.match_length);
+
+            if block_ready {
+                self.next_match = next_match;
+                self.save_next(state);
+                return ProduceStatus::BlockReady(BlockContinuation::None);
+            }
+        }
+    }
 }
 
 impl TokenProducer for MediumProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        if self.phase == MediumPhase::Ready
+            && state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN
+        {
+            return self.produce_local(state, allow_short_tail);
+        }
+
         loop {
             match self.phase {
                 MediumPhase::Ready => {

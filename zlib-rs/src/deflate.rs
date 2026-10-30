@@ -4464,6 +4464,58 @@ mod test {
     }
 
     #[test]
+    fn tuned_medium_long_chain_still_yields_detached_match_search() {
+        let input_bytes = b"tuned-medium-detached-search/".repeat(2_000);
+        let config = DeflateConfig {
+            level: 6,
+            method: Method::Deflated,
+            window_bits: crate::MAX_WBITS,
+            mem_level: 1,
+            strategy: Strategy::Default,
+        };
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        assert_eq!(tune(stream, 8, 16, 128, 129), ReturnCode::Ok);
+        stream.next_in = input_bytes.as_ptr() as *mut u8;
+        stream.avail_in = input_bytes.len() as _;
+        let mut core =
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &*stream.state)
+                .unwrap();
+
+        let search = loop {
+            match core.next_event(&mut *stream.state) {
+                algorithm::CoreEvent::NeedInput(demand) => {
+                    let mut input = InputCursor::from_stream(stream);
+                    let outcome = core.satisfy_input(
+                        &mut *stream.state,
+                        &mut input,
+                        demand,
+                        algorithm::InputCompletion::EndOfSegment,
+                    );
+                    input.apply(stream);
+                    assert!(matches!(
+                        outcome,
+                        algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
+                    ));
+                }
+                algorithm::CoreEvent::MatchSearch(work) => break work,
+                algorithm::CoreEvent::TokenBlockReady(_) => {
+                    panic!("tuned Medium filled a token block before yielding match-search work")
+                }
+                algorithm::CoreEvent::EndOfInput(_) => {
+                    panic!("test input exhausted before tuned Medium yielded match-search work")
+                }
+            }
+        };
+
+        let result = search.request(&*stream.state).execute();
+        core.complete_match_search(&mut *stream.state, result);
+        let _ = end(stream);
+    }
+
+    #[test]
     fn standard_core_rejects_production_before_match_search_completes() {
         let input_bytes = b"detached-match-search/".repeat(2_000);
         let config = DeflateConfig {
