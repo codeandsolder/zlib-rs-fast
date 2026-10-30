@@ -34,6 +34,7 @@ cfg_select! {
 }
 
 mod cpu_features;
+mod output_buffer;
 mod stable;
 mod state_ptr;
 mod weak_slice;

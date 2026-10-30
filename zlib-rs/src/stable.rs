@@ -2,6 +2,7 @@ use core::{ffi::c_uint, mem::MaybeUninit};
 
 use crate::deflate::DeflateConfig;
 use crate::inflate::InflateConfig;
+use crate::output_buffer::WritableBytes;
 use crate::ReturnCode;
 pub use crate::{DeflateFlush, InflateFlush};
 
@@ -155,11 +156,7 @@ impl Inflate {
         output: &mut [u8],
         flush: InflateFlush,
     ) -> Result<Status, InflateError> {
-        self.decompress_uninit(
-            input,
-            unsafe { &mut *(output as *mut _ as *mut [MaybeUninit<u8>]) },
-            flush,
-        )
+        self.decompress_into(input, output, flush)
     }
 
     /// Decompress `input` and write all decompressed bytes into a potentially uninitialized `output`,
@@ -170,20 +167,30 @@ impl Inflate {
         output: &mut [MaybeUninit<u8>],
         flush: InflateFlush,
     ) -> Result<Status, InflateError> {
+        self.decompress_into(input, output, flush)
+    }
+
+    fn decompress_into<O: WritableBytes + ?Sized>(
+        &mut self,
+        input: &[u8],
+        output: &mut O,
+        flush: InflateFlush,
+    ) -> Result<Status, InflateError> {
         // Limit the length of the input and output to the maximum value of a c_uint. For larger
         // inputs, this will either complete or signal that more input and output is needed. The
         // caller should be able to handle this regardless.
         self.inner.avail_in = Ord::min(input.len(), c_uint::MAX as usize) as c_uint;
         self.inner.avail_out = Ord::min(output.len(), c_uint::MAX as usize) as c_uint;
 
-        // This cast_mut is unfortunate, that is just how the types are.
+        // zlib's ABI uses a mutable input pointer even though ordinary inflate only reads it.
         self.inner.next_in = input.as_ptr().cast_mut();
-        self.inner.next_out = output.as_mut_ptr().cast();
+        self.inner.next_out = output.byte_ptr();
 
         let start_in = self.inner.next_in;
         let start_out = self.inner.next_out;
 
-        // SAFETY: the inflate state was properly initialized.
+        // SAFETY: the inflate state was properly initialized and the output capability supplies a
+        // writable span of `avail_out` bytes.
         let ret = unsafe { crate::inflate::inflate(&mut self.inner, flush) };
 
         self.total_in += (self.inner.next_in as usize - start_in as usize) as u64;
@@ -338,11 +345,7 @@ impl Deflate {
         output: &mut [u8],
         flush: DeflateFlush,
     ) -> Result<Status, DeflateError> {
-        self.compress_uninit(
-            input,
-            unsafe { &mut *(output as *mut _ as *mut [MaybeUninit<u8>]) },
-            flush,
-        )
+        self.compress_into(input, output, flush)
     }
 
     /// Compress `input` and write compressed bytes to a potentially uninitialized `output`,
@@ -353,15 +356,24 @@ impl Deflate {
         output: &mut [MaybeUninit<u8>],
         flush: DeflateFlush,
     ) -> Result<Status, DeflateError> {
+        self.compress_into(input, output, flush)
+    }
+
+    fn compress_into<O: WritableBytes + ?Sized>(
+        &mut self,
+        input: &[u8],
+        output: &mut O,
+        flush: DeflateFlush,
+    ) -> Result<Status, DeflateError> {
         // Limit the length of the input and output to the maximum value of a c_uint. For larger
         // inputs, this will either complete or signal that more input and output is needed. The
         // caller should be able to handle this regardless.
         self.inner.avail_in = Ord::min(input.len(), c_uint::MAX as usize) as c_uint;
         self.inner.avail_out = Ord::min(output.len(), c_uint::MAX as usize) as c_uint;
 
-        // This cast_mut is unfortunate, that is just how the types are.
+        // zlib's ABI uses a mutable input pointer even though deflate only reads this input span.
         self.inner.next_in = input.as_ptr().cast_mut();
-        self.inner.next_out = output.as_mut_ptr().cast();
+        self.inner.next_out = output.byte_ptr();
 
         let start_in = self.inner.next_in;
         let start_out = self.inner.next_out;
@@ -371,10 +383,9 @@ impl Deflate {
         self.total_in += (self.inner.next_in as usize - start_in as usize) as u64;
         self.total_out += (self.inner.next_out as usize - start_out as usize) as u64;
 
-        // Clear these pointers so there can be no use after free.
+        // Clear these pointers so there can be no use after the caller's buffers go out of scope.
         self.inner.next_in = core::ptr::null_mut();
         self.inner.next_out = core::ptr::null_mut();
-
         self.inner.avail_in = 0;
         self.inner.avail_out = 0;
 

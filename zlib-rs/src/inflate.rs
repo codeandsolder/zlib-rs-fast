@@ -16,6 +16,7 @@ mod writer;
 
 use crate::allocate::Allocator;
 use crate::c_api::internal_state;
+use crate::output_buffer::{assume_init_prefix, WritableBytes};
 use crate::state_ptr::StatePtr;
 use crate::{
     adler32::adler32,
@@ -229,12 +230,8 @@ pub fn decompress_slice<'a>(
     input: &[u8],
     config: InflateConfig,
 ) -> (&'a mut [u8], ReturnCode) {
-    // SAFETY: [u8] is also a valid [MaybeUninit<u8>]
-    let output_uninit = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut MaybeUninit<u8>, output.len())
-    };
-
-    uncompress(output_uninit, input, config)
+    let (_consumed, produced, ret) = uncompress2_into(output, input, config);
+    (&mut output[..produced], ret)
 }
 
 /// Inflates `source` into `dest`, and writes the final inflated size into `dest_len`.
@@ -243,7 +240,9 @@ pub fn uncompress<'a>(
     input: &[u8],
     config: InflateConfig,
 ) -> (&'a mut [u8], ReturnCode) {
-    let (_consumed, output, ret) = uncompress2(output, input, config);
+    let (_consumed, produced, ret) = uncompress2_into(output, input, config);
+    // SAFETY: `uncompress2_into` reports only bytes initialized by the inflate output cursor.
+    let output = unsafe { assume_init_prefix(output, produced) };
     (output, ret)
 }
 
@@ -252,7 +251,19 @@ pub fn uncompress2<'a>(
     input: &[u8],
     config: InflateConfig,
 ) -> (u64, &'a mut [u8], ReturnCode) {
-    let mut dest_len_ptr = output.len() as z_checksum;
+    let (consumed, produced, ret) = uncompress2_into(output, input, config);
+    // SAFETY: `uncompress2_into` reports only bytes initialized by the inflate output cursor.
+    let output = unsafe { assume_init_prefix(output, produced) };
+    (consumed, output, ret)
+}
+
+fn uncompress2_into<O: WritableBytes + ?Sized>(
+    output: &mut O,
+    input: &[u8],
+    config: InflateConfig,
+) -> (u64, usize, ReturnCode) {
+    let output_len = output.len();
+    let mut dest_len = output_len as z_checksum;
 
     // for detection of incomplete stream when *destLen == 0
     let mut buf = [0u8];
@@ -260,15 +271,13 @@ pub fn uncompress2<'a>(
     let mut left;
     let mut len = input.len() as u64;
 
-    let dest = if output.is_empty() {
+    let dest = if output_len == 0 {
         left = 1;
-
         buf.as_mut_ptr()
     } else {
-        left = output.len() as u64;
-        dest_len_ptr = 0;
-
-        output.as_mut_ptr() as *mut u8
+        left = output_len as u64;
+        dest_len = 0;
+        output.byte_ptr()
     };
 
     let mut stream = z_stream {
@@ -284,14 +293,14 @@ pub fn uncompress2<'a>(
 
     let err = init(&mut stream, config);
     if err != ReturnCode::Ok {
-        return (0, &mut [], err);
+        return (0, 0, err);
     }
 
     stream.next_out = dest;
     stream.avail_out = 0;
 
     let Some(stream) = (unsafe { InflateStream::from_stream_mut(&mut stream) }) else {
-        return (0, &mut [], ReturnCode::StreamError);
+        return (0, 0, ReturnCode::StreamError);
     };
 
     let err = loop {
@@ -313,14 +322,13 @@ pub fn uncompress2<'a>(
     };
 
     let consumed = len + u64::from(stream.avail_in);
-    if !output.is_empty() {
-        dest_len_ptr = stream.total_out;
+    if output_len != 0 {
+        dest_len = stream.total_out;
     } else if stream.total_out != 0 && err == ReturnCode::BufError {
         left = 1;
     }
 
     let avail_out = stream.avail_out;
-
     end(stream);
 
     let ret = match err {
@@ -330,12 +338,12 @@ pub fn uncompress2<'a>(
         _ => err,
     };
 
-    // SAFETY: we have now initialized these bytes
-    let output_slice = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u8, dest_len_ptr as usize)
-    };
-
-    (consumed, output_slice, ret)
+    let produced = dest_len as usize;
+    assert!(
+        produced <= output_len,
+        "inflate reported output beyond caller storage"
+    );
+    (consumed, produced, ret)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3138,6 +3146,40 @@ mod tests {
                 inflate_fragmented(&compressed, &input, input_chunk, output_chunk);
             }
         }
+    }
+
+    #[test]
+    fn uninitialized_output_exposes_exactly_the_decompressed_prefix() {
+        let input: Vec<u8> = (0..257)
+            .flat_map(|i| {
+                let byte = (i % 251) as u8;
+                [b"typed-inflate-output/".as_slice(), &[byte]].concat()
+            })
+            .collect();
+        let mut compressed_storage = vec![0u8; crate::compress_bound(input.len())];
+        let (compressed, code) = crate::compress_slice(
+            &mut compressed_storage,
+            &input,
+            crate::DeflateConfig::default(),
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        let compressed = compressed.to_vec();
+
+        let capacity = input.len() + 97;
+        let mut initialized = vec![0u8; capacity];
+        let (expected, expected_code) =
+            decompress_slice(&mut initialized, &compressed, InflateConfig::default());
+        assert_eq!(expected_code, ReturnCode::Ok);
+        assert_eq!(expected, input);
+        let expected = expected.to_vec();
+
+        let mut uninitialized = vec![MaybeUninit::<u8>::uninit(); capacity];
+        let (actual, actual_code) =
+            uncompress(&mut uninitialized, &compressed, InflateConfig::default());
+        assert_eq!(actual_code, ReturnCode::Ok);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), input.len());
+        assert!(actual.len() < capacity);
     }
 
     #[test]

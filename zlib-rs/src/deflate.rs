@@ -5,6 +5,7 @@ use crate::{
     allocate::Allocator,
     c_api::{gz_header, internal_state, z_checksum, z_stream},
     crc32::{crc32, Crc32Fold},
+    output_buffer::{assume_init_prefix, WritableBytes},
     state_ptr::StatePtr,
     trace,
     weak_slice::{WeakArrayMut, WeakSliceMut},
@@ -3161,45 +3162,12 @@ pub fn compress_with_flush<'a>(
     final_flush: DeflateFlush,
 ) -> (&'a mut [u8], ReturnCode) {
     let (produced, code) = compress_into(output, input, config, final_flush);
-    let initialized = &mut output[..produced];
-
-    // SAFETY: `compress_into` reports only bytes written through the zlib output cursor. Those
-    // bytes are initialized `u8`s; the untouched MaybeUninit tail is not exposed.
-    let initialized = unsafe { &mut *(initialized as *mut [MaybeUninit<u8>] as *mut [u8]) };
+    // SAFETY: `compress_into` reports only bytes written through the zlib output cursor.
+    let initialized = unsafe { assume_init_prefix(output, produced) };
     (initialized, code)
 }
 
-/// Private storage capability for the one-shot compression helpers.
-///
-/// Both initialized and uninitialized byte slices are valid writable destinations. Keeping the
-/// distinction in the wrapper means the common compression loop never needs to erase and recreate
-/// slice initialization state.
-trait CompressionOutput {
-    fn byte_ptr(&mut self) -> *mut u8;
-    fn len(&self) -> usize;
-}
-
-impl CompressionOutput for [u8] {
-    fn byte_ptr(&mut self) -> *mut u8 {
-        self.as_mut_ptr()
-    }
-
-    fn len(&self) -> usize {
-        <[u8]>::len(self)
-    }
-}
-
-impl CompressionOutput for [MaybeUninit<u8>] {
-    fn byte_ptr(&mut self) -> *mut u8 {
-        self.as_mut_ptr().cast()
-    }
-
-    fn len(&self) -> usize {
-        <[MaybeUninit<u8>]>::len(self)
-    }
-}
-
-fn compress_into<O: CompressionOutput + ?Sized>(
+fn compress_into<O: WritableBytes + ?Sized>(
     output: &mut O,
     input: &[u8],
     config: DeflateConfig,
