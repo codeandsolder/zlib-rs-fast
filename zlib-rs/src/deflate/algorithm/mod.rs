@@ -16,7 +16,7 @@ mod rle;
 mod slow;
 mod stored;
 
-const LOCAL_MATCH_SEARCH_MAX_CHAIN: u16 = 32;
+const LOCAL_MATCH_SEARCH_MAX_CHAIN: u16 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InputStatus {
