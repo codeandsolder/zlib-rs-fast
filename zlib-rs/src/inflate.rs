@@ -16,6 +16,7 @@ mod writer;
 
 use crate::allocate::Allocator;
 use crate::c_api::internal_state;
+use crate::state_ptr::StatePtr;
 use crate::{
     adler32::adler32,
     c_api::{gz_header, z_checksum, z_size, z_stream, Z_DEFLATED},
@@ -45,7 +46,7 @@ pub struct InflateStream<'a> {
     pub(crate) avail_out: crate::c_api::uInt,
     pub(crate) total_out: crate::c_api::z_size,
     pub(crate) msg: *mut c_char,
-    pub(crate) state: &'a mut State<'a>,
+    pub(crate) state: StatePtr<State<'a>>,
     pub(crate) alloc: Allocator<'a>,
     pub(crate) data_type: c_int,
     pub(crate) adler: crate::c_api::z_checksum,
@@ -2331,7 +2332,7 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
 
     stream.msg = core::ptr::null_mut();
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     if state.wrap != 0 {
         // to support ill-conceived Java test suite
@@ -2367,7 +2368,7 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
         return ReturnCode::StreamError;
     }
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     // skip check
     if let Mode::Type = state.mode {
@@ -2464,7 +2465,7 @@ fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
 }
 
 pub fn sync(stream: &mut InflateStream) -> ReturnCode {
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     if stream.avail_in == 0 && state.bit_reader.bits_in_buffer() < 8 {
         return ReturnCode::BufError;
@@ -2556,7 +2557,7 @@ pub unsafe fn copy<'a>(
     };
 
     let copy = unsafe { buf.add(allocs.state_pos).cast::<State>() };
-    unsafe { core::ptr::copy_nonoverlapping(source.state, copy, 1) };
+    unsafe { core::ptr::copy_nonoverlapping(source.state.as_ptr(), copy, 1) };
 
     let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).window) };
     unsafe { core::ptr::write(field_ptr, window) };
@@ -2564,10 +2565,7 @@ pub unsafe fn copy<'a>(
     let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).allocation_start) };
     unsafe { core::ptr::write(field_ptr, allocation_start.as_ptr()) };
 
-    // Build the destination ABI shell explicitly. A raw struct copy would duplicate the source's
-    // `&mut State` before replacing it, which is not valid Rust aliasing even though C's
-    // `z_stream.state` pointer is copyable.
-    let copied_state = unsafe { &mut *copy };
+    // Build the destination ABI shell explicitly around the cloned raw state pointer.
     dest.write(InflateStream {
         next_in: source.next_in,
         avail_in: source.avail_in,
@@ -2576,7 +2574,7 @@ pub unsafe fn copy<'a>(
         avail_out: source.avail_out,
         total_out: source.total_out,
         msg: source.msg,
-        state: copied_state,
+        state: unsafe { StatePtr::from_raw(copy) },
         alloc: source.alloc,
         data_type: source.data_type,
         adler: source.adler,
@@ -2608,7 +2606,7 @@ pub fn mark(stream: &InflateStream) -> c_long {
         return c_long::MIN;
     }
 
-    let state = &stream.state;
+    let state = &*stream.state;
 
     let length = match state.mode {
         Mode::CopyBlock => state.length,
@@ -2633,15 +2631,16 @@ pub fn set_dictionary(stream: &mut InflateStream, dictionary: &[u8]) -> ReturnCo
         }
     }
 
-    stream.state.window.extend(
+    let state = &mut *stream.state;
+    state.window.extend(
         dictionary,
-        stream.state.gzip_flags,
+        state.gzip_flags,
         false,
-        &mut stream.state.checksum,
-        &mut stream.state.crc_fold,
+        &mut state.checksum,
+        &mut state.crc_fold,
     );
 
-    stream.state.flags.update(Flags::HAVE_DICT, true);
+    state.flags.update(Flags::HAVE_DICT, true);
 
     ReturnCode::Ok
 }
@@ -2715,6 +2714,16 @@ pub unsafe fn get_dictionary(stream: &InflateStream<'_>, dictionary: *mut u8) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_leaves_null_abi_state_pointer() {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        let raw = end(stream);
+        assert!(raw.state.is_null());
+    }
 
     #[test]
     fn gzip_header_destination_is_shared_safely_across_inflate_copy() {

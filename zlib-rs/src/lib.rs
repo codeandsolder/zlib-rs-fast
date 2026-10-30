@@ -35,6 +35,7 @@ cfg_select! {
 
 mod cpu_features;
 mod stable;
+mod state_ptr;
 mod weak_slice;
 
 pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};

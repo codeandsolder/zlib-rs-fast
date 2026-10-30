@@ -5,6 +5,7 @@ use crate::{
     allocate::Allocator,
     c_api::{gz_header, internal_state, z_checksum, z_stream},
     crc32::{crc32, Crc32Fold},
+    state_ptr::StatePtr,
     trace,
     weak_slice::{WeakArrayMut, WeakSliceMut},
     DeflateFlush, ReturnCode, ADLER32_INITIAL_VALUE, CRC32_INITIAL_VALUE, MAX_WBITS, MIN_WBITS,
@@ -43,7 +44,7 @@ pub struct DeflateStream<'a> {
     pub(crate) avail_out: crate::c_api::uInt,
     pub(crate) total_out: crate::c_api::z_size,
     pub(crate) msg: *const core::ffi::c_char,
-    pub(crate) state: &'a mut State<'a>,
+    pub(crate) state: StatePtr<State<'a>>,
     pub(crate) alloc: Allocator<'a>,
     pub(crate) data_type: core::ffi::c_int,
     pub(crate) adler: crate::c_api::z_checksum,
@@ -604,7 +605,7 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 
     let level = level as i8;
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     if change_requires_block_boundary(state.level, state.strategy, level, strategy)
         && state.last_flush != -2
@@ -615,7 +616,7 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
             return err;
         }
 
-        let state = &mut stream.state;
+        let state = &mut *stream.state;
 
         if stream.avail_in != 0
             || ((state.strstart as isize - state.block_start) + state.lookahead as isize) != 0
@@ -624,7 +625,7 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         }
     }
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     if state.level != level {
         if state.level == 0 && state.matches != 0 {
@@ -645,7 +646,7 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 }
 
 pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> ReturnCode {
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     let wrap = state.wrap;
 
@@ -694,7 +695,7 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
         fill_window(stream);
     }
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     state.strstart += state.lookahead;
     state.block_start = state.strstart as _;
@@ -717,7 +718,7 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
 
     let mut value64 = value as u64;
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
 
     if bits < 0
         || bits > BitWriter::BIT_BUF_SIZE as i32
@@ -759,7 +760,7 @@ pub fn copy<'a>(
     let window_bits = source.state.w_bits() as usize;
     let lit_bufsize = source.state.lit_bufsize;
 
-    let source_state = &source.state;
+    let source_state = &*source.state;
     let alloc = &source.alloc;
 
     let allocs = DeflateAllocOffsets::new(window_bits, lit_bufsize);
@@ -835,10 +836,7 @@ pub fn copy<'a>(
     // write the cloned state into the rebound allocation
     unsafe { state_allocation.write(dest_state) };
 
-    // Build the destination ABI shell explicitly. A raw struct copy would duplicate the source's
-    // `&mut State` value before replacing it, which is not valid Rust aliasing even though C's
-    // `z_stream.state` pointer is copyable.
-    let dest_state = unsafe { &mut *state_allocation };
+    // Build the destination ABI shell explicitly around the cloned raw state pointer.
     dest.write(DeflateStream {
         next_in: source.next_in,
         avail_in: source.avail_in,
@@ -847,7 +845,7 @@ pub fn copy<'a>(
         avail_out: source.avail_out,
         total_out: source.total_out,
         msg: source.msg,
-        state: dest_state,
+        state: unsafe { StatePtr::from_raw(state_allocation) },
         alloc: source.alloc,
         data_type: source.data_type,
         adler: source.adler,
@@ -882,7 +880,7 @@ pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
     let ret = reset_keep(stream);
 
     if ret == ReturnCode::Ok {
-        lm_init(stream.state);
+        lm_init(&mut *stream.state);
     }
 
     ret
@@ -894,7 +892,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     stream.msg = core::ptr::null_mut();
     stream.data_type = crate::c_api::Z_UNKNOWN;
 
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
     state.data_type = crate::c_api::Z_UNKNOWN;
 
     state.bit_writer.pending.reset_keep();
@@ -2627,7 +2625,7 @@ fn encode_block_core(state: &mut State<'_>, is_last: bool) {
 }
 
 fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
-    let mut state = &mut stream.state;
+    let mut state = &mut *stream.state;
 
     // we'll be using the pending buffer as temporary storage
     let mut beg = state.bit_writer.pending.pending().len(); /* start of bytes to update crc */
@@ -2644,7 +2642,7 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 
         state.gzindex += copy;
         flush_pending(stream);
-        state = &mut stream.state;
+        state = &mut *stream.state;
 
         // could not flush all the pending output
         if !state.bit_writer.pending.pending().is_empty() {
@@ -2889,14 +2887,14 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     }
 
     // Start a new block or continue the current one.
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
     if stream.avail_in != 0
         || state.lookahead != 0
         || (flush != DeflateFlush::NoFlush && state.status != Status::Finish)
     {
         let bstate = self::algorithm::run(stream, flush);
 
-        let state = &mut stream.state;
+        let state = &mut *stream.state;
 
         if matches!(bstate, BlockState::FinishStarted | BlockState::FinishDone) {
             state.status = Status::Finish;
@@ -3501,7 +3499,7 @@ pub fn bound(stream: Option<&mut DeflateStream>, source_len: usize) -> usize {
 ///
 /// The `dictionary` must have enough space for the dictionary.
 pub unsafe fn get_dictionary(stream: &DeflateStream<'_>, dictionary: *mut u8) -> usize {
-    let s = &stream.state;
+    let s = &*stream.state;
     let len = Ord::min(s.strstart + s.lookahead, s.w_size);
 
     if !dictionary.is_null() && len > 0 {
@@ -3885,6 +3883,19 @@ mod test {
     }
 
     #[test]
+    fn end_leaves_null_abi_state_pointer() {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        let raw = match end(stream) {
+            Ok(raw) => raw,
+            Err(_) => panic!("fresh deflate stream can be ended"),
+        };
+        assert!(raw.state.is_null());
+    }
+
+    #[test]
     fn end_data_error() {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
@@ -4071,7 +4082,7 @@ mod test {
                 let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
                 stream.next_in = input.as_ptr() as *mut u8;
                 stream.avail_in = input.len() as _;
-                algorithm::StandardDriver::for_algorithm(algorithm, stream.state).unwrap()
+                algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state).unwrap()
             };
 
             Self {
@@ -4096,7 +4107,8 @@ mod test {
             // test honest: a batch scheduler may collect work from several paused streams before
             // executing searches, then resume each producer later with its owned result.
             if let Some(result) = self.pending_match_result.take() {
-                self.driver.complete_match_search(stream.state, result);
+                self.driver
+                    .complete_match_search(&mut *stream.state, result);
                 self.match_result_turns += 1;
                 return None;
             }
@@ -4109,7 +4121,7 @@ mod test {
             let mut input = InputCursor::from_stream(stream);
             let mut output = OutputCursor::from_stream(stream);
             let outcome = self.driver.step(
-                stream.state,
+                &mut *stream.state,
                 &mut input,
                 &mut output,
                 algorithm::StandardSegmentMode::Final,
@@ -4154,7 +4166,7 @@ mod test {
             work: crate::deflate::longest_match::MatchSearchWork,
         ) -> crate::deflate::longest_match::MatchSearchRequest<'_> {
             let stream = unsafe { DeflateStream::from_stream_ref(&self.raw) }.unwrap();
-            work.request(stream.state)
+            work.request(&*stream.state)
         }
 
         fn into_output(mut self) -> Vec<u8> {
@@ -4318,15 +4330,15 @@ mod test {
         stream.next_in = input_bytes.as_ptr() as *mut u8;
         stream.avail_in = input_bytes.len() as _;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, stream.state)
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &*stream.state)
                 .unwrap();
 
         let search = loop {
-            match core.next_event(stream.state) {
+            match core.next_event(&mut *stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        stream.state,
+                        &mut *stream.state,
                         &mut input,
                         demand,
                         algorithm::InputCompletion::EndOfSegment,
@@ -4348,17 +4360,17 @@ mod test {
         };
 
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = core.next_event(stream.state);
+            let _ = core.next_event(&mut *stream.state);
         }));
         assert!(
             rejected.is_err(),
             "production advanced with an outstanding match search"
         );
 
-        let result = search.request(stream.state).execute();
-        core.complete_match_search(stream.state, result);
+        let result = search.request(&*stream.state).execute();
+        core.complete_match_search(&mut *stream.state, result);
         assert!(matches!(
-            core.next_event(stream.state),
+            core.next_event(&mut *stream.state),
             algorithm::CoreEvent::MatchSearch(_)
                 | algorithm::CoreEvent::TokenBlockReady(_)
                 | algorithm::CoreEvent::NeedInput(_)
@@ -4390,15 +4402,15 @@ mod test {
         stream.next_in = input_bytes.as_ptr() as *mut u8;
         stream.avail_in = input_bytes.len() as _;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, stream.state)
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &*stream.state)
                 .unwrap();
 
         let pending = loop {
-            match core.next_event(stream.state) {
+            match core.next_event(&mut *stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        stream.state,
+                        &mut *stream.state,
                         &mut input,
                         demand,
                         algorithm::InputCompletion::EndOfSegment,
@@ -4410,11 +4422,11 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => {
-                    let result = work.request(stream.state).execute();
-                    core.complete_match_search(stream.state, result);
+                    let result = work.request(&*stream.state).execute();
+                    core.complete_match_search(&mut *stream.state, result);
                 }
                 algorithm::CoreEvent::TokenBlockReady(work) => {
-                    break core.encode_token_block(stream.state, work);
+                    break core.encode_token_block(&mut *stream.state, work);
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
                     panic!("test input exhausted before producing a token block")
@@ -4423,7 +4435,7 @@ mod test {
         };
 
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = core.next_event(stream.state);
+            let _ = core.next_event(&mut *stream.state);
         }));
         assert!(
             rejected.is_err(),
@@ -4435,7 +4447,7 @@ mod test {
         stream.avail_out = output_bytes.len() as _;
         let mut output = OutputCursor::from_stream(stream);
         assert!(matches!(
-            core.drain_output(stream.state, &mut output, pending),
+            core.drain_output(&mut *stream.state, &mut output, pending),
             algorithm::PendingOutputOutcome::Ready
         ));
         output.apply(stream);

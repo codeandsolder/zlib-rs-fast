@@ -104,7 +104,7 @@ pub unsafe fn back(
     let mut put = strm.state.window.as_mut_ptr();
     let mut left = strm.state.window.buffer_size();
 
-    let state = &mut strm.state;
+    let state = &mut *strm.state;
 
     'inf_leave: loop {
         macro_rules! initbits {
