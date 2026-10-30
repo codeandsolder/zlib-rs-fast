@@ -61,6 +61,33 @@ pub struct DeflateStream<'a> {
     pub(crate) reserved: crate::c_api::uLong,
 }
 
+// `DeflateStream` is a typed view of the public zlib ABI shell. Prove the complete field mapping,
+// not merely total size/alignment: the `alloc` field deliberately overlays z_stream's
+// zalloc/zfree/opaque triple.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    type D = DeflateStream<'static>;
+    type Z = z_stream;
+
+    assert!(size_of::<D>() == size_of::<Z>());
+    assert!(align_of::<D>() == align_of::<Z>());
+    assert!(offset_of!(D, next_in) == offset_of!(Z, next_in));
+    assert!(offset_of!(D, avail_in) == offset_of!(Z, avail_in));
+    assert!(offset_of!(D, total_in) == offset_of!(Z, total_in));
+    assert!(offset_of!(D, next_out) == offset_of!(Z, next_out));
+    assert!(offset_of!(D, avail_out) == offset_of!(Z, avail_out));
+    assert!(offset_of!(D, total_out) == offset_of!(Z, total_out));
+    assert!(offset_of!(D, msg) == offset_of!(Z, msg));
+    assert!(offset_of!(D, state) == offset_of!(Z, state));
+    assert!(offset_of!(D, alloc) + offset_of!(Allocator<'static>, zalloc) == offset_of!(Z, zalloc));
+    assert!(offset_of!(D, alloc) + offset_of!(Allocator<'static>, zfree) == offset_of!(Z, zfree));
+    assert!(offset_of!(D, alloc) + offset_of!(Allocator<'static>, opaque) == offset_of!(Z, opaque));
+    assert!(offset_of!(D, data_type) == offset_of!(Z, data_type));
+    assert!(offset_of!(D, adler) == offset_of!(Z, adler));
+    assert!(offset_of!(D, reserved) == offset_of!(Z, reserved));
+};
+
 #[derive(Clone, Copy)]
 pub(crate) struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
@@ -455,11 +482,6 @@ unsafe impl Sync for DeflateStream<'_> {}
 unsafe impl Send for DeflateStream<'_> {}
 
 impl<'a> DeflateStream<'a> {
-    // z_stream and DeflateStream must have the same layout. Do our best to check if this is true.
-    // (imperfect check, but should catch most mistakes.)
-    const _S: () = assert!(core::mem::size_of::<z_stream>() == core::mem::size_of::<Self>());
-    const _A: () = assert!(core::mem::align_of::<z_stream>() == core::mem::align_of::<Self>());
-
     /// # Safety
     ///
     /// Behavior is undefined if any of the following conditions are violated:
@@ -537,7 +559,33 @@ impl<'a> DeflateStream<'a> {
         let ret = crate::deflate::init(&mut inner, config);
         assert_eq!(ret, ReturnCode::Ok);
 
-        unsafe { core::mem::transmute(inner) }
+        let state = inner.state.cast::<State<'a>>();
+        let alloc = Allocator {
+            zalloc: inner
+                .zalloc
+                .expect("initialized deflate stream has an allocator"),
+            zfree: inner
+                .zfree
+                .expect("initialized deflate stream has a deallocator"),
+            opaque: inner.opaque,
+            _marker: PhantomData,
+        };
+
+        Self {
+            next_in: inner.next_in.cast_mut(),
+            avail_in: inner.avail_in,
+            total_in: inner.total_in,
+            next_out: inner.next_out,
+            avail_out: inner.avail_out,
+            total_out: inner.total_out,
+            msg: inner.msg.cast_const(),
+            // SAFETY: successful `init` created a live deflate State allocation owned by this stream.
+            state: unsafe { StatePtr::from_raw(state) },
+            alloc,
+            data_type: inner.data_type,
+            adler: inner.adler,
+            reserved: inner.reserved,
+        }
     }
 }
 
