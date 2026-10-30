@@ -34,6 +34,9 @@ macro_rules! assert_eq_rs_ng {
                 fn inflateValidate(strm: *mut z_stream, check: i32) -> core::ffi::c_int;
 
                 #[allow(unused)]
+                fn deflateResetKeep(strm: *mut z_stream) -> core::ffi::c_int;
+
+                #[allow(unused)]
                 fn deflateGetDictionary(
                     strm: *const z_stream,
                     dictionary: *mut core::ffi::c_uchar,

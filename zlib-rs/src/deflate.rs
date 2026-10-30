@@ -996,8 +996,6 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
 
     state.last_flush = -2;
     state.medium_next_match = MatchCandidate::EMPTY;
-    // Match zlib's deflateResetKeep(): a custom gzip header applies only until reset.
-    state.gzhead = None;
 
     state.zng_tr_init();
 
@@ -4154,6 +4152,64 @@ mod test {
     }
 
     #[test]
+    fn reset_keep_rewinds_partially_drained_pending_output() {
+        let mut raw = z_stream::default();
+        let config = DeflateConfig {
+            window_bits: 31,
+            mem_level: 1,
+            ..Default::default()
+        };
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        // Make the gzip name larger than the small mem_level=1 pending buffer. One deflate call
+        // fills that buffer and drains only part of it, leaving `Pending::out` advanced while
+        // bytes are still pending.
+        let mut name = vec![b'n'; 600];
+        name.push(0);
+        let mut header = gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 3,
+            extra: core::ptr::null_mut(),
+            extra_len: 0,
+            extra_max: 0,
+            name: name.as_mut_ptr(),
+            name_max: 0,
+            comment: core::ptr::null_mut(),
+            comm_max: 0,
+            hcrc: 0,
+            done: 0,
+        };
+        assert_eq!(
+            unsafe { set_header(stream, Some(&mut header)) },
+            ReturnCode::Ok
+        );
+
+        let mut output = [0u8; 400];
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = output.len() as _;
+        assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+
+        let capacity = stream.state.bit_writer.pending.capacity();
+        assert!(!stream.state.bit_writer.pending.pending().is_empty());
+        assert!(stream.state.bit_writer.pending.remaining() < capacity);
+
+        assert_eq!(reset_keep(stream), ReturnCode::Ok);
+        assert!(stream.state.bit_writer.pending.pending().is_empty());
+        assert_eq!(
+            stream.state.bit_writer.pending.remaining(),
+            capacity,
+            "deflateResetKeep must rewind pending_out to pending_buf"
+        );
+
+        assert!(end(stream).is_ok());
+    }
+
+    #[test]
     fn hello_world_huffman_only() {
         const EXPECTED: &[u8] = &[
             0x78, 0x01, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x08, 0xcf, 0x2f, 0xca, 0x49, 0x51,
@@ -5029,8 +5085,8 @@ mod test {
     }
 
     #[test]
-    fn reset_clears_custom_gzip_header() {
-        let name = b"must-not-survive-reset\0";
+    fn reset_preserves_custom_gzip_header() {
+        let name = b"survives-reset\0";
         let mut header = gz_header {
             text: 1,
             time: 0x1234_5678,
@@ -5060,6 +5116,7 @@ mod test {
         );
 
         assert_eq!(reset(stream), ReturnCode::Ok);
+        assert!(stream.state.gzhead.is_some());
 
         let input = b"gzip after reset";
         let mut output = [0u8; 128];
@@ -5069,12 +5126,12 @@ mod test {
         stream.avail_out = output.len() as _;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
 
-        // A reset stream has the ordinary default gzip header: no optional fields, zero mtime,
-        // level-6 XFL, and the platform OS byte.
+        // zlib and zlib-ng retain the caller's custom header across both reset variants.
         assert_eq!(
             &output[..10],
-            &[31, 139, 8, 0, 0, 0, 0, 0, 0, gz_header::OS_CODE]
+            &[31, 139, 8, 0b1011, 0x78, 0x56, 0x34, 0x12, 0, 3]
         );
+        assert_eq!(&output[10..10 + name.len()], name);
 
         assert!(end(stream).is_ok());
     }

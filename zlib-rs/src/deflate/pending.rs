@@ -15,7 +15,9 @@ pub struct Pending<'a> {
 
 impl<'a> Pending<'a> {
     pub fn reset_keep(&mut self) {
-        // keep the buffer as it is
+        // Discard pending bytes and rewind the output cursor just like zlib's
+        // `pending = 0; pending_out = pending_buf`.
+        self.out = 0;
         self.pending = 0;
     }
 

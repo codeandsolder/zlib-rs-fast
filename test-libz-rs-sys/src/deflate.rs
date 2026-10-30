@@ -1811,6 +1811,65 @@ fn version_error() {
 }
 
 #[test]
+fn gzip_header_survives_deflate_resets_like_zlib_ng() {
+    for reset_keep in [false, true] {
+        assert_eq_rs_ng!({
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
+            let init = deflateInit2_(
+                raw.as_mut_ptr(),
+                6,
+                Z_DEFLATED,
+                31,
+                8,
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as c_int,
+            );
+            assert_eq!(init, Z_OK);
+            let stream = raw.assume_init_mut();
+
+            let mut name = *b"survives-reset\0";
+            let mut header = gz_header {
+                text: 1,
+                time: 0x1234_5678,
+                xflags: 0,
+                os: 3,
+                extra: core::ptr::null_mut(),
+                extra_len: 0,
+                extra_max: 0,
+                name: name.as_mut_ptr(),
+                name_max: 0,
+                comment: core::ptr::null_mut(),
+                comm_max: 0,
+                hcrc: 1,
+                done: 0,
+            };
+            assert_eq!(deflateSetHeader(stream, &mut header), Z_OK);
+
+            let reset = if reset_keep {
+                deflateResetKeep(stream)
+            } else {
+                deflateReset(stream)
+            };
+            assert_eq!(reset, Z_OK);
+
+            let input = b"payload after reset";
+            let mut output = [0u8; 256];
+            stream.next_in = input.as_ptr() as *mut u8;
+            stream.avail_in = input.len() as _;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output.len() as _;
+            assert_eq!(deflate(stream, Z_FINISH), Z_STREAM_END);
+
+            let len = stream.total_out as usize;
+            let result = output[..len].to_vec();
+            assert_eq!(deflateEnd(stream), Z_OK);
+            result
+        });
+    }
+}
+
+#[test]
 fn gzip_with_header() {
     let extra = "some extra stuff\0";
     let name = "nomen est omen\0";

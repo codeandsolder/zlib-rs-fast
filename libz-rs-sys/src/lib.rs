@@ -1308,7 +1308,7 @@ pub unsafe extern "C" fn deflate(strm: *mut z_stream, flush: i32) -> c_int {
 /// The caller must assure that, if not `NULL`, `name` and `comment` are terminated with a zero byte, and that if `extra` is not NULL, that `extra_len` bytes are available there.
 /// If `hcrc` is true, a gzip header crc is included.
 ///
-/// If [`deflateSetHeader`] is not used, the default gzip header has text false, the time set to zero, and os set to the current operating system, with no extra, name, or comment fields. The gzip header is returned to the default state by [`deflateReset`].
+/// If [`deflateSetHeader`] is not used, the default gzip header has text false, the time set to zero, and os set to the current operating system, with no extra, name, or comment fields. As in current zlib and zlib-ng implementations, a configured header remains associated with the stream across [`deflateReset`] and [`deflateResetKeep`]. Call [`deflateSetHeader`] again (including with a `NULL` header to restore the default) before the next [`deflate`] call to change it.
 ///
 /// # Returns
 ///
