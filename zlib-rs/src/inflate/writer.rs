@@ -339,3 +339,51 @@ mod test {
         assert_eq!(buf.map(|e| unsafe { e.assume_init() }), [1, 2, 3, 1, 2]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inflate::Window;
+
+    #[test]
+    fn back_writer_match_crosses_previous_window_into_current_output() {
+        let mut storage = core::array::from_fn::<_, 32, _>(|i| i as u8);
+        // The current callback window has already overwritten its first four bytes.
+        storage[..4].copy_from_slice(&[100, 101, 102, 103]);
+        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        window.set_have(storage.len());
+
+        let mut writer = BackWriter::new(&mut window, 4);
+        writer.copy_match(true, 6, 8).unwrap();
+        assert_eq!(writer.len(), 12);
+        drop(writer);
+
+        assert_eq!(&storage[4..12], &[30, 31, 100, 101, 102, 103, 30, 31]);
+    }
+
+    #[test]
+    fn back_writer_rejects_distance_beyond_configured_window() {
+        let mut storage = [0u8; 32];
+        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        window.set_have(storage.len());
+
+        let mut writer = BackWriter::new(&mut window, 4);
+        assert_eq!(
+            writer.copy_match(true, 33, 3),
+            Err("invalid distance too far back\0")
+        );
+    }
+
+    #[test]
+    fn back_writer_rejects_history_before_first_full_window() {
+        let mut storage = [0u8; 32];
+        storage[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+
+        let mut writer = BackWriter::new(&mut window, 4);
+        assert_eq!(
+            writer.copy_match(true, 5, 3),
+            Err("invalid distance too far back\0")
+        );
+    }
+}

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use core::ffi::c_void;
 use core::marker::PhantomData;
 
@@ -289,59 +291,6 @@ impl BackOutput {
 }
 
 /// Initialize the stream in an inflate state
-pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -> ReturnCode {
-    assert_eq!(1 << config.window_bits, window.buffer_size());
-
-    if !(MIN_WBITS..=MAX_WBITS).contains(&config.window_bits) {
-        return ReturnCode::StreamError as _;
-    }
-
-    stream.msg = core::ptr::null_mut();
-
-    // for safety we must really make sure that alloc and free are consistent
-    // this is a (slight) deviation from stock zlib. In this crate we pick the rust
-    // allocator as the default, but `libz-rs-sys` configures the C allocator
-    #[cfg(feature = "rust-allocator")]
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_rust_allocator()
-    }
-
-    #[cfg(feature = "c-allocator")]
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_c_allocator()
-    }
-
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
-        return ReturnCode::StreamError;
-    }
-
-    let mut state = State::new(InflateStateKind::Back);
-    // inflateBack uses the caller-provided window directly, so the allocation contains only State
-    // plus alignment headroom.
-    state.window = window;
-
-    let alloc = Allocator {
-        zalloc: stream.zalloc.unwrap(),
-        zfree: stream.zfree.unwrap(),
-        opaque: stream.opaque,
-        _marker: PhantomData,
-    };
-    let allocs = InflateAllocOffsets::state_only();
-    let Some(state_allocation) = allocs.allocate_state(&alloc, state) else {
-        return ReturnCode::MemError;
-    };
-    stream.state = state_allocation.as_ptr().cast::<internal_state>();
-
-    // SAFETY: `allocate_state` initialized a Back state behind the ABI state pointer.
-    let Some(stream) = (unsafe { InflateStream::from_back_stream_mut(stream) }) else {
-        return ReturnCode::StreamError;
-    };
-
-    stream.state.wbits = config.window_bits as u8;
-    stream.state.flags.update(Flags::SANE, true);
-
-    ReturnCode::Ok
-}
 
 /// Run callback-driven raw DEFLATE decompression.
 ///
@@ -1110,57 +1059,4 @@ fn inflate_fast_back(
         debug_assert!(matches!(state.mode, Mode::Bad));
         state.bad(error_message);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn back_writer_match_crosses_previous_window_into_current_output() {
-        let mut storage = core::array::from_fn::<_, 32, _>(|i| i as u8);
-        // The current callback window has already overwritten its first four bytes.
-        storage[..4].copy_from_slice(&[100, 101, 102, 103]);
-        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
-        window.set_have(storage.len());
-
-        let mut writer = BackWriter::new(&mut window, 4);
-        writer.copy_match(true, 6, 8).unwrap();
-        assert_eq!(writer.len(), 12);
-        drop(writer);
-
-        assert_eq!(&storage[4..12], &[30, 31, 100, 101, 102, 103, 30, 31]);
-    }
-
-    #[test]
-    fn back_writer_rejects_distance_beyond_configured_window() {
-        let mut storage = [0u8; 32];
-        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
-        window.set_have(storage.len());
-
-        let mut writer = BackWriter::new(&mut window, 4);
-        assert_eq!(
-            writer.copy_match(true, 33, 3),
-            Err("invalid distance too far back\0")
-        );
-    }
-
-    #[test]
-    fn back_writer_rejects_history_before_first_full_window() {
-        let mut storage = [0u8; 32];
-        storage[..4].copy_from_slice(&[1, 2, 3, 4]);
-        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
-
-        let mut writer = BackWriter::new(&mut window, 4);
-        assert_eq!(
-            writer.copy_match(true, 5, 3),
-            Err("invalid distance too far back\0")
-        );
-    }
-}
-
-pub fn back_end<'a>(strm: &'a mut InflateStream<'a>) {
-    // With infback the window is user-supplied, so we mustn't try to free it.
-    let _ = core::mem::replace(&mut strm.state.window, Window::empty());
-    crate::inflate::end(strm);
 }
