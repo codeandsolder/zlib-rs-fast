@@ -325,9 +325,7 @@ impl<'a> BatchRuntime<'a> {
                 return Err(runtime.finish_error(code));
             }
 
-            if stream.state.status == Status::Busy
-                && stream.state.bit_writer.pending.pending().is_empty()
-            {
+            if stream.state.status == Status::Busy && stream.state.bit_writer.pending.is_empty() {
                 break;
             }
 
@@ -451,7 +449,7 @@ impl<'a> BatchRuntime<'a> {
         {
             let stream = self.stream_mut();
             debug_assert_eq!(stream.avail_in, 0);
-            debug_assert!(stream.state.bit_writer.pending.pending().is_empty());
+            debug_assert!(stream.state.bit_writer.pending.is_empty());
             stream.state.status = Status::Finish;
             stream.next_in = core::ptr::null_mut();
             stream.avail_in = 0;

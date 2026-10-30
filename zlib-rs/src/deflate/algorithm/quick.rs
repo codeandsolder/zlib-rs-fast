@@ -96,8 +96,7 @@ fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> 
 
 #[inline]
 fn pending_needs_drain(state: &State<'_>) -> bool {
-    state.bit_writer.pending.pending + usize::from(State::BIT_BUF_SIZE.div_ceil(8))
-        >= state.pending_buf_size()
+    state.bit_writer.pending.remaining() <= usize::from(State::BIT_BUF_SIZE.div_ceil(8))
 }
 
 fn emit_next(state: &mut State<'_>) {

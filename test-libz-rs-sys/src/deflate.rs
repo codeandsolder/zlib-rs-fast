@@ -904,6 +904,30 @@ fn test_dict_deflate() {
 }
 
 #[test]
+fn deflate_prime_accepts_32_bits_like_zlib_ng() {
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        let init = deflateInit2_(
+            raw.as_mut_ptr(),
+            6,
+            Z_DEFLATED,
+            -15,
+            8,
+            Z_DEFAULT_STRATEGY,
+            zlibVersion(),
+            core::mem::size_of::<z_stream>() as c_int,
+        );
+        assert_eq!(init, Z_OK);
+        let stream = raw.assume_init_mut();
+
+        let prime = deflatePrime(stream, 32, 0x1234_5678);
+        let end = deflateEnd(stream);
+
+        (prime, end)
+    });
+}
+
+#[test]
 fn test_deflate_prime() {
     unsafe fn deflate_prime_32(stream: &mut libz_rs_sys::z_stream, value: i32) -> i32 {
         // zlib's deflatePrime() takes at most 16 bits

@@ -64,7 +64,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         zng_tr_stored_block(stream.state, 0..0, last);
 
         /* Replace the lengths in the dummy stored block with len. */
-        stream.state.bit_writer.pending.rewind(4);
+        stream.state.bit_writer.pending.truncate_tail(4);
         stream
             .state
             .bit_writer

@@ -521,7 +521,7 @@ impl<'a> DeflateStream<'a> {
 
     pub fn pending(&self) -> (usize, u8) {
         (
-            self.state.bit_writer.pending.pending,
+            self.state.bit_writer.pending.len(),
             self.state.bit_writer.bits_valid,
         )
     }
@@ -863,9 +863,6 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
 }
 
 pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCode {
-    // our logic actually supports up to 32 bits.
-    debug_assert!(bits <= 16, "zlib only supports up to 16 bits here");
-
     let mut value64 = value as u64;
 
     let state = &mut *stream.state;
@@ -874,6 +871,15 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
         || bits > BitWriter::BIT_BUF_SIZE as i32
         || bits > (core::mem::size_of_val(&value) << 3) as i32
     {
+        return ReturnCode::BufError;
+    }
+
+    // `flush_bits()` writes every complete byte from the combined reservoir. Preflight the
+    // complete call so a full pending buffer reports zlib's Z_BUF_ERROR instead of reaching the
+    // infallible internal append operation. zlib-ng's 64-bit reservoir accepts up to 32 input
+    // bits here (bounded by `value`), despite the public compatibility documentation saying 16.
+    let bytes_to_flush = (usize::from(state.bit_writer.bits_valid) + bits as usize) / 8;
+    if state.bit_writer.pending.remaining() < bytes_to_flush {
         return ReturnCode::BufError;
     }
 
@@ -1681,12 +1687,6 @@ impl<'a> State<'a> {
 
     pub(crate) fn max_dist(&self) -> usize {
         self.w_size - MIN_LOOKAHEAD
-    }
-
-    /// Total size of the pending buf. But because `pending` shares memory with `sym_buf`, this is
-    /// not the number of bytes that are actually in `pending`!
-    pub(crate) fn pending_buf_size(&self) -> usize {
-        self.lit_bufsize * 4
     }
 
     #[inline(always)]
@@ -2709,7 +2709,7 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
         state = &mut *stream.state;
 
         // could not flush all the pending output
-        if !state.bit_writer.pending.pending().is_empty() {
+        if !state.bit_writer.pending.is_empty() {
             state.last_flush = -1;
             return ControlFlow::Break(ReturnCode::Ok);
         }
@@ -2752,7 +2752,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
     stream.state.last_flush = flush as i8;
 
     /* Flush as much pending output as possible */
-    if !stream.state.bit_writer.pending.pending().is_empty() {
+    if !stream.state.bit_writer.pending.is_empty() {
         let _ = stream.drain_pending();
         if stream.output.avail_out == 0 {
             /* Since avail_out is 0, deflate will be called again with
@@ -2806,7 +2806,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         // compression must start with an empty pending buffer
         let _ = stream.drain_pending();
 
-        if !stream.state.bit_writer.pending.pending().is_empty() {
+        if !stream.state.bit_writer.pending.is_empty() {
             stream.state.last_flush = -1;
 
             return ReturnCode::Ok;
@@ -2835,7 +2835,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
                 /* Compression must start with an empty pending buffer */
                 let _ = stream.drain_pending();
-                if !stream.state.bit_writer.pending.pending().is_empty() {
+                if !stream.state.bit_writer.pending.is_empty() {
                     stream.state.last_flush = -1;
                     return ReturnCode::Ok;
                 }
@@ -2918,7 +2918,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
         // compression must start with an empty pending buffer
         let _ = stream.drain_pending();
-        if !stream.state.bit_writer.pending.pending().is_empty() {
+        if !stream.state.bit_writer.pending.is_empty() {
             stream.state.last_flush = -1;
             return ReturnCode::Ok;
         }
@@ -3023,7 +3023,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         stream.state.wrap = -stream.state.wrap; /* write the trailer only once! */
     }
 
-    if stream.state.bit_writer.pending.pending().is_empty() {
+    if stream.state.bit_writer.pending.is_empty() {
         assert_eq!(stream.state.bit_writer.bits_valid, 0, "bi_buf not flushed");
         return ReturnCode::StreamEnd;
     }
@@ -4195,16 +4195,37 @@ mod test {
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
 
         let capacity = stream.state.bit_writer.pending.capacity();
-        assert!(!stream.state.bit_writer.pending.pending().is_empty());
+        assert!(!stream.state.bit_writer.pending.is_empty());
         assert!(stream.state.bit_writer.pending.remaining() < capacity);
 
         assert_eq!(reset_keep(stream), ReturnCode::Ok);
-        assert!(stream.state.bit_writer.pending.pending().is_empty());
+        assert!(stream.state.bit_writer.pending.is_empty());
         assert_eq!(
             stream.state.bit_writer.pending.remaining(),
             capacity,
             "deflateResetKeep must rewind pending_out to pending_buf"
         );
+
+        assert!(end(stream).is_ok());
+    }
+
+    #[test]
+    fn prime_reports_full_pending_buffer() {
+        let mut raw = z_stream::default();
+        let config = DeflateConfig {
+            window_bits: -15,
+            mem_level: 1,
+            ..Default::default()
+        };
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        let calls = stream.state.bit_writer.pending.capacity() / 2;
+        for _ in 0..calls {
+            assert_eq!(prime(stream, 16, 0xa55a), ReturnCode::Ok);
+        }
+        assert_eq!(stream.state.bit_writer.pending.remaining(), 0);
+        assert_eq!(prime(stream, 16, 0xa55a), ReturnCode::BufError);
 
         assert!(end(stream).is_ok());
     }
@@ -4487,7 +4508,7 @@ mod test {
         stream.next_out = output.as_mut_ptr();
         stream.avail_out = output.len() as _;
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-        assert!(stream.state.bit_writer.pending.pending().is_empty());
+        assert!(stream.state.bit_writer.pending.is_empty());
 
         let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy);
         let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state)
@@ -4548,7 +4569,7 @@ mod test {
         }
 
         assert_eq!(stream.avail_in, 0);
-        assert!(stream.state.bit_writer.pending.pending().is_empty());
+        assert!(stream.state.bit_writer.pending.is_empty());
 
         // The StandardDriver already encoded the final DEFLATE block. Mark only that fact in the
         // outer zlib status machine, then let the real deflate path emit the wrapper trailer.

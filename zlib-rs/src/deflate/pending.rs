@@ -8,7 +8,7 @@ pub struct Pending<'a> {
     /// next pending byte to output to the stream
     out: usize,
     /// number of bytes in the pending buffer
-    pub(crate) pending: usize,
+    pending: usize,
     /// semantically we're storing a mutable slice of bytes
     _marker: PhantomData<&'a mut [u8]>,
 }
@@ -27,6 +27,16 @@ impl<'a> Pending<'a> {
         unsafe { &*(slice as *const [MaybeUninit<u8>] as *const [u8]) }
     }
 
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.pending
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending == 0
+    }
+
     /// Number of bytes that can be added to the pending buffer until it is full
     pub(crate) fn remaining(&self) -> usize {
         self.buf.len() - (self.out + self.pending)
@@ -41,9 +51,12 @@ impl<'a> Pending<'a> {
     #[track_caller]
     /// Mark a number of pending bytes as no longer pending
     pub fn advance(&mut self, number_of_bytes: usize) {
-        debug_assert!(self.pending >= number_of_bytes);
+        assert!(
+            number_of_bytes <= self.pending,
+            "advancing past pending output"
+        );
 
-        self.out = self.out.wrapping_add(number_of_bytes);
+        self.out += number_of_bytes;
         self.pending -= number_of_bytes;
 
         if self.pending == 0 {
@@ -53,8 +66,8 @@ impl<'a> Pending<'a> {
 
     #[inline(always)]
     #[track_caller]
-    pub fn rewind(&mut self, n: usize) {
-        assert!(n <= self.pending, "rewinding past then start");
+    pub fn truncate_tail(&mut self, n: usize) {
+        assert!(n <= self.pending, "truncating past pending output");
 
         self.pending -= n;
 
@@ -90,20 +103,46 @@ impl<'a> Pending<'a> {
         }
     }
 
-    /// Clone this pending-buffer state into independent raw storage.
+    /// Clone this pending-buffer state into independent raw storage without reading its
+    /// uninitialized tail.
     ///
     /// # Safety
     ///
     /// `ptr` must be valid for writes of `self.buf.len()` bytes, must not overlap the source, and
     /// must remain alive and uniquely owned for the returned destination lifetime.
     pub(crate) unsafe fn clone_to<'dst>(&self, ptr: *mut u8) -> Pending<'dst> {
-        let ptr = ptr.cast::<MaybeUninit<u8>>();
-        unsafe { ptr.copy_from_nonoverlapping(self.buf.as_ptr(), self.buf.len()) };
-        Pending {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, self.buf.len()) },
-            out: self.out,
-            pending: self.pending,
-            _marker: PhantomData,
-        }
+        let mut cloned =
+            unsafe { Pending::from_raw_parts(ptr.cast::<MaybeUninit<u8>>(), self.buf.len()) };
+        let initialized = self.out + self.pending;
+        cloned.buf.as_mut_slice()[..initialized]
+            .copy_from_slice(&self.buf.as_slice()[..initialized]);
+        cloned.out = self.out;
+        cloned.pending = self.pending;
+        cloned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_copies_initialized_prefix_and_preserves_cursor() {
+        let mut source_storage = [MaybeUninit::<u8>::uninit(); 16];
+        let mut destination_storage = [MaybeUninit::<u8>::uninit(); 16];
+
+        let mut source =
+            unsafe { Pending::from_raw_parts(source_storage.as_mut_ptr(), source_storage.len()) };
+        source.extend(&[1, 2, 3, 4, 5, 6]);
+        source.advance(2);
+
+        assert_eq!(source.pending(), &[3, 4, 5, 6]);
+        assert_eq!(source.remaining(), 10);
+
+        let cloned = unsafe { source.clone_to(destination_storage.as_mut_ptr().cast::<u8>()) };
+
+        assert_eq!(cloned.pending(), &[3, 4, 5, 6]);
+        assert_eq!(cloned.len(), 4);
+        assert_eq!(cloned.remaining(), source.remaining());
     }
 }
