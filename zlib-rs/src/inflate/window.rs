@@ -108,6 +108,22 @@ impl<'a> Window<'a> {
         self.buf.as_mut_ptr()
     }
 
+    /// Return the logical inflate dictionary as at most two contiguous segments, oldest first.
+    ///
+    /// Before the circular window fills, all history is one initialized prefix. Once full, `next`
+    /// points at the oldest byte, so the logical dictionary is the tail followed by the head.
+    pub fn dictionary_segments(&self) -> (&[u8], &[u8]) {
+        let initialized = self.as_slice();
+        if self.have < self.size() {
+            debug_assert_eq!(self.next, self.have);
+            (initialized, &[])
+        } else {
+            debug_assert!(self.next <= self.have);
+            let (head, tail) = initialized.split_at(self.next);
+            (tail, head)
+        }
+    }
+
     #[cfg(test)]
     fn extend_adler32(&mut self, slice: &[u8], checksum: &mut u32) {
         self.extend(slice, 0, true, checksum, &mut Crc32Fold::new());
@@ -347,6 +363,27 @@ mod test {
                 window.buf.as_mut_slice().as_mut_ptr(),
                 window.buf.as_slice().len(),
             )
+        }
+    }
+
+    #[test]
+    fn dictionary_segments_preserve_logical_history_order() {
+        let mut checksum = 0;
+        let mut window = alloc_window(2);
+
+        window.extend_adler32(&[1, 2, 3], &mut checksum);
+        let (first, second) = window.dictionary_segments();
+        assert_eq!(first, &[1, 2, 3]);
+        assert!(second.is_empty());
+
+        window.extend_adler32(&[4, 5, 6], &mut checksum);
+        let (first, second) = window.dictionary_segments();
+        assert_eq!(first, &[3, 4]);
+        assert_eq!(second, &[5, 6]);
+
+        unsafe {
+            crate::allocate::RUST
+                .deallocate(window.buf.as_mut_slice().as_mut_ptr(), window.buf.len())
         }
     }
 

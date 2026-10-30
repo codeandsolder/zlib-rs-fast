@@ -2305,10 +2305,22 @@ pub unsafe extern "C" fn inflateGetDictionary(
         return ReturnCode::StreamError as c_int;
     };
 
-    let whave = zlib_rs::inflate::get_dictionary(stream, dictionary);
+    let (first, second) = zlib_rs::inflate::dictionary(stream);
+    let dictionary_len = first.len() + second.len();
+
+    if !dictionary.is_null() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(first.as_ptr(), dictionary, first.len());
+            core::ptr::copy_nonoverlapping(
+                second.as_ptr(),
+                dictionary.add(first.len()),
+                second.len(),
+            );
+        }
+    }
 
     if let Some(dictLength) = unsafe { dictLength.as_mut() } {
-        *dictLength = whave as c_uint;
+        *dictLength = dictionary_len as c_uint;
     }
 
     ReturnCode::Ok as _
@@ -2350,10 +2362,14 @@ pub unsafe extern "C" fn deflateGetDictionary(
         return ReturnCode::StreamError as c_int;
     };
 
-    let len = zlib_rs::deflate::get_dictionary(stream, dictionary);
+    let history = zlib_rs::deflate::dictionary(stream);
+
+    if !dictionary.is_null() {
+        unsafe { core::ptr::copy_nonoverlapping(history.as_ptr(), dictionary, history.len()) };
+    }
 
     if let Some(dictLength) = unsafe { dictLength.as_mut() } {
-        *dictLength = len as c_uint;
+        *dictLength = history.len() as c_uint;
     }
 
     ReturnCode::Ok as _

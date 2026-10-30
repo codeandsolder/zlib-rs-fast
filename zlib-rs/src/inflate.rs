@@ -2852,30 +2852,12 @@ pub unsafe fn get_header(
     ReturnCode::Ok
 }
 
-/// # Safety
+/// Return the sliding dictionary as at most two contiguous segments in logical input order.
 ///
-/// The `dictionary` must have enough space for the dictionary.
-pub unsafe fn get_dictionary(stream: &InflateStream<'_>, dictionary: *mut u8) -> usize {
-    let whave = stream.state.window.have();
-    let wnext = stream.state.window.next();
-
-    if !dictionary.is_null() {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                stream.state.window.as_ptr().add(wnext),
-                dictionary,
-                whave - wnext,
-            );
-
-            core::ptr::copy_nonoverlapping(
-                stream.state.window.as_ptr(),
-                dictionary.add(whave).sub(wnext).cast(),
-                wnext,
-            );
-        }
-    }
-
-    stream.state.window.have()
+/// Raw caller-buffer handling belongs to the C ABI layer; the inflate core exposes only checked
+/// slices over the initialized circular window.
+pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8], &'stream [u8]) {
+    stream.state.window.dictionary_segments()
 }
 
 #[cfg(test)]

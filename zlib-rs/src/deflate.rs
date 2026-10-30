@@ -3505,24 +3505,15 @@ pub fn bound(stream: Option<&mut DeflateStream>, source_len: usize) -> usize {
     }
 }
 
-/// # Safety
+/// Return the sliding dictionary in logical input order.
 ///
-/// The `dictionary` must have enough space for the dictionary.
-pub unsafe fn get_dictionary(stream: &DeflateStream<'_>, dictionary: *mut u8) -> usize {
-    let s = &*stream.state;
-    let len = Ord::min(s.strstart + s.lookahead, s.w_size);
-
-    if !dictionary.is_null() && len > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                s.window.as_ptr().add(s.strstart + s.lookahead - len),
-                dictionary,
-                len,
-            );
-        }
-    }
-
-    len
+/// Raw caller-buffer handling belongs to the C ABI layer; the compression core exposes only a
+/// checked slice over its initialized window storage.
+pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] {
+    let state = &*stream.state;
+    state
+        .window
+        .recent_history(state.strstart + state.lookahead, state.w_size)
 }
 
 const DEFLATE_ALLOC_ALIGN: usize = 64;
