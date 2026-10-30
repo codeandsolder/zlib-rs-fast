@@ -658,11 +658,6 @@ pub(crate) struct State<'a> {
     total_allocation_size: usize,
 }
 
-// `inflateCopy` snapshots `State` byte-for-byte before rebinding its window to independent
-// storage. Any future field with drop glue would make that strategy invalid and must force this
-// assertion (and the clone implementation) to be revisited.
-const _: () = assert!(!core::mem::needs_drop::<State<'static>>());
-
 impl<'a> State<'a> {
     fn new(kind: InflateStateKind) -> Self {
         Self {
@@ -711,6 +706,53 @@ impl<'a> State<'a> {
 
             allocation_start: core::ptr::null_mut(),
             total_allocation_size: 0,
+        }
+    }
+
+    /// Clone regular inflate state while rebinding the destination-owned history window.
+    ///
+    /// The explicit field list keeps `inflateCopy` semantics reviewable: adding a new state field
+    /// requires choosing whether it is copied or rebound instead of silently joining a raw memcpy.
+    fn clone_rebound(
+        &self,
+        window: Window<'a>,
+        allocation_start: *mut u8,
+        total_allocation_size: usize,
+    ) -> Self {
+        Self {
+            kind: self.kind,
+            mode: self.mode,
+            flags: self.flags,
+            wbits: self.wbits,
+            wrap: self.wrap,
+            window,
+            ncode: self.ncode,
+            nlen: self.nlen,
+            ndist: self.ndist,
+            have: self.have,
+            next: self.next,
+            bit_buffer: self.bit_buffer,
+            total: self.total,
+            length: self.length,
+            offset: self.offset,
+            extra: self.extra,
+            back: self.back,
+            was: self.was,
+            gzip_flags: self.gzip_flags,
+            checksum: self.checksum,
+            crc_fold: self.crc_fold,
+            error_message: self.error_message,
+            head: self.head,
+            dmax: self.dmax,
+            len_table: self.len_table,
+            dist_table: self.dist_table,
+            codes_codes: self.codes_codes,
+            len_codes: self.len_codes,
+            dist_codes: self.dist_codes,
+            lens: self.lens,
+            work: self.work,
+            allocation_start,
+            total_allocation_size,
         }
     }
 
@@ -2425,10 +2467,6 @@ impl InflateAllocOffsets {
     }
 
     /// Snapshot a live regular inflate state into independent state + window storage.
-    ///
-    /// `State` intentionally has no drop glue (enforced above), so it may be copied byte-for-byte.
-    /// The copied raw window handle is never exposed: it is immediately replaced by a clone into
-    /// this fresh allocation before the returned pointer can be materialized as a Rust reference.
     fn clone_state<'a>(
         &self,
         alloc: &Allocator<'a>,
@@ -2453,16 +2491,12 @@ impl InflateAllocOffsets {
         let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
         let window = unsafe { source.window.clone_to(window_allocation) };
 
-        // SAFETY: `state_pos` is aligned and in-bounds. `State` has no drop glue, and the copied
-        // window handle is replaced before any reference to the destination state is created.
-        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
-        unsafe { core::ptr::copy_nonoverlapping(source as *const State<'a>, state_ptr, 1) };
-        unsafe {
-            core::ptr::addr_of_mut!((*state_ptr).window).write(window);
-            core::ptr::addr_of_mut!((*state_ptr).allocation_start).write(allocation_start.as_ptr());
-            core::ptr::addr_of_mut!((*state_ptr).total_allocation_size).write(self.total_size);
-        }
+        let state = source.clone_rebound(window, allocation_start.as_ptr(), self.total_size);
 
+        // SAFETY: `state_pos` is aligned and in-bounds in this fresh allocation, and no State has
+        // previously been materialized there.
+        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
+        unsafe { state_ptr.write(state) };
         NonNull::new(state_ptr)
     }
 }
