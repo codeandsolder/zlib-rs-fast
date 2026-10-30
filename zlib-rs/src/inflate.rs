@@ -815,8 +815,7 @@ impl State<'_> {
         let avail_out = output.remaining();
 
         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
-            // SAFETY: INFLATE_FAST_MIN_HAVE is enough bytes remaining to satisfy the precondition.
-            unsafe { inflate_fast_help(self, reader, output, 0) };
+            inflate_fast_help(self, reader, output);
             match self.mode {
                 Mode::Len => {}
                 _ => return ControlFlow::Continue(()),
@@ -857,14 +856,11 @@ impl State<'_> {
                         let avail_in = bit_reader.bytes_remaining();
                         let avail_out = output.remaining();
 
-                        // INFLATE_FAST_MIN_LEFT is important. It makes sure there is at least 32 bytes of free
-                        // space available. This means for many SIMD operations we don't need to process a
-                        // remainder; we just copy blindly, and a later operation will overwrite the extra copied
-                        // bytes
+                        // The fast decoder may emit a maximum-length DEFLATE match before it
+                        // rechecks output space, so keep the complete fast-path reserve available.
                         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
                             self.mode = mode;
-                            // SAFETY: INFLATE_FAST_MIN_HAVE >= 15.
-                            unsafe { inflate_fast_help(self, &mut bit_reader, output, 0) };
+                            inflate_fast_help(self, &mut bit_reader, output);
                             return LenDecodeOutcome::continue_with(self.mode, bit_reader);
                         }
 
@@ -1976,30 +1972,25 @@ impl State<'_> {
     }
 }
 
-/// # Safety
+/// Fast literal/length/distance decoder.
 ///
-/// `bit_reader` must have at least 15 bytes available to read, as indicated by
-/// `bit_reader.bytes_remaining() >= 15`.
-unsafe fn inflate_fast_help(
+/// Callers enter only when at least `INFLATE_FAST_MIN_HAVE` bytes and
+/// `INFLATE_FAST_MIN_LEFT` output bytes are available. The helper retains those fast-path
+/// invariants with assertions in the checked reader/output primitives rather than an unsafe
+/// caller contract.
+fn inflate_fast_help(
     state: &mut State,
     bit_reader: &mut BitReader<'_>,
     output: &mut InflateOutput<'_>,
-    start: usize,
 ) {
-    // SAFETY: The caller ensured enough bytes remain for the fast decoder.
-    unsafe { inflate_fast_help_impl(state, bit_reader, output, start) };
+    inflate_fast_help_impl(state, bit_reader, output);
 }
 
-/// # Safety
-///
-/// `bit_reader` must have at least 15 bytes available to read, as indicated by
-/// `bit_reader.bytes_remaining() >= 15`.
 #[inline(always)]
-unsafe fn inflate_fast_help_impl(
+fn inflate_fast_help_impl(
     state: &mut State,
     bit_reader: &mut BitReader<'_>,
     output: &mut InflateOutput<'_>,
-    _start: usize,
 ) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
@@ -2009,9 +2000,6 @@ unsafe fn inflate_fast_help_impl(
     // IDEA: use const generics for the bits here?
     let lmask = (1u64 << state.len_table.bits) - 1;
     let dmask = (1u64 << state.dist_table.bits) - 1;
-
-    // TODO verify if this is relevant for us
-    let extra_safe = false;
 
     let window_size = state.window.size();
 
@@ -2173,8 +2161,6 @@ unsafe fn inflate_fast_help_impl(
                                 // here we need some bytes from the output itself
                                 output.copy_match(dist as usize, len as usize - op);
                             }
-                        } else if extra_safe {
-                            todo!()
                         } else {
                             output.copy_match(dist as usize, len as usize)
                         }
