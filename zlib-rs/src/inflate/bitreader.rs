@@ -51,10 +51,13 @@ impl BitBuffer {
 
     #[inline(always)]
     pub fn start_sync_search(&mut self) -> ([u8; 4], usize) {
+        assert!(
+            self.bits_used <= 32,
+            "persistent inflate reservoir fits sync-search scratch storage"
+        );
         let mut buf = [0u8; 4];
 
-        self.bit_buffer <<= self.bits_used & 7;
-        self.bits_used -= self.bits_used & 7;
+        self.next_byte_boundary();
 
         let mut len = 0;
         while self.bits_used >= 8 {
@@ -214,6 +217,19 @@ impl std::io::Read for BitReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::{BitBuffer, BitReader};
+
+    #[test]
+    fn sync_search_discards_partial_low_bits_before_scanning_bytes() {
+        let mut bits = BitBuffer::default();
+        bits.prime(3, 0b101);
+        bits.prime(8, 0x00);
+        bits.prime(8, 0x00);
+
+        let (buf, len) = bits.start_sync_search();
+        assert_eq!(len, 2);
+        assert_eq!(&buf[..len], &[0x00, 0x00]);
+        assert_eq!(bits.bits_in_buffer(), 0);
+    }
 
     #[test]
     fn bit_buffer_owns_reservoir_operations() {

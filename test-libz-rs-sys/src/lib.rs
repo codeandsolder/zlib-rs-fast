@@ -841,6 +841,27 @@ mod null {
     }
 
     #[test]
+    fn inflate_sync_discards_partial_reservoir_bits() {
+        assert_eq_rs_ng!({
+            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let init = inflateInit_(
+                strm.as_mut_ptr(),
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as _,
+            );
+            let strm = unsafe { strm.assume_init_mut() };
+            let prime_partial = inflatePrime(strm, 3, 0b101);
+            let prime_zeros = inflatePrime(strm, 16, 0);
+            let mut input = [0xffu8, 0xff];
+            strm.next_in = input.as_mut_ptr();
+            strm.avail_in = input.len() as _;
+            let sync = inflateSync(strm);
+            let end = inflateEnd(strm);
+            (init, prime_partial, prime_zeros, sync, end)
+        });
+    }
+
+    #[test]
     fn inflate_sync_allows_null_for_empty_input_with_buffered_bits() {
         assert_eq_rs_ng!({
             let mut strm = MaybeUninit::<z_stream>::zeroed();
