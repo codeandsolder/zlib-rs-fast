@@ -138,6 +138,10 @@ impl<'a, 'state> Compressor<'a, 'state> {
         fill_window_core(self.state, &mut self.input);
     }
 
+    fn drain_pending(&mut self) -> DrainOutcome {
+        drain_pending_output(self.state, &mut self.output)
+    }
+
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
         read_buf_window_core(self.state, &mut self.input, offset, size)
     }
@@ -209,7 +213,7 @@ impl<'a, 'state> Compressor<'a, 'state> {
     }
 }
 
-pub(crate) fn with_compressor<'state, R>(
+fn with_compressor<'state, R>(
     stream: &mut DeflateStream<'state>,
     f: impl FnOnce(&mut Compressor<'_, 'state>) -> R,
 ) -> R {
@@ -1389,7 +1393,7 @@ pub(crate) struct State<'a> {
     /// were previously explicit alignment padding, so the hand-packed cache-line layout is stable.
     pub(crate) medium_next_match: MatchCandidate,
     /// Working copy of z_stream::data_type. Kept in compression state so block encoding is
-    /// independent of the caller I/O cursor; synchronized at `with_compressor` boundaries.
+    /// independent of caller I/O and synchronized once at the outer compression-call boundary.
     pub(crate) data_type: core::ffi::c_int,
     _padding_0: [u8; 4],
 
@@ -1719,12 +1723,6 @@ pub(crate) enum BlockState {
 
 // Maximum stored block length in deflate format (not including header).
 pub(crate) const MAX_STORED: usize = 65535; // so u16::max
-
-pub(crate) fn flush_pending(stream: &mut DeflateStream<'_>) {
-    with_compressor(stream, |compressor| {
-        let _ = drain_pending_output(compressor.state, &mut compressor.output);
-    });
-}
 
 fn read_buf_window_core(
     state: &mut State<'_>,
@@ -2487,7 +2485,7 @@ fn encode_block_core(state: &mut State<'_>, is_last: bool) {
     state.block_start = state.strstart as isize;
 }
 
-fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
+fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
     let mut state = &mut *stream.state;
 
     // we'll be using the pending buffer as temporary storage
@@ -2498,13 +2496,13 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 
         state.bit_writer.pending.extend(&bytes[..copy]);
 
-        stream.adler = crc32(
-            stream.adler as u32,
+        stream.input.adler = crc32(
+            stream.input.adler as u32,
             &state.bit_writer.pending.pending()[beg..],
         ) as z_checksum;
 
         state.gzindex += copy;
-        flush_pending(stream);
+        let _ = stream.drain_pending();
         state = &mut *stream.state;
 
         // could not flush all the pending output
@@ -2519,8 +2517,8 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 
     state.bit_writer.pending.extend(bytes);
 
-    stream.adler = crc32(
-        stream.adler as u32,
+    stream.input.adler = crc32(
+        stream.input.adler as u32,
         &state.bit_writer.pending.pending()[beg..],
     ) as z_checksum;
     state.gzindex = 0;
@@ -2529,28 +2527,32 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 }
 
 pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
-    if stream.next_out.is_null()
+    let result = if stream.next_out.is_null()
         || (stream.avail_in != 0 && stream.next_in.is_null())
         || (stream.state.status == Status::Finish && flush != DeflateFlush::Finish)
     {
-        let err = ReturnCode::StreamError;
-        stream.msg = err.error_message();
-        return err;
+        ReturnCode::StreamError
+    } else if stream.avail_out == 0 {
+        ReturnCode::BufError
+    } else {
+        with_compressor(stream, |compressor| deflate_core(compressor, flush))
+    };
+
+    if matches!(result, ReturnCode::StreamError | ReturnCode::BufError) {
+        stream.msg = result.error_message();
     }
 
-    if stream.avail_out == 0 {
-        let err = ReturnCode::BufError;
-        stream.msg = err.error_message();
-        return err;
-    }
+    result
+}
 
+fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnCode {
     let old_flush = stream.state.last_flush;
     stream.state.last_flush = flush as i8;
 
     /* Flush as much pending output as possible */
     if !stream.state.bit_writer.pending.pending().is_empty() {
-        flush_pending(stream);
-        if stream.avail_out == 0 {
+        let _ = stream.drain_pending();
+        if stream.output.avail_out == 0 {
             /* Since avail_out is 0, deflate will be called again with
              * more output space, but possibly with both pending and
              * avail_in equal to zero. There won't be anything to do,
@@ -2565,20 +2567,16 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
          * flushes. For repeated and useless calls with Z_FINISH, we keep
          * returning Z_STREAM_END instead of Z_BUF_ERROR.
          */
-    } else if stream.avail_in == 0
+    } else if stream.input.avail_in == 0
         && rank_flush(flush as i8) <= rank_flush(old_flush)
         && flush != DeflateFlush::Finish
     {
-        let err = ReturnCode::BufError;
-        stream.msg = err.error_message();
-        return err;
+        return ReturnCode::BufError;
     }
 
     /* User must not provide more input after the first FINISH: */
-    if stream.state.status == Status::Finish && stream.avail_in != 0 {
-        let err = ReturnCode::BufError;
-        stream.msg = err.error_message();
-        return err;
+    if stream.state.status == Status::Finish && stream.input.avail_in != 0 {
+        return ReturnCode::BufError;
     }
 
     /* Write the header */
@@ -2596,15 +2594,15 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
 
         /* Save the adler32 of the preset dictionary: */
         if stream.state.strstart != 0 {
-            let adler = stream.adler as u32;
+            let adler = stream.input.adler as u32;
             stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
         }
 
-        stream.adler = ADLER32_INITIAL_VALUE as _;
+        stream.input.adler = ADLER32_INITIAL_VALUE as _;
         stream.state.status = Status::Busy;
 
         // compression must start with an empty pending buffer
-        flush_pending(stream);
+        let _ = stream.drain_pending();
 
         if !stream.state.bit_writer.pending.pending().is_empty() {
             stream.state.last_flush = -1;
@@ -2634,7 +2632,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                 stream.state.status = Status::Busy;
 
                 /* Compression must start with an empty pending buffer */
-                flush_pending(stream);
+                let _ = stream.drain_pending();
                 if !stream.state.bit_writer.pending.pending().is_empty() {
                     stream.state.last_flush = -1;
                     return ReturnCode::Ok;
@@ -2659,8 +2657,8 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                 }
 
                 if gzhead.hcrc != 0 {
-                    stream.adler = crc32(
-                        stream.adler as u32,
+                    stream.input.adler = crc32(
+                        stream.input.adler as u32,
                         stream.state.bit_writer.pending.pending(),
                     ) as z_checksum
                 }
@@ -2732,7 +2730,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
             // SAFETY: see `set_header`; this stage only reads the caller-owned header.
             let gzhead = unsafe { gzhead.as_ref() };
             if gzhead.hcrc != 0 {
-                let bytes = (stream.adler as u16).to_le_bytes();
+                let bytes = (stream.input.adler as u16).to_le_bytes();
                 if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
                     return err;
                 }
@@ -2742,7 +2740,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
         stream.state.status = Status::Busy;
 
         // compression must start with an empty pending buffer
-        flush_pending(stream);
+        let _ = stream.drain_pending();
         if !stream.state.bit_writer.pending.pending().is_empty() {
             stream.state.last_flush = -1;
             return ReturnCode::Ok;
@@ -2751,7 +2749,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
 
     // Start a new block or continue the current one.
     let state = &mut *stream.state;
-    if stream.avail_in != 0
+    if stream.input.avail_in != 0
         || state.lookahead != 0
         || (flush != DeflateFlush::NoFlush && state.status != Status::Finish)
     {
@@ -2765,7 +2763,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
 
         match bstate {
             BlockState::NeedMore | BlockState::FinishStarted => {
-                if stream.avail_out == 0 {
+                if stream.output.avail_out == 0 {
                     state.last_flush = -1; /* avoid BUF_ERROR next call, see above */
                 }
                 return ReturnCode::Ok;
@@ -2807,9 +2805,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                     DeflateFlush::Finish => unreachable!("condition of outer surrounding if"),
                 }
 
-                flush_pending(stream);
+                let _ = stream.drain_pending();
 
-                if stream.avail_out == 0 {
+                if stream.output.avail_out == 0 {
                     stream.state.last_flush = -1; /* avoid BUF_ERROR at next call, see above */
                     return ReturnCode::Ok;
                 }
@@ -2825,23 +2823,23 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     // write the trailer
     if stream.state.wrap == 2 {
         let crc_fold = core::mem::take(&mut stream.state.crc_fold);
-        stream.adler = crc_fold.finish() as z_checksum;
+        stream.input.adler = crc_fold.finish() as z_checksum;
 
-        let adler = stream.adler as u32;
+        let adler = stream.input.adler as u32;
         stream.state.bit_writer.pending.extend(&adler.to_le_bytes());
 
-        let total_in = stream.total_in as u32;
+        let total_in = stream.input.total_in as u32;
         stream
             .state
             .bit_writer
             .pending
             .extend(&total_in.to_le_bytes());
     } else if stream.state.wrap == 1 {
-        let adler = stream.adler as u32;
+        let adler = stream.input.adler as u32;
         stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
     }
 
-    flush_pending(stream);
+    let _ = stream.drain_pending();
 
     // If avail_out is zero, the application will call deflate again to flush the rest.
     if stream.state.wrap > 0 {
@@ -4264,7 +4262,9 @@ mod test {
         stream.avail_out = output.len() as _;
 
         assert!(matches!(
-            algorithm::run(stream, DeflateFlush::Finish),
+            with_compressor(stream, |compressor| {
+                algorithm::run(compressor, DeflateFlush::Finish)
+            }),
             BlockState::FinishDone
         ));
         let len = stream.total_out as usize;

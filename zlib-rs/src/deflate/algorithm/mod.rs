@@ -2,8 +2,7 @@ use crate::{
     deflate::{
         drain_pending_output, fill_window_core,
         longest_match::{execute_match_search_batch, MatchSearchResult, MatchSearchWork},
-        with_compressor, BlockState, Compressor, DeflateStream, DrainOutcome, InputCursor, State,
-        Strategy, MIN_LOOKAHEAD,
+        BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, MIN_LOOKAHEAD,
     },
     DeflateFlush,
 };
@@ -773,9 +772,9 @@ impl Algorithm {
     }
 }
 
-pub fn run(stream: &mut DeflateStream, flush: DeflateFlush) -> BlockState {
+pub(super) fn run(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> BlockState {
     let algorithm = Algorithm::for_stream(stream.state.level, stream.state.strategy);
-    with_compressor(stream, |compressor| algorithm.run(compressor, flush))
+    algorithm.run(stream, flush)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
