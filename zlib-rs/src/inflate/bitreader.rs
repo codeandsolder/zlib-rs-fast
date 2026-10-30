@@ -15,6 +15,28 @@ impl BitBuffer {
     }
 
     #[inline(always)]
+    pub fn hold(&self) -> u64 {
+        self.bit_buffer
+    }
+
+    #[inline(always)]
+    pub fn bits(&self, n: usize) -> u64 {
+        let lowest_n_bits = (1 << n) - 1;
+        self.bit_buffer & lowest_n_bits
+    }
+
+    #[inline(always)]
+    pub fn drop_bits(&mut self, n: u8) {
+        self.bit_buffer >>= n;
+        self.bits_used -= n;
+    }
+
+    #[inline(always)]
+    pub fn next_byte_boundary(&mut self) {
+        self.drop_bits(self.bits_used & 0b0111);
+    }
+
+    #[inline(always)]
     pub fn init_bits(&mut self) {
         self.bit_buffer = 0;
         self.bits_used = 0;
@@ -97,7 +119,7 @@ impl<'input> BitReader<'input> {
 
     #[inline(always)]
     pub fn hold(&self) -> u64 {
-        self.bits.bit_buffer
+        self.bits.hold()
     }
 
     #[inline(always)]
@@ -120,8 +142,7 @@ impl<'input> BitReader<'input> {
 
     #[inline(always)]
     pub fn next_byte_boundary(&mut self) {
-        self.bits.bit_buffer >>= self.bits.bits_used & 0b0111;
-        self.bits.bits_used -= self.bits.bits_used & 0b0111;
+        self.bits.next_byte_boundary();
     }
 
     #[inline(always)]
@@ -130,8 +151,7 @@ impl<'input> BitReader<'input> {
             return Err(ReturnCode::Ok);
         };
         self.position += 1;
-        self.bits.bit_buffer |= (byte as u64) << self.bits.bits_used;
-        self.bits.bits_used += 8;
+        self.bits.prime(8, byte as u64);
         Ok(byte)
     }
 
@@ -158,14 +178,12 @@ impl<'input> BitReader<'input> {
 
     #[inline(always)]
     pub fn bits(&self, n: usize) -> u64 {
-        let lowest_n_bits = (1 << n) - 1;
-        self.bits.bit_buffer & lowest_n_bits
+        self.bits.bits(n)
     }
 
     #[inline(always)]
     pub fn drop_bits(&mut self, n: u8) {
-        self.bits.bit_buffer >>= n;
-        self.bits.bits_used -= n;
+        self.bits.drop_bits(n);
     }
 
     #[inline(always)]
@@ -205,6 +223,25 @@ impl std::io::Read for BitReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::{BitBuffer, BitReader};
+
+    #[test]
+    fn bit_buffer_owns_reservoir_operations() {
+        let mut bits = BitBuffer::default();
+        bits.prime(3, 0b101);
+        bits.prime(8, 0xab);
+
+        assert_eq!(bits.bits_in_buffer(), 11);
+        assert_eq!(bits.bits(3), 0b101);
+        assert_eq!(bits.hold(), 0b101 | (0xabu64 << 3));
+
+        bits.next_byte_boundary();
+        assert_eq!(bits.bits_in_buffer(), 8);
+        assert_eq!(bits.bits(8), 0xab);
+
+        bits.drop_bits(4);
+        assert_eq!(bits.bits_in_buffer(), 4);
+        assert_eq!(bits.bits(4), 0x0a);
+    }
 
     #[test]
     fn reader_round_trip_persists_bits_without_caller_input() {
