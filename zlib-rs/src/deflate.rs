@@ -3085,12 +3085,7 @@ pub fn compress_slice<'a>(
     input: &[u8],
     config: DeflateConfig,
 ) -> (&'a mut [u8], ReturnCode) {
-    // SAFETY: a [u8] is a valid [MaybeUninit<u8>].
-    let output_uninit = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut MaybeUninit<u8>, output.len())
-    };
-
-    compress(output_uninit, input, config)
+    compress_slice_with_flush(output, input, config, DeflateFlush::Finish)
 }
 
 pub fn compress<'a>(
@@ -3107,12 +3102,8 @@ pub fn compress_slice_with_flush<'a>(
     config: DeflateConfig,
     flush: DeflateFlush,
 ) -> (&'a mut [u8], ReturnCode) {
-    // SAFETY: a [u8] is a valid [MaybeUninit<u8>], and `compress_with_flush` never uninitializes previously initialized memory.
-    let output_uninit = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut MaybeUninit<u8>, output.len())
-    };
-
-    compress_with_flush(output_uninit, input, config, flush)
+    let (produced, code) = compress_into(output, input, config, flush);
+    (&mut output[..produced], code)
 }
 
 pub fn compress_with_flush<'a>(
@@ -3121,11 +3112,57 @@ pub fn compress_with_flush<'a>(
     config: DeflateConfig,
     final_flush: DeflateFlush,
 ) -> (&'a mut [u8], ReturnCode) {
+    let (produced, code) = compress_into(output, input, config, final_flush);
+    let initialized = &mut output[..produced];
+
+    // SAFETY: `compress_into` reports only bytes written through the zlib output cursor. Those
+    // bytes are initialized `u8`s; the untouched MaybeUninit tail is not exposed.
+    let initialized = unsafe { &mut *(initialized as *mut [MaybeUninit<u8>] as *mut [u8]) };
+    (initialized, code)
+}
+
+/// Private storage capability for the one-shot compression helpers.
+///
+/// Both initialized and uninitialized byte slices are valid writable destinations. Keeping the
+/// distinction in the wrapper means the common compression loop never needs to erase and recreate
+/// slice initialization state.
+trait CompressionOutput {
+    fn byte_ptr(&mut self) -> *mut u8;
+    fn len(&self) -> usize;
+}
+
+impl CompressionOutput for [u8] {
+    fn byte_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+}
+
+impl CompressionOutput for [MaybeUninit<u8>] {
+    fn byte_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr().cast()
+    }
+
+    fn len(&self) -> usize {
+        <[MaybeUninit<u8>]>::len(self)
+    }
+}
+
+fn compress_into<O: CompressionOutput + ?Sized>(
+    output: &mut O,
+    input: &[u8],
+    config: DeflateConfig,
+    final_flush: DeflateFlush,
+) -> (usize, ReturnCode) {
+    let output_len = output.len();
     let mut stream = z_stream {
         next_in: input.as_ptr() as *mut u8,
-        avail_in: 0, // for special logic in the first  iteration
+        avail_in: 0, // for special logic in the first iteration
         total_in: 0,
-        next_out: output.as_mut_ptr() as *mut u8,
+        next_out: output.byte_ptr(),
         avail_out: 0, // for special logic on the first iteration
         total_out: 0,
         msg: core::ptr::null_mut(),
@@ -3140,12 +3177,11 @@ pub fn compress_with_flush<'a>(
 
     let err = init(&mut stream, config);
     if err != ReturnCode::Ok {
-        return (&mut [], err);
+        return (0, err);
     }
 
     let max = core::ffi::c_uint::MAX as usize;
-
-    let mut left = output.len();
+    let mut left = output_len;
     let mut source_len = input.len();
 
     let return_code = loop {
@@ -3178,17 +3214,18 @@ pub fn compress_with_flush<'a>(
         }
     };
 
-    // SAFETY: we have now initialized these bytes
-    let output_slice = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u8, stream.total_out as usize)
-    };
+    let produced = stream.total_out as usize;
+    assert!(
+        produced <= output_len,
+        "deflate reported output beyond caller storage"
+    );
 
     // may DataError if insufficient output space
     if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {
         let _ = end(stream);
     }
 
-    (output_slice, return_code)
+    (produced, return_code)
 }
 
 /// Returns the upper bound on the compressed size for an input of `source_len` bytes.
@@ -4226,6 +4263,25 @@ mod test {
         assert_eq!(prime(stream, 16, 0xa55a), ReturnCode::BufError);
 
         assert!(end(stream).is_ok());
+    }
+
+    #[test]
+    fn uninitialized_output_exposes_exactly_the_produced_prefix() {
+        let input = b"MaybeUninit output should expose only bytes actually written by deflate";
+        let config = DeflateConfig::default();
+        let capacity = compress_bound(input.len());
+
+        let mut initialized = vec![0u8; capacity];
+        let (expected, expected_code) = compress_slice(&mut initialized, input, config);
+        assert_eq!(expected_code, ReturnCode::Ok);
+        let expected = expected.to_vec();
+
+        let mut uninitialized = vec![MaybeUninit::<u8>::uninit(); capacity];
+        let (actual, actual_code) = compress(&mut uninitialized, input, config);
+        assert_eq!(actual_code, ReturnCode::Ok);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), expected.len());
+        assert!(actual.len() < capacity);
     }
 
     #[test]
