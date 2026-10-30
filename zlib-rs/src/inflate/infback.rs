@@ -316,6 +316,9 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
     }
 
     let mut state = State::new(InflateStateKind::Back);
+    // inflateBack uses the caller-provided window directly, so the allocation contains only State
+    // plus alignment headroom.
+    state.window = window;
 
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
@@ -324,30 +327,15 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
         _marker: PhantomData,
     };
     let allocs = InflateAllocOffsets::state_only();
-
-    let Some(allocation_start) = alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
+    let Some(state_allocation) = allocs.allocate_state(&alloc, state) else {
         return ReturnCode::MemError;
     };
+    stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
-    let address = allocation_start.as_ptr() as usize;
-    let align_offset = address.next_multiple_of(64) - address;
-    let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
-
-    // inflateBack uses the caller-provided window directly, so this allocation contains only
-    // State plus alignment headroom.
-    state.window = window;
-
-    let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
-    unsafe { state_allocation.write(state) };
-    stream.state = state_allocation.cast::<internal_state>();
-
-    // SAFETY: we've correctly initialized the stream to be an InflateStream
+    // SAFETY: `allocate_state` initialized a Back state behind the ABI state pointer.
     let Some(stream) = (unsafe { InflateStream::from_back_stream_mut(stream) }) else {
         return ReturnCode::StreamError;
     };
-
-    stream.state.allocation_start = allocation_start.as_ptr();
-    stream.state.total_allocation_size = allocs.total_size;
 
     stream.state.wbits = config.window_bits as u8;
     stream.state.flags.update(Flags::SANE, true);

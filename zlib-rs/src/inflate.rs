@@ -2280,6 +2280,44 @@ impl InflateAllocOffsets {
         self.window_pos
             .expect("inflate allocation layout includes an owned window")
     }
+
+    /// Allocate and place one inflate state using this layout.
+    ///
+    /// For the ordinary layout this also creates the owned padded history window. For the
+    /// state-only layout (used by `inflateBack`) any caller-owned window already stored in `state`
+    /// is preserved. Raw alignment, placement, and allocation metadata stay confined here.
+    fn allocate_state<'a>(
+        &self,
+        alloc: &Allocator<'a>,
+        mut state: State<'a>,
+    ) -> Option<NonNull<State<'a>>> {
+        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
+        let address = allocation_start.as_ptr() as usize;
+        let align_offset = address.next_multiple_of(Self::ALIGN_SIZE) - address;
+        // SAFETY: `total_size` reserves `ALIGN_SIZE - 1` bytes of alignment headroom.
+        let aligned = unsafe { allocation_start.as_ptr().add(align_offset) };
+
+        if let Some(window_pos) = self.window_pos {
+            // SAFETY: `window_pos` is computed inside this allocation and leaves enough room for
+            // the full padded window.
+            let window_allocation = unsafe { aligned.add(window_pos) };
+            state.window = unsafe {
+                Window::from_uninitialized_raw_parts(
+                    window_allocation,
+                    (1 << MAX_WBITS) + Self::WINDOW_PAD_SIZE,
+                )
+            };
+        }
+
+        state.allocation_start = allocation_start.as_ptr();
+        state.total_allocation_size = self.total_size;
+
+        // SAFETY: `state_pos` is aligned for `State`, lies inside this fresh allocation, and no
+        // `State` has previously been materialized there.
+        let state_ptr = unsafe { aligned.add(self.state_pos).cast::<State<'a>>() };
+        unsafe { state_ptr.write(state) };
+        NonNull::new(state_ptr)
+    }
 }
 
 /// Configuration for decompresssion.
@@ -2319,7 +2357,7 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new(InflateStateKind::Regular);
+    let state = State::new(InflateStateKind::Regular);
 
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
@@ -2328,28 +2366,13 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         _marker: PhantomData,
     };
     let allocs = InflateAllocOffsets::with_window();
-
-    let Some(allocation_start) = alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
+    let Some(state_allocation) = allocs.allocate_state(&alloc, state) else {
         return ReturnCode::MemError;
     };
+    stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
-    let address = allocation_start.as_ptr() as usize;
-    let align_offset = address.next_multiple_of(64) - address;
-    let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
-
-    let window_allocation = unsafe { buf.add(allocs.window_pos()) };
-    let window =
-        unsafe { Window::from_uninitialized_raw_parts(window_allocation, (1 << MAX_WBITS) + 64) };
-    state.window = window;
-
-    let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
-    unsafe { state_allocation.write(state) };
-    stream.state = state_allocation.cast::<internal_state>();
-
-    // SAFETY: we've correctly initialized the stream to be an InflateStream
+    // SAFETY: `allocate_state` initialized a regular `State` behind the ABI state pointer.
     if let Some(stream) = unsafe { InflateStream::from_stream_mut(stream) } {
-        stream.state.allocation_start = allocation_start.as_ptr();
-        stream.state.total_allocation_size = allocs.total_size;
         let ret = reset_with_config(stream, config);
 
         if ret != ReturnCode::Ok {
