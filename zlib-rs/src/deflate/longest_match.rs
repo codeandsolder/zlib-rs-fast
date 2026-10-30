@@ -170,6 +170,45 @@ impl MatchSearchBackend for ScalarMatchSearchBackend {
     }
 }
 
+#[cfg(feature = "std")]
+pub(super) struct ScopedThreadMatchSearchBackend {
+    workers: usize,
+}
+
+#[cfg(feature = "std")]
+impl ScopedThreadMatchSearchBackend {
+    pub(super) fn new(workers: usize) -> Self {
+        Self { workers }
+    }
+}
+
+#[cfg(feature = "std")]
+impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
+    fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]) {
+        if requests.is_empty() {
+            return;
+        }
+
+        let workers = self.workers.max(1).min(requests.len());
+        if workers == 1 {
+            ScalarMatchSearchBackend.execute(requests, results);
+            return;
+        }
+
+        let chunk_len = requests.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (request_chunk, result_chunk) in requests
+                .chunks(chunk_len)
+                .zip(results.chunks_mut(chunk_len))
+            {
+                scope.spawn(move || {
+                    ScalarMatchSearchBackend.execute(request_chunk, result_chunk);
+                });
+            }
+        });
+    }
+}
+
 pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
     backend: &B,
     requests: &[MatchSearchRequest<'_>],
@@ -460,31 +499,6 @@ fn break_matching(
 mod tests {
     use super::*;
 
-    struct ScopedThreadMatchSearchBackend {
-        workers: usize,
-    }
-
-    impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
-        fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]) {
-            if requests.is_empty() {
-                return;
-            }
-
-            let workers = self.workers.max(1).min(requests.len());
-            let chunk_len = requests.len().div_ceil(workers);
-            std::thread::scope(|scope| {
-                for (request_chunk, result_chunk) in requests
-                    .chunks(chunk_len)
-                    .zip(results.chunks_mut(chunk_len))
-                {
-                    scope.spawn(move || {
-                        ScalarMatchSearchBackend.execute(request_chunk, result_chunk);
-                    });
-                }
-            });
-        }
-    }
-
     #[test]
     fn requests_are_worker_safe_and_batchable() {
         fn assert_send_sync<T: Send + Sync>() {}
@@ -542,7 +556,7 @@ mod tests {
             start: 0,
         }; 2];
         execute_match_search_batch_with_backend(
-            &ScopedThreadMatchSearchBackend { workers: 2 },
+            &ScopedThreadMatchSearchBackend::new(2),
             &requests,
             &mut parallel_results,
         );

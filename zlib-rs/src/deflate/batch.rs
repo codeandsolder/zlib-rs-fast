@@ -7,7 +7,8 @@ use super::{
     },
     compress_slice, deflate, end, init,
     longest_match::{
-        execute_match_search_batch, MatchSearchRequest, MatchSearchResult, MatchSearchWork,
+        execute_match_search_batch, execute_match_search_batch_with_backend, MatchSearchRequest,
+        MatchSearchResult, MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     DeflateConfig, DeflateFlush, DeflateStream, InputCursor, OutputCursor, ReturnCode, Status,
 };
@@ -35,6 +36,19 @@ pub struct BatchCompressResult {
     pub code: ReturnCode,
 }
 
+/// Match-search executor used by [`compress_slices_batch_with_backend`].
+///
+/// No automatic policy is applied: scalar remains the default, while scoped threads are an explicit
+/// caller choice. A scoped-thread worker count of zero is treated as one worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BatchMatchSearchBackend {
+    #[default]
+    Scalar,
+    ScopedThreads {
+        workers: usize,
+    },
+}
+
 /// Compress several independent buffers while batching detached longest-match searches.
 ///
 /// Every job uses the same configuration and produces the same bytes as an independent
@@ -49,6 +63,15 @@ pub struct BatchCompressResult {
 pub fn compress_slices_batch(
     jobs: &mut [BatchCompressJob<'_>],
     config: DeflateConfig,
+) -> Vec<BatchCompressResult> {
+    compress_slices_batch_with_backend(jobs, config, BatchMatchSearchBackend::Scalar)
+}
+
+/// Variant of [`compress_slices_batch`] with an explicit match-search executor.
+pub fn compress_slices_batch_with_backend(
+    jobs: &mut [BatchCompressJob<'_>],
+    config: DeflateConfig,
+    backend: BatchMatchSearchBackend,
 ) -> Vec<BatchCompressResult> {
     let Some(algorithm) = configured_algorithm(config) else {
         return compress_synchronously(jobs, config);
@@ -117,7 +140,18 @@ pub fn compress_slices_batch(
                 .iter()
                 .map(|(runtime_index, work)| runtimes[*runtime_index].match_request(*work))
                 .collect::<Vec<MatchSearchRequest<'_>>>();
-            execute_match_search_batch(&requests, &mut match_results[..requests.len()]);
+            match backend {
+                BatchMatchSearchBackend::Scalar => {
+                    execute_match_search_batch(&requests, &mut match_results[..requests.len()]);
+                }
+                BatchMatchSearchBackend::ScopedThreads { workers } => {
+                    execute_match_search_batch_with_backend(
+                        &ScopedThreadMatchSearchBackend::new(workers),
+                        &requests,
+                        &mut match_results[..requests.len()],
+                    );
+                }
+            }
         }
 
         for ((runtime_index, _), result) in match_work
@@ -480,6 +514,69 @@ mod tests {
                 let (reference, code) = &references[index];
                 assert_eq!(result.code, *code);
                 assert_eq!(&outputs[index][..result.written], reference);
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_thread_backend_matches_scalar_batch_output() {
+        let inputs = [
+            b"threaded-search-alpha/".repeat(6_000),
+            b"threaded-search-beta/beta/beta/".repeat(5_000),
+            (0..140_000)
+                .map(|i| (((i / 17) * 31 + i % 7) % 251) as u8)
+                .collect(),
+            b"abcabcabcabcabcabcabcabcabcabcabcabc".repeat(4_500),
+        ];
+        let config = DeflateConfig {
+            level: 9,
+            method: Method::Deflated,
+            window_bits: 16 + crate::MAX_WBITS,
+            mem_level: 1,
+            strategy: Strategy::Default,
+        };
+
+        let capacities = inputs
+            .iter()
+            .map(|input| compress_bound(input.len()) + 64)
+            .collect::<Vec<_>>();
+        let mut scalar_outputs = capacities
+            .iter()
+            .map(|capacity| vec![0u8; *capacity])
+            .collect::<Vec<_>>();
+        let mut scalar_jobs = inputs
+            .iter()
+            .zip(scalar_outputs.iter_mut())
+            .map(|(input, output)| BatchCompressJob::new(input, output))
+            .collect::<Vec<_>>();
+        let scalar_results = compress_slices_batch(&mut scalar_jobs, config);
+        drop(scalar_jobs);
+
+        for workers in [0, 3] {
+            let mut threaded_outputs = capacities
+                .iter()
+                .map(|capacity| vec![0u8; *capacity])
+                .collect::<Vec<_>>();
+            let mut threaded_jobs = inputs
+                .iter()
+                .zip(threaded_outputs.iter_mut())
+                .map(|(input, output)| BatchCompressJob::new(input, output))
+                .collect::<Vec<_>>();
+
+            let threaded_results = compress_slices_batch_with_backend(
+                &mut threaded_jobs,
+                config,
+                BatchMatchSearchBackend::ScopedThreads { workers },
+            );
+            drop(threaded_jobs);
+
+            assert_eq!(threaded_results, scalar_results);
+            for (index, result) in threaded_results.iter().enumerate() {
+                assert_eq!(
+                    &threaded_outputs[index][..result.written],
+                    &scalar_outputs[index][..result.written],
+                    "scoped-thread backend changed job {index} with workers={workers}"
+                );
             }
         }
     }

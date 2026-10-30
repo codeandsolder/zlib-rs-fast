@@ -34,7 +34,10 @@ mod window;
 
 // Position relative to the current window
 #[cfg(feature = "std")]
-pub use batch::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
+pub use batch::{
+    compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,
+    BatchCompressResult, BatchMatchSearchBackend,
+};
 
 pub(crate) type Pos = u16;
 

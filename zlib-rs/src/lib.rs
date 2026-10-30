@@ -45,7 +45,10 @@ pub use inflate::InflateConfig;
 
 pub use deflate::{compress_bound, compress_slice};
 #[cfg(feature = "std")]
-pub use deflate::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
+pub use deflate::{
+    compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,
+    BatchCompressResult, BatchMatchSearchBackend,
+};
 pub use inflate::decompress_slice;
 
 macro_rules! traceln {
