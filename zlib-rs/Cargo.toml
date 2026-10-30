@@ -44,3 +44,8 @@ quickcheck.workspace = true
 name = "batch"
 harness = false
 required-features = ["std"]
+
+[[bench]]
+name = "single"
+harness = false
+required-features = ["std"]
