@@ -468,6 +468,11 @@ pub(crate) struct State<'a> {
     total_allocation_size: usize,
 }
 
+// `inflateCopy` snapshots `State` byte-for-byte before rebinding its window to independent
+// storage. Any future field with drop glue would make that strategy invalid and must force this
+// assertion (and the clone implementation) to be revisited.
+const _: () = assert!(!core::mem::needs_drop::<State<'static>>());
+
 impl<'a> State<'a> {
     fn new(kind: InflateStateKind) -> Self {
         Self {
@@ -2281,6 +2286,19 @@ impl InflateAllocOffsets {
             .expect("inflate allocation layout includes an owned window")
     }
 
+    /// Allocate raw storage and return both the original allocation pointer (needed for freeing)
+    /// and its 64-byte-aligned interior base used by this layout.
+    fn allocate_storage<'a>(&self, alloc: &Allocator<'a>) -> Option<(NonNull<u8>, NonNull<u8>)> {
+        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
+        let address = allocation_start.as_ptr() as usize;
+        let align_offset = address.next_multiple_of(Self::ALIGN_SIZE) - address;
+        // SAFETY: `total_size` reserves `ALIGN_SIZE - 1` bytes of alignment headroom, and offsetting
+        // a non-null allocation pointer within that allocation cannot produce null.
+        let aligned =
+            unsafe { NonNull::new_unchecked(allocation_start.as_ptr().add(align_offset)) };
+        Some((allocation_start, aligned))
+    }
+
     /// Allocate and place one inflate state using this layout.
     ///
     /// For the ordinary layout this also creates the owned padded history window. For the
@@ -2291,16 +2309,12 @@ impl InflateAllocOffsets {
         alloc: &Allocator<'a>,
         mut state: State<'a>,
     ) -> Option<NonNull<State<'a>>> {
-        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
-        let address = allocation_start.as_ptr() as usize;
-        let align_offset = address.next_multiple_of(Self::ALIGN_SIZE) - address;
-        // SAFETY: `total_size` reserves `ALIGN_SIZE - 1` bytes of alignment headroom.
-        let aligned = unsafe { allocation_start.as_ptr().add(align_offset) };
+        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
 
         if let Some(window_pos) = self.window_pos {
             // SAFETY: `window_pos` is computed inside this allocation and leaves enough room for
             // the full padded window.
-            let window_allocation = unsafe { aligned.add(window_pos) };
+            let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
             state.window = unsafe {
                 Window::from_uninitialized_raw_parts(
                     window_allocation,
@@ -2314,8 +2328,50 @@ impl InflateAllocOffsets {
 
         // SAFETY: `state_pos` is aligned for `State`, lies inside this fresh allocation, and no
         // `State` has previously been materialized there.
-        let state_ptr = unsafe { aligned.add(self.state_pos).cast::<State<'a>>() };
+        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
         unsafe { state_ptr.write(state) };
+        NonNull::new(state_ptr)
+    }
+
+    /// Snapshot a live regular inflate state into independent state + window storage.
+    ///
+    /// `State` intentionally has no drop glue (enforced above), so it may be copied byte-for-byte.
+    /// The copied raw window handle is never exposed: it is immediately replaced by a clone into
+    /// this fresh allocation before the returned pointer can be materialized as a Rust reference.
+    fn clone_state<'a>(
+        &self,
+        alloc: &Allocator<'a>,
+        source: &State<'a>,
+    ) -> Option<NonNull<State<'a>>> {
+        debug_assert_eq!(source.kind, InflateStateKind::Regular);
+        debug_assert_eq!(self.total_size, source.total_allocation_size);
+
+        // A regular inflate state always owns the canonical MAX_WBITS backing window. This is a
+        // memory-safety invariant for the raw copy below, so keep it as a release assertion rather
+        // than a debug-only check.
+        assert_eq!(
+            source.window.size(),
+            1 << MAX_WBITS,
+            "regular inflate state owns the canonical history window"
+        );
+
+        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        let window_pos = self.window_pos();
+        // SAFETY: the ordinary layout reserves exactly the source window's full padded backing
+        // length at `window_pos`, and the fresh destination allocation cannot overlap the source.
+        let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
+        let window = unsafe { source.window.clone_to(window_allocation) };
+
+        // SAFETY: `state_pos` is aligned and in-bounds. `State` has no drop glue, and the copied
+        // window handle is replaced before any reference to the destination state is created.
+        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
+        unsafe { core::ptr::copy_nonoverlapping(source as *const State<'a>, state_ptr, 1) };
+        unsafe {
+            core::ptr::addr_of_mut!((*state_ptr).window).write(window);
+            core::ptr::addr_of_mut!((*state_ptr).allocation_start).write(allocation_start.as_ptr());
+            core::ptr::addr_of_mut!((*state_ptr).total_allocation_size).write(self.total_size);
+        }
+
         NonNull::new(state_ptr)
     }
 }
@@ -2630,7 +2686,7 @@ pub fn sync_point(stream: &mut InflateStream) -> bool {
     matches!(stream.state.mode, Mode::Stored) && stream.state.bit_buffer.bits_in_buffer() == 0
 }
 
-pub unsafe fn copy<'a>(
+pub fn copy<'a>(
     dest: &mut MaybeUninit<InflateStream<'a>>,
     source: &InflateStream<'a>,
 ) -> ReturnCode {
@@ -2639,36 +2695,14 @@ pub unsafe fn copy<'a>(
     }
 
     // `inflateCopy` snapshots decoder state; zlib does not require live input/output pointers.
-    // Allocate independent state and window storage for the destination.
+    // The allocation helper keeps the transient duplicated raw window handle private and returns
+    // only after the copied state owns independent window storage.
     let allocs = InflateAllocOffsets::with_window();
-    debug_assert_eq!(allocs.total_size, source.state.total_allocation_size);
-
-    let Some(allocation_start) = source.alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
+    let Some(copy) = allocs.clone_state(&source.alloc, &source.state) else {
         return ReturnCode::MemError;
     };
 
-    let address = allocation_start.as_ptr() as usize;
-    let align_offset = address.next_multiple_of(64) - address;
-    let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
-
-    let window_allocation = unsafe { buf.add(allocs.window_pos()) };
-    let window = unsafe {
-        source
-            .state
-            .window
-            .clone_to(window_allocation, (1 << MAX_WBITS) + 64)
-    };
-
-    let copy = unsafe { buf.add(allocs.state_pos).cast::<State>() };
-    unsafe { core::ptr::copy_nonoverlapping(source.state.as_ptr(), copy, 1) };
-
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).window) };
-    unsafe { core::ptr::write(field_ptr, window) };
-
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).allocation_start) };
-    unsafe { core::ptr::write(field_ptr, allocation_start.as_ptr()) };
-
-    // Build the destination ABI shell explicitly around the cloned raw state pointer.
+    // Build the destination ABI shell explicitly around the cloned state allocation.
     dest.write(InflateStream {
         next_in: source.next_in,
         avail_in: source.avail_in,
@@ -2677,7 +2711,9 @@ pub unsafe fn copy<'a>(
         avail_out: source.avail_out,
         total_out: source.total_out,
         msg: source.msg,
-        state: unsafe { StatePtr::from_raw(copy) },
+        // SAFETY: `clone_state` returns a live initialized `State` in an allocation owned by this
+        // destination stream.
+        state: unsafe { StatePtr::from_raw(copy.as_ptr()) },
         alloc: source.alloc,
         data_type: source.data_type,
         adler: source.adler,
@@ -2833,6 +2869,29 @@ mod tests {
     }
 
     #[test]
+    fn inflate_copy_owns_independent_state_and_window_storage() {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let source = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let source_state = source.state.as_ptr();
+        let source_window = source.state.window.as_ptr();
+
+        let mut copied = MaybeUninit::<InflateStream>::uninit();
+        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
+        let copied = unsafe { copied.assume_init_mut() };
+
+        assert_ne!(source_state, copied.state.as_ptr());
+        assert_ne!(source_window, copied.state.window.as_ptr());
+        assert_eq!(
+            source.state.total_allocation_size,
+            copied.state.total_allocation_size
+        );
+
+        end(copied);
+        end(source);
+    }
+
+    #[test]
     fn gzip_header_destination_is_shared_safely_across_inflate_copy() {
         // Extended gzip header with FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT set. The payload starts after
         // the header; this test only needs both copied streams to finish parsing the header.
@@ -2881,7 +2940,7 @@ mod tests {
         source.avail_out = source_out.len() as _;
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
-        assert_eq!(unsafe { copy(&mut copied, source) }, ReturnCode::Ok);
+        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
         let copied = unsafe { copied.assume_init_mut() };
         let mut copied_out = [0u8; 1];
         copied.next_out = copied_out.as_mut_ptr();

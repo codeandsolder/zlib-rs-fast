@@ -200,9 +200,13 @@ impl<'a> Window<'a> {
         })
     }
 
-    pub unsafe fn clone_to(&self, ptr: *mut u8, len: usize) -> Self {
-        debug_assert_eq!(self.buf.len(), len);
-
+    /// Clone this complete backing buffer into independent raw storage.
+    ///
+    /// # Safety
+    /// `ptr` must be valid and uniquely writable for `self.buf.len()` bytes, and must not overlap
+    /// this window's backing allocation.
+    pub(super) unsafe fn clone_to(&self, ptr: *mut u8) -> Self {
+        let len = self.buf.len();
         unsafe { core::ptr::copy_nonoverlapping(self.buf.as_ptr(), ptr, len) };
 
         Self {
