@@ -13,8 +13,7 @@ use crate::{
 pub struct Window<'a> {
     buf: WeakSliceMut<'a, u8>,
 
-    have: usize, // number of bytes logically written to the window. this can be higher than
-    // buf.len() if we run out of space in the window
+    have: usize, // number of initialized/logically available bytes, bounded by the backing buffer
     next: usize, // write head
 }
 
@@ -67,7 +66,11 @@ impl<'a> Window<'a> {
         self.have
     }
 
-    pub unsafe fn set_have(&mut self, have: usize) {
+    pub fn set_have(&mut self, have: usize) {
+        assert!(
+            have <= self.buf.len(),
+            "window initialized length stays in-bounds"
+        );
         self.have = have;
     }
 
@@ -227,6 +230,17 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "window initialized length stays in-bounds")]
+    fn initialized_prefix_cannot_exceed_backing_buffer() {
+        use core::mem::MaybeUninit;
+
+        let mut storage = [MaybeUninit::<u8>::uninit(); 8];
+        let mut window =
+            unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
+        window.set_have(storage.len() + 1);
+    }
+
+    #[test]
     fn raw_window_slice_exposes_only_initialized_prefix() {
         use core::mem::MaybeUninit;
 
@@ -237,7 +251,7 @@ mod test {
 
         let mut window =
             unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
-        unsafe { window.set_have(3) };
+        window.set_have(3);
 
         assert_eq!(window.as_slice(), &[0x11, 0x22, 0x33]);
     }
@@ -253,7 +267,7 @@ mod test {
 
         // Expose the whole logical window only after the constructor has initialized it. Under
         // Miri this also exercises the old invalid typed-read path directly.
-        unsafe { window.set_have(window.size()) };
+        window.set_have(window.size());
         assert!(window.as_slice().iter().all(|byte| *byte == 0));
     }
 

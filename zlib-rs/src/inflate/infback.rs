@@ -16,20 +16,31 @@ use crate::{MAX_WBITS, MIN_WBITS};
 /// Callback-fed input cursor for `inflateBack`.
 ///
 /// The callback may replace the backing buffer whenever the current span is exhausted, so unlike
-/// ordinary inflate this cursor cannot own one long-lived borrowed slice. Raw pointer lifetime is
-/// confined here; decoding sees ordinary byte/bit operations and the shared [`BitBuffer`].
+/// ordinary inflate this cursor cannot own one long-lived borrowed slice. Raw pointer lifetime and
+/// callback unsafety are confined here; decoding sees ordinary byte/bit operations and the shared
+/// [`BitBuffer`].
 struct BackInput {
     next: *const u8,
     remaining: usize,
     bits: BitBuffer,
+    callback: in_func,
+    descriptor: *mut c_void,
 }
 
 impl BackInput {
-    /// Bind the initial zlib input span.
+    /// Bind the initial zlib input span and callback contract.
     ///
     /// # Safety
     /// A non-null `next` must be readable for `available` bytes for the duration of this call.
-    unsafe fn new(next: *const u8, available: u32) -> Self {
+    /// `callback` must obey the zlib `in_func` contract: a non-zero count must provide a non-null
+    /// pointer readable for that many bytes, and that span must remain unchanged until the next
+    /// callback invocation or until `inflateBack` returns.
+    unsafe fn new(
+        next: *const u8,
+        available: u32,
+        callback: in_func,
+        descriptor: *mut c_void,
+    ) -> Self {
         Self {
             next,
             remaining: if next.is_null() {
@@ -38,6 +49,8 @@ impl BackInput {
                 available as usize
             },
             bits: BitBuffer::default(),
+            callback,
+            descriptor,
         }
     }
 
@@ -56,7 +69,9 @@ impl BackInput {
         if self.remaining == 0 {
             &[]
         } else {
-            // SAFETY: maintained by `new`, `ensure_available`, and `advance`.
+            // SAFETY: maintained by `new`, `ensure_available`, and `advance`. A mutable borrow of
+            // this cursor is required before the callback can replace the span, so this shared
+            // slice cannot overlap a later callback invocation.
             unsafe { core::slice::from_raw_parts(self.next, self.remaining) }
         }
     }
@@ -108,48 +123,40 @@ impl BackInput {
             "inflateBack input advance stays in-bounds"
         );
         self.remaining -= count;
-        self.next = self.next.wrapping_add(count);
+        if count != 0 {
+            // SAFETY: the cursor invariant guarantees `next..next + remaining + count` belongs to
+            // the current callback-owned span, and `count` has just been checked in-bounds.
+            self.next = unsafe { self.next.add(count) };
+        }
     }
 
     /// Ensure that at least one callback-owned byte is available.
-    ///
-    /// # Safety
-    /// `in_` must obey the zlib `in_func` contract: a non-zero count must return a pointer readable
-    /// for that many bytes until the next callback invocation.
     #[inline(always)]
-    unsafe fn ensure_available(
-        &mut self,
-        in_: in_func,
-        in_desc: *mut c_void,
-    ) -> Result<(), ReturnCode> {
+    fn ensure_available(&mut self) -> Result<(), ReturnCode> {
         if self.remaining != 0 {
             return Ok(());
         }
 
         let mut next = core::ptr::null();
-        let available = unsafe { in_(in_desc, &mut next) } as usize;
-        if available == 0 {
+        // SAFETY: the callback contract is established once by `BackInput::new` and retained as a
+        // cursor invariant. No shared slice from the previous span can exist through this `&mut`.
+        let available = unsafe { (self.callback)(self.descriptor, &mut next) } as usize;
+        if available == 0 || next.is_null() {
             self.next = core::ptr::null();
+            self.remaining = 0;
             return Err(ReturnCode::BufError);
         }
 
-        debug_assert!(
-            !next.is_null(),
-            "inflateBack callback returned bytes without a pointer"
-        );
         self.next = next;
         self.remaining = available;
         Ok(())
     }
 
     /// Pull one byte from the callback-fed stream into the shared DEFLATE reservoir.
-    ///
-    /// # Safety
-    /// Same callback contract as [`Self::ensure_available`].
     #[inline(always)]
-    unsafe fn pull_byte(&mut self, in_: in_func, in_desc: *mut c_void) -> Result<(), ReturnCode> {
-        unsafe { self.ensure_available(in_, in_desc)? };
-        // SAFETY: `ensure_available` established one readable byte.
+    fn pull_byte(&mut self) -> Result<(), ReturnCode> {
+        self.ensure_available()?;
+        // SAFETY: `ensure_available` established one readable byte in the current callback span.
         let byte = unsafe { *self.next };
         self.advance(1);
         self.bits.prime(8, byte as u64);
@@ -157,18 +164,10 @@ impl BackInput {
     }
 
     /// Fill the shared reservoir to `count` bits, asking the callback for another span as needed.
-    ///
-    /// # Safety
-    /// Same callback contract as [`Self::ensure_available`].
     #[inline(always)]
-    unsafe fn need_bits(
-        &mut self,
-        count: usize,
-        in_: in_func,
-        in_desc: *mut c_void,
-    ) -> Result<(), ReturnCode> {
+    fn need_bits(&mut self, count: usize) -> Result<(), ReturnCode> {
         while usize::from(self.bits.bits_in_buffer()) < count {
-            unsafe { self.pull_byte(in_, in_desc)? };
+            self.pull_byte()?;
         }
         Ok(())
     }
@@ -177,14 +176,29 @@ impl BackInput {
 /// Cursor over the caller-provided `inflateBack` output window.
 ///
 /// The window storage itself remains owned by `State::window`; this cursor owns only the initialized
-/// prefix length. Writes go through `Writer`, so the uninitialized tail is never materialized as a
-/// typed `u8` slice.
-#[derive(Debug, Default)]
+/// prefix length and the callback contract. Writes go through `Writer`, so the uninitialized tail is
+/// never materialized as a typed `u8` slice.
 struct BackOutput {
     filled: usize,
+    callback: out_func,
+    descriptor: *mut c_void,
 }
 
 impl BackOutput {
+    /// Bind the zlib output callback contract to this cursor.
+    ///
+    /// # Safety
+    /// `callback` must obey the zlib `out_func` contract for the caller-supplied window: it may read
+    /// the initialized prefix passed to it, but must not mutate or invalidate that window while
+    /// `inflateBack` is running.
+    unsafe fn new(callback: out_func, descriptor: *mut c_void) -> Self {
+        Self {
+            filled: 0,
+            callback,
+            descriptor,
+        }
+    }
+
     #[inline(always)]
     fn len(&self) -> usize {
         self.filled
@@ -243,27 +257,39 @@ impl BackOutput {
     }
 
     /// Flush a full output window to the zlib callback and reset the cursor for reuse.
-    ///
-    /// # Safety
-    /// `out` must obey the zlib `out_func` callback contract for the supplied window.
     #[inline(always)]
-    unsafe fn flush_if_full(
-        &mut self,
-        window: &mut Window<'_>,
-        out: out_func,
-        out_desc: *mut c_void,
-    ) -> Result<(), ReturnCode> {
+    fn flush_if_full(&mut self, window: &mut Window<'_>) -> Result<(), ReturnCode> {
         if self.filled != window.buffer_size() {
             return Ok(());
         }
 
         // The whole window is initialized before it is exposed to the callback or later history
         // reads.
-        unsafe { window.set_have(self.filled) };
-        if unsafe { out(out_desc, window.as_mut_ptr(), self.filled as u32) } != 0 {
+        window.set_have(self.filled);
+        // SAFETY: `BackOutput::new` established the callback contract, and `filled == capacity`
+        // proves the complete window is initialized for this callback.
+        if unsafe { (self.callback)(self.descriptor, window.as_mut_ptr(), self.filled as u32) } != 0
+        {
             return Err(ReturnCode::BufError);
         }
         self.filled = 0;
+        Ok(())
+    }
+
+    /// Deliver any final partial window. This intentionally does not change `window.have()`: no
+    /// later decode step consumes history after `inflateBack` starts returning.
+    #[inline(always)]
+    fn flush_remaining(&mut self, window: &mut Window<'_>) -> Result<(), ReturnCode> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: `BackOutput::new` established the callback contract and `filled` tracks exactly
+        // the initialized prefix of the caller-owned window.
+        if unsafe { (self.callback)(self.descriptor, window.as_mut_ptr(), self.filled as u32) } != 0
+        {
+            return Err(ReturnCode::BufError);
+        }
         Ok(())
     }
 }
@@ -390,6 +416,13 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
     ReturnCode::Ok
 }
 
+/// Run callback-driven raw DEFLATE decompression.
+///
+/// # Safety
+/// The initial `strm.next_in` span must be readable for `strm.avail_in` bytes when non-null.
+/// `in_` must provide readable, unchanged spans until its next invocation or this function returns.
+/// `out` must not mutate or invalidate the caller-provided output window while this function runs.
+/// Both descriptors must remain valid for their callback's use for the duration of the call.
 pub unsafe fn back(
     strm: &mut InflateStream,
     in_: in_func,
@@ -406,8 +439,11 @@ pub unsafe fn back(
     strm.state.window.clear();
 
     // SAFETY: `inflateBack` requires the caller-provided initial span to be valid for `avail_in`.
-    let mut input = unsafe { BackInput::new(strm.next_in.cast_const(), strm.avail_in) };
-    let mut output = BackOutput::default();
+    let mut input =
+        unsafe { BackInput::new(strm.next_in.cast_const(), strm.avail_in, in_, in_desc) };
+    // SAFETY: `back` inherits zlib's callback contract from its caller for the duration of this
+    // invocation.
+    let mut output = unsafe { BackOutput::new(out, out_desc) };
 
     let state = &mut *strm.state;
 
@@ -420,7 +456,7 @@ pub unsafe fn back(
                     continue;
                 }
 
-                if let Err(code) = unsafe { input.need_bits(3, in_, in_desc) } {
+                if let Err(code) = input.need_bits(3) {
                     ret = code;
                     break 'inf_leave;
                 }
@@ -477,7 +513,7 @@ pub unsafe fn back(
             }
             Mode::Stored => {
                 input.next_byte_boundary();
-                if let Err(code) = unsafe { input.need_bits(32, in_, in_desc) } {
+                if let Err(code) = input.need_bits(32) {
                     ret = code;
                     break 'inf_leave;
                 }
@@ -497,13 +533,11 @@ pub unsafe fn back(
                 while state.length != 0 {
                     let mut copy = state.length;
 
-                    if let Err(code) = unsafe { input.ensure_available(in_, in_desc) } {
+                    if let Err(code) = input.ensure_available() {
                         ret = code;
                         break 'inf_leave;
                     }
-                    if let Err(code) =
-                        unsafe { output.flush_if_full(&mut state.window, out, out_desc) }
-                    {
+                    if let Err(code) = output.flush_if_full(&mut state.window) {
                         ret = code;
                         break 'inf_leave;
                     }
@@ -519,7 +553,7 @@ pub unsafe fn back(
                 continue;
             }
             Mode::Table => {
-                if let Err(code) = unsafe { input.need_bits(14, in_, in_desc) } {
+                if let Err(code) = input.need_bits(14) {
                     ret = code;
                     break 'inf_leave;
                 }
@@ -546,7 +580,7 @@ pub unsafe fn back(
                 ];
 
                 while state.have < state.ncode {
-                    if let Err(code) = unsafe { input.need_bits(3, in_, in_desc) } {
+                    if let Err(code) = input.need_bits(3) {
                         ret = code;
                         break 'inf_leave;
                     }
@@ -586,7 +620,7 @@ pub unsafe fn back(
                             break here;
                         }
 
-                        if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                        if let Err(code) = input.pull_byte() {
                             ret = code;
 
                             break 'inf_leave;
@@ -602,9 +636,7 @@ pub unsafe fn back(
                             state.have += 1;
                         }
                         16 => {
-                            if let Err(code) =
-                                unsafe { input.need_bits(usize::from(here_bits) + 2, in_, in_desc) }
-                            {
+                            if let Err(code) = input.need_bits(usize::from(here_bits) + 2) {
                                 ret = code;
                                 break 'inf_leave;
                             }
@@ -629,9 +661,7 @@ pub unsafe fn back(
                             state.have += copy;
                         }
                         17 => {
-                            if let Err(code) =
-                                unsafe { input.need_bits(usize::from(here_bits) + 3, in_, in_desc) }
-                            {
+                            if let Err(code) = input.need_bits(usize::from(here_bits) + 3) {
                                 ret = code;
                                 break 'inf_leave;
                             }
@@ -649,9 +679,7 @@ pub unsafe fn back(
                             state.have += copy;
                         }
                         18.. => {
-                            if let Err(code) =
-                                unsafe { input.need_bits(usize::from(here_bits) + 7, in_, in_desc) }
-                            {
+                            if let Err(code) = input.need_bits(usize::from(here_bits) + 7) {
                                 ret = code;
                                 break 'inf_leave;
                             }
@@ -728,7 +756,7 @@ pub unsafe fn back(
                         Writer::new_uninit_raw(state.window.as_mut_ptr(), output.len(), capacity)
                     };
 
-                    unsafe { inflate_fast_back(state, &mut bit_reader, &mut writer) };
+                    inflate_fast_back(state, &mut bit_reader, &mut writer);
 
                     let remaining = bit_reader.bytes_remaining();
                     let bits = bit_reader.into_buffer();
@@ -755,7 +783,7 @@ pub unsafe fn back(
                         break;
                     }
 
-                    if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                    if let Err(code) = input.pull_byte() {
                         ret = code;
 
                         break 'inf_leave;
@@ -771,7 +799,7 @@ pub unsafe fn back(
                             break;
                         }
 
-                        if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                        if let Err(code) = input.pull_byte() {
                             ret = code;
 
                             break 'inf_leave;
@@ -790,9 +818,7 @@ pub unsafe fn back(
                     } else {
                         traceln!("inflate:         literal {:#04x}", here.val);
                     }
-                    if let Err(code) =
-                        unsafe { output.flush_if_full(&mut state.window, out, out_desc) }
-                    {
+                    if let Err(code) = output.flush_if_full(&mut state.window) {
                         ret = code;
                         break 'inf_leave;
                     }
@@ -818,7 +844,7 @@ pub unsafe fn back(
 
                 // get extra bits, if any
                 if state.extra != 0 {
-                    if let Err(code) = unsafe { input.need_bits(state.extra, in_, in_desc) } {
+                    if let Err(code) = input.need_bits(state.extra) {
                         ret = code;
                         break 'inf_leave;
                     }
@@ -835,7 +861,7 @@ pub unsafe fn back(
                         break;
                     }
 
-                    if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                    if let Err(code) = input.pull_byte() {
                         ret = code;
 
                         break 'inf_leave;
@@ -856,7 +882,7 @@ pub unsafe fn back(
                             break;
                         }
 
-                        if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                        if let Err(code) = input.pull_byte() {
                             ret = code;
 
                             break 'inf_leave;
@@ -881,7 +907,7 @@ pub unsafe fn back(
                 let extra = state.extra;
 
                 if extra > 0 {
-                    if let Err(code) = unsafe { input.need_bits(extra, in_, in_desc) } {
+                    if let Err(code) = input.need_bits(extra) {
                         ret = code;
                         break 'inf_leave;
                     }
@@ -898,9 +924,7 @@ pub unsafe fn back(
                 traceln!("inflate:         distance {}", state.offset);
 
                 loop {
-                    if let Err(code) =
-                        unsafe { output.flush_if_full(&mut state.window, out, out_desc) }
-                    {
+                    if let Err(code) = output.flush_if_full(&mut state.window) {
                         ret = code;
                         break 'inf_leave;
                     }
@@ -972,10 +996,7 @@ pub unsafe fn back(
         }
     }
 
-    if output.len() != 0
-        && unsafe { out(out_desc, state.window.as_mut_ptr(), output.len() as u32) } != 0
-        && ret == ReturnCode::StreamEnd
-    {
+    if output.flush_remaining(&mut state.window).is_err() && ret == ReturnCode::StreamEnd {
         ret = ReturnCode::BufError;
     }
 
@@ -986,11 +1007,7 @@ pub unsafe fn back(
 }
 
 #[inline(always)]
-unsafe fn inflate_fast_back(
-    state: &mut State,
-    bit_reader: &mut BitReader<'_>,
-    writer: &mut Writer<'_>,
-) {
+fn inflate_fast_back(state: &mut State, bit_reader: &mut BitReader<'_>, writer: &mut Writer<'_>) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
     let lcode = state.len_table_ref();

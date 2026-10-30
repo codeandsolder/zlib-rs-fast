@@ -737,6 +737,12 @@ pub unsafe extern "C" fn inflateBackInit_(
 /// * Either
 ///     - `strm` is `NULL`
 ///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`inflateBackInit_`]
+/// * A non-null initial `strm.next_in` is readable for `strm.avail_in` bytes.
+/// * If `in_` is present, every non-zero callback result supplies a non-null readable span that
+///   remains unchanged until the next input callback or this function returns; `in_desc` remains
+///   valid for the callback's use.
+/// * If `out` is present, it does not mutate or invalidate the `inflateBackInit_` output window
+///   while this function runs; `out_desc` remains valid for the callback's use.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateBack))]
 pub unsafe extern "C" fn inflateBack(
     strm: z_streamp,
