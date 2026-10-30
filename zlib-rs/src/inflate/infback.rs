@@ -11,7 +11,7 @@ use crate::inflate::{
     MAX_DIST_EXTRA_BITS,
 };
 use crate::traceln;
-use crate::{c_api::z_stream, inflate::writer::Writer, ReturnCode};
+use crate::{c_api::z_stream, inflate::writer::BackWriter, ReturnCode};
 use crate::{MAX_WBITS, MIN_WBITS};
 
 /// Callback-fed input cursor for `inflateBack`.
@@ -288,106 +288,6 @@ impl BackOutput {
     }
 }
 
-/// Exclusive writer over the caller-owned `inflateBack` callback window.
-///
-/// The mutable borrow prevents the decoder from separately accessing `Window` while output bytes
-/// are being written. `previous_history` snapshots how much of the previous callback window is
-/// valid; current output always starts again at index zero after a flush, so Back mode does not need
-/// the ordinary circular-window `next` cursor.
-struct BackWriter<'a> {
-    writer: Writer<'a>,
-    previous_history: usize,
-}
-
-impl<'a> BackWriter<'a> {
-    #[inline(always)]
-    fn new(window: &'a mut Window<'_>, filled: usize) -> Self {
-        let capacity = window.buffer_size();
-        assert!(
-            filled <= capacity,
-            "inflateBack output prefix stays in-bounds"
-        );
-        let previous_history = window.have();
-        let ptr = window.as_mut_ptr();
-
-        // SAFETY: `Window` owns a writable backing allocation of `capacity` bytes for this borrow,
-        // and `filled` is exactly the initialized current-output prefix tracked by `BackOutput`.
-        let writer = unsafe { Writer::new_uninit_raw(ptr, filled, capacity) };
-        Self {
-            writer,
-            previous_history,
-        }
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.writer.len()
-    }
-
-    #[inline(always)]
-    fn remaining(&self) -> usize {
-        self.writer.remaining()
-    }
-
-    #[inline(always)]
-    fn push(&mut self, byte: u8) {
-        self.writer.push(byte);
-    }
-
-    #[inline(always)]
-    fn extend(&mut self, bytes: &[u8]) {
-        self.writer.extend(bytes);
-    }
-
-    /// Copy one DEFLATE back-reference into the current output prefix.
-    ///
-    /// If the distance reaches before the current prefix, history begins in the untouched tail of
-    /// the previous full callback window. Once that tail is consumed, ordinary overlapping match
-    /// expansion continues from the current prefix.
-    #[inline(always)]
-    fn copy_match(
-        &mut self,
-        sane: bool,
-        distance: usize,
-        length: usize,
-    ) -> Result<(), &'static str> {
-        if distance > self.writer.capacity() {
-            if sane {
-                return Err("invalid distance too far back\\0");
-            }
-            panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
-        }
-
-        let written = self.writer.len();
-        if distance > written {
-            let from_previous = distance - written;
-            if from_previous > self.previous_history {
-                if sane {
-                    return Err("invalid distance too far back\0");
-                }
-                panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
-            }
-
-            let copy = Ord::min(from_previous, length);
-            let source_start = self.writer.capacity() - from_previous;
-            // SAFETY: `previous_history` describes initialized bytes from the preceding full
-            // callback window. Back output overwrites from index zero, so the still-needed history
-            // is exactly the untouched tail ending at capacity. `copy <= from_previous` keeps the
-            // source within that initialized tail; the Writer bounds-checks the destination.
-            unsafe { self.writer.extend_from_backing(source_start, copy) };
-
-            if copy < length {
-                // `copy < length` implies `copy == from_previous`, so after consuming the previous
-                // tail the remaining match begins at index zero of current output.
-                self.writer.copy_match(distance, length - copy);
-            }
-        } else {
-            self.writer.copy_match(distance, length);
-        }
-        Ok(())
-    }
-}
-
 /// Initialize the stream in an inflate state
 pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -> ReturnCode {
     assert_eq!(1 << config.window_bits, window.buffer_size());
@@ -473,6 +373,22 @@ pub unsafe fn back(
         return ReturnCode::StreamError;
     }
 
+    // SAFETY: `back` inherits zlib's input-span and callback contracts from its caller for this
+    // invocation. Once bound, `decode_back` uses only safe cursor operations.
+    let input = unsafe { BackInput::new(strm.next_in.cast_const(), strm.avail_in, in_, in_desc) };
+    // SAFETY: same contract for the output callback and caller-owned window.
+    let output = unsafe { BackOutput::new(out, out_desc) };
+
+    decode_back(strm, input, output)
+}
+
+/// Safe `inflateBack` state-machine core. Raw callback and initial-span contracts are bound before
+/// entry; decoding itself only manipulates checked cursors, state, and the exclusive `BackWriter`.
+fn decode_back(
+    strm: &mut InflateStream,
+    mut input: BackInput,
+    mut output: BackOutput,
+) -> ReturnCode {
     let mut ret;
 
     /* Reset the state */
@@ -486,13 +402,6 @@ pub unsafe fn back(
     let state = &mut *strm.state;
     let mut window = core::mem::replace(&mut state.window, Window::empty());
     window.clear();
-
-    // SAFETY: `inflateBack` requires the caller-provided initial span to be valid for `avail_in`.
-    let mut input =
-        unsafe { BackInput::new(strm.next_in.cast_const(), strm.avail_in, in_, in_desc) };
-    // SAFETY: `back` inherits zlib's callback contract from its caller for the duration of this
-    // invocation.
-    let mut output = unsafe { BackOutput::new(out, out_desc) };
 
     'inf_leave: loop {
         match state.mode {
@@ -1244,7 +1153,7 @@ mod tests {
         let mut writer = BackWriter::new(&mut window, 4);
         assert_eq!(
             writer.copy_match(true, 33, 3),
-            Err("invalid distance too far back\\0")
+            Err("invalid distance too far back\0")
         );
     }
 
