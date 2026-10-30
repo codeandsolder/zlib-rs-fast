@@ -7,8 +7,8 @@ use super::{
     },
     compress_slice, deflate, end, init,
     longest_match::{
-        execute_match_search_batch, execute_match_search_batch_with_backend, MatchSearchRequest,
-        MatchSearchResult, MatchSearchWork, ScopedThreadMatchSearchBackend,
+        execute_match_search_batch_with_backend, MatchSearchRequest, MatchSearchResult,
+        MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     DeflateConfig, DeflateFlush, DeflateStream, InputCursor, OutputCursor, ReturnCode, Status,
 };
@@ -53,9 +53,10 @@ pub enum BatchMatchSearchBackend {
 ///
 /// Every job uses the same configuration and produces the same bytes as an independent
 /// [`super::compress_slice`] call. Fast, Medium, Slow, Huffman-only, and RLE compression share the
-/// schedulable standard-driver path and collect outstanding match searches across streams before
-/// executing them as one batch. Stored and Quick compression have different block mechanics and
-/// therefore fall back to the ordinary synchronous slice compressor.
+/// schedulable standard-driver path. The default scalar backend executes detached searches directly
+/// without staging; backends that need cross-stream concurrency collect outstanding searches into a
+/// batch. Stored and Quick compression have different block mechanics and therefore fall back to the
+/// ordinary synchronous slice compressor.
 ///
 /// The function is available with the `std` feature because the cross-stream scheduler owns dynamic
 /// scratch vectors. Per-stream compression state still uses the crate's ordinary zlib allocator
@@ -101,14 +102,26 @@ pub fn compress_slices_batch_with_backend(
     }
 
     let mut active = runtimes.len();
-    let mut match_work = Vec::<(usize, MatchSearchWork)>::with_capacity(runtimes.len());
-    let mut match_results = vec![
-        MatchSearchResult {
-            length: 0,
-            start: 0,
-        };
-        runtimes.len()
-    ];
+    let concurrent_searches = matches!(
+        backend,
+        BatchMatchSearchBackend::ScopedThreads { workers } if workers > 1
+    );
+    let mut match_work = if concurrent_searches {
+        Vec::<(usize, MatchSearchWork)>::with_capacity(runtimes.len())
+    } else {
+        Vec::new()
+    };
+    let mut match_results = if concurrent_searches {
+        vec![
+            MatchSearchResult {
+                length: 0,
+                start: 0,
+            };
+            runtimes.len()
+        ]
+    } else {
+        Vec::new()
+    };
 
     while active != 0 {
         match_work.clear();
@@ -120,7 +133,16 @@ pub fn compress_slices_batch_with_backend(
 
             match runtime.step() {
                 RuntimeStep::Progress => {}
-                RuntimeStep::MatchSearch(work) => match_work.push((runtime_index, work)),
+                RuntimeStep::MatchSearch(work) => {
+                    if concurrent_searches {
+                        match_work.push((runtime_index, work));
+                    } else {
+                        // Scalar and one-worker execution borrow only this paused runtime and can be
+                        // completed immediately, so they need no cross-stream scratch vectors.
+                        let result = runtime.match_request(work).execute();
+                        runtime.complete_match_search(result);
+                    }
+                }
                 RuntimeStep::Done(result) => {
                     results[runtime.job_index] = result;
                     active -= 1;
@@ -132,26 +154,31 @@ pub fn compress_slices_batch_with_backend(
             continue;
         }
 
-        // Requests intentionally borrow immutable window/hash resources from the paused streams.
-        // Keep them in a short scope, execute the backend batch, then drop every borrow before
-        // delivering results and mutating compression state again.
+        if match_work.len() == 1 {
+            // A temporarily desynchronized batch has nothing to parallelize. Avoid allocating a
+            // request vector just to let the threaded backend collapse back to one scalar worker.
+            let (runtime_index, work) = match_work[0];
+            let result = runtimes[runtime_index].match_request(work).execute();
+            runtimes[runtime_index].complete_match_search(result);
+            continue;
+        }
+
+        let BatchMatchSearchBackend::ScopedThreads { workers } = backend else {
+            unreachable!("only concurrent backends stage match-search work");
+        };
+
+        // Concurrent execution needs all immutable requests alive at once. Keep that staging vector
+        // in the shortest possible scope so no borrowed runtime survives into the resume pass.
         {
             let requests = match_work
                 .iter()
                 .map(|(runtime_index, work)| runtimes[*runtime_index].match_request(*work))
                 .collect::<Vec<MatchSearchRequest<'_>>>();
-            match backend {
-                BatchMatchSearchBackend::Scalar => {
-                    execute_match_search_batch(&requests, &mut match_results[..requests.len()]);
-                }
-                BatchMatchSearchBackend::ScopedThreads { workers } => {
-                    execute_match_search_batch_with_backend(
-                        &ScopedThreadMatchSearchBackend::new(workers),
-                        &requests,
-                        &mut match_results[..requests.len()],
-                    );
-                }
-            }
+            execute_match_search_batch_with_backend(
+                &ScopedThreadMatchSearchBackend::new(workers),
+                &requests,
+                &mut match_results[..requests.len()],
+            );
         }
 
         for ((runtime_index, _), result) in match_work
