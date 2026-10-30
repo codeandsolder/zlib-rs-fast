@@ -54,9 +54,10 @@ impl<'a> Writer<'a> {
     /// Returns a shared reference to the filled portion of the buffer.
     #[inline]
     pub fn filled(&self) -> &[u8] {
+        let filled = &self.buf.as_slice()[..self.filled];
         // SAFETY: the filled area of the buffer is always initialized, and self.filled is always
         // in-bounds.
-        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast(), self.filled) }
+        unsafe { filled.assume_init_ref() }
     }
 
     /// Returns the number of bytes at the end of the slice that have not yet been filled.
@@ -80,7 +81,7 @@ impl<'a> Writer<'a> {
     #[inline(always)]
     pub fn extend(&mut self, buf: &[u8]) {
         // using simd here (on x86_64) was not fruitful
-        self.buf.as_mut_slice()[self.filled..][..buf.len()].copy_from_slice(slice_to_uninit(buf));
+        self.buf.as_mut_slice()[self.filled..][..buf.len()].write_copy_of_slice(buf);
 
         self.filled += buf.len();
     }
@@ -260,10 +261,6 @@ impl fmt::Debug for Writer<'_> {
             .field("capacity", &self.capacity())
             .finish()
     }
-}
-
-fn slice_to_uninit(slice: &[u8]) -> &[MaybeUninit<u8>] {
-    unsafe { &*(slice as *const [u8] as *const [MaybeUninit<u8>]) }
 }
 
 #[cfg(test)]

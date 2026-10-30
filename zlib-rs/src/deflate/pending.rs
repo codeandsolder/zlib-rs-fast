@@ -23,8 +23,8 @@ impl<'a> Pending<'a> {
 
     pub fn pending(&self) -> &[u8] {
         let slice = &self.buf.as_slice()[self.out..][..self.pending];
-        // SAFETY: the slice contains initialized bytes.
-        unsafe { &*(slice as *const [MaybeUninit<u8>] as *const [u8]) }
+        // SAFETY: `out..out + pending` is exactly the initialized pending-output range.
+        unsafe { slice.assume_init_ref() }
     }
 
     #[inline(always)]
@@ -84,10 +84,7 @@ impl<'a> Pending<'a> {
             "buf.len() must fit in remaining()"
         );
 
-        // SAFETY: [u8] is valid [MaybeUninit<u8>]
-        let buf = unsafe { &*(buf as *const [u8] as *const [MaybeUninit<u8>]) };
-
-        self.buf.as_mut_slice()[self.out + self.pending..][..buf.len()].copy_from_slice(buf);
+        self.buf.as_mut_slice()[self.out + self.pending..][..buf.len()].write_copy_of_slice(buf);
 
         self.pending += buf.len();
     }

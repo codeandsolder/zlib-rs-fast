@@ -50,7 +50,7 @@ impl<'a> Window<'a> {
         let slice = &self.buf.as_slice()[..self.initialized];
         // SAFETY: `initialized` advances only after those bytes are written, and may shrink without
         // exposing any previously invalid byte again.
-        unsafe { &*(slice as *const [MaybeUninit<u8>] as *const [u8]) }
+        unsafe { slice.assume_init_ref() }
     }
 
     /// Returns a mutable view of the logically initialized prefix of the window.
@@ -58,7 +58,7 @@ impl<'a> Window<'a> {
     pub fn filled_mut(&mut self) -> &mut [u8] {
         let slice = &mut self.buf.as_mut_slice()[..self.initialized];
         // SAFETY: same initialized-prefix invariant as `filled()`; the borrow is exclusive.
-        unsafe { &mut *(slice as *mut [MaybeUninit<u8>] as *mut [u8]) }
+        unsafe { slice.assume_init_mut() }
     }
 
     /// Forget all logical window contents without touching the backing allocation.
