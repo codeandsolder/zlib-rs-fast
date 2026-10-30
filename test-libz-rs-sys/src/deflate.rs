@@ -1024,6 +1024,34 @@ fn test_deflate_prime() {
 }
 
 #[test]
+fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
+    let dictionary = vec![0x5a; (1 << 15) + 1];
+
+    assert_eq_rs_ng!({
+        let mut strm = MaybeUninit::<z_stream>::zeroed();
+        let init = deflateInit2_(
+            strm.as_mut_ptr(),
+            6,
+            Z_DEFLATED,
+            15,
+            8,
+            Z_DEFAULT_STRATEGY,
+            zlibVersion(),
+            core::mem::size_of::<z_stream>() as _,
+        );
+        let strm = strm.assume_init_mut();
+        let set = deflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
+        let total_in = strm.total_in;
+        let adler = strm.adler;
+        let mut dictionary_len = 0;
+        let get = deflateGetDictionary(strm, core::ptr::null_mut(), &mut dictionary_len);
+        let end = deflateEnd(strm);
+
+        (init, set, total_in, adler, get, dictionary_len, end)
+    });
+}
+
+#[test]
 fn small_window() {
     let deflate_config = DeflateConfig {
         level: Z_BEST_COMPRESSION,

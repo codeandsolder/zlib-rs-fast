@@ -595,7 +595,7 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     state.wrap = 0;
 
     // if dictionary would fill window, just replace the history
-    if dictionary.len() >= state.window.capacity() {
+    if dictionary.len() >= state.w_size {
         if wrap == 0 {
             // clear the hash table
             state.head.as_mut_slice().fill(0);
@@ -611,23 +611,25 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
         dictionary = &dictionary[dictionary.len() - state.w_size..];
     }
 
-    // insert dictionary into window and hash
-    let avail = stream.avail_in;
-    let next = stream.next_in;
-    stream.avail_in = dictionary.len() as _;
-    stream.next_in = dictionary.as_ptr() as *mut u8;
-    fill_window(stream);
+    // Feed the dictionary through the ordinary window-refill core without impersonating caller
+    // input in the public z_stream. zlib counts retained dictionary bytes in total_in, but next_in
+    // and avail_in remain exactly the caller's values across deflateSetDictionary.
+    let mut dictionary_input = InputCursor {
+        next_in: dictionary.as_ptr() as *mut u8,
+        avail_in: dictionary.len() as _,
+        total_in: stream.total_in,
+        adler: stream.adler,
+    };
+    fill_window_core(state, &mut dictionary_input);
 
-    while stream.state.lookahead >= STD_MIN_MATCH {
-        let str = stream.state.strstart;
-        let n = stream.state.lookahead - (STD_MIN_MATCH - 1);
-        stream.state.insert_string(str, n);
-        stream.state.strstart = str + n;
-        stream.state.lookahead = STD_MIN_MATCH - 1;
-        fill_window(stream);
+    while state.lookahead >= STD_MIN_MATCH {
+        let str = state.strstart;
+        let n = state.lookahead - (STD_MIN_MATCH - 1);
+        state.insert_string(str, n);
+        state.strstart = str + n;
+        state.lookahead = STD_MIN_MATCH - 1;
+        fill_window_core(state, &mut dictionary_input);
     }
-
-    let state = &mut *stream.state;
 
     state.strstart += state.lookahead;
     state.block_start = state.strstart as _;
@@ -635,11 +637,8 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     state.lookahead = 0;
     state.prev_length = 0;
     state.match_available = false;
-
-    // restore the state
-    stream.next_in = next;
-    stream.avail_in = avail;
     state.wrap = wrap;
+    stream.total_in = dictionary_input.total_in;
 
     ReturnCode::Ok
 }
@@ -1720,10 +1719,6 @@ pub(crate) enum BlockState {
 
 // Maximum stored block length in deflate format (not including header).
 pub(crate) const MAX_STORED: usize = 65535; // so u16::max
-
-pub(crate) fn fill_window(stream: &mut DeflateStream<'_>) {
-    with_compressor(stream, |compressor| compressor.fill_window());
-}
 
 pub(crate) fn flush_pending(stream: &mut DeflateStream<'_>) {
     with_compressor(stream, |compressor| {
@@ -3844,6 +3839,42 @@ mod test {
 
             assert!(end(stream).is_ok());
         }
+    }
+
+    #[test]
+    fn set_dictionary_keeps_abi_input_cursor_detached() {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        // A caller may have already populated the next input cursor even though no bytes have been
+        // consumed yet. Dictionary setup must not temporarily publish its own slice through these
+        // ABI fields or disturb the caller's cursor.
+        let caller_input = b"future caller input";
+        stream.next_in = caller_input.as_ptr() as *mut u8;
+        stream.avail_in = caller_input.len() as _;
+        let original_next = stream.next_in;
+        let original_avail = stream.avail_in;
+        let total_before = stream.total_in;
+
+        let retained = stream.state.w_size;
+        let dictionary = vec![0x5a; retained + 1];
+        assert_eq!(set_dictionary(stream, &dictionary), ReturnCode::Ok);
+
+        assert_eq!(stream.next_in, original_next);
+        assert_eq!(stream.avail_in, original_avail);
+        assert_eq!(
+            stream.total_in,
+            total_before + retained as crate::c_api::z_size,
+            "only the logical-window tail is ingested into compression history"
+        );
+        assert_eq!(
+            stream.adler as u32,
+            adler32(ADLER32_INITIAL_VALUE as u32, &dictionary),
+            "zlib wrapper dictionary id still covers the entire supplied dictionary"
+        );
+
+        assert!(end(stream).is_ok());
     }
 
     #[test]
