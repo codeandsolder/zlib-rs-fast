@@ -122,13 +122,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
                 // Slide the initialized portion of the history window down.
                 let state = &mut stream.state;
                 state.strstart -= state.w_size;
-                let copy = state
-                    .strstart
-                    .min(state.window.filled().len() - state.w_size);
-                state
-                    .window
-                    .filled_mut()
-                    .copy_within(state.w_size..state.w_size + copy, 0);
+                state.window.slide_down(state.w_size);
                 state.matches = (state.matches + 1).min(2); // pending slide_hash
                 state.insert = state.insert.min(state.strstart);
             }
@@ -167,14 +161,8 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         state.block_start -= state.w_size as isize;
         state.strstart -= state.w_size;
 
-        // make sure we don't copy uninitialized bytes. While we discard the first lower w_size
-        // bytes, it is not guaranteed that the upper w_size bytes are all initialized
-        let copy = Ord::min(state.strstart, state.window.filled().len() - state.w_size);
-
-        state
-            .window
-            .filled_mut()
-            .copy_within(state.w_size..state.w_size + copy, 0);
+        // Preserve only the logically initialized upper-half history.
+        state.window.slide_down(state.w_size);
 
         if state.matches < 2 {
             // add a pending slide_hash

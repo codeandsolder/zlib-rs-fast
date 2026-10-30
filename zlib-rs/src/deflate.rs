@@ -826,6 +826,7 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
             state.strstart = 0;
             state.block_start = 0;
             state.insert = 0;
+            state.window.clear();
         } else {
             /* already empty otherwise */
         }
@@ -1010,6 +1011,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
 
 fn lm_init(state: &mut State) {
     state.window_size = 2 * state.w_size;
+    state.window.clear();
 
     // zlib uses CLEAR_HASH here
     state.head.as_mut_slice().fill(0);
@@ -2027,9 +2029,8 @@ pub(crate) fn fill_window_core(
         // If the window is almost full and there is insufficient lookahead,
         // move the upper half to the lower one to make room in the upper half.
         if state.strstart >= wsize + state.max_dist() {
-            // shift the window to the left
-            let (old, new) = state.window.filled_mut()[..2 * wsize].split_at_mut(wsize);
-            old.copy_from_slice(new);
+            // Shift only the logically initialized upper-half bytes down.
+            state.window.slide_down(wsize);
 
             if state.match_start >= wsize as u16 {
                 state.match_start -= wsize as u16;
@@ -2976,6 +2977,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
                             state.strstart = 0;
                             state.block_start = 0;
                             state.insert = 0;
+                            state.window.clear();
                         }
                     }
                     DeflateFlush::Block => { /* fall through */ }
@@ -3699,7 +3701,6 @@ impl DeflateAllocOffsets {
         let w_size = 1usize << self.window_bits;
 
         let window_ptr = unsafe { base.add(self.window_pos) };
-        unsafe { window_ptr.write_bytes(0, 2 * w_size) };
         let window = unsafe { Window::from_raw_parts(window_ptr, self.window_bits) };
 
         let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
@@ -3744,10 +3745,7 @@ impl DeflateAllocOffsets {
         debug_assert_eq!(source.lit_bufsize, self.lit_bufsize);
 
         let window_ptr = unsafe { base.add(self.window_pos) };
-        unsafe {
-            window_ptr.copy_from_nonoverlapping(source.window.as_ptr(), source.window.capacity())
-        };
-        let window = unsafe { Window::from_raw_parts(window_ptr, self.window_bits) };
+        let window = unsafe { source.window.clone_to(window_ptr) };
 
         let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
         unsafe { prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len()) };
@@ -4312,6 +4310,49 @@ mod test {
         assert_eq!(output.len(), EXPECTED.len());
 
         assert_eq!(EXPECTED, output);
+    }
+
+    fn compress_with_input_chunks(
+        input: &[u8],
+        config: DeflateConfig,
+        chunk_size: usize,
+    ) -> Vec<u8> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        let mut output = vec![0u8; compress_bound(input.len()) + 64];
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = output.len() as _;
+
+        for chunk in input.chunks(chunk_size) {
+            stream.next_in = chunk.as_ptr() as *mut u8;
+            stream.avail_in = chunk.len() as _;
+            while stream.avail_in != 0 {
+                assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+                assert_ne!(
+                    stream.avail_out, 0,
+                    "compress_bound-sized output unexpectedly filled"
+                );
+            }
+        }
+
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        loop {
+            match deflate(stream, DeflateFlush::Finish) {
+                ReturnCode::Ok => assert_ne!(
+                    stream.avail_out, 0,
+                    "compress_bound-sized output unexpectedly filled while finishing"
+                ),
+                ReturnCode::StreamEnd => break,
+                other => panic!("input-chunked deflate failed: {other:?}"),
+            }
+        }
+
+        output.truncate(stream.total_out as usize);
+        assert!(end(stream).is_ok());
+        output
     }
 
     fn compress_with_output_chunks(
@@ -4951,6 +4992,36 @@ mod test {
     }
 
     #[test]
+    fn fast_deflate_is_input_chunking_independent() {
+        let mut input = Vec::with_capacity(100_000);
+        for i in 0..3_000usize {
+            input.extend_from_slice(b"logical-window-tail/");
+            input.extend(core::iter::repeat_n((i % 251) as u8, 1 + i % 19));
+            input.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+
+        let config = DeflateConfig {
+            level: 2,
+            method: Method::Deflated,
+            window_bits: crate::MAX_WBITS,
+            mem_level: 8,
+            strategy: Strategy::Default,
+        };
+        let mut reference_buf = vec![0u8; compress_bound(input.len())];
+        let (reference, rc) = compress_slice(&mut reference_buf, &input, config);
+        assert_eq!(rc, ReturnCode::Ok);
+        let reference = reference.to_vec();
+
+        for chunk_size in [1, 2, 3, 4, 7, 31, 257] {
+            assert_eq!(
+                compress_with_input_chunks(&input, config, chunk_size),
+                reference,
+                "fast output changed with {chunk_size}-byte input chunks"
+            );
+        }
+    }
+
+    #[test]
     fn token_producers_are_output_chunking_independent_across_block_boundaries() {
         let mut input = Vec::with_capacity(160_000);
         for i in 0..4_000usize {
@@ -5272,7 +5343,13 @@ mod test {
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
         let source = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
 
-        source.state.window.filled_mut()[0] = 0x11;
+        let initial_window_byte = 0x11u8;
+        unsafe {
+            source
+                .state
+                .window
+                .copy_and_initialize(0..1, &initial_window_byte)
+        };
         source.state.prev.as_mut_slice()[0] = 0x1234;
         source.state.head.as_mut_slice()[0] = 0x2345;
         source.state.bit_writer.pending.extend(&[1, 2, 3]);

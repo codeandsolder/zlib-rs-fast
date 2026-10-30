@@ -53,10 +53,19 @@ impl TokenProducer for FastProducer {
                         state.strstart += match_len;
                     } else {
                         state.strstart += match_len;
-                        StandardHashCalc::quick_insert_string(
-                            state,
-                            state.strstart + 2 - STD_MIN_MATCH,
-                        );
+
+                        // zlib-ng performs this insertion unconditionally and relies on its
+                        // high-water zero padding when fewer than STD_MIN_MATCH tail bytes remain.
+                        // The key starts one byte before the new strstart, so three real lookahead
+                        // bytes are exactly what is required to form the four-byte StandardHash.
+                        // With a shorter tail the native insertion is deliberately garbage and is
+                        // never useful; do not manufacture padded input just to reproduce it.
+                        if state.lookahead >= STD_MIN_MATCH {
+                            StandardHashCalc::quick_insert_string(
+                                state,
+                                state.strstart + 2 - STD_MIN_MATCH,
+                            );
+                        }
                     }
 
                     if block_ready {
