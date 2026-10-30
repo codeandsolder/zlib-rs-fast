@@ -11,6 +11,7 @@ use super::{
         MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     DeflateConfig, DeflateFlush, DeflateStream, InputCursor, OutputCursor, ReturnCode, Status,
+    StreamChecksum,
 };
 use crate::c_api::z_stream;
 
@@ -397,9 +398,17 @@ impl<'a> BatchRuntime<'a> {
             .expect("live batch runtime has initialized state");
         let mut input = InputCursor::from_stream(stream);
         let mut output = OutputCursor::from_stream(stream);
-        let outcome = driver.step(&mut *stream.state, &mut input, &mut output, mode);
+        let mut checksum = StreamChecksum::from_stream(stream);
+        let outcome = driver.step(
+            &mut *stream.state,
+            &mut input,
+            &mut output,
+            &mut checksum,
+            mode,
+        );
         input.apply(stream);
         output.apply(stream);
+        checksum.apply(stream);
 
         match outcome {
             StandardTurnOutcome::Progress => RuntimeStep::Progress,

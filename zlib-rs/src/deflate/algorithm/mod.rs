@@ -2,7 +2,8 @@ use crate::{
     deflate::{
         drain_pending_output, fill_window_core,
         longest_match::{execute_match_search_batch, MatchSearchResult, MatchSearchWork},
-        BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, MIN_LOOKAHEAD,
+        BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, StreamChecksum,
+        MIN_LOOKAHEAD,
     },
     DeflateFlush,
 };
@@ -333,10 +334,18 @@ impl StandardCore {
         &mut self,
         state: &mut State<'_>,
         input: &mut InputCursor,
+        checksum: &mut StreamChecksum,
         demand: InputDemand,
         completion: InputCompletion,
     ) -> RefillOutcome {
-        let outcome = satisfy_input_demand(state, input, &mut self.producer, demand, completion);
+        let outcome = satisfy_input_demand(
+            state,
+            input,
+            checksum,
+            &mut self.producer,
+            demand,
+            completion,
+        );
         if outcome == RefillOutcome::FinalTail {
             self.input_phase = InputPhase::FinalTail;
         }
@@ -472,9 +481,10 @@ impl StandardDriver {
         state: &mut State<'_>,
         input: &mut InputCursor,
         output: &mut crate::deflate::OutputCursor,
+        checksum: &mut StreamChecksum,
         mode: StandardSegmentMode,
     ) -> StandardTurnOutcome {
-        self.step_inner(state, input, output, mode)
+        self.step_inner(state, input, output, checksum, mode)
     }
 
     #[inline(always)]
@@ -483,6 +493,7 @@ impl StandardDriver {
         state: &mut State<'_>,
         input: &mut InputCursor,
         output: &mut crate::deflate::OutputCursor,
+        checksum: &mut StreamChecksum,
         mode: StandardSegmentMode,
     ) -> StandardTurnOutcome {
         if let Some(pending) = self.pending_drain.take() {
@@ -518,10 +529,13 @@ impl StandardDriver {
 
         match event {
             OwnedCoreEvent::NeedInput(demand) => {
-                match self
-                    .core
-                    .satisfy_input(state, input, demand, mode.input_completion())
-                {
+                match self.core.satisfy_input(
+                    state,
+                    input,
+                    checksum,
+                    demand,
+                    mode.input_completion(),
+                ) {
                     RefillOutcome::Ready | RefillOutcome::FinalTail => {
                         StandardTurnOutcome::Progress
                     }
@@ -662,13 +676,14 @@ pub(super) enum RefillOutcome {
 fn satisfy_input_demand(
     state: &mut State<'_>,
     input: &mut InputCursor,
+    checksum: &mut StreamChecksum,
     producer: &mut StandardProducer,
     demand: InputDemand,
     completion: InputCompletion,
 ) -> RefillOutcome {
     debug_assert!(!demand.is_satisfied(state));
 
-    fill_window_core(state, input);
+    fill_window_core(state, input, checksum);
     producer.after_refill(state);
 
     if demand.is_satisfied(state) {
@@ -689,6 +704,7 @@ pub(super) fn drive_standard(
     state: &mut State<'_>,
     input: &mut InputCursor,
     output: &mut crate::deflate::OutputCursor,
+    checksum: &mut StreamChecksum,
     flush: DeflateFlush,
     driver: &mut StandardDriver,
 ) -> BlockState {
@@ -699,7 +715,7 @@ pub(super) fn drive_standard(
     };
 
     loop {
-        match driver.step_inner(state, input, output, mode) {
+        match driver.step_inner(state, input, output, checksum, mode) {
             StandardTurnOutcome::Progress => {}
             StandardTurnOutcome::MatchSearch(work) => {
                 let request = work.request(state);
@@ -764,6 +780,7 @@ impl Algorithm {
                     stream.state,
                     &mut stream.input,
                     &mut stream.output,
+                    &mut stream.checksum,
                     flush,
                     &mut driver,
                 )

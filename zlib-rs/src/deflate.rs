@@ -66,7 +66,6 @@ pub(crate) struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
-    pub(crate) adler: crate::c_api::z_checksum,
 }
 
 impl InputCursor {
@@ -75,7 +74,6 @@ impl InputCursor {
             next_in: stream.next_in,
             avail_in: stream.avail_in,
             total_in: stream.total_in,
-            adler: stream.adler,
         }
     }
 
@@ -83,19 +81,13 @@ impl InputCursor {
         stream.next_in = self.next_in;
         stream.avail_in = self.avail_in;
         stream.total_in = self.total_in;
-        stream.adler = self.adler;
     }
 
-    fn from_slice(
-        bytes: &[u8],
-        total_in: crate::c_api::z_size,
-        adler: crate::c_api::z_checksum,
-    ) -> Self {
+    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Self {
         Self {
             next_in: bytes.as_ptr() as *mut u8,
             avail_in: bytes.len() as crate::c_api::uInt,
             total_in,
-            adler,
         }
     }
 
@@ -147,6 +139,45 @@ impl InputCursor {
         self.next_in = self.next_in.wrapping_add(len);
         self.avail_in -= len as crate::c_api::uInt;
         self.total_in = self.total_in.wrapping_add(len as crate::c_api::z_size);
+    }
+}
+
+/// Public zlib checksum field detached from caller input traversal.
+///
+/// zlib overloads `z_stream.adler`: it is the running Adler-32 for zlib streams, temporary gzip
+/// header CRC state while emitting an HCRC header, and the final gzip data CRC once finishing.
+/// Keeping that ABI-visible value explicit prevents input cursors from silently carrying stream
+/// state unrelated to byte traversal.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamChecksum(crate::c_api::z_checksum);
+
+impl StreamChecksum {
+    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+        Self(stream.adler)
+    }
+
+    fn apply(self, stream: &mut DeflateStream<'_>) {
+        stream.adler = self.0;
+    }
+
+    fn value(self) -> crate::c_api::z_checksum {
+        self.0
+    }
+
+    fn set(&mut self, value: crate::c_api::z_checksum) {
+        self.0 = value;
+    }
+
+    fn reset_adler(&mut self) {
+        self.0 = ADLER32_INITIAL_VALUE as _;
+    }
+
+    fn update_adler(&mut self, bytes: &[u8]) {
+        self.0 = adler32(self.0 as u32, bytes) as _;
+    }
+
+    fn update_crc(&mut self, bytes: &[u8]) {
+        self.0 = crc32(self.0 as u32, bytes) as _;
     }
 }
 
@@ -228,23 +259,30 @@ pub(crate) struct Compressor<'a, 'state> {
     pub(crate) state: &'a mut State<'state>,
     pub(crate) input: InputCursor,
     pub(crate) output: OutputCursor,
+    pub(crate) checksum: StreamChecksum,
 }
 
 impl<'a, 'state> Compressor<'a, 'state> {
-    fn new(state: &'a mut State<'state>, input: InputCursor, output: OutputCursor) -> Self {
+    fn new(
+        state: &'a mut State<'state>,
+        input: InputCursor,
+        output: OutputCursor,
+        checksum: StreamChecksum,
+    ) -> Self {
         Self {
             state,
             input,
             output,
+            checksum,
         }
     }
 
-    fn into_cursors(self) -> (InputCursor, OutputCursor) {
-        (self.input, self.output)
+    fn into_call_state(self) -> (InputCursor, OutputCursor, StreamChecksum) {
+        (self.input, self.output, self.checksum)
     }
 
     pub(crate) fn fill_window(&mut self) {
-        fill_window_core(self.state, &mut self.input);
+        fill_window_core(self.state, &mut self.input, &mut self.checksum);
     }
 
     fn drain_pending(&mut self) -> DrainOutcome {
@@ -252,7 +290,13 @@ impl<'a, 'state> Compressor<'a, 'state> {
     }
 
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
-        read_buf_window_core(self.state, &mut self.input, offset, size)
+        read_buf_window_core(
+            self.state,
+            &mut self.input,
+            &mut self.checksum,
+            offset,
+            size,
+        )
     }
 
     /// Copy initialized history bytes to the caller's output buffer.
@@ -281,7 +325,7 @@ impl<'a, 'state> Compressor<'a, 'state> {
         let copied = unsafe { self.input.copy_to_output(&mut self.output, len) };
         match self.state.wrap {
             2 => self.state.crc_fold.fold(copied),
-            1 => self.input.adler = crate::adler32::adler32(self.input.adler as u32, copied) as _,
+            1 => self.checksum.update_adler(copied),
             _ => {}
         }
 
@@ -312,15 +356,17 @@ fn with_compressor<'state, R>(
     stream.state.data_type = stream.data_type;
     let input = InputCursor::from_stream(stream);
     let output = OutputCursor::from_stream(stream);
-    let (result, input, output, data_type) = {
-        let mut compressor = Compressor::new(&mut *stream.state, input, output);
+    let checksum = StreamChecksum::from_stream(stream);
+    let (result, input, output, checksum, data_type) = {
+        let mut compressor = Compressor::new(&mut *stream.state, input, output, checksum);
         let result = f(&mut compressor);
         let data_type = compressor.state.data_type;
-        let (input, output) = compressor.into_cursors();
-        (result, input, output, data_type)
+        let (input, output, checksum) = compressor.into_call_state();
+        (result, input, output, checksum, data_type)
     };
     input.apply(stream);
     output.apply(stream);
+    checksum.apply(stream);
     stream.data_type = data_type;
     result
 }
@@ -672,19 +718,22 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 }
 
 pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> ReturnCode {
-    let state = &mut *stream.state;
+    let wrap = stream.state.wrap;
 
-    let wrap = state.wrap;
-
-    if wrap == 2 || (wrap == 1 && state.status != Status::Init) || state.lookahead != 0 {
+    if wrap == 2
+        || (wrap == 1 && stream.state.status != Status::Init)
+        || stream.state.lookahead != 0
+    {
         return ReturnCode::StreamError;
     }
 
+    let mut checksum = StreamChecksum::from_stream(stream);
     // when using zlib wrappers, compute Adler-32 for provided dictionary
     if wrap == 1 {
-        stream.adler = adler32(stream.adler as u32, dictionary) as z_checksum;
+        checksum.update_adler(dictionary);
     }
 
+    let state = &mut *stream.state;
     // avoid computing Adler-32 in read_buf
     state.wrap = 0;
 
@@ -708,8 +757,8 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     // Feed the dictionary through the ordinary window-refill core without impersonating caller
     // input in the public z_stream. zlib counts retained dictionary bytes in total_in, but next_in
     // and avail_in remain exactly the caller's values across deflateSetDictionary.
-    let mut dictionary_input = InputCursor::from_slice(dictionary, stream.total_in, stream.adler);
-    fill_window_core(state, &mut dictionary_input);
+    let mut dictionary_input = InputCursor::from_slice(dictionary, stream.total_in);
+    fill_window_core(state, &mut dictionary_input, &mut checksum);
 
     while state.lookahead >= STD_MIN_MATCH {
         let str = state.strstart;
@@ -717,7 +766,7 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
         state.insert_string(str, n);
         state.strstart = str + n;
         state.lookahead = STD_MIN_MATCH - 1;
-        fill_window_core(state, &mut dictionary_input);
+        fill_window_core(state, &mut dictionary_input, &mut checksum);
     }
 
     state.strstart += state.lookahead;
@@ -728,6 +777,7 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     state.match_available = false;
     state.wrap = wrap;
     stream.total_in = dictionary_input.total_in;
+    checksum.apply(stream);
 
     ReturnCode::Ok
 }
@@ -1812,6 +1862,7 @@ pub(crate) const MAX_STORED: usize = 65535; // so u16::max
 fn read_buf_window_core(
     state: &mut State<'_>,
     input: &mut InputCursor,
+    checksum: &mut StreamChecksum,
     offset: usize,
     size: usize,
 ) -> usize {
@@ -1829,7 +1880,7 @@ fn read_buf_window_core(
     if state.wrap == 2 {
         state.crc_fold.fold(data);
     } else if state.wrap == 1 {
-        input.adler = adler32(input.adler as u32, data) as _;
+        checksum.update_adler(data);
     }
 
     len
@@ -1883,7 +1934,11 @@ pub(crate) const WANT_MIN_MATCH: usize = 4;
 pub(crate) const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
 
 #[inline]
-pub(crate) fn fill_window_core(state: &mut State<'_>, input: &mut InputCursor) {
+pub(crate) fn fill_window_core(
+    state: &mut State<'_>,
+    input: &mut InputCursor,
+    checksum: &mut StreamChecksum,
+) {
     debug_assert!(state.lookahead < MIN_LOOKAHEAD);
 
     let wsize = state.w_size;
@@ -1930,7 +1985,13 @@ pub(crate) fn fill_window_core(state: &mut State<'_>, input: &mut InputCursor) {
         // If there was sliding, more >= WSIZE. So in all cases, more >= 2.
         assert!(more >= 2, "more < 2");
 
-        let n = read_buf_window_core(state, input, state.strstart + state.lookahead, more);
+        let n = read_buf_window_core(
+            state,
+            input,
+            checksum,
+            state.strstart + state.lookahead,
+            more,
+        );
 
         state.lookahead += n;
 
@@ -2561,10 +2622,9 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
 
         state.bit_writer.pending.extend(&bytes[..copy]);
 
-        stream.input.adler = crc32(
-            stream.input.adler as u32,
-            &state.bit_writer.pending.pending()[beg..],
-        ) as z_checksum;
+        stream
+            .checksum
+            .update_crc(&state.bit_writer.pending.pending()[beg..]);
 
         state.gzindex += copy;
         let _ = stream.drain_pending();
@@ -2582,10 +2642,9 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
 
     state.bit_writer.pending.extend(bytes);
 
-    stream.input.adler = crc32(
-        stream.input.adler as u32,
-        &state.bit_writer.pending.pending()[beg..],
-    ) as z_checksum;
+    stream
+        .checksum
+        .update_crc(&state.bit_writer.pending.pending()[beg..]);
     state.gzindex = 0;
 
     ControlFlow::Continue(())
@@ -2659,11 +2718,11 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
         /* Save the adler32 of the preset dictionary: */
         if stream.state.strstart != 0 {
-            let adler = stream.input.adler as u32;
+            let adler = stream.checksum.value() as u32;
             stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
         }
 
-        stream.input.adler = ADLER32_INITIAL_VALUE as _;
+        stream.checksum.reset_adler();
         stream.state.status = Status::Busy;
 
         // compression must start with an empty pending buffer
@@ -2722,10 +2781,9 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
                 }
 
                 if gzhead.hcrc != 0 {
-                    stream.input.adler = crc32(
-                        stream.input.adler as u32,
-                        stream.state.bit_writer.pending.pending(),
-                    ) as z_checksum
+                    stream
+                        .checksum
+                        .update_crc(stream.state.bit_writer.pending.pending());
                 }
 
                 stream.state.gzindex = 0;
@@ -2795,7 +2853,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
             // SAFETY: see `set_header`; this stage only reads the caller-owned header.
             let gzhead = unsafe { gzhead.as_ref() };
             if gzhead.hcrc != 0 {
-                let bytes = (stream.input.adler as u16).to_le_bytes();
+                let bytes = (stream.checksum.value() as u16).to_le_bytes();
                 if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
                     return err;
                 }
@@ -2888,9 +2946,9 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
     // write the trailer
     if stream.state.wrap == 2 {
         let crc_fold = core::mem::take(&mut stream.state.crc_fold);
-        stream.input.adler = crc_fold.finish() as z_checksum;
+        stream.checksum.set(crc_fold.finish() as z_checksum);
 
-        let adler = stream.input.adler as u32;
+        let adler = stream.checksum.value() as u32;
         stream.state.bit_writer.pending.extend(&adler.to_le_bytes());
 
         let total_in = stream.input.total_in as u32;
@@ -2900,7 +2958,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
             .pending
             .extend(&total_in.to_le_bytes());
     } else if stream.state.wrap == 1 {
-        let adler = stream.input.adler as u32;
+        let adler = stream.checksum.value() as u32;
         stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
     }
 
@@ -4249,14 +4307,17 @@ mod test {
 
             let mut input = InputCursor::from_stream(stream);
             let mut output = OutputCursor::from_stream(stream);
+            let mut checksum = StreamChecksum::from_stream(stream);
             let outcome = self.driver.step(
                 &mut *stream.state,
                 &mut input,
                 &mut output,
+                &mut checksum,
                 algorithm::StandardSegmentMode::Final,
             );
             input.apply(stream);
             output.apply(stream);
+            checksum.apply(stream);
 
             let produced = (stream.total_out - before) as usize;
             if produced != 0 {
@@ -4365,14 +4426,17 @@ mod test {
 
             let mut input_cursor = InputCursor::from_stream(stream);
             let mut output_cursor = OutputCursor::from_stream(stream);
+            let mut checksum = StreamChecksum::from_stream(stream);
             let outcome = driver.step(
                 &mut *stream.state,
                 &mut input_cursor,
                 &mut output_cursor,
+                &mut checksum,
                 algorithm::StandardSegmentMode::Final,
             );
             input_cursor.apply(stream);
             output_cursor.apply(stream);
+            checksum.apply(stream);
 
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
@@ -4606,13 +4670,16 @@ mod test {
             match core.next_event(&mut *stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
+                    let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
                         &mut *stream.state,
                         &mut input,
+                        &mut checksum,
                         demand,
                         algorithm::InputCompletion::EndOfSegment,
                     );
                     input.apply(stream);
+                    checksum.apply(stream);
                     assert!(matches!(
                         outcome,
                         algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
@@ -4657,13 +4724,16 @@ mod test {
             match core.next_event(&mut *stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
+                    let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
                         &mut *stream.state,
                         &mut input,
+                        &mut checksum,
                         demand,
                         algorithm::InputCompletion::EndOfSegment,
                     );
                     input.apply(stream);
+                    checksum.apply(stream);
                     assert!(matches!(
                         outcome,
                         algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
@@ -4729,13 +4799,16 @@ mod test {
             match core.next_event(&mut *stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
+                    let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
                         &mut *stream.state,
                         &mut input,
+                        &mut checksum,
                         demand,
                         algorithm::InputCompletion::EndOfSegment,
                     );
                     input.apply(stream);
+                    checksum.apply(stream);
                     assert!(matches!(
                         outcome,
                         algorithm::RefillOutcome::Ready | algorithm::RefillOutcome::FinalTail
