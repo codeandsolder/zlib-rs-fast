@@ -89,24 +89,6 @@ impl<'a> Writer<'a> {
         self.extend(src);
     }
 
-    /// Variant of `extend_from_window` used with `inflateBack`. It does not attempt a chunked
-    /// copy, because there is no padding at the end and the window and output buffer alias.
-    /// So a standard `memmove` will have to do.
-    #[inline(always)]
-    pub fn extend_from_window_back(&mut self, window: &super::window::Window, range: Range<usize>) {
-        let len = range.end - range.start;
-
-        unsafe {
-            core::ptr::copy(
-                window.as_ptr().add(range.start),
-                self.buf.as_mut_ptr().add(self.filled).cast(),
-                len,
-            );
-        }
-
-        self.filled += len;
-    }
-
     #[inline(always)]
     pub fn copy_match(&mut self, offset_from_end: usize, length: usize) {
         let current = self.filled;
@@ -138,11 +120,33 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Variant used by `inflateBack`. Match expansion itself needs no padding now,
-    /// so it shares the exact-copy implementation with ordinary inflate.
+    /// Copy initialized bytes from another position in this same backing allocation.
+    ///
+    /// # Safety
+    /// `source_start..source_start + length` must contain initialized bytes. The range may overlap
+    /// the destination; this uses memmove semantics.
     #[inline(always)]
-    pub fn copy_match_back(&mut self, offset_from_end: usize, length: usize) {
-        self.copy_match(offset_from_end, length);
+    pub(crate) unsafe fn extend_from_backing(&mut self, source_start: usize, length: usize) {
+        let source_end = source_start
+            .checked_add(length)
+            .expect("backing copy source range overflow");
+        assert!(
+            source_end <= self.capacity(),
+            "backing copy source in bounds"
+        );
+        assert!(
+            length <= self.remaining(),
+            "backing copy destination in bounds"
+        );
+
+        unsafe {
+            core::ptr::copy(
+                self.buf.as_ptr().add(source_start),
+                self.buf.as_mut_ptr().add(self.filled),
+                length,
+            );
+        }
+        self.filled += length;
     }
 }
 

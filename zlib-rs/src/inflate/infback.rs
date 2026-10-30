@@ -230,29 +230,22 @@ impl BackOutput {
 
     #[inline(always)]
     fn push(&mut self, window: &mut Window<'_>, byte: u8) {
-        let capacity = window.buffer_size();
+        let mut writer = BackWriter::new(window, self.filled);
         assert!(
-            self.filled < capacity,
+            writer.remaining() != 0,
             "inflateBack output has room for literal"
         );
-        // SAFETY: `filled <= capacity`, the caller-owned window remains valid for the whole
-        // inflateBack call, and Writer tracks initialization of exactly this prefix.
-        let mut writer =
-            unsafe { Writer::new_uninit_raw(window.as_mut_ptr(), self.filled, capacity) };
         writer.push(byte);
         self.filled = writer.len();
     }
 
     #[inline(always)]
     fn extend(&mut self, window: &mut Window<'_>, bytes: &[u8]) {
-        let capacity = window.buffer_size();
+        let mut writer = BackWriter::new(window, self.filled);
         assert!(
-            bytes.len() <= capacity - self.filled,
+            bytes.len() <= writer.remaining(),
             "inflateBack output copy fits"
         );
-        // SAFETY: same window/prefix invariant as `push`; Writer writes only `bytes.len()` bytes.
-        let mut writer =
-            unsafe { Writer::new_uninit_raw(window.as_mut_ptr(), self.filled, capacity) };
         writer.extend(bytes);
         self.filled = writer.len();
     }
@@ -295,60 +288,104 @@ impl BackOutput {
     }
 }
 
-/// Copy one DEFLATE back-reference into the current inflateBack output prefix.
+/// Exclusive writer over the caller-owned `inflateBack` callback window.
 ///
-/// History may start in the previous full callback window and continue into bytes already emitted in
-/// the current window. Keeping this in one place makes the slow and fast decoders share those wrap
-/// and overlap semantics.
-#[inline(always)]
-fn copy_back_match(
-    window: &Window<'_>,
-    sane: bool,
-    writer: &mut Writer<'_>,
-    distance: usize,
-    length: usize,
-) -> Result<(), &'static str> {
-    let written = writer.len();
-    if distance > written {
-        let mut from_end = distance - written;
-        if from_end > window.have() {
+/// The mutable borrow prevents the decoder from separately accessing `Window` while output bytes
+/// are being written. `previous_history` snapshots how much of the previous callback window is
+/// valid; current output always starts again at index zero after a flush, so Back mode does not need
+/// the ordinary circular-window `next` cursor.
+struct BackWriter<'a> {
+    writer: Writer<'a>,
+    previous_history: usize,
+}
+
+impl<'a> BackWriter<'a> {
+    #[inline(always)]
+    fn new(window: &'a mut Window<'_>, filled: usize) -> Self {
+        let capacity = window.buffer_size();
+        assert!(
+            filled <= capacity,
+            "inflateBack output prefix stays in-bounds"
+        );
+        let previous_history = window.have();
+        let ptr = window.as_mut_ptr();
+
+        // SAFETY: `Window` owns a writable backing allocation of `capacity` bytes for this borrow,
+        // and `filled` is exactly the initialized current-output prefix tracked by `BackOutput`.
+        let writer = unsafe { Writer::new_uninit_raw(ptr, filled, capacity) };
+        Self {
+            writer,
+            previous_history,
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.writer.len()
+    }
+
+    #[inline(always)]
+    fn remaining(&self) -> usize {
+        self.writer.remaining()
+    }
+
+    #[inline(always)]
+    fn push(&mut self, byte: u8) {
+        self.writer.push(byte);
+    }
+
+    #[inline(always)]
+    fn extend(&mut self, bytes: &[u8]) {
+        self.writer.extend(bytes);
+    }
+
+    /// Copy one DEFLATE back-reference into the current output prefix.
+    ///
+    /// If the distance reaches before the current prefix, history begins in the untouched tail of
+    /// the previous full callback window. Once that tail is consumed, ordinary overlapping match
+    /// expansion continues from the current prefix.
+    #[inline(always)]
+    fn copy_match(
+        &mut self,
+        sane: bool,
+        distance: usize,
+        length: usize,
+    ) -> Result<(), &'static str> {
+        if distance > self.writer.capacity() {
             if sane {
-                return Err("invalid distance too far back\0");
+                return Err("invalid distance too far back\\0");
             }
             panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
         }
 
-        let window_size = window.buffer_size();
-        let window_next = window.next();
-        let from = if window_next == 0 {
-            window_size - from_end
-        } else if window_next >= from_end {
-            window_next - from_end
-        } else {
-            from_end -= window_next;
-            let from = window_size - from_end;
-            if from_end < length {
-                writer.extend_from_window_back(window, from..from + from_end);
-                let remaining = length - from_end;
-                let copy = Ord::min(window_next, remaining);
-                writer.extend_from_window_back(window, 0..copy);
-                if copy < remaining {
-                    writer.copy_match_back(distance, remaining - copy);
+        let written = self.writer.len();
+        if distance > written {
+            let from_previous = distance - written;
+            if from_previous > self.previous_history {
+                if sane {
+                    return Err("invalid distance too far back\0");
                 }
-                return Ok(());
+                panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
             }
-            from
-        };
 
-        let copy = Ord::min(from_end, length);
-        writer.extend_from_window_back(window, from..from + copy);
-        if copy < length {
-            writer.copy_match_back(distance, length - copy);
+            let copy = Ord::min(from_previous, length);
+            let source_start = self.writer.capacity() - from_previous;
+            // SAFETY: `previous_history` describes initialized bytes from the preceding full
+            // callback window. Back output overwrites from index zero, so the still-needed history
+            // is exactly the untouched tail ending at capacity. `copy <= from_previous` keeps the
+            // source within that initialized tail; the Writer bounds-checks the destination.
+            unsafe { self.writer.extend_from_backing(source_start, copy) };
+
+            if copy < length {
+                // `copy < length` implies `copy == from_previous`, so after consuming the previous
+                // tail the remaining match begins at index zero of current output.
+                self.writer.copy_match(distance, length - copy);
+            }
+        } else {
+            self.writer.copy_match(distance, length);
         }
-    } else {
-        writer.copy_match_back(distance, length);
+        Ok(())
     }
-    Ok(())
 }
 
 /// Initialize the stream in an inflate state
@@ -759,20 +796,16 @@ pub unsafe fn back(
                     let input_len = input.available();
                     let mut bit_reader =
                         BitReader::from_buffer(input.bit_buffer(), input.as_slice());
-                    let capacity = window.buffer_size();
-                    // SAFETY: BackOutput guarantees its initialized prefix is in-bounds; the
-                    // writer is call-local and dropped before the output cursor or callback is used.
-                    let mut writer = unsafe {
-                        Writer::new_uninit_raw(window.as_mut_ptr(), output.len(), capacity)
-                    };
-
-                    inflate_fast_back(state, &window, &mut bit_reader, &mut writer);
+                    let mut writer = BackWriter::new(&mut window, output.len());
+                    inflate_fast_back(state, &mut bit_reader, &mut writer);
 
                     let remaining = bit_reader.bytes_remaining();
                     let bits = bit_reader.into_buffer();
                     input.advance(input_len - remaining);
                     input.set_bit_buffer(bits);
-                    output.set_len(writer.len(), &window);
+                    let filled = writer.len();
+                    drop(writer);
+                    output.set_len(filled, &window);
 
                     continue 'inf_leave;
                 }
@@ -938,25 +971,18 @@ pub unsafe fn back(
                         ret = code;
                         break 'inf_leave;
                     }
-                    let copy = Ord::min(state.length, output.remaining(&window));
-                    let capacity = window.buffer_size();
-                    // SAFETY: BackOutput owns the initialized-prefix length and `copy` is bounded
-                    // by the remaining window capacity.
-                    let mut writer = unsafe {
-                        Writer::new_uninit_raw(window.as_mut_ptr(), output.len(), capacity)
-                    };
-                    if let Err(msg) = copy_back_match(
-                        &window,
-                        state.flags.contains(Flags::SANE),
-                        &mut writer,
-                        state.offset,
-                        copy,
-                    ) {
+                    let mut writer = BackWriter::new(&mut window, output.len());
+                    let copy = Ord::min(state.length, writer.remaining());
+                    if let Err(msg) =
+                        writer.copy_match(state.flags.contains(Flags::SANE), state.offset, copy)
+                    {
                         state.mode = Mode::Bad;
                         state.bad(msg);
                         continue 'inf_leave;
                     }
-                    output.set_len(writer.len(), &window);
+                    let filled = writer.len();
+                    drop(writer);
+                    output.set_len(filled, &window);
                     state.length -= copy;
                     if state.length == 0 {
                         break;
@@ -1020,9 +1046,8 @@ pub unsafe fn back(
 #[inline(always)]
 fn inflate_fast_back(
     state: &mut State,
-    window: &Window<'_>,
     bit_reader: &mut BitReader<'_>,
-    writer: &mut Writer<'_>,
+    writer: &mut BackWriter<'_>,
 ) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
@@ -1134,10 +1159,8 @@ fn inflate_fast_back(
 
                         bit_reader.drop_bits(op);
 
-                        if let Err(msg) = copy_back_match(
-                            window,
+                        if let Err(msg) = writer.copy_match(
                             state.flags.contains(Flags::SANE),
-                            writer,
                             dist as usize,
                             len as usize,
                         ) {
@@ -1189,6 +1212,53 @@ fn inflate_fast_back(
     if let Some(error_message) = bad {
         debug_assert!(matches!(state.mode, Mode::Bad));
         state.bad(error_message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn back_writer_match_crosses_previous_window_into_current_output() {
+        let mut storage = core::array::from_fn::<_, 32, _>(|i| i as u8);
+        // The current callback window has already overwritten its first four bytes.
+        storage[..4].copy_from_slice(&[100, 101, 102, 103]);
+        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        window.set_have(storage.len());
+
+        let mut writer = BackWriter::new(&mut window, 4);
+        writer.copy_match(true, 6, 8).unwrap();
+        assert_eq!(writer.len(), 12);
+        drop(writer);
+
+        assert_eq!(&storage[4..12], &[30, 31, 100, 101, 102, 103, 30, 31]);
+    }
+
+    #[test]
+    fn back_writer_rejects_distance_beyond_configured_window() {
+        let mut storage = [0u8; 32];
+        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        window.set_have(storage.len());
+
+        let mut writer = BackWriter::new(&mut window, 4);
+        assert_eq!(
+            writer.copy_match(true, 33, 3),
+            Err("invalid distance too far back\\0")
+        );
+    }
+
+    #[test]
+    fn back_writer_rejects_history_before_first_full_window() {
+        let mut storage = [0u8; 32];
+        storage[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+
+        let mut writer = BackWriter::new(&mut window, 4);
+        assert_eq!(
+            writer.copy_match(true, 5, 3),
+            Err("invalid distance too far back\0")
+        );
     }
 }
 
