@@ -12,7 +12,32 @@ pub fn compare256_slice(src0: &[u8], src1: &[u8]) -> usize {
         .get(..COMPARE_SIZE)
         .expect("compare256 requires 256 bytes");
 
-    first_mismatch(src0, src1).unwrap_or(COMPARE_SIZE)
+    common_prefix_len(src0, src1)
+}
+
+/// Length of the common prefix of two equally-sized byte slices.
+///
+/// Full 32-byte chunks use portable SIMD; the final partial chunk is compared scalar so callers
+/// can preserve their exact logical lookahead instead of padding or over-reading.
+#[inline]
+pub(crate) fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "common-prefix inputs must have equal lengths"
+    );
+
+    let vector_len = left.len() / LANES * LANES;
+    if let Some(mismatch) = first_mismatch_chunks(&left[..vector_len], &right[..vector_len]) {
+        return mismatch;
+    }
+
+    vector_len
+        + left[vector_len..]
+            .iter()
+            .zip(&right[vector_len..])
+            .position(|(left, right)| left != right)
+            .unwrap_or(left.len() - vector_len)
 }
 
 pub fn compare256_rle_slice(byte: u8, src: &[u8]) -> usize {
@@ -33,7 +58,7 @@ pub fn compare256_rle_slice(byte: u8, src: &[u8]) -> usize {
 }
 
 #[inline]
-fn first_mismatch(left: &[u8], right: &[u8]) -> Option<usize> {
+fn first_mismatch_chunks(left: &[u8], right: &[u8]) -> Option<usize> {
     debug_assert_eq!(left.len(), right.len());
     debug_assert_eq!(left.len() % LANES, 0);
 
@@ -80,6 +105,22 @@ mod tests {
             input[mismatch] = b'a';
         }
         assert_eq!(compare256_rle_slice(b'a', &input), COMPARE_SIZE);
+    }
+
+    #[test]
+    fn common_prefix_handles_every_length_and_mismatch_through_max_match() {
+        const MAX: usize = crate::deflate::STD_MAX_MATCH;
+        let left = [b'a'; MAX];
+        let mut right = left;
+
+        for len in 0..=MAX {
+            assert_eq!(common_prefix_len(&left[..len], &right[..len]), len);
+            for mismatch in 0..len {
+                right[mismatch] = b'b';
+                assert_eq!(common_prefix_len(&left[..len], &right[..len]), mismatch);
+                right[mismatch] = b'a';
+            }
+        }
     }
 
     #[test]
