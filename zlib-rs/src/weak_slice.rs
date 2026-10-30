@@ -30,7 +30,10 @@ impl<'a, T> WeakSliceMut<'a, T> {
         (self.ptr, self.len)
     }
 
-    pub(crate) fn as_slice(&self) -> &'a [T] {
+    pub(crate) fn as_slice(&self) -> &[T] {
+        // Keep the materialized Rust reference tied to this borrow. Returning the backing
+        // allocation lifetime here would allow a shared slice to outlive `&self` and overlap a
+        // later mutable materialization from the same raw pointer.
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -81,7 +84,8 @@ impl<'a, T, const N: usize> WeakArrayMut<'a, T, N> {
         }
     }
 
-    pub(crate) fn as_slice(&self) -> &'a [T] {
+    pub(crate) fn as_slice(&self) -> &[T] {
+        // As above, the reference must not outlive the borrow used to materialize it.
         unsafe { core::slice::from_raw_parts(self.ptr.cast(), N) }
     }
 
