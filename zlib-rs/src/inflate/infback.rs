@@ -6,8 +6,9 @@ use crate::c_api::{in_func, internal_state, out_func};
 use crate::inflate::bitreader::{BitBuffer, BitReader};
 use crate::inflate::inftrees::{inflate_table, CodeType, InflateTable};
 use crate::inflate::{
-    Codes, Flags, InflateAllocOffsets, InflateConfig, InflateStream, Mode, State, Table, Window,
-    INFLATE_FAST_MIN_HAVE, INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS, MAX_DIST_EXTRA_BITS,
+    Codes, Flags, InflateAllocOffsets, InflateConfig, InflateStateKind, InflateStream, Mode, State,
+    Table, Window, INFLATE_FAST_MIN_HAVE, INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS,
+    MAX_DIST_EXTRA_BITS,
 };
 use crate::traceln;
 use crate::{c_api::z_stream, inflate::writer::Writer, ReturnCode};
@@ -377,7 +378,7 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new();
+    let mut state = State::new(InflateStateKind::Back);
 
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
@@ -385,7 +386,7 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
         opaque: stream.opaque,
         _marker: PhantomData,
     };
-    let allocs = InflateAllocOffsets::new();
+    let allocs = InflateAllocOffsets::state_only();
 
     let Some(allocation_start) = alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
         return ReturnCode::MemError;
@@ -395,7 +396,8 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
     let align_offset = address.next_multiple_of(64) - address;
     let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
 
-    // NOTE: the window part of the allocation is ignored in this case.
+    // inflateBack uses the caller-provided window directly, so this allocation contains only
+    // State plus alignment headroom.
     state.window = window;
 
     let state_allocation = unsafe { buf.add(allocs.state_pos).cast::<State>() };
@@ -403,7 +405,7 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
     stream.state = state_allocation.cast::<internal_state>();
 
     // SAFETY: we've correctly initialized the stream to be an InflateStream
-    let Some(stream) = (unsafe { InflateStream::from_stream_mut(stream) }) else {
+    let Some(stream) = (unsafe { InflateStream::from_back_stream_mut(stream) }) else {
         return ReturnCode::StreamError;
     };
 
@@ -430,6 +432,10 @@ pub unsafe fn back(
     out: out_func,
     out_desc: *mut c_void,
 ) -> ReturnCode {
+    if strm.state.kind != InflateStateKind::Back {
+        return ReturnCode::StreamError;
+    }
+
     let mut ret;
 
     /* Reset the state */

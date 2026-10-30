@@ -91,49 +91,56 @@ impl<'a> InflateStream<'a> {
     ///
     /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
     #[inline(always)]
-    pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
-        {
-            // Safety: ptr points to a valid value of type z_stream (if non-null)
-            let stream = unsafe { strm.as_ref() }?;
-
-            if stream.zalloc.is_none() || stream.zfree.is_none() {
-                return None;
-            }
-
-            if stream.state.is_null() {
-                return None;
-            }
+    unsafe fn from_stream_ref_kind(
+        strm: *const z_stream,
+        kind: InflateStateKind,
+    ) -> Option<&'a Self> {
+        // SAFETY: caller guarantees `strm` is either null or points to a valid z_stream.
+        let stream = unsafe { strm.as_ref() }?;
+        if stream.zalloc.is_none() || stream.zfree.is_none() || stream.state.is_null() {
+            return None;
         }
 
-        // Safety: InflateStream has an equivalent layout as z_stream
+        // SAFETY: initialized inflate streams store a `State` behind the ABI `internal_state`
+        // pointer. Checking the kind before materializing `InflateStream` keeps the regular and
+        // callback-driven APIs from accidentally sharing incompatible window/storage invariants.
+        let state = unsafe { stream.state.cast::<State>().as_ref() }?;
+        if state.kind != kind {
+            return None;
+        }
+
+        // SAFETY: InflateStream has an equivalent layout as z_stream.
         unsafe { strm.cast::<InflateStream>().as_ref() }
     }
 
-    /// # Safety
-    ///
-    /// Behavior is undefined if any of the following conditions are violated:
-    ///
-    /// - `strm` satisfies the conditions of [`pointer::as_mut`]
-    /// - if not `NULL`, `strm` as initialized using [`init`] or similar
-    ///
-    /// [`pointer::as_mut`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_mut
+    #[inline(always)]
+    unsafe fn from_stream_mut_kind(
+        strm: *mut z_stream,
+        kind: InflateStateKind,
+    ) -> Option<&'a mut Self> {
+        // Validate through a shared borrow before constructing the exclusive ABI view.
+        unsafe { Self::from_stream_ref_kind(strm.cast_const(), kind)? };
+        // SAFETY: InflateStream has an equivalent layout as z_stream and the caller supplied a
+        // mutable raw pointer satisfying `pointer::as_mut`.
+        unsafe { strm.cast::<InflateStream>().as_mut() }
+    }
+
+    /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
+    #[inline(always)]
+    pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
+        unsafe { Self::from_stream_ref_kind(strm, InflateStateKind::Regular) }
+    }
+
+    /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
     #[inline(always)]
     pub unsafe fn from_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
-        {
-            // Safety: ptr points to a valid value of type z_stream (if non-null)
-            let stream = unsafe { strm.as_ref() }?;
+        unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Regular) }
+    }
 
-            if stream.zalloc.is_none() || stream.zfree.is_none() {
-                return None;
-            }
-
-            if stream.state.is_null() {
-                return None;
-            }
-        }
-
-        // Safety: InflateStream has an equivalent layout as z_stream
-        unsafe { strm.cast::<InflateStream>().as_mut() }
+    /// Convert an `inflateBackInit*` stream. Regular inflate streams are rejected.
+    #[inline(always)]
+    pub unsafe fn from_back_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
+        unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Back) }
     }
 
     fn as_z_stream_mut(&mut self) -> &mut z_stream {
@@ -371,8 +378,16 @@ impl Flags {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InflateStateKind {
+    Regular,
+    Back,
+}
+
 #[repr(C, align(64))]
 pub(crate) struct State<'a> {
+    kind: InflateStateKind,
     /// Current inflate mode
     mode: Mode,
 
@@ -454,8 +469,9 @@ pub(crate) struct State<'a> {
 }
 
 impl<'a> State<'a> {
-    fn new() -> Self {
+    fn new(kind: InflateStateKind) -> Self {
         Self {
+            kind,
             flags: Flags::default(),
             wrap: 0,
             mode: Mode::Head,
@@ -2221,42 +2237,48 @@ pub fn prime(stream: &mut InflateStream, bits: i32, value: i32) -> ReturnCode {
 struct InflateAllocOffsets {
     total_size: usize,
     state_pos: usize,
-    window_pos: usize,
+    window_pos: Option<usize>,
 }
 
 impl InflateAllocOffsets {
-    fn new() -> Self {
+    const ALIGN_SIZE: usize = 64;
+    const WINDOW_PAD_SIZE: usize = 64;
+
+    fn with_window() -> Self {
+        Self::new(true)
+    }
+
+    fn state_only() -> Self {
+        Self::new(false)
+    }
+
+    fn new(with_window: bool) -> Self {
         use core::mem::size_of;
 
-        // 64B padding for SIMD operations. This allows unaligned operations (up to 512-bit) to run
-        // off the end of the object without issue.
-        const WINDOW_PAD_SIZE: usize = 64;
-
-        // 64B alignment of individual items in the alloc.
-        // Note that changing this also requires changes in 'init' and 'copy'.
-        const ALIGN_SIZE: usize = 64;
         let mut curr_size = 0usize;
+        let state_pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
+        curr_size = state_pos + size_of::<State>();
 
-        /* Define sizes */
-        let state_size = size_of::<State>();
-        let window_size = (1 << MAX_WBITS) + WINDOW_PAD_SIZE;
+        let window_pos = with_window.then(|| {
+            let pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
+            curr_size = pos + (1 << MAX_WBITS) + Self::WINDOW_PAD_SIZE;
+            pos
+        });
 
-        /* Calculate relative buffer positions and paddings */
-        let state_pos = curr_size.next_multiple_of(ALIGN_SIZE);
-        curr_size = state_pos + state_size;
-
-        let window_pos = curr_size.next_multiple_of(ALIGN_SIZE);
-        curr_size = window_pos + window_size;
-
-        /* Add ALIGN_SIZE-1 to allow alignment (done in the 'init' and 'copy' functions), and round
-         * size of buffer up to next multiple of ALIGN_SIZE */
-        let total_size = (curr_size + (ALIGN_SIZE - 1)).next_multiple_of(ALIGN_SIZE);
+        // Reserve enough headroom to align the allocation start to 64 bytes, then round the whole
+        // allocation up to the same granularity.
+        let total_size = (curr_size + (Self::ALIGN_SIZE - 1)).next_multiple_of(Self::ALIGN_SIZE);
 
         Self {
             total_size,
             state_pos,
             window_pos,
         }
+    }
+
+    fn window_pos(&self) -> usize {
+        self.window_pos
+            .expect("inflate allocation layout includes an owned window")
     }
 }
 
@@ -2297,7 +2319,7 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         return ReturnCode::StreamError;
     }
 
-    let mut state = State::new();
+    let mut state = State::new(InflateStateKind::Regular);
 
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
@@ -2305,7 +2327,7 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         opaque: stream.opaque,
         _marker: PhantomData,
     };
-    let allocs = InflateAllocOffsets::new();
+    let allocs = InflateAllocOffsets::with_window();
 
     let Some(allocation_start) = alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
         return ReturnCode::MemError;
@@ -2315,7 +2337,7 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     let align_offset = address.next_multiple_of(64) - address;
     let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
 
-    let window_allocation = unsafe { buf.add(allocs.window_pos) };
+    let window_allocation = unsafe { buf.add(allocs.window_pos()) };
     let window =
         unsafe { Window::from_uninitialized_raw_parts(window_allocation, (1 << MAX_WBITS) + 64) };
     state.window = window;
@@ -2589,12 +2611,13 @@ pub unsafe fn copy<'a>(
     dest: &mut MaybeUninit<InflateStream<'a>>,
     source: &InflateStream<'a>,
 ) -> ReturnCode {
-    if source.next_out.is_null() || (source.next_in.is_null() && source.avail_in != 0) {
+    if source.state.kind != InflateStateKind::Regular {
         return ReturnCode::StreamError;
     }
 
-    // Allocate space.
-    let allocs = InflateAllocOffsets::new();
+    // `inflateCopy` snapshots decoder state; zlib does not require live input/output pointers.
+    // Allocate independent state and window storage for the destination.
+    let allocs = InflateAllocOffsets::with_window();
     debug_assert_eq!(allocs.total_size, source.state.total_allocation_size);
 
     let Some(allocation_start) = source.alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
@@ -2605,7 +2628,7 @@ pub unsafe fn copy<'a>(
     let align_offset = address.next_multiple_of(64) - address;
     let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
 
-    let window_allocation = unsafe { buf.add(allocs.window_pos) };
+    let window_allocation = unsafe { buf.add(allocs.window_pos()) };
     let window = unsafe {
         source
             .state

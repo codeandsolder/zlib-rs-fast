@@ -153,6 +153,11 @@ fn mem_limit(stream: &mut libz_rs_sys::z_stream, limit: usize) {
     zone.limit = limit;
 }
 
+fn mem_highwater(stream: &libz_rs_sys::z_stream) -> usize {
+    assert!(!stream.opaque.is_null());
+    unsafe { (*(stream.opaque as *const MemZone)).highwater }
+}
+
 fn mem_done(stream: &mut libz_rs_sys::z_stream) {
     assert!(!stream.opaque.is_null());
 
@@ -181,6 +186,35 @@ fn mem_done(stream: &mut libz_rs_sys::z_stream) {
     stream.opaque = std::ptr::null_mut();
     stream.zalloc = None;
     stream.zfree = None;
+}
+
+#[test]
+fn inflate_back_init_allocates_state_only() {
+    use libz_rs_sys::*;
+
+    let mut regular = mem_setup();
+    assert_eq!(
+        unsafe { inflateInit_(&mut regular, VERSION, STREAM_SIZE) },
+        Z_OK
+    );
+    let regular_highwater = mem_highwater(&regular);
+    assert_eq!(unsafe { inflateEnd(&mut regular) }, Z_OK);
+    mem_done(&mut regular);
+
+    let mut back = mem_setup();
+    let mut window = vec![0u8; 1 << 15];
+    assert_eq!(
+        unsafe { inflateBackInit_(&mut back, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE) },
+        Z_OK
+    );
+    let back_highwater = mem_highwater(&back);
+    assert_eq!(unsafe { inflateBackEnd(&mut back) }, Z_OK);
+    mem_done(&mut back);
+
+    assert!(
+        regular_highwater >= back_highwater + (1 << 15),
+        "regular inflate used {regular_highwater} bytes vs {back_highwater} for inflateBack"
+    );
 }
 
 #[test]
@@ -2899,6 +2933,35 @@ fn done_state_returns_stream_end() {
 
         unsafe { inflateEnd(stream) }
     });
+}
+
+#[test]
+fn inflate_copy_does_not_require_live_io_pointers() {
+    let result = assert_eq_rs_ng!({
+        let mut source = MaybeUninit::<z_stream>::zeroed();
+        let ret = inflateInit_(
+            source.as_mut_ptr(),
+            zlibVersion(),
+            core::mem::size_of::<z_stream>() as c_int,
+        );
+        assert_eq!(ret, Z_OK);
+
+        let source = source.assume_init_mut();
+        source.next_in = core::ptr::null_mut();
+        source.avail_in = 7;
+        source.next_out = core::ptr::null_mut();
+        source.avail_out = 0;
+
+        let mut copy = MaybeUninit::<z_stream>::zeroed();
+        let ret = inflateCopy(copy.as_mut_ptr(), source);
+        if ret == Z_OK {
+            let _ = inflateEnd(copy.as_mut_ptr());
+        }
+        let _ = inflateEnd(source);
+        ret
+    });
+
+    assert_eq!(result, libz_rs_sys::Z_OK);
 }
 
 #[test]

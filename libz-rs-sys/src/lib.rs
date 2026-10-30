@@ -751,7 +751,7 @@ pub unsafe extern "C" fn inflateBack(
     out: Option<out_func>,
     out_desc: *mut c_void,
 ) -> c_int {
-    let Some(strm) = (unsafe { InflateStream::from_stream_mut(strm) }) else {
+    let Some(strm) = (unsafe { InflateStream::from_back_stream_mut(strm) }) else {
         return ReturnCode::StreamError as _;
     };
 
@@ -784,7 +784,7 @@ pub unsafe extern "C" fn inflateBack(
 ///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`inflateBackInit_`]
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateBackEnd))]
 pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
-    let Some(stream) = (unsafe { InflateStream::from_stream_mut(strm) }) else {
+    let Some(stream) = (unsafe { InflateStream::from_back_stream_mut(strm) }) else {
         return ReturnCode::StreamError as _;
     };
 

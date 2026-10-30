@@ -42,6 +42,41 @@ fn edge_cases() {
 }
 
 #[test]
+fn inflate_copy_rejects_back_init_state() {
+    for force_non_null_output in [false, true] {
+        let result = assert_eq_rs_ng!({
+            let mut source = MaybeUninit::<z_stream>::zeroed();
+            let mut copy = MaybeUninit::<z_stream>::zeroed();
+            let mut window = vec![0xAA; 1 << 15];
+            let mut output_byte = 0u8;
+
+            let init = inflateBackInit_(
+                source.as_mut_ptr(),
+                15,
+                window.as_mut_ptr(),
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as c_int,
+            );
+            assert_eq!(init, Z_OK);
+
+            if force_non_null_output {
+                (*source.as_mut_ptr()).next_out = &mut output_byte;
+                (*source.as_mut_ptr()).avail_out = 1;
+            }
+
+            let ret = inflateCopy(copy.as_mut_ptr(), source.as_mut_ptr());
+            if ret == Z_OK {
+                let _ = inflateEnd(copy.as_mut_ptr());
+            }
+            let _ = inflateBackEnd(source.as_mut_ptr());
+            ret
+        });
+
+        assert_eq!(result, libz_ng_sys::Z_STREAM_ERROR);
+    }
+}
+
+#[test]
 fn blow_up_the_stack_1() {
     const INPUT: &[u8] = include_bytes!("test-data/blow_up_the_stack_1.gz");
     entry(INPUT);
