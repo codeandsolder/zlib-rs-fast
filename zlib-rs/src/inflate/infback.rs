@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 
 use crate::allocate::Allocator;
 use crate::c_api::{in_func, internal_state, out_func};
-use crate::inflate::bitreader::BitReader;
+use crate::inflate::bitreader::{BitBuffer, BitReader};
 use crate::inflate::inftrees::{inflate_table, CodeType, InflateTable};
 use crate::inflate::{
     Codes, Flags, InflateAllocOffsets, InflateConfig, InflateStream, Mode, State, Table, Window,
@@ -12,6 +12,167 @@ use crate::inflate::{
 use crate::traceln;
 use crate::{c_api::z_stream, inflate::writer::Writer, ReturnCode};
 use crate::{MAX_WBITS, MIN_WBITS};
+
+/// Callback-fed input cursor for `inflateBack`.
+///
+/// The callback may replace the backing buffer whenever the current span is exhausted, so unlike
+/// ordinary inflate this cursor cannot own one long-lived borrowed slice. Raw pointer lifetime is
+/// confined here; decoding sees ordinary byte/bit operations and the shared [`BitBuffer`].
+struct BackInput {
+    next: *const u8,
+    remaining: usize,
+    bits: BitBuffer,
+}
+
+impl BackInput {
+    /// Bind the initial zlib input span.
+    ///
+    /// # Safety
+    /// A non-null `next` must be readable for `available` bytes for the duration of this call.
+    unsafe fn new(next: *const u8, available: u32) -> Self {
+        Self {
+            next,
+            remaining: if next.is_null() {
+                0
+            } else {
+                available as usize
+            },
+            bits: BitBuffer::default(),
+        }
+    }
+
+    #[inline(always)]
+    fn available(&self) -> usize {
+        self.remaining
+    }
+
+    #[inline(always)]
+    fn next_ptr(&self) -> *const u8 {
+        self.next
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        if self.remaining == 0 {
+            &[]
+        } else {
+            // SAFETY: maintained by `new`, `ensure_available`, and `advance`.
+            unsafe { core::slice::from_raw_parts(self.next, self.remaining) }
+        }
+    }
+
+    #[inline(always)]
+    fn bit_buffer(&self) -> BitBuffer {
+        self.bits
+    }
+
+    #[inline(always)]
+    fn set_bit_buffer(&mut self, bits: BitBuffer) {
+        self.bits = bits;
+    }
+
+    #[inline(always)]
+    fn bits_in_buffer(&self) -> u8 {
+        self.bits.bits_in_buffer()
+    }
+
+    #[inline(always)]
+    fn bits(&self, count: usize) -> u64 {
+        self.bits.bits(count)
+    }
+
+    #[inline(always)]
+    fn hold(&self) -> u64 {
+        self.bits.hold()
+    }
+
+    #[inline(always)]
+    fn drop_bits(&mut self, count: u8) {
+        self.bits.drop_bits(count);
+    }
+
+    #[inline(always)]
+    fn init_bits(&mut self) {
+        self.bits.init_bits();
+    }
+
+    #[inline(always)]
+    fn next_byte_boundary(&mut self) {
+        self.bits.next_byte_boundary();
+    }
+
+    #[inline(always)]
+    fn advance(&mut self, count: usize) {
+        assert!(
+            count <= self.remaining,
+            "inflateBack input advance stays in-bounds"
+        );
+        self.remaining -= count;
+        self.next = self.next.wrapping_add(count);
+    }
+
+    /// Ensure that at least one callback-owned byte is available.
+    ///
+    /// # Safety
+    /// `in_` must obey the zlib `in_func` contract: a non-zero count must return a pointer readable
+    /// for that many bytes until the next callback invocation.
+    #[inline(always)]
+    unsafe fn ensure_available(
+        &mut self,
+        in_: in_func,
+        in_desc: *mut c_void,
+    ) -> Result<(), ReturnCode> {
+        if self.remaining != 0 {
+            return Ok(());
+        }
+
+        let mut next = core::ptr::null();
+        let available = unsafe { in_(in_desc, &mut next) } as usize;
+        if available == 0 {
+            self.next = core::ptr::null();
+            return Err(ReturnCode::BufError);
+        }
+
+        debug_assert!(
+            !next.is_null(),
+            "inflateBack callback returned bytes without a pointer"
+        );
+        self.next = next;
+        self.remaining = available;
+        Ok(())
+    }
+
+    /// Pull one byte from the callback-fed stream into the shared DEFLATE reservoir.
+    ///
+    /// # Safety
+    /// Same callback contract as [`Self::ensure_available`].
+    #[inline(always)]
+    unsafe fn pull_byte(&mut self, in_: in_func, in_desc: *mut c_void) -> Result<(), ReturnCode> {
+        unsafe { self.ensure_available(in_, in_desc)? };
+        // SAFETY: `ensure_available` established one readable byte.
+        let byte = unsafe { *self.next };
+        self.advance(1);
+        self.bits.prime(8, byte as u64);
+        Ok(())
+    }
+
+    /// Fill the shared reservoir to `count` bits, asking the callback for another span as needed.
+    ///
+    /// # Safety
+    /// Same callback contract as [`Self::ensure_available`].
+    #[inline(always)]
+    unsafe fn need_bits(
+        &mut self,
+        count: usize,
+        in_: in_func,
+        in_desc: *mut c_void,
+    ) -> Result<(), ReturnCode> {
+        while usize::from(self.bits.bits_in_buffer()) < count {
+            unsafe { self.pull_byte(in_, in_desc)? };
+        }
+        Ok(())
+    }
+}
 
 /// Initialize the stream in an inflate state
 pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -> ReturnCode {
@@ -94,77 +255,14 @@ pub unsafe fn back(
     strm.state.flags.update(Flags::IS_LAST_BLOCK, false);
     strm.state.window.clear();
 
-    let mut next = strm.next_in.cast_const();
-    let mut have = if !next.is_null() { strm.avail_in } else { 0 };
-    let mut hold = 0;
-    let mut bits = 0u8;
+    // SAFETY: `inflateBack` requires the caller-provided initial span to be valid for `avail_in`.
+    let mut input = unsafe { BackInput::new(strm.next_in.cast_const(), strm.avail_in) };
     let mut put = strm.state.window.as_mut_ptr();
     let mut left = strm.state.window.buffer_size();
 
     let state = &mut *strm.state;
 
     'inf_leave: loop {
-        macro_rules! initbits {
-            () => {
-                hold = 0;
-                bits = 0;
-            };
-        }
-
-        macro_rules! bytebits {
-            () => {
-                hold >>= bits & 7;
-                bits -= bits & 7;
-            };
-        }
-
-        macro_rules! dropbits {
-            ($n:expr) => {
-                hold >>= $n;
-                bits -= $n;
-            };
-        }
-
-        macro_rules! bits {
-            ($n:expr) => {
-                hold & ((1 << $n) - 1)
-            };
-        }
-
-        macro_rules! needbits {
-            ($n:expr) => {
-                while usize::from(bits) < $n {
-                    pullbyte!();
-                }
-            };
-        }
-
-        macro_rules! pull {
-            () => {
-                if have == 0 {
-                    have = unsafe { in_(in_desc, &mut next) };
-                    if have == 0 {
-                        #[allow(unused_assignments)]
-                        {
-                            next = core::ptr::null();
-                        }
-                        ret = ReturnCode::BufError;
-                        break 'inf_leave;
-                    }
-                }
-            };
-        }
-
-        macro_rules! pullbyte {
-            () => {
-                pull!();
-                have -= 1;
-                hold += (unsafe { *next as u64 }) << bits;
-                next = unsafe { next.add(1) };
-                bits += 8;
-            };
-        }
-
         macro_rules! room {
             () => {
                 if left == 0 {
@@ -184,22 +282,25 @@ pub unsafe fn back(
         match state.mode {
             Mode::Type => {
                 if state.flags.contains(Flags::IS_LAST_BLOCK) {
-                    bytebits!();
+                    input.next_byte_boundary();
                     state.mode = Mode::Done;
                     continue;
                 }
 
-                needbits!(3);
+                if let Err(code) = unsafe { input.need_bits(3, in_, in_desc) } {
+                    ret = code;
+                    break 'inf_leave;
+                }
 
-                let last = bits!(1) != 0;
+                let last = input.bits(1) != 0;
                 state.flags.update(Flags::IS_LAST_BLOCK, last);
-                dropbits!(1);
+                input.drop_bits(1);
 
-                match bits!(2) {
+                match input.bits(2) {
                     0b00 => {
                         traceln!("inflate:     stored block (last = {last})");
 
-                        dropbits!(2);
+                        input.drop_bits(2);
                         state.mode = Mode::Stored;
                         continue;
                     }
@@ -216,21 +317,21 @@ pub unsafe fn back(
                             bits: 5,
                         };
 
-                        dropbits!(2);
+                        input.drop_bits(2);
                         state.mode = Mode::Len;
                         continue;
                     }
                     0b10 => {
                         traceln!("inflate:     dynamic codes block (last = {last})");
 
-                        dropbits!(2);
+                        input.drop_bits(2);
                         state.mode = Mode::Table;
                         continue;
                     }
                     0b11 => {
                         traceln!("inflate:     invalid block type");
 
-                        dropbits!(2);
+                        input.drop_bits(2);
                         state.mode = Mode::Bad;
                         state.bad("invalid block type\0");
                         continue;
@@ -242,34 +343,40 @@ pub unsafe fn back(
                 }
             }
             Mode::Stored => {
-                bytebits!();
-                needbits!(32);
+                input.next_byte_boundary();
+                if let Err(code) = unsafe { input.need_bits(32, in_, in_desc) } {
+                    ret = code;
+                    break 'inf_leave;
+                }
 
-                if hold as u16 != !((hold >> 16) as u16) {
+                if input.hold() as u16 != !((input.hold() >> 16) as u16) {
                     state.mode = Mode::Bad;
                     state.bad("invalid stored block lengths\0");
                     continue;
                 }
 
-                state.length = hold as usize & 0xFFFF;
+                state.length = input.hold() as usize & 0xFFFF;
                 traceln!("inflate:     stored length {}", state.length);
 
-                initbits!();
+                input.init_bits();
 
                 /* copy stored block from input to output */
                 while state.length != 0 {
                     let mut copy = state.length;
 
-                    pull!();
+                    if let Err(code) = unsafe { input.ensure_available(in_, in_desc) } {
+                        ret = code;
+                        break 'inf_leave;
+                    }
                     room!();
 
-                    copy = Ord::min(copy, have as usize);
+                    copy = Ord::min(copy, input.available());
                     copy = Ord::min(copy, left);
 
-                    unsafe { core::ptr::copy(next, put, copy) };
-
-                    have -= copy as u32;
-                    next = unsafe { next.add(copy) };
+                    // SAFETY: `input` exposes exactly its callback-validated readable span, and
+                    // `room!` established `copy <= left` writable output bytes.
+                    unsafe { core::ptr::copy(input.next_ptr(), put, copy) };
+                    input.advance(copy);
 
                     left -= copy;
                     put = unsafe { put.add(copy) };
@@ -281,13 +388,16 @@ pub unsafe fn back(
                 continue;
             }
             Mode::Table => {
-                needbits!(14);
-                state.nlen = bits!(5) as usize + 257;
-                dropbits!(5);
-                state.ndist = bits!(5) as usize + 1;
-                dropbits!(5);
-                state.ncode = bits!(4) as usize + 4;
-                dropbits!(4);
+                if let Err(code) = unsafe { input.need_bits(14, in_, in_desc) } {
+                    ret = code;
+                    break 'inf_leave;
+                }
+                state.nlen = input.bits(5) as usize + 257;
+                input.drop_bits(5);
+                state.ndist = input.bits(5) as usize + 1;
+                input.drop_bits(5);
+                state.ncode = input.bits(4) as usize + 4;
+                input.drop_bits(4);
 
                 // TODO pkzit_bug_workaround
                 if state.nlen > 286 || state.ndist > 30 {
@@ -305,10 +415,13 @@ pub unsafe fn back(
                 ];
 
                 while state.have < state.ncode {
-                    needbits!(3);
-                    state.lens[usize::from(ORDER[state.have])] = bits!(3) as u16;
+                    if let Err(code) = unsafe { input.need_bits(3, in_, in_desc) } {
+                        ret = code;
+                        break 'inf_leave;
+                    }
+                    state.lens[usize::from(ORDER[state.have])] = input.bits(3) as u16;
                     state.have += 1;
-                    dropbits!(3);
+                    input.drop_bits(3);
                 }
 
                 while state.have < 19 {
@@ -337,25 +450,34 @@ pub unsafe fn back(
 
                 while state.have < state.nlen + state.ndist {
                     let here = loop {
-                        let here = state.len_table_get(bits!(state.len_table.bits) as usize);
-                        if here.bits <= bits {
+                        let here = state.len_table_get(input.bits(state.len_table.bits) as usize);
+                        if here.bits <= input.bits_in_buffer() {
                             break here;
                         }
 
-                        pullbyte!();
+                        if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                            ret = code;
+
+                            break 'inf_leave;
+                        }
                     };
 
                     let here_bits = here.bits;
 
                     match here.val {
                         0..=15 => {
-                            dropbits!(here_bits);
+                            input.drop_bits(here_bits);
                             state.lens[state.have] = here.val;
                             state.have += 1;
                         }
                         16 => {
-                            needbits!(usize::from(here_bits) + 2);
-                            dropbits!(here_bits);
+                            if let Err(code) =
+                                unsafe { input.need_bits(usize::from(here_bits) + 2, in_, in_desc) }
+                            {
+                                ret = code;
+                                break 'inf_leave;
+                            }
+                            input.drop_bits(here_bits);
                             if state.have == 0 {
                                 state.mode = Mode::Bad;
                                 state.bad("invalid bit length repeat\0");
@@ -363,8 +485,8 @@ pub unsafe fn back(
                             }
 
                             let len = state.lens[state.have - 1];
-                            let copy = 3 + bits!(2) as usize;
-                            dropbits!(2);
+                            let copy = 3 + input.bits(2) as usize;
+                            input.drop_bits(2);
 
                             if state.have + copy > state.nlen + state.ndist {
                                 state.mode = Mode::Bad;
@@ -376,10 +498,15 @@ pub unsafe fn back(
                             state.have += copy;
                         }
                         17 => {
-                            needbits!(usize::from(here_bits) + 3);
-                            dropbits!(here_bits);
-                            let copy = 3 + bits!(3) as usize;
-                            dropbits!(3);
+                            if let Err(code) =
+                                unsafe { input.need_bits(usize::from(here_bits) + 3, in_, in_desc) }
+                            {
+                                ret = code;
+                                break 'inf_leave;
+                            }
+                            input.drop_bits(here_bits);
+                            let copy = 3 + input.bits(3) as usize;
+                            input.drop_bits(3);
 
                             if state.have + copy > state.nlen + state.ndist {
                                 state.mode = Mode::Bad;
@@ -391,10 +518,15 @@ pub unsafe fn back(
                             state.have += copy;
                         }
                         18.. => {
-                            needbits!(usize::from(here_bits) + 7);
-                            dropbits!(here_bits);
-                            let copy = 11 + bits!(7) as usize;
-                            dropbits!(7);
+                            if let Err(code) =
+                                unsafe { input.need_bits(usize::from(here_bits) + 7, in_, in_desc) }
+                            {
+                                ret = code;
+                                break 'inf_leave;
+                            }
+                            input.drop_bits(here_bits);
+                            let copy = 11 + input.bits(7) as usize;
+                            input.drop_bits(7);
 
                             if state.have + copy > state.nlen + state.ndist {
                                 state.mode = Mode::Bad;
@@ -452,13 +584,10 @@ pub unsafe fn back(
                 state.mode = Mode::Len;
             }
             Mode::Len => {
-                if (have as usize) >= INFLATE_FAST_MIN_HAVE && left >= INFLATE_FAST_MIN_LEFT {
-                    // SAFETY: `next`/`have` are the current input span supplied by the caller or
-                    // inflateBack input callback, and this branch already proved at least
-                    // `INFLATE_FAST_MIN_HAVE` readable bytes remain.
-                    let input = unsafe { core::slice::from_raw_parts(next, have as usize) };
-                    let mut bit_reader = BitReader::new(input);
-                    bit_reader.prime(bits, hold);
+                if input.available() >= INFLATE_FAST_MIN_HAVE && left >= INFLATE_FAST_MIN_LEFT {
+                    let input_len = input.available();
+                    let mut bit_reader =
+                        BitReader::from_buffer(input.bit_buffer(), input.as_slice());
 
                     let mut writer = unsafe {
                         Writer::new_uninit_raw(
@@ -474,11 +603,10 @@ pub unsafe fn back(
 
                     unsafe { inflate_fast_back(state, &mut bit_reader, &mut writer) };
 
-                    hold = bit_reader.hold();
-                    bits = bit_reader.bits_in_buffer();
-
-                    next = bit_reader.next_input_ptr();
-                    have = bit_reader.bytes_remaining() as u32;
+                    let remaining = bit_reader.bytes_remaining();
+                    let bits = bit_reader.into_buffer();
+                    input.advance(input_len - remaining);
+                    input.set_bit_buffer(bits);
 
                     put = writer.next_out().cast();
                     left = writer.remaining();
@@ -496,31 +624,39 @@ pub unsafe fn back(
                 // get a literal, length, or end-of-block code
                 let mut here;
                 loop {
-                    here = len_table[bits!(state.len_table.bits) as usize];
+                    here = len_table[input.bits(state.len_table.bits) as usize];
 
-                    if here.bits <= bits {
+                    if here.bits <= input.bits_in_buffer() {
                         break;
                     }
 
-                    pullbyte!();
+                    if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                        ret = code;
+
+                        break 'inf_leave;
+                    }
                 }
 
                 if here.op != 0 && here.op & 0xf0 == 0 {
                     let last = here;
                     loop {
-                        let tmp = bits!((last.bits + last.op) as usize) as u16;
+                        let tmp = input.bits((last.bits + last.op) as usize) as u16;
                         here = len_table[(last.val + (tmp >> last.bits)) as usize];
-                        if last.bits + here.bits <= bits {
+                        if last.bits + here.bits <= input.bits_in_buffer() {
                             break;
                         }
 
-                        pullbyte!();
+                        if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                            ret = code;
+
+                            break 'inf_leave;
+                        }
                     }
 
-                    dropbits!(last.bits);
+                    input.drop_bits(last.bits);
                 }
 
-                dropbits!(here.bits);
+                input.drop_bits(here.bits);
                 state.length = here.val as usize;
 
                 if here.op == 0 {
@@ -557,21 +693,28 @@ pub unsafe fn back(
 
                 // get extra bits, if any
                 if state.extra != 0 {
-                    needbits!(state.extra);
-                    state.length += bits!(state.extra) as usize;
-                    dropbits!(state.extra as u8);
+                    if let Err(code) = unsafe { input.need_bits(state.extra, in_, in_desc) } {
+                        ret = code;
+                        break 'inf_leave;
+                    }
+                    state.length += input.bits(state.extra) as usize;
+                    input.drop_bits(state.extra as u8);
                 }
                 traceln!("inflate:         length {}", state.length);
 
                 // get distance code
                 let mut here;
                 loop {
-                    here = state.dist_table_get(bits!(state.dist_table.bits) as usize);
-                    if here.bits <= bits {
+                    here = state.dist_table_get(input.bits(state.dist_table.bits) as usize);
+                    if here.bits <= input.bits_in_buffer() {
                         break;
                     }
 
-                    pullbyte!();
+                    if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                        ret = code;
+
+                        break 'inf_leave;
+                    }
                 }
 
                 if here.op & 0xf0 == 0 {
@@ -580,20 +723,25 @@ pub unsafe fn back(
                     loop {
                         here = state.dist_table_get(
                             last.val as usize
-                                + ((bits!((last.bits + last.op) as usize) as usize) >> last.bits),
+                                + ((input.bits((last.bits + last.op) as usize) as usize)
+                                    >> last.bits),
                         );
 
-                        if last.bits + here.bits <= bits {
+                        if last.bits + here.bits <= input.bits_in_buffer() {
                             break;
                         }
 
-                        pullbyte!();
+                        if let Err(code) = unsafe { input.pull_byte(in_, in_desc) } {
+                            ret = code;
+
+                            break 'inf_leave;
+                        }
                     }
 
-                    dropbits!(last.bits);
+                    input.drop_bits(last.bits);
                 }
 
-                dropbits!(here.bits);
+                input.drop_bits(here.bits);
 
                 if here.op & 64 != 0 {
                     state.mode = Mode::Bad;
@@ -608,9 +756,12 @@ pub unsafe fn back(
                 let extra = state.extra;
 
                 if extra > 0 {
-                    needbits!(extra);
-                    state.offset += bits!(extra) as usize;
-                    dropbits!(extra as u8);
+                    if let Err(code) = unsafe { input.need_bits(extra, in_, in_desc) } {
+                        ret = code;
+                        break 'inf_leave;
+                    }
+                    state.offset += input.bits(extra) as usize;
+                    input.drop_bits(extra as u8);
                 }
 
                 if INFLATE_STRICT
@@ -715,8 +866,8 @@ pub unsafe fn back(
         ret = ReturnCode::BufError;
     }
 
-    strm.next_in = next.cast_mut();
-    strm.avail_in = have;
+    strm.next_in = input.next_ptr().cast_mut();
+    strm.avail_in = input.available() as u32;
 
     ret
 }

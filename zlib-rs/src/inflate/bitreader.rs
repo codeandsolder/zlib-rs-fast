@@ -81,10 +81,6 @@ pub(crate) struct BitReader<'input> {
 }
 
 impl<'input> BitReader<'input> {
-    pub fn new(input: &'input [u8]) -> Self {
-        Self::from_buffer(BitBuffer::default(), input)
-    }
-
     pub fn from_buffer(bits: BitBuffer, input: &'input [u8]) -> Self {
         Self {
             input,
@@ -192,11 +188,6 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline(always)]
-    pub fn prime(&mut self, bits: u8, value: u64) {
-        self.bits.prime(bits, value);
-    }
-
-    #[inline(always)]
     pub fn return_unused_bytes(&mut self) {
         let bytes = usize::from(self.bits.bits_used >> 3);
         self.position = self
@@ -266,7 +257,7 @@ mod tests {
     #[test]
     fn cursor_never_advances_past_its_input() {
         let input = [1u8, 2, 3];
-        let mut reader = BitReader::new(&input);
+        let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
         reader.advance(2);
         assert_eq!(reader.as_slice(), &[3]);
         reader.advance(usize::MAX);
@@ -277,7 +268,7 @@ mod tests {
     #[test]
     fn refill_and_rewind_preserve_the_unconsumed_input() {
         let input = [0x10u8, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98];
-        let mut reader = BitReader::new(&input);
+        let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
         reader.refill();
         assert_eq!(reader.bits_in_buffer(), 56);
         assert_eq!(reader.bytes_remaining(), 2);
