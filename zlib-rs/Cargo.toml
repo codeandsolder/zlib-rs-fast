@@ -49,3 +49,8 @@ required-features = ["std"]
 name = "single"
 harness = false
 required-features = ["std"]
+
+[[bench]]
+name = "adler"
+harness = false
+required-features = ["std"]
