@@ -2680,6 +2680,10 @@ pub fn set_dictionary(stream: &mut InflateStream, dictionary: &[u8]) -> ReturnCo
 }
 
 pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
+    if stream.state.as_ptr().is_null() {
+        return stream.as_z_stream_mut();
+    }
+
     let alloc = stream.alloc;
     let allocation_start = stream.state.allocation_start;
     let total_allocation_size = stream.state.total_allocation_size;
@@ -2755,8 +2759,8 @@ mod tests {
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
         let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
 
-        let raw = end(stream);
-        assert!(raw.state.is_null());
+        assert!(end(stream).state.is_null());
+        assert!(end(stream).state.is_null());
     }
 
     #[test]

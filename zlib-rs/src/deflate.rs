@@ -860,6 +860,10 @@ pub fn copy<'a>(
 /// - Err when deflate is not done. A common cause is insufficient output space
 /// - Ok otherwise
 pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mut z_stream> {
+    if stream.state.as_ptr().is_null() {
+        return Err(stream.as_z_stream_mut());
+    }
+
     let status = stream.state.status;
     let allocation_start = stream.state.allocation_start;
     let total_allocation_size = stream.state.total_allocation_size;
@@ -3888,11 +3892,10 @@ mod test {
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
         let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
 
-        let raw = match end(stream) {
-            Ok(raw) => raw,
-            Err(_) => panic!("fresh deflate stream can be ended"),
-        };
-        assert!(raw.state.is_null());
+        assert!(end(stream).is_ok());
+        assert!(stream.as_z_stream_mut().state.is_null());
+        assert!(end(stream).is_err());
+        assert!(stream.as_z_stream_mut().state.is_null());
     }
 
     #[test]
