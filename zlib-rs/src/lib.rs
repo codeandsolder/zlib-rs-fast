@@ -44,6 +44,8 @@ pub use deflate::{DeflateConfig, Method, Strategy};
 pub use inflate::InflateConfig;
 
 pub use deflate::{compress_bound, compress_slice};
+#[cfg(feature = "std")]
+pub use deflate::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
 pub use inflate::decompress_slice;
 
 macro_rules! traceln {

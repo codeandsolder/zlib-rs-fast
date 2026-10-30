@@ -21,6 +21,8 @@ use self::{
 };
 
 mod algorithm;
+#[cfg(feature = "std")]
+mod batch;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
@@ -31,6 +33,9 @@ mod trees_tbl;
 mod window;
 
 // Position relative to the current window
+#[cfg(feature = "std")]
+pub use batch::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
+
 pub(crate) type Pos = u16;
 
 // SAFETY: This struct must have the same layout as [`z_stream`], so that casts and transmutations
