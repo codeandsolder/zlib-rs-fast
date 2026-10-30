@@ -39,7 +39,10 @@ pub struct BatchCompressResult {
 /// Match-search executor used by [`compress_slices_batch_with_backend`].
 ///
 /// No automatic policy is applied: scalar remains the default, while scoped threads are an explicit
-/// caller choice. A scoped-thread worker count of zero is treated as one worker.
+/// caller choice. A scoped-thread worker count of zero is treated as one worker. The scoped-thread
+/// backend creates OS threads for each concurrent match-search batch; it is primarily a concrete
+/// backend-boundary implementation, not a promise that threading will improve throughput. Measure
+/// it on the intended workload before selecting it for performance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BatchMatchSearchBackend {
     #[default]
@@ -49,18 +52,17 @@ pub enum BatchMatchSearchBackend {
     },
 }
 
-/// Compress several independent buffers while batching detached longest-match searches.
+/// Compress several independent buffers with scalar per-stream compression.
 ///
 /// Every job uses the same configuration and produces the same bytes as an independent
-/// [`super::compress_slice`] call. Fast, Medium, Slow, Huffman-only, and RLE compression share the
-/// schedulable standard-driver path. The default scalar backend executes detached searches directly
-/// without staging; backends that need cross-stream concurrency collect outstanding searches into a
-/// batch. Stored and Quick compression have different block mechanics and therefore fall back to the
-/// ordinary synchronous slice compressor.
+/// [`super::compress_slice`] call. The default scalar backend deliberately drives each stream to
+/// completion instead of round-robin scheduling compressor states: without a concurrent compute
+/// executor there is no cross-stream work to rendezvous, and preserving per-stream cache locality is
+/// both simpler and substantially cheaper.
 ///
-/// The function is available with the `std` feature because the cross-stream scheduler owns dynamic
-/// scratch vectors. Per-stream compression state still uses the crate's ordinary zlib allocator
-/// initialization path.
+/// Use [`compress_slices_batch_with_backend`] to opt into a backend that can execute detached
+/// longest-match searches concurrently. Stored and Quick compression always use the ordinary
+/// synchronous slice compressor because their block mechanics do not use that search backend.
 pub fn compress_slices_batch(
     jobs: &mut [BatchCompressJob<'_>],
     config: DeflateConfig,
@@ -74,6 +76,16 @@ pub fn compress_slices_batch_with_backend(
     config: DeflateConfig,
     backend: BatchMatchSearchBackend,
 ) -> Vec<BatchCompressResult> {
+    // With no concurrent search executor there is no cross-stream work to rendezvous. Driving each
+    // stream to completion preserves compressor-state cache locality and avoids paying scheduler
+    // turns for a batch that can never execute compute concurrently.
+    if matches!(
+        backend,
+        BatchMatchSearchBackend::Scalar | BatchMatchSearchBackend::ScopedThreads { workers: 0 | 1 }
+    ) {
+        return compress_synchronously(jobs, config);
+    }
+
     let Some(algorithm) = configured_algorithm(config) else {
         return compress_synchronously(jobs, config);
     };
@@ -102,26 +114,14 @@ pub fn compress_slices_batch_with_backend(
     }
 
     let mut active = runtimes.len();
-    let concurrent_searches = matches!(
-        backend,
-        BatchMatchSearchBackend::ScopedThreads { workers } if workers > 1
-    );
-    let mut match_work = if concurrent_searches {
-        Vec::<(usize, MatchSearchWork)>::with_capacity(runtimes.len())
-    } else {
-        Vec::new()
-    };
-    let mut match_results = if concurrent_searches {
-        vec![
-            MatchSearchResult {
-                length: 0,
-                start: 0,
-            };
-            runtimes.len()
-        ]
-    } else {
-        Vec::new()
-    };
+    let mut match_work = Vec::<(usize, MatchSearchWork)>::with_capacity(runtimes.len());
+    let mut match_results = vec![
+        MatchSearchResult {
+            length: 0,
+            start: 0,
+        };
+        runtimes.len()
+    ];
 
     while active != 0 {
         match_work.clear();
@@ -133,16 +133,7 @@ pub fn compress_slices_batch_with_backend(
 
             match runtime.step() {
                 RuntimeStep::Progress => {}
-                RuntimeStep::MatchSearch(work) => {
-                    if concurrent_searches {
-                        match_work.push((runtime_index, work));
-                    } else {
-                        // Scalar and one-worker execution borrow only this paused runtime and can be
-                        // completed immediately, so they need no cross-stream scratch vectors.
-                        let result = runtime.match_request(work).execute();
-                        runtime.complete_match_search(result);
-                    }
-                }
+                RuntimeStep::MatchSearch(work) => match_work.push((runtime_index, work)),
                 RuntimeStep::Done(result) => {
                     results[runtime.job_index] = result;
                     active -= 1;
