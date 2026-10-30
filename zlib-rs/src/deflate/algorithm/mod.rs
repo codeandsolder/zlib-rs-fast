@@ -727,7 +727,7 @@ pub(crate) enum Algorithm {
 }
 
 impl Algorithm {
-    fn for_stream(level: i8, strategy: Strategy) -> Self {
+    pub(super) fn for_stream(level: i8, strategy: Strategy) -> Self {
         if level == 0 {
             return Self::Stored;
         }

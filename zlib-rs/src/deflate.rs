@@ -4204,6 +4204,133 @@ mod test {
         output
     }
 
+    fn framed_standard_driver_output(input: &[u8], config: DeflateConfig) -> Vec<u8> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        let mut output = vec![0u8; compress_bound(input.len()) + 64];
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        // Use the real zlib framing/status path with no caller input attached. `reset_keep()`
+        // initializes last_flush to zlib's -2 sentinel, so this emits any zlib/gzip header without
+        // entering the compression algorithm.
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = output.len() as _;
+        assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert!(stream.state.bit_writer.pending.pending().is_empty());
+
+        let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy);
+        let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state)
+            .expect("proof only covers the five standard token-producing algorithms");
+
+        stream.next_in = input.as_ptr() as *mut u8;
+        stream.avail_in = input.len().try_into().expect("proof input fits zlib uInt");
+
+        let mut turns = 0usize;
+        loop {
+            turns += 1;
+            assert!(
+                turns < 100_000,
+                "framed StandardDriver failed to make progress"
+            );
+
+            let mut input_cursor = InputCursor::from_stream(stream);
+            let mut output_cursor = OutputCursor::from_stream(stream);
+            let outcome = driver.step(
+                &mut *stream.state,
+                &mut input_cursor,
+                &mut output_cursor,
+                algorithm::StandardSegmentMode::Final,
+            );
+            input_cursor.apply(stream);
+            output_cursor.apply(stream);
+
+            match outcome {
+                algorithm::StandardTurnOutcome::Progress => {}
+                algorithm::StandardTurnOutcome::MatchSearch(work) => {
+                    let request = work.request(&*stream.state);
+                    let mut results = [crate::deflate::longest_match::MatchSearchResult {
+                        length: 0,
+                        start: 0,
+                    }];
+                    crate::deflate::longest_match::execute_match_search_batch(
+                        core::slice::from_ref(&request),
+                        &mut results,
+                    );
+                    driver.complete_match_search(&mut *stream.state, results[0]);
+                }
+                algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
+                    panic!("final proof supplied the complete caller input")
+                }
+                algorithm::StandardTurnOutcome::NeedMoreOutput { .. } => {
+                    panic!("compress_bound-sized proof output unexpectedly filled")
+                }
+                algorithm::StandardTurnOutcome::SegmentDone(algorithm::EndBlockKind::Final) => {
+                    break;
+                }
+                algorithm::StandardTurnOutcome::SegmentDone(
+                    algorithm::EndBlockKind::FlushBoundary,
+                ) => panic!("final proof ended at a non-final boundary"),
+            }
+        }
+
+        assert_eq!(stream.avail_in, 0);
+        assert!(stream.state.bit_writer.pending.pending().is_empty());
+
+        // The StandardDriver already encoded the final DEFLATE block. Mark only that fact in the
+        // outer zlib status machine, then let the real deflate path emit the wrapper trailer.
+        stream.state.status = Status::Finish;
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+
+        let len = stream.total_out as usize;
+        assert!(end(stream).is_ok());
+        output.truncate(len);
+        output
+    }
+
+    #[test]
+    fn standard_driver_middle_preserves_full_stream_framing() {
+        let mut input = Vec::with_capacity(120_000);
+        for i in 0..3_000usize {
+            input.extend_from_slice(b"framed-standard-driver/");
+            input.extend_from_slice(&(i as u32).rotate_left(9).to_le_bytes());
+            input.extend(core::iter::repeat_n(((i * 29) % 251) as u8, 3 + i % 31));
+        }
+
+        let algorithms = [
+            (2, Strategy::Default),
+            (6, Strategy::Default),
+            (9, Strategy::Default),
+            (6, Strategy::HuffmanOnly),
+            (6, Strategy::Rle),
+        ];
+        let wrappers = [-crate::MAX_WBITS, crate::MAX_WBITS, 16 + crate::MAX_WBITS];
+
+        for window_bits in wrappers {
+            for (level, strategy) in algorithms {
+                let config = DeflateConfig {
+                    level,
+                    method: Method::Deflated,
+                    window_bits,
+                    mem_level: 1,
+                    strategy,
+                };
+                let mut reference_buf = vec![0u8; compress_bound(input.len()) + 64];
+                let (reference, rc) = compress_slice(&mut reference_buf, &input, config);
+                assert_eq!(rc, ReturnCode::Ok);
+
+                let scheduled = framed_standard_driver_output(&input, config);
+                assert_eq!(
+                    scheduled, reference,
+                    "framed StandardDriver changed output for level {level}, strategy {strategy:?}, window_bits {window_bits}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn standard_core_events_can_be_round_robin_scheduled_across_streams() {
         let mut input = Vec::with_capacity(160_000);
