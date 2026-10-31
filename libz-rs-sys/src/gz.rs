@@ -312,6 +312,55 @@ impl GzState {
     }
 }
 
+/// Owns the custom allocation containing one fully initialized [`GzState`].
+///
+/// A live gzip C handle is an escaped `GzStateOwner`; the matching close function
+/// reclaims that ownership after validating that it is the correct close operation.
+struct GzStateOwner {
+    ptr: NonNull<GzState>,
+}
+
+impl GzStateOwner {
+    fn allocate() -> Option<Self> {
+        let ptr = ALLOCATOR.allocate_raw::<GzState>()?;
+        // Safety: `ptr` has the size and alignment required for `GzState`, and this
+        // owner has exclusive access to the fresh allocation.
+        unsafe { ptr.as_ptr().write(GzState::new()) };
+        Some(Self { ptr })
+    }
+
+    fn as_mut(&mut self) -> &mut GzState {
+        // Safety: the owner uniquely owns a live, fully initialized `GzState`.
+        unsafe { self.ptr.as_mut() }
+    }
+
+    fn into_raw(self) -> NonNull<GzState> {
+        let ptr = self.ptr;
+        core::mem::forget(self);
+        ptr
+    }
+
+    /// Reclaim an allocation previously escaped through [`Self::into_raw`].
+    ///
+    /// # Safety
+    /// `ptr` must identify a live `GzState` allocation produced by `into_raw`, and
+    /// ownership of that allocation must be transferred exclusively to the returned owner.
+    unsafe fn reclaim(ptr: NonNull<GzState>) -> Self {
+        Self { ptr }
+    }
+}
+
+impl Drop for GzStateOwner {
+    fn drop(&mut self) {
+        // Safety: the owner uniquely owns one fully initialized `GzState` in an
+        // allocation created by `ALLOCATOR`. Run field drop glue before returning storage.
+        unsafe {
+            ptr::drop_in_place(self.ptr.as_ptr());
+            ALLOCATOR.deallocate(self.ptr.as_ptr(), 1);
+        }
+    }
+}
+
 // Gzip operating modes
 // NOTE: These values match what zlib-ng uses.
 #[allow(non_camel_case_types)]
@@ -443,37 +492,24 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
         return ptr::null_mut();
     }
 
-    let Some(mut state) = ALLOCATOR.allocate_raw::<GzState>() else {
+    let Some(mut state_owner) = GzStateOwner::allocate() else {
         return ptr::null_mut();
     };
-    // Safety: `allocate_raw` returned storage with the size and alignment required for
-    // `GzState`. Initialize the complete Rust value before creating a reference to it.
-    unsafe { state.as_ptr().write(GzState::new()) };
-    // Safety: the allocation now contains a fully initialized `GzState` and remains
-    // exclusively owned by this function until the returned gzFile escapes.
-    let state = unsafe { state.as_mut() };
+    let state = state_owner.as_mut();
 
     let mode = unsafe { CStr::from_ptr(mode) };
     let Ok((exclusive, cloexec)) = state.configure(mode.to_bytes()) else {
-        // Safety: state is a valid pointer allocated in this function and not used after freeing
-        unsafe { free_state(state) };
         return ptr::null_mut();
     };
 
     // Must specify read, write, or append
     if state.mode == GzMode::GZ_NONE {
-        // Safety: we know state is a valid pointer because it was allocated earlier in this
-        // function, and it is not used after the free because we return immediately afterward.
-        unsafe { free_state(state) };
         return ptr::null_mut();
     }
 
     // Can't force transparent read
     if state.mode == GzMode::GZ_READ {
         if state.direct {
-            // Safety: we know state is a valid pointer because it was allocated earlier in this
-            // function, and it is not used after the free because we return immediately afterward.
-            unsafe { free_state(state) };
             return ptr::null_mut();
         }
         state.direct = true; // Assume an empty file for now. Later, we'll check for a gzip header.
@@ -528,9 +564,6 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
     }
 
     if state.fd == -1 {
-        // Safety: we know state is a valid pointer because it was allocated earlier in this
-        // function, and it is not used after the free because we return immediately afterward.
-        unsafe { free_state(state) };
         return ptr::null_mut();
     }
 
@@ -552,8 +585,7 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
     // Initialize stream
     gz_reset(state);
 
-    // FIXME change this to core::ptr::from_mut(state).cast::<gzFile_s>() once MSRV >= 1.76
-    (state as *mut GzState).cast::<gzFile_s>()
+    state_owner.into_raw().as_ptr().cast::<gzFile_s>()
 }
 
 // Format a fake file path corresponding to an fd, for use in error messages.
@@ -655,25 +687,6 @@ fn gz_error(state: &mut GzState, err_msg: Option<(c_int, &str)>) {
     }
 }
 
-// Deallocate a GzState structure and all heap-allocated fields inside it.
-//
-// # Safety
-//
-// - The `state` object and all heap-allocated fields within it must have been obtained
-//   using `ALLOCATOR`.
-// - The caller must not use the `state` after passing it to this function.
-unsafe fn free_state(state: *mut GzState) {
-    if state.is_null() {
-        return;
-    }
-    // Safety: `state` is fully initialized. Dropping it releases all owned gzip
-    // buffers and C strings before the outer custom allocation is returned.
-    unsafe { ptr::drop_in_place(state) };
-
-    // Safety: The caller has ensured that `state` was allocated using `ALLOCATOR`.
-    unsafe { ALLOCATOR.deallocate(state, 1) };
-}
-
 // Release any lazily allocated gzip I/O buffers while keeping the `GzState` alive.
 fn free_buffers(state: &mut GzState) {
     state.input = None;
@@ -726,14 +739,20 @@ pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
 /// been deallocated.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzclose_r))]
 pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
-    let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
+    let Some(state_ptr) = NonNull::new(file.cast::<GzState>()) else {
         return Z_STREAM_ERROR;
     };
+    // Safety: the public contract requires a live gzip handle when `file` is non-null.
+    let state = unsafe { state_ptr.as_ref() };
 
-    // Check that we're reading.
+    // A mode mismatch must not consume the handle; the matching close operation may still use it.
     if state.mode != GzMode::GZ_READ {
         return Z_STREAM_ERROR;
     }
+
+    // Safety: mode validation above establishes that this close operation consumes the live handle.
+    let mut state_owner = unsafe { GzStateOwner::reclaim(state_ptr) };
+    let state = state_owner.as_mut();
 
     // Process any buffered input.
     if state.input.is_some() {
@@ -751,10 +770,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
         _ => Z_ERRNO,
     };
 
-    // Delete the underlying allocation.
-    // Safety: The `state` reference is not used beyond this point.
-    unsafe { free_state(file.cast::<GzState>()) };
-
+    // `state_owner` drops the complete state and returns its custom allocation here.
     ret
 }
 
@@ -777,14 +793,20 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
 pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     let mut ret = Z_OK;
 
-    let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
+    let Some(state_ptr) = NonNull::new(file.cast::<GzState>()) else {
         return Z_STREAM_ERROR;
     };
+    // Safety: the public contract requires a live gzip handle when `file` is non-null.
+    let state = unsafe { state_ptr.as_ref() };
 
-    // Check that we're writing.
+    // A mode mismatch must not consume the handle; the matching close operation may still use it.
     if state.mode != GzMode::GZ_WRITE {
         return Z_STREAM_ERROR;
     }
+
+    // Safety: mode validation above establishes that this close operation consumes the live handle.
+    let mut state_owner = unsafe { GzStateOwner::reclaim(state_ptr) };
+    let state = state_owner.as_mut();
 
     // Check for a pending seek request
     if state.seek {
@@ -806,10 +828,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
         ret = Z_ERRNO;
     }
 
-    // Delete the underlying allocation.
-    // Safety: The `state` reference is not used beyond this point.
-    unsafe { free_state(file.cast::<GzState>()) };
-
+    // `state_owner` drops the complete state and returns its custom allocation here.
     ret
 }
 
