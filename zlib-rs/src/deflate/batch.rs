@@ -194,10 +194,8 @@ pub fn compress_slices_batch_gpu(
         return Ok(compress_synchronously(jobs, config));
     };
     let max_dist = u32::try_from(max_dist).expect("DEFLATE max distance fits u32");
-    let tables = jobs
-        .iter()
-        .map(|job| searcher.search_with_max_dist(job.input, search_budget, max_dist))
-        .collect::<Result<Vec<_>, _>>()?;
+    let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
+    let tables = searcher.search_batch_with_max_dist(&inputs, search_budget, max_dist)?;
     let mut resolver = WholeInputTableResolver { tables: &tables };
     Ok(compress_scheduled(
         jobs,

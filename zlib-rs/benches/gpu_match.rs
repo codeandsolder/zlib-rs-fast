@@ -38,7 +38,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let adapter_filter = option_value(&args, "--adapter=");
     let level = option_value(&args, "--level=").map_or(Ok(9), str::parse)?;
+    let batch = option_value(&args, "--batch=").map_or(Ok(1usize), str::parse)?;
 
+    if batch == 0 {
+        return Err("--batch must be nonzero".into());
+    }
     if bytes < 3 {
         return Err("--bytes must be at least 3".into());
     }
@@ -64,31 +68,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     assert_eq!(steady.as_slice(), expected.as_slice());
 
+    let batch_inputs = vec![input.as_slice(); batch];
+    let sequential_tables = timed("GPU sequential tables", || {
+        batch_inputs
+            .iter()
+            .map(|input| searcher.search(input, search_budget))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    for table in &sequential_tables {
+        assert_eq!(table.as_slice(), expected.as_slice());
+    }
+    let batch_tables = timed("GPU batched tables", || {
+        searcher.search_batch(&batch_inputs, search_budget)
+    })?;
+    for table in &batch_tables {
+        assert_eq!(table.as_slice(), expected.as_slice());
+    }
+
     let config = DeflateConfig::new(level);
     let mut scalar_compressed = vec![0u8; compress_bound(input.len()) + 64];
     let scalar_started = Instant::now();
-    let (scalar_written, scalar_code) = compress_slice(&mut scalar_compressed, &input, config);
+    let mut scalar_len = 0usize;
+    for _ in 0..batch {
+        let (scalar_written, scalar_code) = compress_slice(&mut scalar_compressed, &input, config);
+        assert_eq!(scalar_code, ReturnCode::Ok);
+        scalar_len += scalar_written.len();
+    }
     let scalar_elapsed = scalar_started.elapsed();
-    assert_eq!(scalar_code, ReturnCode::Ok);
-    let scalar_len = scalar_written.len();
 
-    let mut compressed = vec![0u8; compress_bound(input.len()) + 64];
-    let mut jobs = [BatchCompressJob::new(&input, &mut compressed)];
+    let mut compressed = (0..batch)
+        .map(|_| vec![0u8; compress_bound(input.len()) + 64])
+        .collect::<Vec<_>>();
+    let mut jobs = compressed
+        .iter_mut()
+        .map(|output| BatchCompressJob::new(&input, output))
+        .collect::<Vec<_>>();
     let started = Instant::now();
     let results = compress_slices_batch_gpu(&mut jobs, config, &searcher, search_budget)?;
     let compression_elapsed = started.elapsed();
     drop(jobs);
-    assert_eq!(results[0].code, ReturnCode::Ok);
-    let compressed_len = results[0].written;
+    let compressed_len = results.iter().map(|result| result.written).sum::<usize>();
 
-    let mut decoded = vec![0u8; input.len()];
-    let (decoded, code) = decompress_slice(
-        &mut decoded,
-        &compressed[..compressed_len],
-        InflateConfig::default(),
-    );
-    assert_eq!(code, ReturnCode::Ok);
-    assert_eq!(decoded, input.as_slice());
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result.code, ReturnCode::Ok);
+        let mut decoded = vec![0u8; input.len()];
+        let (decoded, code) = decompress_slice(
+            &mut decoded,
+            &compressed[index][..result.written],
+            InflateConfig::default(),
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input.as_slice());
+    }
 
     let matches = steady
         .as_slice()
@@ -101,7 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|item| u64::from(item.length))
         .sum();
     println!(
-        "validated {} {:?} bytes at budget {} on {}: {} matches, {} total matched bytes; level {} scalar {} bytes ({:.3}%) in {:?}; GPU-fed {} bytes ({:.3}%) in {:?}",
+        "validated batch {} x {} {:?} bytes at budget {} on {}: {} matches/input, {} total matched bytes/input; level {} scalar {} bytes ({:.3}%) in {:?}; GPU-fed {} bytes ({:.3}%) in {:?}",
+        batch,
         input.len(),
         corpus,
         search_budget,
@@ -110,13 +142,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         matched_bytes,
         level,
         scalar_len,
-        scalar_len as f64 * 100.0 / input.len() as f64,
+        scalar_len as f64 * 100.0 / (input.len() * batch) as f64,
         scalar_elapsed,
         compressed_len,
-        compressed_len as f64 * 100.0 / input.len() as f64,
+        compressed_len as f64 * 100.0 / (input.len() * batch) as f64,
         compression_elapsed,
     );
-    black_box((first, steady, scalar_len, compressed_len));
+    black_box((
+        first,
+        steady,
+        sequential_tables,
+        batch_tables,
+        scalar_len,
+        compressed_len,
+    ));
     Ok(())
 }
 

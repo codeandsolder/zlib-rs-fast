@@ -4,11 +4,11 @@ use std::{fmt, sync::mpsc};
 
 use bytemuck::cast_slice;
 use wgpu::{
-    util::{DeviceExt, DownloadBuffer},
-    Adapter, Backends, BindGroupDescriptor, BindGroupEntry, BufferUsages, CommandEncoderDescriptor,
-    ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor,
-    DeviceType, ExperimentalFeatures, Features, Instance, InstanceDescriptor, Limits, MemoryHints,
-    PipelineCompilationOptions, Queue, ShaderModuleDescriptor, Trace,
+    util::DeviceExt, Adapter, Backends, BindGroupDescriptor, BindGroupEntry, BufferUsages,
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor,
+    Device, DeviceDescriptor, DeviceType, ExperimentalFeatures, Features, Instance,
+    InstanceDescriptor, Limits, MemoryHints, PipelineCompilationOptions, Queue,
+    ShaderModuleDescriptor, Trace,
 };
 
 const HASH_SIZE: usize = 1 << 16;
@@ -207,142 +207,213 @@ impl GpuMatchSearcher {
         self.search_with_max_dist(input, search_budget, DEFAULT_MAX_DIST)
     }
 
+    /// Search several independent complete inputs in one GPU submission.
+    ///
+    /// All inputs use the same search budget and DEFLATE default maximum distance. Dispatches and
+    /// result copies are encoded together, then all readbacks complete behind one device poll.
+    pub fn search_batch(
+        &self,
+        inputs: &[&[u8]],
+        search_budget: u32,
+    ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
+        self.search_batch_with_max_dist(inputs, search_budget, DEFAULT_MAX_DIST)
+    }
+
     pub(crate) fn search_with_max_dist(
         &self,
         input: &[u8],
         search_budget: u32,
         max_dist: u32,
     ) -> Result<GpuMatchTable, GpuMatchError> {
+        let mut tables = self.search_batch_with_max_dist(&[input], search_budget, max_dist)?;
+        Ok(tables
+            .pop()
+            .expect("one GPU match-search input produces one table"))
+    }
+
+    pub(crate) fn search_batch_with_max_dist(
+        &self,
+        inputs: &[&[u8]],
+        search_budget: u32,
+        max_dist: u32,
+    ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
         if search_budget == 0 {
             return Err(GpuMatchError(
                 "GPU match search budget must be nonzero".into(),
             ));
         }
-        let input_len = u32::try_from(input.len())
-            .map_err(|_| GpuMatchError("GPU match search input exceeds u32::MAX bytes".into()))?;
-        if input.is_empty() {
-            return Ok(GpuMatchTable {
-                entries: Vec::new(),
-            });
+
+        let mut tables = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        if inputs.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let index = build_hash_index(input)?;
-        let input_words = pack_words(input);
-        let result_words = vec![[0u32; 2]; input.len()];
-        let params = [input_len, max_dist, MAX_MATCH, search_budget];
-
-        let input_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("match input"),
-                contents: cast_slice(&input_words),
-                usage: BufferUsages::STORAGE,
-            });
-        let offsets_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("match bucket offsets"),
-                contents: cast_slice(&index.offsets),
-                usage: BufferUsages::STORAGE,
-            });
-        let positions_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("match bucket positions"),
-                contents: cast_slice(&index.positions),
-                usage: BufferUsages::STORAGE,
-            });
-        let result_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("match results"),
-                contents: cast_slice(&result_words),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            });
-        let params_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("match params"),
-                contents: cast_slice(&params),
-                usage: BufferUsages::UNIFORM,
-            });
-
         let layout = self.pipeline.get_bind_group_layout(0);
-        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("whole-input match buffers"),
-            layout: &layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: offsets_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: positions_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: result_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("whole-input match command encoder"),
+                label: Some("whole-input match batch command encoder"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("whole-input match search"),
-                timestamp_writes: None,
+        let mut downloads = Vec::with_capacity(inputs.len());
+
+        for (input_index, input) in inputs.iter().copied().enumerate() {
+            let input_len = u32::try_from(input.len()).map_err(|_| {
+                GpuMatchError("GPU match search input exceeds u32::MAX bytes".into())
+            })?;
+            if input.is_empty() {
+                tables[input_index] = Some(GpuMatchTable {
+                    entries: Vec::new(),
+                });
+                continue;
+            }
+
+            let index = build_hash_index(input)?;
+            let input_words = pack_words(input);
+            let params = [input_len, max_dist, MAX_MATCH, search_budget];
+            let result_size = u64::from(input_len) * 8;
+
+            let input_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("match input"),
+                    contents: cast_slice(&input_words),
+                    usage: BufferUsages::STORAGE,
+                });
+            let offsets_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("match bucket offsets"),
+                        contents: cast_slice(&index.offsets),
+                        usage: BufferUsages::STORAGE,
+                    });
+            let positions_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("match bucket positions"),
+                        contents: cast_slice(&index.positions),
+                        usage: BufferUsages::STORAGE,
+                    });
+            let result_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("match results"),
+                size: result_size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(input_len.div_ceil(WORKGROUP_SIZE), 1, 1);
+            let params_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("match params"),
+                    contents: cast_slice(&params),
+                    usage: BufferUsages::UNIFORM,
+                });
+
+            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("whole-input match buffers"),
+                layout: &layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: input_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: offsets_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: positions_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: result_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("whole-input match search"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(input_len.div_ceil(WORKGROUP_SIZE), 1, 1);
+            }
+
+            let download = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("match result download"),
+                size: result_size,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_buffer_to_buffer(&result_buffer, 0, &download, 0, result_size);
+            downloads.push((input_index, input.len(), download));
         }
+
+        if downloads.is_empty() {
+            return Ok(tables
+                .into_iter()
+                .map(|table| table.expect("empty inputs receive empty match tables"))
+                .collect());
+        }
+
         self.queue.submit(Some(encoder.finish()));
 
-        let (sender, receiver) = mpsc::sync_channel(1);
-        DownloadBuffer::read_buffer(
-            &self.device,
-            &self.queue,
-            &result_buffer.slice(..),
-            move |result| {
-                let _ = sender.send(result);
-            },
-        );
+        let (sender, receiver) = mpsc::channel();
+        for (input_index, _, download) in &downloads {
+            let sender = sender.clone();
+            let input_index = *input_index;
+            download
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send((input_index, result));
+                });
+        }
+        drop(sender);
+
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|error| GpuMatchError(format!("GPU poll failed: {error}")))?;
-        let download = receiver
-            .recv()
-            .map_err(|_| GpuMatchError("GPU download callback was dropped".into()))?
-            .map_err(|error| GpuMatchError(format!("GPU result download failed: {error}")))?;
-        let bytes: &[u8] = &download;
-        if bytes.len() != input.len() * 8 {
-            return Err(GpuMatchError(
-                "GPU result buffer has an unexpected length".into(),
-            ));
+
+        for _ in 0..downloads.len() {
+            let (input_index, result) = receiver
+                .recv()
+                .map_err(|_| GpuMatchError("GPU download callback was dropped".into()))?;
+            result.map_err(|error| {
+                GpuMatchError(format!(
+                    "GPU result download for input {input_index} failed: {error}"
+                ))
+            })?;
         }
 
-        Ok(GpuMatchTable {
-            entries: bytes
+        for (input_index, input_len, download) in downloads {
+            let mapped = download.slice(..).get_mapped_range();
+            let bytes: &[u8] = &mapped;
+            if bytes.len() != input_len * 8 {
+                return Err(GpuMatchError(format!(
+                    "GPU result buffer for input {input_index} has an unexpected length"
+                )));
+            }
+            let entries = bytes
                 .chunks_exact(8)
                 .map(|bytes| GpuMatch {
                     length: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
                     start: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
                 })
-                .collect(),
-        })
+                .collect();
+            drop(mapped);
+            download.unmap();
+            tables[input_index] = Some(GpuMatchTable { entries });
+        }
+
+        Ok(tables
+            .into_iter()
+            .map(|table| table.expect("every GPU input receives a match table"))
+            .collect())
     }
 }
 
