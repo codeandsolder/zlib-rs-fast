@@ -1,13 +1,17 @@
 #![forbid(unsafe_code)]
 
-use std::{fmt, sync::mpsc};
+use std::{
+    fmt,
+    num::NonZeroU64,
+    sync::{mpsc, Mutex},
+};
 
 use bytemuck::cast_slice;
 use wgpu::{
-    util::DeviceExt, Adapter, Backends, BindGroupDescriptor, BindGroupEntry, BufferUsages,
-    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor,
-    Device, DeviceDescriptor, DeviceType, ExperimentalFeatures, Features, Instance,
-    InstanceDescriptor, Limits, MemoryHints, PipelineCompilationOptions, Queue,
+    Adapter, Backends, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferBinding,
+    BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline,
+    ComputePipelineDescriptor, Device, DeviceDescriptor, DeviceType, ExperimentalFeatures,
+    Features, Instance, InstanceDescriptor, Limits, MemoryHints, PipelineCompilationOptions, Queue,
     ShaderModuleDescriptor, Trace,
 };
 
@@ -167,6 +171,159 @@ struct HashIndex {
     positions: Vec<u32>,
 }
 
+struct ReusableBuffer {
+    buffer: Buffer,
+    capacity: u64,
+    usage: BufferUsages,
+    label: &'static str,
+}
+
+impl ReusableBuffer {
+    fn new(device: &Device, label: &'static str, usage: BufferUsages) -> Self {
+        let capacity = 4;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: capacity,
+            usage,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            capacity,
+            usage,
+            label,
+        }
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        device: &Device,
+        required: u64,
+        max_buffer_size: u64,
+    ) -> Result<(), GpuMatchError> {
+        if required <= self.capacity {
+            return Ok(());
+        }
+        if required > max_buffer_size {
+            return Err(GpuMatchError(format!(
+                "GPU {} buffer requires {required} bytes, device limit is {max_buffer_size}",
+                self.label
+            )));
+        }
+        let grown = required
+            .checked_next_power_of_two()
+            .unwrap_or(required)
+            .min(max_buffer_size);
+        let capacity = grown.max(required);
+        self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(self.label),
+            size: capacity,
+            usage: self.usage,
+            mapped_at_creation: false,
+        });
+        self.capacity = capacity;
+        Ok(())
+    }
+}
+
+struct GpuWorkspace {
+    input: ReusableBuffer,
+    offsets: ReusableBuffer,
+    positions: ReusableBuffer,
+    results: ReusableBuffer,
+    params: ReusableBuffer,
+    download: ReusableBuffer,
+}
+
+impl GpuWorkspace {
+    fn new(device: &Device) -> Self {
+        Self {
+            input: ReusableBuffer::new(
+                device,
+                "match input workspace",
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            ),
+            offsets: ReusableBuffer::new(
+                device,
+                "match bucket-offset workspace",
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            ),
+            positions: ReusableBuffer::new(
+                device,
+                "match bucket-position workspace",
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            ),
+            results: ReusableBuffer::new(
+                device,
+                "match result workspace",
+                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            ),
+            params: ReusableBuffer::new(
+                device,
+                "match parameter workspace",
+                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            ),
+            download: ReusableBuffer::new(
+                device,
+                "match download workspace",
+                BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            ),
+        }
+    }
+}
+
+struct PreparedGpuInput {
+    input_index: usize,
+    input_len: u32,
+    input_words: Vec<u32>,
+    index: HashIndex,
+    params: [u32; 4],
+    input_offset: u64,
+    offsets_offset: u64,
+    positions_offset: u64,
+    result_offset: u64,
+    params_offset: u64,
+    download_offset: u64,
+}
+
+impl PreparedGpuInput {
+    fn input_size(&self) -> u64 {
+        (self.input_words.len() * size_of::<u32>()) as u64
+    }
+
+    fn offsets_size(&self) -> u64 {
+        (self.index.offsets.len() * size_of::<u32>()) as u64
+    }
+
+    fn positions_data_size(&self) -> u64 {
+        (self.index.positions.len() * size_of::<u32>()) as u64
+    }
+
+    fn positions_binding_size(&self) -> u64 {
+        self.positions_data_size().max(size_of::<u32>() as u64)
+    }
+
+    fn result_size(&self) -> u64 {
+        u64::from(self.input_len) * 2 * size_of::<u32>() as u64
+    }
+}
+
+fn allocate_aligned(cursor: &mut u64, size: u64, alignment: u64) -> Result<u64, GpuMatchError> {
+    let remainder = *cursor % alignment;
+    let padding = if remainder == 0 {
+        0
+    } else {
+        alignment - remainder
+    };
+    let offset = cursor
+        .checked_add(padding)
+        .ok_or_else(|| GpuMatchError("GPU batch buffer layout overflowed".into()))?;
+    *cursor = offset
+        .checked_add(size)
+        .ok_or_else(|| GpuMatchError("GPU batch buffer layout overflowed".into()))?;
+    Ok(offset)
+}
+
 /// Persistent Vulkan whole-input match-search engine.
 ///
 /// Device selection, shader compilation, and compute-pipeline creation happen once in [`Self::new`].
@@ -177,6 +334,7 @@ pub struct GpuMatchSearcher {
     queue: Queue,
     pipeline: ComputePipeline,
     adapter_name: String,
+    workspace: Mutex<GpuWorkspace>,
 }
 
 impl GpuMatchSearcher {
@@ -210,11 +368,13 @@ impl GpuMatchSearcher {
             cache: None,
         });
 
+        let workspace = Mutex::new(GpuWorkspace::new(&device));
         Ok(Self {
             device,
             queue,
             pipeline,
             adapter_name,
+            workspace,
         })
     }
 
@@ -267,13 +427,19 @@ impl GpuMatchSearcher {
             return Ok(Vec::new());
         }
 
-        let layout = self.pipeline.get_bind_group_layout(0);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("whole-input match batch command encoder"),
-            });
-        let mut downloads = Vec::with_capacity(inputs.len());
+        let limits = self.device.limits();
+        let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment.max(1));
+        let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment.max(1));
+        let max_storage_binding_size = u64::from(limits.max_storage_buffer_binding_size);
+        let max_uniform_binding_size = u64::from(limits.max_uniform_buffer_binding_size);
+
+        let mut input_cursor = 0u64;
+        let mut offsets_cursor = 0u64;
+        let mut positions_cursor = 0u64;
+        let mut result_cursor = 0u64;
+        let mut params_cursor = 0u64;
+        let mut download_cursor = 0u64;
+        let mut prepared = Vec::with_capacity(inputs.len());
 
         for (input_index, input) in inputs.iter().copied().enumerate() {
             let input_len = u32::try_from(input.len()).map_err(|_| {
@@ -288,67 +454,166 @@ impl GpuMatchSearcher {
 
             let index = build_hash_index(input)?;
             let input_words = pack_words(input);
-            let params = [input_len, max_dist, MAX_MATCH, search_budget];
-            let result_size = u64::from(input_len) * 8;
+            let mut item = PreparedGpuInput {
+                input_index,
+                input_len,
+                input_words,
+                index,
+                params: [input_len, max_dist, MAX_MATCH, search_budget],
+                input_offset: 0,
+                offsets_offset: 0,
+                positions_offset: 0,
+                result_offset: 0,
+                params_offset: 0,
+                download_offset: 0,
+            };
 
-            let input_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("match input"),
-                    contents: cast_slice(&input_words),
-                    usage: BufferUsages::STORAGE,
-                });
-            let offsets_buffer =
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("match bucket offsets"),
-                        contents: cast_slice(&index.offsets),
-                        usage: BufferUsages::STORAGE,
-                    });
-            let positions_buffer =
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("match bucket positions"),
-                        contents: cast_slice(&index.positions),
-                        usage: BufferUsages::STORAGE,
-                    });
-            let result_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("match results"),
-                size: result_size,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
+            for (name, size) in [
+                ("input", item.input_size()),
+                ("bucket offsets", item.offsets_size()),
+                ("bucket positions", item.positions_binding_size()),
+                ("results", item.result_size()),
+            ] {
+                if size > max_storage_binding_size {
+                    return Err(GpuMatchError(format!(
+                        "GPU {name} binding for input {input_index} requires {size} bytes, device limit is {max_storage_binding_size}"
+                    )));
+                }
+            }
+            let params_size = size_of_val(&item.params) as u64;
+            if params_size > max_uniform_binding_size {
+                return Err(GpuMatchError(format!(
+                    "GPU parameter binding requires {params_size} bytes, device limit is {max_uniform_binding_size}"
+                )));
+            }
+
+            item.input_offset =
+                allocate_aligned(&mut input_cursor, item.input_size(), storage_alignment)?;
+            item.offsets_offset =
+                allocate_aligned(&mut offsets_cursor, item.offsets_size(), storage_alignment)?;
+            item.positions_offset = allocate_aligned(
+                &mut positions_cursor,
+                item.positions_binding_size(),
+                storage_alignment,
+            )?;
+            item.result_offset =
+                allocate_aligned(&mut result_cursor, item.result_size(), storage_alignment)?;
+            item.params_offset =
+                allocate_aligned(&mut params_cursor, params_size, uniform_alignment)?;
+            item.download_offset = download_cursor;
+            download_cursor = download_cursor
+                .checked_add(item.result_size())
+                .ok_or_else(|| GpuMatchError("GPU download buffer layout overflowed".into()))?;
+            prepared.push(item);
+        }
+
+        if prepared.is_empty() {
+            return Ok(tables
+                .into_iter()
+                .map(|table| table.expect("empty inputs receive empty match tables"))
+                .collect());
+        }
+
+        let mut workspace = self
+            .workspace
+            .lock()
+            .map_err(|_| GpuMatchError("GPU match workspace lock was poisoned".into()))?;
+        let max_buffer_size = limits.max_buffer_size;
+        workspace
+            .input
+            .ensure_capacity(&self.device, input_cursor, max_buffer_size)?;
+        workspace
+            .offsets
+            .ensure_capacity(&self.device, offsets_cursor, max_buffer_size)?;
+        workspace
+            .positions
+            .ensure_capacity(&self.device, positions_cursor, max_buffer_size)?;
+        workspace
+            .results
+            .ensure_capacity(&self.device, result_cursor, max_buffer_size)?;
+        workspace
+            .params
+            .ensure_capacity(&self.device, params_cursor, max_buffer_size)?;
+        workspace
+            .download
+            .ensure_capacity(&self.device, download_cursor, max_buffer_size)?;
+
+        for item in &prepared {
+            self.queue.write_buffer(
+                &workspace.input.buffer,
+                item.input_offset,
+                cast_slice(&item.input_words),
+            );
+            self.queue.write_buffer(
+                &workspace.offsets.buffer,
+                item.offsets_offset,
+                cast_slice(&item.index.offsets),
+            );
+            if !item.index.positions.is_empty() {
+                self.queue.write_buffer(
+                    &workspace.positions.buffer,
+                    item.positions_offset,
+                    cast_slice(&item.index.positions),
+                );
+            }
+            self.queue.write_buffer(
+                &workspace.params.buffer,
+                item.params_offset,
+                cast_slice(&item.params),
+            );
+        }
+
+        let layout = self.pipeline.get_bind_group_layout(0);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("whole-input match batch command encoder"),
             });
-            let params_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("match params"),
-                    contents: cast_slice(&params),
-                    usage: BufferUsages::UNIFORM,
-                });
 
+        for item in &prepared {
             let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-                label: Some("whole-input match buffers"),
+                label: Some("whole-input packed match buffers"),
                 layout: &layout,
                 entries: &[
                     BindGroupEntry {
                         binding: 0,
-                        resource: input_buffer.as_entire_binding(),
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &workspace.input.buffer,
+                            offset: item.input_offset,
+                            size: NonZeroU64::new(item.input_size()),
+                        }),
                     },
                     BindGroupEntry {
                         binding: 1,
-                        resource: offsets_buffer.as_entire_binding(),
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &workspace.offsets.buffer,
+                            offset: item.offsets_offset,
+                            size: NonZeroU64::new(item.offsets_size()),
+                        }),
                     },
                     BindGroupEntry {
                         binding: 2,
-                        resource: positions_buffer.as_entire_binding(),
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &workspace.positions.buffer,
+                            offset: item.positions_offset,
+                            size: NonZeroU64::new(item.positions_binding_size()),
+                        }),
                     },
                     BindGroupEntry {
                         binding: 3,
-                        resource: result_buffer.as_entire_binding(),
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &workspace.results.buffer,
+                            offset: item.result_offset,
+                            size: NonZeroU64::new(item.result_size()),
+                        }),
                     },
                     BindGroupEntry {
                         binding: 4,
-                        resource: params_buffer.as_entire_binding(),
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &workspace.params.buffer,
+                            offset: item.params_offset,
+                            size: NonZeroU64::new(size_of_val(&item.params) as u64),
+                        }),
                     },
                 ],
             });
@@ -360,74 +625,54 @@ impl GpuMatchSearcher {
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(input_len.div_ceil(WORKGROUP_SIZE), 1, 1);
+                pass.dispatch_workgroups(item.input_len.div_ceil(WORKGROUP_SIZE), 1, 1);
             }
-
-            let download = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("match result download"),
-                size: result_size,
-                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            encoder.copy_buffer_to_buffer(&result_buffer, 0, &download, 0, result_size);
-            downloads.push((input_index, input.len(), download));
-        }
-
-        if downloads.is_empty() {
-            return Ok(tables
-                .into_iter()
-                .map(|table| table.expect("empty inputs receive empty match tables"))
-                .collect());
+            encoder.copy_buffer_to_buffer(
+                &workspace.results.buffer,
+                item.result_offset,
+                &workspace.download.buffer,
+                item.download_offset,
+                item.result_size(),
+            );
         }
 
         self.queue.submit(Some(encoder.finish()));
 
-        let (sender, receiver) = mpsc::channel();
-        for (input_index, _, download) in &downloads {
-            let sender = sender.clone();
-            let input_index = *input_index;
-            download
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = sender.send((input_index, result));
-                });
-        }
-        drop(sender);
-
+        let (sender, receiver) = mpsc::sync_channel(1);
+        workspace
+            .download
+            .buffer
+            .slice(0..download_cursor)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|error| GpuMatchError(format!("GPU poll failed: {error}")))?;
+        receiver
+            .recv()
+            .map_err(|_| GpuMatchError("GPU download callback was dropped".into()))?
+            .map_err(|error| GpuMatchError(format!("GPU result download failed: {error}")))?;
 
-        for _ in 0..downloads.len() {
-            let (input_index, result) = receiver
-                .recv()
-                .map_err(|_| GpuMatchError("GPU download callback was dropped".into()))?;
-            result.map_err(|error| {
-                GpuMatchError(format!(
-                    "GPU result download for input {input_index} failed: {error}"
-                ))
-            })?;
-        }
-
-        for (input_index, input_len, download) in downloads {
-            let mapped = download.slice(..).get_mapped_range();
-            let bytes: &[u8] = &mapped;
-            if bytes.len() != input_len * 8 {
-                return Err(GpuMatchError(format!(
-                    "GPU result buffer for input {input_index} has an unexpected length"
-                )));
-            }
-            let entries = bytes
+        let mapped = workspace
+            .download
+            .buffer
+            .slice(0..download_cursor)
+            .get_mapped_range();
+        for item in &prepared {
+            let start = item.download_offset as usize;
+            let end = start + item.result_size() as usize;
+            let entries = mapped[start..end]
                 .chunks_exact(8)
                 .map(|bytes| GpuMatch {
                     length: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
                     start: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
                 })
                 .collect();
-            drop(mapped);
-            download.unmap();
-            tables[input_index] = Some(GpuMatchTable { entries });
+            tables[item.input_index] = Some(GpuMatchTable { entries });
         }
+        drop(mapped);
+        workspace.download.buffer.unmap();
 
         Ok(tables
             .into_iter()
