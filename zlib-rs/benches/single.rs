@@ -39,6 +39,13 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
     let full = args.iter().any(|arg| arg == "--full");
     let sweep = args.iter().any(|arg| arg == "--sweep");
+    let profile = args.iter().any(|arg| arg == "--profile");
+    let profile_iters = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--profile-iters="))
+        .map_or(Ok(1usize), str::parse)
+        .expect("--profile-iters must be a positive integer");
+    assert!(profile_iters != 0, "--profile-iters must be nonzero");
     let mut cases = if sweep {
         sweep_cases()
     } else if full {
@@ -50,6 +57,14 @@ fn main() {
         let filters = only.split(',').collect::<Vec<_>>();
         cases.retain(|case| filters.iter().any(|filter| case.name.contains(filter)));
     }
+    if profile {
+        println!("zlib-rs single-stream profile workload");
+        for case in cases {
+            profile_case(case, profile_iters);
+        }
+        return;
+    }
+
     let (target, samples) = benchmark_shape(full);
 
     println!("zlib-rs single-stream benchmark");
@@ -86,10 +101,22 @@ fn quick_cases() -> Vec<Case> {
             level: 6,
         },
         Case {
+            name: "structured-256k-l7",
+            corpus: Corpus::Structured,
+            bytes: 256 * 1024,
+            level: 7,
+        },
+        Case {
             name: "random-256k-l6",
             corpus: Corpus::PseudoRandom,
             bytes: 256 * 1024,
             level: 6,
+        },
+        Case {
+            name: "random-256k-l9",
+            corpus: Corpus::PseudoRandom,
+            bytes: 256 * 1024,
+            level: 9,
         },
         Case {
             name: "structured-256k-l9",
@@ -144,6 +171,31 @@ fn full_cases() -> Vec<Case> {
         },
     ]);
     cases
+}
+
+fn profile_case(case: Case, iters: usize) {
+    let input = make_input(case.corpus, case.bytes, 0x1234_5678_9abc_def0);
+    let config = DeflateConfig::new(case.level);
+    let mut output = vec![0u8; compress_bound(input.len()) + 64];
+
+    let mut written_len = 0usize;
+    for _ in 0..iters {
+        let (written, code) = compress_slice(&mut output, &input, config);
+        assert_eq!(code, ReturnCode::Ok);
+        written_len = black_box(written.len());
+    }
+    black_box((&input, &output, written_len));
+
+    println!(
+        "{:<22} {:?} {:>4} KiB L{} | {} bytes ({:.4}) | {} compression iteration(s)",
+        case.name,
+        case.corpus,
+        case.bytes / 1024,
+        case.level,
+        written_len,
+        written_len as f64 / input.len() as f64,
+        iters,
+    );
 }
 
 fn run_case(case: Case, full: bool) {
