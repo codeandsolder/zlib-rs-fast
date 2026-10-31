@@ -29,6 +29,8 @@ mod gpu_match;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
+#[cfg(any(test, feature = "__internal-api"))]
+mod near_optimal;
 mod pending;
 mod slide_hash;
 mod sym_buf;
@@ -3201,6 +3203,80 @@ pub(crate) fn drain_pending_output(
         DrainOutcome::OutputFull
     } else {
         DrainOutcome::Ready
+    }
+}
+
+/// Experimental complete-buffer near-optimal compressor for one symbol-buffer-sized block.
+///
+/// This is intentionally available only through the `__internal-api` feature while the parser and
+/// block splitter are being developed. It emits a normal zlib-wrapped DEFLATE stream and reuses the
+/// production tree builder/bit writer; only token selection is new.
+#[cfg(any(test, feature = "__internal-api"))]
+pub fn compress_slice_near_optimal_block<'a>(
+    output: &'a mut [u8],
+    input: &[u8],
+    refinement_passes: usize,
+) -> (&'a mut [u8], ReturnCode) {
+    if input.len() > near_optimal::ONE_BLOCK_MAX_INPUT {
+        return (&mut output[..0], ReturnCode::StreamError);
+    }
+
+    let mut raw = z_stream::default();
+    let init_result = init(&mut raw, DeflateConfig::new(9));
+    if init_result != ReturnCode::Ok {
+        return (&mut output[..0], init_result);
+    }
+
+    let produced = {
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }
+            .expect("successful deflate init creates typed state");
+        let state = &mut *stream.state;
+
+        let candidates = near_optimal::build_match_candidates(input, state.max_dist());
+        let parsed = near_optimal::refined_parse(state, input, &candidates, refinement_passes);
+
+        // `refined_parse` leaves an empty initialized block after its final cost-model pass.
+        near_optimal::tally_tokens(state, &parsed.tokens);
+
+        // Preserve the original bytes so the production block chooser may still select a stored
+        // block when that is smaller than either Huffman encoding.
+        if !input.is_empty() {
+            // SAFETY: `input` is readable for exactly input.len() bytes, the freshly allocated
+            // window is uniquely owned by this state, and the one-block limit is well below its
+            // 64 KiB backing allocation.
+            unsafe {
+                state
+                    .window
+                    .copy_and_initialize(0..input.len(), input.as_ptr())
+            };
+        }
+        let header = state.header().to_be_bytes();
+        state.bit_writer.pending.extend(&header);
+
+        state.block_start = 0;
+        state.strstart = input.len();
+        state.lookahead = 0;
+        state.encode_block(true);
+        let checksum = adler32(ADLER32_INITIAL_VALUE as u32, input);
+        state.bit_writer.pending.extend(&checksum.to_be_bytes());
+
+        let pending = state.bit_writer.pending.pending();
+        if pending.len() > output.len() {
+            None
+        } else {
+            output[..pending.len()].copy_from_slice(pending);
+            Some(pending.len())
+        }
+    };
+
+    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut raw) } {
+        stream.state.status = Status::Finish;
+        let _ = end(stream);
+    }
+
+    match produced {
+        Some(len) => (&mut output[..len], ReturnCode::Ok),
+        None => (&mut output[..0], ReturnCode::BufError),
     }
 }
 

@@ -63,3 +63,7 @@ required-features = ["std"]
 name = "gpu_match"
 harness = false
 required-features = ["gpu"]
+
+[[example]]
+name = "near_optimal_probe"
+required-features = ["__internal-api"]
