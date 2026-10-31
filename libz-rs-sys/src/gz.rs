@@ -26,6 +26,70 @@ pub enum gzFile_s {}
 #[allow(non_camel_case_types)]
 pub type gzFile = *mut gzFile_s;
 
+struct GzCString {
+    ptr: NonNull<c_char>,
+    len_with_nul: usize,
+}
+
+impl GzCString {
+    fn clone_from_c_str(src: &CStr) -> Option<Self> {
+        let bytes = src.to_bytes_with_nul();
+        let ptr = ALLOCATOR.allocate_slice_raw::<c_char>(bytes.len())?;
+
+        // Safety: `ptr` is a fresh allocation for exactly `bytes.len()` c_char values.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), ptr.as_ptr(), bytes.len())
+        };
+
+        Some(Self {
+            ptr,
+            len_with_nul: bytes.len(),
+        })
+    }
+
+    fn concat(parts: &[&[u8]]) -> Option<Self> {
+        let len_with_nul = parts
+            .iter()
+            .try_fold(1usize, |len, part| len.checked_add(part.len()))?;
+        let ptr = ALLOCATOR.allocate_slice_raw::<c_char>(len_with_nul)?;
+        let mut offset = 0usize;
+
+        for part in parts {
+            // Safety: `offset + part.len()` is bounded by `len_with_nul - 1`, and
+            // the fresh destination allocation cannot overlap any source slice.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    part.as_ptr(),
+                    ptr.as_ptr().cast::<u8>().add(offset),
+                    part.len(),
+                )
+            };
+            offset += part.len();
+        }
+        // Safety: `offset == len_with_nul - 1`, so the terminator is in-bounds.
+        unsafe { *ptr.as_ptr().cast::<u8>().add(offset) = 0 };
+
+        Some(Self { ptr, len_with_nul })
+    }
+
+    fn as_ptr(&self) -> *const c_char {
+        self.ptr.as_ptr()
+    }
+
+    fn as_c_str(&self) -> &CStr {
+        // Safety: construction always writes one trailing NUL after bytes that came from
+        // either a C string or internal byte slices, and the allocation stays owned by self.
+        unsafe { CStr::from_ptr(self.as_ptr()) }
+    }
+}
+
+impl Drop for GzCString {
+    fn drop(&mut self) {
+        // Safety: `ptr` was allocated by `ALLOCATOR` for exactly `len_with_nul` c_char values.
+        unsafe { ALLOCATOR.deallocate(self.ptr.as_ptr(), self.len_with_nul) };
+    }
+}
+
 struct GzBuffer {
     ptr: NonNull<u8>,
     capacity: usize,
@@ -101,8 +165,8 @@ struct GzState {
     seek: bool, // whether a seek request is pending
 
     // Error information
-    err: c_int,         // last error (0 if no error)
-    msg: *const c_char, // error message from last error (NULL if none)
+    err: c_int,             // last error (0 if no error)
+    msg: Option<GzCString>, // error message from last error
 
     // zlib inflate or deflate stream
     stream: z_stream,
@@ -136,7 +200,7 @@ impl GzState {
             skip: 0,
             seek: false,
             err: Z_OK,
-            msg: ptr::null(),
+            msg: None,
             stream,
         }
     }
@@ -283,8 +347,23 @@ compile_error!("Either rust-allocator or c-allocator feature is required");
 
 // The different ways to specify the source for gzopen_help
 enum Source {
-    Path(*const c_char),
+    Path(GzCString),
     Fd(c_int),
+}
+
+impl Source {
+    /// Clone a caller-owned path so all state after the FFI boundary has explicit ownership.
+    ///
+    /// # Safety
+    /// `path` must point to a valid NUL-terminated C string.
+    unsafe fn clone_path(path: *const c_char) -> Option<Self> {
+        if path.is_null() {
+            return None;
+        }
+        // Safety: guaranteed by the caller.
+        let path = unsafe { CStr::from_ptr(path) };
+        GzCString::clone_from_c_str(path).map(Self::Path)
+    }
 }
 
 /// Open a gzip file for reading or writing.
@@ -302,10 +381,9 @@ enum Source {
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen64))]
 pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> gzFile {
-    if path.is_null() {
+    let Some(source) = (unsafe { Source::clone_path(path) }) else {
         return ptr::null_mut();
-    }
-    let source = Source::Path(path);
+    };
     unsafe { gzopen_help(source, mode) }
 }
 
@@ -324,10 +402,9 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen))]
 pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzFile {
-    if path.is_null() {
+    let Some(source) = (unsafe { Source::clone_path(path) }) else {
         return ptr::null_mut();
-    }
-    let source = Source::Path(path);
+    };
     unsafe { gzopen_help(source, mode) }
 }
 
@@ -409,14 +486,10 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
             state.source = Some(Source::Fd(fd));
         }
         Source::Path(path) => {
-            // Save the path name for error messages
+            // The caller path was cloned at the FFI boundary, so it remains valid both for
+            // opening the file and for later byte-exact error reporting.
             // FIXME: support Windows wide characters for compatibility with zlib-ng
-            let cloned_path = unsafe { gz_strdup(path) };
-            if cloned_path.is_null() {
-                unsafe { free_state(state) };
-                return ptr::null_mut();
-            }
-            state.source = Some(Source::Path(cloned_path));
+            let path_ptr = path.as_ptr();
             let mut oflag = 0;
 
             #[cfg(target_os = "linux")]
@@ -448,8 +521,9 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
                 }
             }
             // FIXME: support _wopen for WIN32
-            // Safety: We constructed state.path as a valid C string above.
-            state.fd = unsafe { libc::open(cloned_path, oflag, 0o666) };
+            // Safety: `path_ptr` points into the owned `path` C string.
+            state.fd = unsafe { libc::open(path_ptr, oflag, 0o666) };
+            state.source = Some(Source::Path(path));
         }
     }
 
@@ -529,70 +603,52 @@ fn gz_reset(state: &mut GzState) {
         state.reset = false; // no deflateReset pending
     }
     state.seek = false; // no seek request pending
-                        // Safety: It is valid to pass a null msg pointer to `gz_error`.
-    unsafe { gz_error(state, None) }; // clear error status
+    gz_error(state, None); // clear error status
     state.pos = 0; // no uncompressed data yet
     state.stream.avail_in = 0; // no input data yet
 }
 
-// Set the error message for a gzip stream, and deallocate any
-// previously set error message.
+// Set the error message for a gzip stream, replacing any previously set message.
 //
 // # Arguments
 //
 // * `state` - An initialized stream state.
-// * `err_msg` - `None` or `Some(err, msg)`. In the latter case, this function will
-//   make a deep copy of the `msg` string, so `msg` need not remain in scope after the
-//   call to this function.
-//
-// # Safety
-//
-// - `state` must be a properly constructed `GzState`, e.g. as produced by [`gzopen`]
-unsafe fn gz_error(state: &mut GzState, err_msg: Option<(c_int, &str)>) {
-    if !state.msg.is_null() {
-        // NOTE: zlib-ng has a special case here: it skips the deallocation if
-        // state.err == Z_MEM_ERROR. However, we always set state.msg to null
-        // when state.err is set to Z_MEM_ERROR, so that case is unreachable
-        // here.
-        unsafe { deallocate_cstr(state.msg.cast_mut()) };
-        state.msg = ptr::null_mut();
-    }
+// * `err_msg` - `None` or `Some(err, msg)`. In the latter case, this function makes
+//   an owned C-string copy, so `msg` need not remain in scope after the call.
+fn gz_error(state: &mut GzState, err_msg: Option<(c_int, &str)>) {
+    state.msg = None;
 
     match err_msg {
         None => {
             state.err = Z_OK;
         }
         Some((err, msg)) => {
-            // On error, set state.have to 0 so that the `gzgetc()` C macro fails
+            // On error, set state.have to 0 so that the `gzgetc()` C macro fails.
             if err != Z_OK && err != Z_BUF_ERROR {
                 state.have = 0;
             }
 
-            // Set the error code
             state.err = err;
 
-            // For an out of memory error, don't bother trying to allocate space for an error string.
-            // ([`gzerror`] will provide literal string as a special case for OOM errors.)
+            // For an out-of-memory error, don't try to allocate another error string.
+            // `gzerror` supplies the literal OOM message instead.
             if err == Z_MEM_ERROR {
                 return;
             }
 
-            // Format the error string to identify the source when one has been installed.
-            // During early construction `source` can still be `None`, in which case there is
-            // no owned path or descriptor to include.
-            let sep = ": ";
-            let buf = &mut [0u8; 27];
+            let sep = b": ";
+            let mut fd_buf = [0u8; 27];
             state.msg = match state.source.as_ref() {
-                Some(Source::Path(path)) => unsafe {
-                    gz_strcat(&[CStr::from_ptr(*path).to_str().unwrap(), sep, msg])
-                },
-                Some(Source::Fd(fd)) => unsafe {
-                    gz_strcat(&[fd_path(buf, *fd).to_str().unwrap(), sep, msg])
-                },
-                None => unsafe { gz_strcat(&[msg]) },
+                Some(Source::Path(path)) => {
+                    GzCString::concat(&[path.as_c_str().to_bytes(), sep, msg.as_bytes()])
+                }
+                Some(Source::Fd(fd)) => {
+                    GzCString::concat(&[fd_path(&mut fd_buf, *fd).to_bytes(), sep, msg.as_bytes()])
+                }
+                None => GzCString::concat(&[msg.as_bytes()]),
             };
 
-            if state.msg.is_null() {
+            if state.msg.is_none() {
                 state.err = Z_MEM_ERROR;
             }
         }
@@ -610,17 +666,8 @@ unsafe fn free_state(state: *mut GzState) {
     if state.is_null() {
         return;
     }
-    // Safety: `deallocate_cstr` accepts null pointers or C strings, and in this
-    // module we use only `ALLOCATOR` to allocate strings assigned to these fields.
-    unsafe {
-        match (*state).source.as_ref() {
-            Some(Source::Path(path)) => deallocate_cstr((*path).cast_mut()),
-            Some(Source::Fd(_)) | None => {}
-        }
-        deallocate_cstr((*state).msg.cast_mut());
-    }
-    // Safety: `state` is fully initialized. Dropping it releases the owned input/output
-    // buffers through `GzBuffer::drop`; the raw source/message allocations were handled above.
+    // Safety: `state` is fully initialized. Dropping it releases all owned gzip
+    // buffers and C strings before the outer custom allocation is returned.
     unsafe { ptr::drop_in_place(state) };
 
     // Safety: The caller has ensured that `state` was allocated using `ALLOCATOR`.
@@ -631,22 +678,6 @@ unsafe fn free_state(state: *mut GzState) {
 fn free_buffers(state: &mut GzState) {
     state.input = None;
     state.output = None;
-}
-
-// Free a string that was allocated with `ALLOCATOR`
-//
-// # Safety
-//
-// * `s` must be either null or a null-terminated C string that was allocated with `ALLOCATOR`.
-// * If `s` is not null, the length of the string (including the null terminator byte) must
-//   exactly match the allocation size.
-unsafe fn deallocate_cstr(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    // Safety: We checked above that `s` is non-null, and the caller ensured it
-    // is a C string allocated with `ALLOCATOR`.
-    unsafe { ALLOCATOR.deallocate::<c_char>(s, libc::strlen(s) + 1) };
 }
 
 /// Close an open gzip file and free the internal data structures referenced by the file handle.
@@ -883,10 +914,10 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
     }
     if state.err == Z_MEM_ERROR {
         b"out of memory\0".as_ptr().cast::<c_char>()
-    } else if state.msg.is_null() {
-        b"\0".as_ptr().cast::<c_char>()
+    } else if let Some(msg) = state.msg.as_ref() {
+        msg.as_ptr()
     } else {
-        state.msg
+        b"\0".as_ptr().cast::<c_char>()
     }
 }
 
@@ -915,8 +946,7 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
         state.past = false;
     }
 
-    // Safety: we've checked state, and gz_error supports a null message argument.
-    unsafe { gz_error(state, None) };
+    gz_error(state, None);
 }
 
 /// Check whether a read operation has tried to read beyond the end of `file`.
@@ -1049,8 +1079,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
     // Check that the requested number of bytes can be represented by the return type.
     if c_int::try_from(len).is_err() {
         const MSG: &str = "request does not fit in an int";
-        // Safety: we confirmed above that state is valid.
-        unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+        gz_error(state, Some((Z_STREAM_ERROR, MSG)));
         return -1;
     }
 
@@ -1118,7 +1147,7 @@ pub unsafe extern "C" fn gzfread(
     // Compute the number of bytes to read, and make sure it fits in a size_t.
     let Some(len) = size.checked_mul(nitems) else {
         const MSG: &str = "request does not fit in a size_t";
-        unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+        gz_error(state, Some((Z_STREAM_ERROR, MSG)));
         return 0;
     };
 
@@ -1297,8 +1326,7 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
     // Allocate buffers if needed.
     if state.input.is_none() {
         let Some(input) = state.allocate_input_buffer() else {
-            // Safety: The caller confirmed the validity of state.
-            unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+            gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
             return Err(());
         };
         state.input = Some(input);
@@ -1306,8 +1334,7 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
         if state.output.is_none() {
             let Some(output) = state.allocate_output_buffer() else {
                 free_buffers(state);
-                // Safety: The caller confirmed the validity of state.
-                unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+                gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
                 return Err(());
             };
             state.output = Some(output);
@@ -1328,8 +1355,7 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
         } != Z_OK
         {
             free_buffers(state);
-            // Safety: The caller confirmed the validity of `state`.
-            unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+            gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
             return Err(());
         }
     }
@@ -1462,7 +1488,7 @@ unsafe fn gz_load(state: &mut GzState, buf: *mut u8, len: usize) -> Result<usize
         have += ret as usize;
     }
     if ret < 0 {
-        unsafe { gz_error(state, Some((Z_ERRNO, "read error"))) }; // FIXME implement `zstrerror`
+        gz_error(state, Some((Z_ERRNO, "read error"))); // FIXME implement `zstrerror`
         return Err(());
     }
     if ret == 0 {
@@ -1544,7 +1570,7 @@ unsafe fn gz_decomp(state: &mut GzState) -> Result<(), ()> {
             return Err(());
         }
         if state.stream.avail_in == 0 {
-            unsafe { gz_error(state, Some((Z_BUF_ERROR, "unexpected end of file"))) };
+            gz_error(state, Some((Z_BUF_ERROR, "unexpected end of file")));
             break;
         }
 
@@ -1552,16 +1578,16 @@ unsafe fn gz_decomp(state: &mut GzState) -> Result<(), ()> {
         match unsafe { inflate(&mut state.stream, Z_NO_FLUSH) } {
             Z_STREAM_ERROR | Z_NEED_DICT => {
                 const MSG: &str = "internal error: inflate stream corrupt";
-                unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+                gz_error(state, Some((Z_STREAM_ERROR, MSG)));
                 return Err(());
             }
             Z_MEM_ERROR => {
-                unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+                gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
                 return Err(());
             }
             Z_DATA_ERROR => {
                 // FIXME gz_error(state, Z_DATA_ERROR, strm->msg == NULL ? "compressed data error" : strm->msg);
-                unsafe { gz_error(state, Some((Z_DATA_ERROR, "compressed data error"))) };
+                gz_error(state, Some((Z_DATA_ERROR, "compressed data error")));
                 return Err(());
             }
             Z_STREAM_END => {
@@ -1609,8 +1635,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
     // Check that the requested number of bytes can be represented by the return type.
     if c_int::try_from(len).is_err() {
         const MSG: &str = "requested length does not fit in int";
-        // Safety: we confirmed above that state is valid.
-        unsafe { gz_error(state, Some((Z_DATA_ERROR, MSG))) };
+        gz_error(state, Some((Z_DATA_ERROR, MSG)));
         return 0;
     }
 
@@ -1618,8 +1643,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
     // which gz_write uses internally.
     let Ok(len) = usize::try_from(len) else {
         const MSG: &str = "requested length does not fit in usize";
-        // Safety: we confirmed above that state is valid.
-        unsafe { gz_error(state, Some((Z_DATA_ERROR, MSG))) };
+        gz_error(state, Some((Z_DATA_ERROR, MSG)));
         return 0;
     };
 
@@ -1667,7 +1691,7 @@ pub unsafe extern "C" fn gzfwrite(
     // Compute the number of bytes to write, and make sure it fits in a size_t.
     let Some(len) = size.checked_mul(nitems) else {
         const MSG: &str = "request does not fit in a size_t";
-        unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+        gz_error(state, Some((Z_STREAM_ERROR, MSG)));
         return 0;
     };
 
@@ -1811,8 +1835,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
     // ensure that we always have state.want bytes available for exclusive use
     // by gzprintf.
     let Some(input) = state.allocate_input_buffer() else {
-        // Safety: The caller confirmed the validity of state.
-        unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+        gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
         return Err(());
     };
     state.input = Some(input);
@@ -1823,8 +1846,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
         // Allocate output buffer.
         let Some(output) = state.allocate_output_buffer() else {
             free_buffers(state);
-            // Safety: The caller confirmed the validity of state.
-            unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+            gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
             return Err(());
         };
         state.output = Some(output);
@@ -1848,8 +1870,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
         } != Z_OK
         {
             free_buffers(state);
-            // Safety: The caller confirmed the validity of state.
-            unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
+            gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
             return Err(());
         }
         state.stream.next_in = ptr::null_mut();
@@ -1891,7 +1912,7 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
         };
         if got < 0 || got as c_uint != state.stream.avail_in {
             // FIXME implement zstrerror and use it instead of a hard-coded error message here.
-            unsafe { gz_error(state, Some((Z_ERRNO, "write error"))) };
+            gz_error(state, Some((Z_ERRNO, "write error")));
             return Err(());
         }
         state.stream.avail_in = 0;
@@ -1923,13 +1944,13 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
             let have = unsafe { state.stream.next_out.offset_from(state.next) };
             if have < 0 {
                 const MSG: &str = "corrupt internal state in gz_comp";
-                unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+                gz_error(state, Some((Z_STREAM_ERROR, MSG)));
                 return Err(());
             }
             if have != 0 {
                 let ret = unsafe { libc::write(state.fd, state.next.cast::<c_void>(), have as _) };
                 if ret != have as _ {
-                    unsafe { gz_error(state, Some((Z_ERRNO, "write error"))) };
+                    gz_error(state, Some((Z_ERRNO, "write error")));
                     return Err(());
                 }
             }
@@ -1945,7 +1966,7 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
         ret = unsafe { deflate(&mut state.stream, flush) };
         if ret == Z_STREAM_ERROR {
             const MSG: &str = "internal error: deflate stream corrupt";
-            unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+            gz_error(state, Some((Z_STREAM_ERROR, MSG)));
             return Err(());
         }
         have -= state.stream.avail_out;
@@ -2203,7 +2224,7 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
     let len = unsafe { libc::strlen(s) };
     if c_int::try_from(len).is_err() {
         const MSG: &str = "string length does not fit in int";
-        unsafe { gz_error(state, Some((Z_STREAM_ERROR, MSG))) };
+        gz_error(state, Some((Z_STREAM_ERROR, MSG)));
         return -1;
     }
     let put = unsafe { gz_write(state, s.cast::<c_void>(), len) };
@@ -2344,8 +2365,7 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     // If no room, give up (must have already done a `gzungetc`).
     if state.have as usize == state.out_size() {
         const MSG: &str = "out of room to push characters";
-        // Safety: We have verified that `state` is valid.
-        unsafe { gz_error(state, Some((Z_DATA_ERROR, MSG))) };
+        gz_error(state, Some((Z_DATA_ERROR, MSG)));
         return -1;
     }
 
@@ -2623,8 +2643,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
         state.eof = false;
         state.past = false;
         state.seek = false;
-        // Safety: `state` was validated above.
-        unsafe { gz_error(state, None) };
+        gz_error(state, None);
         state.stream.avail_in = 0;
         state.pos += offset;
         return state.pos as _;
@@ -2866,63 +2885,6 @@ pub unsafe extern "C" fn gzvprintf(
     len
 }
 
-// Create a deep copy of a C string using `ALLOCATOR`
-//
-// # Safety
-//
-// The caller must ensure that s is either null or a pointer to a null-terminated C string.
-unsafe fn gz_strdup(src: *const c_char) -> *mut c_char {
-    if src.is_null() {
-        return ptr::null_mut();
-    }
-
-    // SAFETY: the caller must ensure this is a valid C string
-    let src = unsafe { CStr::from_ptr(src) };
-
-    let len = src.to_bytes_with_nul().len();
-    let Some(dst) = ALLOCATOR.allocate_slice_raw::<c_char>(len) else {
-        return ptr::null_mut();
-    };
-
-    // SAFETY: src and dst don't overlap, because dst was just allocated. src is valid for a read
-    // of len bytes, and dst is valid for a write of len bytes.
-    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), len) };
-
-    dst.as_ptr()
-}
-
-// Create a new C string, allocated using `ALLOCATOR`, that contains the
-// concatenation of zero or more C strings.
-//
-// # Returns
-//
-// * A pointer to a C string, for which the caller receives ownership,
-// * Or a null pointer upon error.
-//
-// # Safety
-//
-// * The return value, if non-null, must be freed using `ALLOCATOR`.
-unsafe fn gz_strcat(strings: &[&str]) -> *mut c_char {
-    let mut len = 1; // 1 for null terminator
-    for src in strings {
-        len += src.len();
-    }
-    let Some(buf) = ALLOCATOR.allocate_slice_raw::<c_char>(len) else {
-        return ptr::null_mut();
-    };
-    let start = buf.as_ptr().cast::<c_char>();
-    let mut dst = start.cast::<u8>();
-    for src in strings {
-        let size = src.len();
-        unsafe {
-            ptr::copy_nonoverlapping(src.as_ptr(), dst, size);
-        };
-        dst = unsafe { dst.add(size) };
-    }
-    unsafe { *dst = 0 };
-    start
-}
-
 fn lseek64(fd: c_int, offset: z_off64_t, origin: c_int) -> z_off64_t {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     {
@@ -3064,49 +3026,29 @@ mod tests {
     }
 
     #[test]
-    fn test_gz_strdup() {
-        let src = ptr::null();
-        let dup = unsafe { gz_strdup(src) };
-        assert!(dup.is_null());
+    fn owned_c_string_clones_and_concatenates_bytes() {
+        let empty = GzCString::clone_from_c_str(c"").unwrap();
+        assert_eq!(empty.as_c_str().to_bytes_with_nul(), b"\0");
 
-        let src = b"\0";
-        let dup = unsafe { gz_strdup(src.as_ptr().cast::<c_char>()) };
-        assert!(!dup.is_null());
-        assert_eq!(unsafe { CStr::from_ptr(dup) }.to_bytes_with_nul(), src);
-        unsafe { ALLOCATOR.deallocate(dup, libc::strlen(dup) + 1) };
+        let example = GzCString::clone_from_c_str(c"example").unwrap();
+        assert_eq!(example.as_c_str().to_bytes_with_nul(), b"example\0");
 
-        let src = b"example\0";
-        let dup = unsafe { gz_strdup(src.as_ptr().cast::<c_char>()) };
-        assert!(!dup.is_null());
-        assert_eq!(unsafe { CStr::from_ptr(dup) }.to_bytes_with_nul(), src);
-        unsafe { ALLOCATOR.deallocate(dup, libc::strlen(dup) + 1) };
+        let joined = GzCString::concat(&[b"hello", b"", b",", b"world"]).unwrap();
+        assert_eq!(joined.as_c_str().to_bytes_with_nul(), b"hello,world\0");
     }
 
     #[test]
-    fn test_gz_strcat() {
-        let src = [];
-        let dup = unsafe { gz_strcat(&src) };
-        assert!(!dup.is_null());
-        assert_eq!(unsafe { libc::strlen(dup) }, 0);
-        unsafe { ALLOCATOR.deallocate(dup, libc::strlen(dup) + 1) };
+    fn owned_c_string_preserves_non_utf8_bytes() {
+        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").unwrap();
+        let owned = GzCString::clone_from_c_str(path).unwrap();
+        assert_eq!(owned.as_c_str().to_bytes_with_nul(), b"bad-\xff-path\0");
 
-        let src = ["example"];
-        let dup = unsafe { gz_strcat(&src) };
-        assert!(!dup.is_null());
+        let message =
+            GzCString::concat(&[owned.as_c_str().to_bytes(), b": ", b"read error"]).unwrap();
         assert_eq!(
-            unsafe { CStr::from_ptr(dup) }.to_bytes_with_nul(),
-            b"example\0"
+            message.as_c_str().to_bytes_with_nul(),
+            b"bad-\xff-path: read error\0"
         );
-        unsafe { ALLOCATOR.deallocate(dup, libc::strlen(dup) + 1) };
-
-        let src = ["hello", "", ",", "world"];
-        let dup = unsafe { gz_strcat(&src) };
-        assert!(!dup.is_null());
-        assert_eq!(
-            unsafe { CStr::from_ptr(dup) }.to_bytes_with_nul(),
-            b"hello,world\0"
-        );
-        unsafe { ALLOCATOR.deallocate(dup, libc::strlen(dup) + 1) };
     }
 
     #[test]
@@ -3137,7 +3079,7 @@ mod tests {
 
         let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
         assert_eq!(state.err, Z_OK);
-        assert!(state.msg.is_null());
+        assert!(state.msg.is_none());
         let mut err = Z_ERRNO;
         let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
@@ -3145,10 +3087,10 @@ mod tests {
 
         // When an error is set, the path should be prepended to the error message automatically.
         let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
-        unsafe { gz_error(state, Some((Z_ERRNO, "example error"))) };
+        gz_error(state, Some((Z_ERRNO, "example error")));
         assert_eq!(state.err, Z_ERRNO);
         assert_eq!(
-            unsafe { CStr::from_ptr(state.msg) }.to_bytes_with_nul(),
+            state.msg.as_ref().unwrap().as_c_str().to_bytes_with_nul(),
             b"<fd:-2>: example error\0"
         );
         let mut err = Z_OK;
@@ -3161,9 +3103,9 @@ mod tests {
 
         // Setting the error message to null should clear the old error message.
         let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
-        unsafe { gz_error(state, None) };
+        gz_error(state, None);
         assert_eq!(state.err, Z_OK);
-        assert!(state.msg.is_null());
+        assert!(state.msg.is_none());
         let mut err = Z_ERRNO;
         let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
@@ -3173,9 +3115,9 @@ mod tests {
         // (because gz_error doesn't try to allocate space for a copy of the message if
         // the reason for the error is that allocations are failing).
         let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
-        unsafe { gz_error(state, Some((Z_MEM_ERROR, "should be ignored"))) };
+        gz_error(state, Some((Z_MEM_ERROR, "should be ignored")));
         assert_eq!(state.err, Z_MEM_ERROR);
-        assert!(state.msg.is_null());
+        assert!(state.msg.is_none());
         let mut err = Z_OK;
         let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
         assert_eq!(
@@ -3186,6 +3128,22 @@ mod tests {
 
         // gzclose should return an error because the fd is invalid.
         assert_eq!(unsafe { gzclose(handle) }, Z_ERRNO);
+    }
+
+    #[test]
+    fn gz_error_preserves_non_utf8_path_bytes() {
+        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").unwrap();
+        let mut state = GzState::new();
+        state.mode = GzMode::GZ_READ;
+        state.source = Some(Source::Path(GzCString::clone_from_c_str(path).unwrap()));
+
+        gz_error(&mut state, Some((Z_ERRNO, "read error")));
+
+        assert_eq!(state.err, Z_ERRNO);
+        assert_eq!(
+            state.msg.as_ref().unwrap().as_c_str().to_bytes_with_nul(),
+            b"bad-\xff-path: read error\0"
+        );
     }
 
     #[test]
