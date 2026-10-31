@@ -394,7 +394,7 @@ use zlib_rs::allocate::C as ALLOCATOR;
 #[cfg(not(feature = "c-allocator"))]
 compile_error!("Either rust-allocator or c-allocator feature is required");
 
-// The different ways to specify the source for gzopen_help
+// The different ways to specify the source for gzopen_bound
 enum Source {
     Path(GzCString),
     Fd(c_int),
@@ -402,15 +402,7 @@ enum Source {
 
 impl Source {
     /// Clone a caller-owned path so all state after the FFI boundary has explicit ownership.
-    ///
-    /// # Safety
-    /// `path` must point to a valid NUL-terminated C string.
-    unsafe fn clone_path(path: *const c_char) -> Option<Self> {
-        if path.is_null() {
-            return None;
-        }
-        // Safety: guaranteed by the caller.
-        let path = unsafe { CStr::from_ptr(path) };
+    fn clone_path(path: &CStr) -> Option<Self> {
         GzCString::clone_from_c_str(path).map(Self::Path)
     }
 }
@@ -430,10 +422,22 @@ impl Source {
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen64))]
 pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> gzFile {
-    let Some(source) = (unsafe { Source::clone_path(path) }) else {
+    if path.is_null() {
+        return ptr::null_mut();
+    }
+    // Safety: guaranteed by this public function's caller contract.
+    let path = unsafe { CStr::from_ptr(path) };
+    let Some(source) = Source::clone_path(path) else {
         return ptr::null_mut();
     };
-    unsafe { gzopen_help(source, mode) }
+    if mode.is_null() {
+        return ptr::null_mut();
+    }
+    // Safety: guaranteed by this public function's caller contract.
+    let mode = unsafe { CStr::from_ptr(mode) };
+    gzopen_bound(source, mode)
+        .map(|owner| owner.into_raw().as_ptr().cast::<gzFile_s>())
+        .unwrap_or(ptr::null_mut())
 }
 
 /// Open a gzip file for reading or writing.
@@ -451,10 +455,22 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen))]
 pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzFile {
-    let Some(source) = (unsafe { Source::clone_path(path) }) else {
+    if path.is_null() {
+        return ptr::null_mut();
+    }
+    // Safety: guaranteed by this public function's caller contract.
+    let path = unsafe { CStr::from_ptr(path) };
+    let Some(source) = Source::clone_path(path) else {
         return ptr::null_mut();
     };
-    unsafe { gzopen_help(source, mode) }
+    if mode.is_null() {
+        return ptr::null_mut();
+    }
+    // Safety: guaranteed by this public function's caller contract.
+    let mode = unsafe { CStr::from_ptr(mode) };
+    gzopen_bound(source, mode)
+        .map(|owner| owner.into_raw().as_ptr().cast::<gzFile_s>())
+        .unwrap_or(ptr::null_mut())
 }
 
 /// Given an open file descriptor, prepare to read or write a gzip file.
@@ -478,39 +494,34 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzdopen))]
 pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
-    // Safety: the caller is responsible for `mode` being a non-null C string.
-    unsafe { gzopen_help(Source::Fd(fd), mode) }
-}
-
-/// Internal implementation shared by gzopen and gzdopen.
-///
-/// # Safety
-///
-/// The caller must ensure that mode points to a valid C string.
-unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
     if mode.is_null() {
         return ptr::null_mut();
     }
+    // Safety: guaranteed by this public function's caller contract.
+    let mode = unsafe { CStr::from_ptr(mode) };
+    gzopen_bound(Source::Fd(fd), mode)
+        .map(|owner| owner.into_raw().as_ptr().cast::<gzFile_s>())
+        .unwrap_or(ptr::null_mut())
+}
 
-    let Some(mut state_owner) = GzStateOwner::allocate() else {
-        return ptr::null_mut();
-    };
+/// Safe construction core shared by the raw gzip-open FFI shims.
+fn gzopen_bound(source: Source, mode: &CStr) -> Option<GzStateOwner> {
+    let mut state_owner = GzStateOwner::allocate()?;
     let state = state_owner.as_mut();
 
-    let mode = unsafe { CStr::from_ptr(mode) };
     let Ok((exclusive, cloexec)) = state.configure(mode.to_bytes()) else {
-        return ptr::null_mut();
+        return None;
     };
 
     // Must specify read, write, or append
     if state.mode == GzMode::GZ_NONE {
-        return ptr::null_mut();
+        return None;
     }
 
     // Can't force transparent read
     if state.mode == GzMode::GZ_READ {
         if state.direct {
-            return ptr::null_mut();
+            return None;
         }
         state.direct = true; // Assume an empty file for now. Later, we'll check for a gzip header.
     }
@@ -564,7 +575,7 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
     }
 
     if state.fd == -1 {
-        return ptr::null_mut();
+        return None;
     }
 
     // NOTE: the `lseek64` return value is ignored, an invalid file descriptor will only be
@@ -585,7 +596,7 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
     // Initialize stream
     gz_reset(state);
 
-    state_owner.into_raw().as_ptr().cast::<gzFile_s>()
+    Some(state_owner)
 }
 
 // Format a fake file path corresponding to an fd, for use in error messages.
@@ -756,7 +767,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
 
     // Process any buffered input.
     if state.input.is_some() {
-        // Safety: state.stream was properly initialized as a z_stream in gzopen_help.
+        // Safety: state.stream was properly initialized as a z_stream during gzip open.
         unsafe { inflateEnd(&mut state.stream as *mut z_stream) };
     }
 
@@ -821,7 +832,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
         ret = state.err;
     }
     if state.input.is_some() && !state.direct {
-        // Safety: state.stream was properly initialized as a z_stream in gzopen_help.
+        // Safety: state.stream was properly initialized as a z_stream during gzip open.
         unsafe { deflateEnd(&mut state.stream as *mut z_stream) };
     }
     if unsafe { libc::close(state.fd) } == -1 {
@@ -1031,7 +1042,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
         return 0;
     };
 
-    // In write mode, the direct flag was set in `gzopen_help`. In read mode, the
+    // In write mode, the direct flag was set in `gzopen_bound`. In read mode, the
     // direct status is determined lazily on the first read operation. If the first
     // read hasn't happened yet, we can look at the header now to determine if the
     // file is in gzip format.
@@ -1188,7 +1199,7 @@ pub unsafe extern "C" fn gzfread(
 //
 // # Safety
 //
-// * `state` must have been properly initialized, e.g. by [`gzopen_help`].
+// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 // * `buf` must point to at least `len` bytes of writable memory.
 unsafe fn gz_read(state: &mut GzState, mut buf: *mut u8, mut len: usize) -> usize {
     if len == 0 {
@@ -1340,7 +1351,7 @@ fn gz_skip(state: &mut GzState, mut len: i64) -> Result<(), ()> {
 //
 // # Safety
 //
-// `state` must have been properly initialized, e.g. by [`gzopen_help`].
+// `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
     // Allocate buffers if needed.
     if state.input.is_none() {
@@ -1362,7 +1373,7 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
         // Allocate memory for inflate.
         state.stream.avail_in = 0;
         state.stream.next_in = ptr::null_mut();
-        // Safety: `gzopen_help` initialized `state.stream`'s `zalloc`, `zfree`, and
+        // Safety: `gzopen_bound` initialized `state.stream`'s `zalloc`, `zfree`, and
         // `opaque` fields as needed by `inflateInit2`.
         if unsafe {
             inflateInit2_(
@@ -1449,7 +1460,7 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
 //
 // # Safety
 //
-// `state` must have been properly initialized, e.g. by [`gzopen_help`].
+// `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 unsafe fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
     if state.err != Z_OK && state.err != Z_BUF_ERROR {
         return Err(());
@@ -1494,7 +1505,7 @@ unsafe fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
 //
 // # Safety
 //
-// * `state` must have been properly initialized, e.g. by [`gzopen_help`].
+// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 // * `buf` mut point to a writable block of at least `len` bytes.
 unsafe fn gz_load(state: &mut GzState, buf: *mut u8, len: usize) -> Result<usize, ()> {
     let mut have = 0;
@@ -1525,7 +1536,7 @@ unsafe fn gz_load(state: &mut GzState, buf: *mut u8, len: usize) -> Result<usize
 // * `Err` on error. Check [`gzerror`] for more information on the error condition.
 //
 // # Safety
-// * `state` must have been properly initialized, e.g. by [`gzopen_help`].
+// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 // * `state.have` must be zero.
 //
 unsafe fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
@@ -1578,7 +1589,7 @@ unsafe fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
 //
 // # Safety
 //
-// * `state` must have been properly initialized, e.g. by [`gzopen_help`].
+// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 unsafe fn gz_decomp(state: &mut GzState) -> Result<(), ()> {
     // Decompress into the output buffer until we run out of either input data
     // or space in the output buffer.
@@ -1731,7 +1742,7 @@ pub unsafe extern "C" fn gzfwrite(
 //
 // # Safety
 //
-/// - `state` must have been properly initialized, e.g. by [`gzopen_help`].
+/// - `state` must have been properly initialized, e.g. by [`gzopen_bound`].
 /// - `buf` must point to at least `len` bytes of readable memory.
 unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) -> c_int {
     // If len is zero, avoid unnecessary operations.
