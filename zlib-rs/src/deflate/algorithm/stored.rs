@@ -202,7 +202,11 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
             && stream.input.avail_in == 0
             && left <= have as isize)
     {
-        let len = Ord::min(left as usize, have); // TODO wrapping?
+        // The branch predicate above requires `left >= 0`: either it is at least
+        // `min_block`, or the flush arm requires `left > 0`. `deflateParams()`
+        // also flushes and resolves any algorithm transition before entering stored mode.
+        debug_assert!(left >= 0);
+        let len = Ord::min(left as usize, have);
         last =
             flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == (left as usize);
 
