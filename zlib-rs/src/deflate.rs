@@ -24,6 +24,8 @@ use self::{
 mod algorithm;
 #[cfg(feature = "std")]
 mod batch;
+#[cfg(feature = "gpu")]
+mod gpu_match;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
@@ -34,6 +36,8 @@ mod trees_tbl;
 mod window;
 
 // Position relative to the current window
+#[cfg(feature = "gpu")]
+pub use batch::compress_slices_batch_gpu;
 #[cfg(feature = "parallel")]
 pub use batch::compress_slices_batch_parallel;
 #[cfg(feature = "std")]
@@ -41,6 +45,8 @@ pub use batch::{
     compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,
     BatchCompressResult, BatchMatchSearchBackend,
 };
+#[cfg(feature = "gpu")]
+pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 
 pub(crate) type Pos = u16;
 

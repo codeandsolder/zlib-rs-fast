@@ -1,6 +1,8 @@
 use core::marker::PhantomData;
 use std::vec::Vec;
 
+#[cfg(feature = "gpu")]
+use super::gpu_match::{GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 use super::{
     algorithm::{
         Algorithm, EndBlockKind, StandardDriver, StandardSegmentMode, StandardTurnOutcome,
@@ -11,9 +13,11 @@ use super::{
         MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     DeflateConfig, DeflateFlush, DeflateStream, InputCursor, OutputCursor, ReturnCode, Status,
-    StreamChecksum,
+    StreamChecksum, STD_MIN_MATCH,
 };
 use crate::c_api::z_stream;
+#[cfg(feature = "gpu")]
+use crate::{MAX_WBITS, MIN_WBITS};
 
 /// One independent input/output pair for [`compress_slices_batch`].
 ///
@@ -145,14 +149,148 @@ pub fn compress_slices_batch_with_backend(
     let Some(algorithm) = configured_algorithm(config) else {
         return compress_synchronously(jobs, config);
     };
-
-    if !matches!(
-        algorithm,
-        Algorithm::Fast | Algorithm::Medium | Algorithm::Slow | Algorithm::Huffman | Algorithm::Rle
-    ) {
+    if !uses_match_search(algorithm) {
         return compress_synchronously(jobs, config);
     }
 
+    let BatchMatchSearchBackend::ScopedThreads { workers } = backend else {
+        unreachable!("scalar backends returned before scheduled compression")
+    };
+    let mut resolver = ScopedThreadResolver { workers };
+    compress_scheduled(jobs, config, algorithm, &mut resolver)
+}
+
+/// Compress complete input buffers using a persistent GPU whole-input match table.
+///
+/// The GPU device and compute pipeline belong to `searcher` and are reused across calls. Each input
+/// receives one whole-input table before compression begins; when the ordinary producer yields a
+/// detached match-search request, the scheduler resolves it from that table instead of walking the
+/// hash chain on the CPU. Framing, parsing, token emission, Huffman coding, and output draining stay
+/// on the existing CPU path.
+#[cfg(feature = "gpu")]
+pub fn compress_slices_batch_gpu(
+    jobs: &mut [BatchCompressJob<'_>],
+    config: DeflateConfig,
+    searcher: &GpuMatchSearcher,
+    search_budget: u32,
+) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
+    let Some(algorithm) = configured_algorithm(config) else {
+        return Ok(compress_synchronously(jobs, config));
+    };
+    if !uses_match_search(algorithm) {
+        return Ok(compress_synchronously(jobs, config));
+    }
+
+    let Some(max_dist) = configured_max_dist(config) else {
+        return Ok(compress_synchronously(jobs, config));
+    };
+    let max_dist = u32::try_from(max_dist).expect("DEFLATE max distance fits u32");
+    let tables = jobs
+        .iter()
+        .map(|job| searcher.search_with_max_dist(job.input, search_budget, max_dist))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut resolver = WholeInputTableResolver { tables: &tables };
+    Ok(compress_scheduled(jobs, config, algorithm, &mut resolver))
+}
+
+fn uses_match_search(algorithm: Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::Fast | Algorithm::Medium | Algorithm::Slow
+    )
+}
+
+#[cfg(feature = "gpu")]
+fn configured_max_dist(config: DeflateConfig) -> Option<usize> {
+    let mut window_bits = config.window_bits;
+    let zlib_wrapper = if window_bits < 0 {
+        if window_bits < -MAX_WBITS {
+            return None;
+        }
+        window_bits = -window_bits;
+        false
+    } else if window_bits > MAX_WBITS {
+        window_bits -= 16;
+        false
+    } else {
+        true
+    };
+
+    if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) || (window_bits == 8 && !zlib_wrapper) {
+        return None;
+    }
+    let effective_bits = if window_bits == 8 {
+        9
+    } else {
+        window_bits as usize
+    };
+    Some((1usize << effective_bits) - super::MIN_LOOKAHEAD)
+}
+
+trait MatchResolver {
+    fn resolve(
+        &mut self,
+        runtimes: &[BatchRuntime<'_>],
+        work: &[(usize, MatchSearchWork)],
+        results: &mut [MatchSearchResult],
+    );
+}
+
+struct ScopedThreadResolver {
+    workers: usize,
+}
+
+impl MatchResolver for ScopedThreadResolver {
+    fn resolve(
+        &mut self,
+        runtimes: &[BatchRuntime<'_>],
+        work: &[(usize, MatchSearchWork)],
+        results: &mut [MatchSearchResult],
+    ) {
+        if work.len() == 1 {
+            let (runtime_index, search) = work[0];
+            results[0] = runtimes[runtime_index].match_request(search).execute();
+            return;
+        }
+
+        let requests = work
+            .iter()
+            .map(|(runtime_index, search)| runtimes[*runtime_index].match_request(*search))
+            .collect::<Vec<MatchSearchRequest<'_>>>();
+        execute_match_search_batch_with_backend(
+            &ScopedThreadMatchSearchBackend::new(self.workers),
+            &requests,
+            &mut results[..requests.len()],
+        );
+    }
+}
+
+#[cfg(feature = "gpu")]
+struct WholeInputTableResolver<'a> {
+    tables: &'a [GpuMatchTable],
+}
+
+#[cfg(feature = "gpu")]
+impl MatchResolver for WholeInputTableResolver<'_> {
+    fn resolve(
+        &mut self,
+        runtimes: &[BatchRuntime<'_>],
+        work: &[(usize, MatchSearchWork)],
+        results: &mut [MatchSearchResult],
+    ) {
+        for ((runtime_index, _), result) in work.iter().zip(results.iter_mut()) {
+            let runtime = &runtimes[*runtime_index];
+            *result = runtime.match_from_table(&self.tables[runtime.job_index]);
+        }
+    }
+}
+
+fn compress_scheduled(
+    jobs: &mut [BatchCompressJob<'_>],
+    config: DeflateConfig,
+    algorithm: Algorithm,
+    resolver: &mut impl MatchResolver,
+) -> Vec<BatchCompressResult> {
     let mut results = vec![
         BatchCompressResult {
             written: 0,
@@ -201,33 +339,11 @@ pub fn compress_slices_batch_with_backend(
             continue;
         }
 
-        if match_work.len() == 1 {
-            // A temporarily desynchronized batch has nothing to parallelize. Avoid allocating a
-            // request vector just to let the threaded backend collapse back to one scalar worker.
-            let (runtime_index, work) = match_work[0];
-            let result = runtimes[runtime_index].match_request(work).execute();
-            runtimes[runtime_index].complete_match_search(result);
-            continue;
-        }
-
-        let BatchMatchSearchBackend::ScopedThreads { workers } = backend else {
-            unreachable!("only concurrent backends stage match-search work");
-        };
-
-        // Concurrent execution needs all immutable requests alive at once. Keep that staging vector
-        // in the shortest possible scope so no borrowed runtime survives into the resume pass.
-        {
-            let requests = match_work
-                .iter()
-                .map(|(runtime_index, work)| runtimes[*runtime_index].match_request(*work))
-                .collect::<Vec<MatchSearchRequest<'_>>>();
-            execute_match_search_batch_with_backend(
-                &ScopedThreadMatchSearchBackend::new(workers),
-                &requests,
-                &mut match_results[..requests.len()],
-            );
-        }
-
+        resolver.resolve(
+            &runtimes,
+            &match_work,
+            &mut match_results[..match_work.len()],
+        );
         for ((runtime_index, _), result) in match_work
             .iter()
             .copied()
@@ -438,6 +554,58 @@ impl<'a> BatchRuntime<'a> {
         work.request(&*self.stream_ref().state)
     }
 
+    #[cfg(feature = "gpu")]
+    fn match_from_table(&self, table: &GpuMatchTable) -> MatchSearchResult {
+        let stream = self.stream_ref();
+        let state = &*stream.state;
+        let total_in =
+            usize::try_from(stream.total_in).expect("batch whole-input position must fit usize");
+        let absolute_position = total_in
+            .checked_sub(state.lookahead)
+            .expect("lookahead cannot exceed total batch input consumed");
+
+        let incumbent_length = if state.prev_length == 0 {
+            STD_MIN_MATCH - 1
+        } else {
+            usize::from(state.prev_length)
+        }
+        .min(state.lookahead);
+        let incumbent = MatchSearchResult {
+            length: incumbent_length,
+            start: state.match_start,
+        };
+
+        let Some(candidate) = table.get(absolute_position) else {
+            return incumbent;
+        };
+        let candidate_length = usize::try_from(candidate.length)
+            .expect("GPU match length fits usize")
+            .min(state.lookahead);
+        if candidate_length <= incumbent_length {
+            return incumbent;
+        }
+
+        let candidate_start =
+            usize::try_from(candidate.start).expect("GPU absolute match position fits usize");
+        let Some(distance) = absolute_position.checked_sub(candidate_start) else {
+            return incumbent;
+        };
+        if !(1..=state.max_dist()).contains(&distance) {
+            return incumbent;
+        }
+        let Some(local_start) = state.strstart.checked_sub(distance) else {
+            return incumbent;
+        };
+        let Ok(local_start) = u16::try_from(local_start) else {
+            return incumbent;
+        };
+
+        MatchSearchResult {
+            length: candidate_length,
+            start: local_start,
+        }
+    }
+
     fn complete_match_search(&mut self, result: MatchSearchResult) {
         let Self { raw, driver, .. } = self;
         let stream = unsafe { DeflateStream::from_stream_mut(raw) }
@@ -502,6 +670,44 @@ mod tests {
         let len = written.len();
         output.truncate(len);
         (output, code)
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_window_distance_matches_deflate_initialization() {
+        let cases = [
+            (8, (1usize << 9) - super::super::MIN_LOOKAHEAD),
+            (9, (1usize << 9) - super::super::MIN_LOOKAHEAD),
+            (15, (1usize << 15) - super::super::MIN_LOOKAHEAD),
+            (-15, (1usize << 15) - super::super::MIN_LOOKAHEAD),
+            (31, (1usize << 15) - super::super::MIN_LOOKAHEAD),
+        ];
+        for (window_bits, expected) in cases {
+            let config = DeflateConfig {
+                window_bits,
+                ..DeflateConfig::default()
+            };
+            assert_eq!(configured_max_dist(config), Some(expected));
+        }
+
+        for window_bits in [-8, 7, 32] {
+            let config = DeflateConfig {
+                window_bits,
+                ..DeflateConfig::default()
+            };
+            assert_eq!(configured_max_dist(config), None);
+        }
+    }
+
+    #[test]
+    fn scheduled_match_search_is_only_used_by_lz_algorithms() {
+        assert!(uses_match_search(Algorithm::Fast));
+        assert!(uses_match_search(Algorithm::Medium));
+        assert!(uses_match_search(Algorithm::Slow));
+        assert!(!uses_match_search(Algorithm::Stored));
+        assert!(!uses_match_search(Algorithm::Quick));
+        assert!(!uses_match_search(Algorithm::Huffman));
+        assert!(!uses_match_search(Algorithm::Rle));
     }
 
     #[test]

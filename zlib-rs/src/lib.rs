@@ -52,6 +52,10 @@ pub use deflate::{
     compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,
     BatchCompressResult, BatchMatchSearchBackend,
 };
+#[cfg(feature = "gpu")]
+pub use deflate::{
+    compress_slices_batch_gpu, GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable,
+};
 pub use inflate::decompress_slice;
 
 macro_rules! traceln {
