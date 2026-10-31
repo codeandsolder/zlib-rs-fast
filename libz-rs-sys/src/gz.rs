@@ -45,7 +45,7 @@ struct GzState {
     // Fields used for both reading and writing
     mode: GzMode,
     fd: c_int, // file descriptor
-    source: Source,
+    source: Option<Source>,
     want: usize,     // requested buffer size, default is GZBUFSIZE
     input: *mut u8,  // input buffer (double-sized when writing)
     in_size: usize,  // usable size of input buffer (See [`gz_init`] for explanation.)
@@ -77,6 +77,40 @@ struct GzState {
 }
 
 impl GzState {
+    fn new() -> Self {
+        let mut stream = z_stream::default();
+        stream.zalloc = Some(ALLOCATOR.zalloc);
+        stream.zfree = Some(ALLOCATOR.zfree);
+        stream.opaque = ALLOCATOR.opaque;
+
+        Self {
+            have: 0,
+            next: ptr::null(),
+            pos: 0,
+            mode: GzMode::GZ_NONE,
+            fd: -1,
+            source: None,
+            want: GZBUFSIZE,
+            input: ptr::null_mut(),
+            in_size: 0,
+            output: ptr::null_mut(),
+            out_size: 0,
+            direct: false,
+            how: How::Look,
+            start: 0,
+            eof: false,
+            past: false,
+            level: crate::Z_DEFAULT_COMPRESSION as i8,
+            strategy: Strategy::Default,
+            reset: false,
+            skip: 0,
+            seek: false,
+            err: Z_OK,
+            msg: ptr::null(),
+            stream,
+        }
+    }
+
     fn configure(&mut self, mode: &[u8]) -> Result<(bool, bool), ()> {
         let mut exclusive = false;
         let mut cloexec = false;
@@ -270,27 +304,15 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
         return ptr::null_mut();
     }
 
-    let Some(state) = ALLOCATOR.allocate_zeroed_raw::<GzState>() else {
+    let Some(mut state) = ALLOCATOR.allocate_raw::<GzState>() else {
         return ptr::null_mut();
     };
-    // Safety: the allocate_zeroed_raw call above ensures that the allocated block
-    // has the right size and alignment to be used as a GzState. And because the
-    // allocator zeroes the allocated space, all the GzState fields are initialized.
-    let state = unsafe { state.cast::<GzState>().as_mut() };
-    state.in_size = 0;
-    state.out_size = 0;
-    state.want = GZBUFSIZE;
-    state.msg = ptr::null();
-
-    state.mode = GzMode::GZ_NONE;
-    state.level = crate::Z_DEFAULT_COMPRESSION as i8;
-    state.strategy = Strategy::Default;
-    state.direct = false;
-
-    state.stream = z_stream::default();
-    state.stream.zalloc = Some(ALLOCATOR.zalloc);
-    state.stream.zfree = Some(ALLOCATOR.zfree);
-    state.stream.opaque = ALLOCATOR.opaque;
+    // Safety: `allocate_raw` returned storage with the size and alignment required for
+    // `GzState`. Initialize the complete Rust value before creating a reference to it.
+    unsafe { state.as_ptr().write(GzState::new()) };
+    // Safety: the allocation now contains a fully initialized `GzState` and remains
+    // exclusively owned by this function until the returned gzFile escapes.
+    let state = unsafe { state.as_mut() };
 
     let mode = unsafe { CStr::from_ptr(mode) };
     let Ok((exclusive, cloexec)) = state.configure(mode.to_bytes()) else {
@@ -322,7 +344,7 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
     match source {
         Source::Fd(fd) => {
             state.fd = fd;
-            state.source = Source::Fd(fd);
+            state.source = Some(Source::Fd(fd));
         }
         Source::Path(path) => {
             // Save the path name for error messages
@@ -332,7 +354,7 @@ unsafe fn gzopen_help(source: Source, mode: *const c_char) -> gzFile {
                 unsafe { free_state(state) };
                 return ptr::null_mut();
             }
-            state.source = Source::Path(cloned_path);
+            state.source = Some(Source::Path(cloned_path));
             let mut oflag = 0;
 
             #[cfg(target_os = "linux")]
@@ -493,17 +515,19 @@ unsafe fn gz_error(state: &mut GzState, err_msg: Option<(c_int, &str)>) {
                 return;
             }
 
-            // Format the error string to include the file path.
-            // Safety: `gzopen` and `gzdopen` ensure that `state.path` is a non-null C string
+            // Format the error string to identify the source when one has been installed.
+            // During early construction `source` can still be `None`, in which case there is
+            // no owned path or descriptor to include.
             let sep = ": ";
             let buf = &mut [0u8; 27];
-            state.msg = match state.source {
-                Source::Path(path) => unsafe {
-                    gz_strcat(&[CStr::from_ptr(path).to_str().unwrap(), sep, msg])
+            state.msg = match state.source.as_ref() {
+                Some(Source::Path(path)) => unsafe {
+                    gz_strcat(&[CStr::from_ptr(*path).to_str().unwrap(), sep, msg])
                 },
-                Source::Fd(fd) => unsafe {
-                    gz_strcat(&[fd_path(buf, fd).to_str().unwrap(), sep, msg])
+                Some(Source::Fd(fd)) => unsafe {
+                    gz_strcat(&[fd_path(buf, *fd).to_str().unwrap(), sep, msg])
                 },
+                None => unsafe { gz_strcat(&[msg]) },
             };
 
             if state.msg.is_null() {
@@ -527,9 +551,9 @@ unsafe fn free_state(state: *mut GzState) {
     // Safety: `deallocate_cstr` accepts null pointers or C strings, and in this
     // module we use only `ALLOCATOR` to allocate strings assigned to these fields.
     unsafe {
-        match (*state).source {
-            Source::Path(path) => deallocate_cstr(path.cast_mut()),
-            Source::Fd(_) => { /* fd is owned by the caller */ }
+        match (*state).source.as_ref() {
+            Some(Source::Path(path)) => deallocate_cstr((*path).cast_mut()),
+            Some(Source::Fd(_)) | None => {}
         }
         deallocate_cstr((*state).msg.cast_mut());
     }
@@ -2896,8 +2920,7 @@ mod tests {
 
     #[test]
     fn test_configure() {
-        let mut state = core::mem::MaybeUninit::<GzState>::zeroed();
-        let state = unsafe { state.assume_init_mut() };
+        let mut state = GzState::new();
 
         state.configure(b"r").unwrap();
         assert_eq!(state.mode, GzMode::GZ_READ);
