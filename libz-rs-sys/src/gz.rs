@@ -476,26 +476,27 @@ impl GzState {
         len
     }
 
-    /// Compute the number of bytes of input buffered in `self`.
+    /// Return the logical end offset of write input currently owned by this state.
     ///
-    /// # Safety
-    ///
-    /// `state.input` must be initialized and
-    /// `state.stream.next_in .. state.stream.next_in + state.stream.avail_in`
-    /// must be contained in the usable prefix of that input allocation.
-    ///
-    /// That invariant holds whenever this helper is called. The notable temporary exception
-    /// elsewhere in this module is a specific block within
-    /// `gz_write`, where we temporarily set `state.next_in` to point to a
-    /// caller-supplied buffer to do a zero-copy optimization when compressing
-    /// large inputs.
-    unsafe fn input_len(&self) -> usize {
-        let input = self.input_ptr();
-        // Safety: `next_in .. next_in + avail_in` is a subslice, so the preconditions hold.
-        let end = unsafe { self.stream.next_in.add(self.stream.avail_in as usize) };
-
-        // Safety: the caller guarantees that the input slice of `stream` is a subslice of `input`.
-        (unsafe { end.offset_from(input) }) as _
+    /// The large-write zero-copy path temporarily violates this invariant, but it does
+    /// not call this helper while caller memory is bound to `next_in`.
+    fn owned_write_input_end(&self) -> usize {
+        debug_assert_eq!(self.mode, GzMode::GZ_WRITE);
+        let input = self
+            .input
+            .as_ref()
+            .expect("write input must be allocated before measuring it");
+        let base = input.as_ptr() as usize;
+        let next = self.stream.next_in as usize;
+        assert!(
+            next >= base,
+            "gzip write input pointer precedes owned input"
+        );
+        let offset = next - base;
+        let avail = self.stream.avail_in as usize;
+        assert!(offset <= input.capacity);
+        assert!(avail <= input.capacity - offset);
+        offset + avail
     }
 }
 
@@ -1904,7 +1905,7 @@ unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) 
                 state.stream.next_in = state.input_ptr();
             }
             // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
-            let have = unsafe { state.input_len() };
+            let have = state.owned_write_input_end();
             let copy = Ord::min(state.in_size().saturating_sub(have), len);
             // Safety: The caller is responsible for ensuring that buf points to at least len readable
             // bytes, and copy is <= len.
@@ -1931,19 +1932,25 @@ unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) 
         // `state.stream.next_in` points to somewhere in the `state.input` buffer.
         let save_next_in = state.stream.next_in;
         state.stream.next_in = buf.cast::<_>();
-        loop {
+        let result = loop {
             let n = Ord::min(len, c_uint::MAX as usize) as c_uint;
             state.stream.avail_in = n;
             state.pos += n as i64;
             if gz_comp(state, Z_NO_FLUSH).is_err() {
-                return 0;
+                break Err(());
             }
             len -= n as usize;
             if len == 0 {
-                break;
+                break Ok(());
             }
-        }
+        };
+        // `next_in` temporarily borrowed caller memory above. Never let that pointer
+        // or a length describing it escape this operation, including on I/O failure.
         state.stream.next_in = save_next_in;
+        if result.is_err() {
+            state.stream.avail_in = 0;
+            return 0;
+        }
     }
 
     // Input was all buffered or compressed.
@@ -2077,6 +2084,10 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
             gz_error(state, Some((Z_ERRNO, "write error")));
             return Err(());
         }
+        let consumed = state.stream.avail_in as usize;
+        // Safety: the direct-write contract above established a readable span of
+        // exactly `avail_in` bytes starting at `next_in`.
+        state.stream.next_in = unsafe { state.stream.next_in.add(consumed) };
         state.stream.avail_in = 0;
         return Ok(());
     }
@@ -2336,10 +2347,14 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
         // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
         // (This is an invariant maintained throughout this module, except for a specific
         // block within `gz_write` that does not call any function that might call `gzputc`.)
-        let have = unsafe { state.input_len() };
+        let have = state.owned_write_input_end();
         if have < state.in_size() {
-            // Safety: `input` has `in_size` bytes, and `have` < `in_size`.
-            unsafe { *state.input_ptr().add(have) = c as u8 };
+            state
+                .input
+                .as_mut()
+                .expect("write input must remain allocated")
+                .usable_uninit_mut()[have]
+                .write(c as u8);
             state.stream.avail_in += 1;
             state.pos += 1;
             return c & 0xff;
@@ -3114,6 +3129,29 @@ mod tests {
         // Safety: `gz_init` initialized the deflate stream above. Ending without
         // `Z_FINISH` reports `Z_DATA_ERROR`, but still releases the deflate state.
         assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_DATA_ERROR);
+    }
+
+    #[test]
+    fn large_write_error_does_not_retain_caller_input() {
+        let mut state = GzState::new();
+        state.mode = GzMode::GZ_WRITE;
+        state.direct = true;
+        state.fd = -2;
+
+        assert!(gz_init(&mut state).is_ok());
+        let saved_next_in = state.stream.next_in;
+        let input = vec![b'A'; state.in_size()];
+        let caller_start = input.as_ptr() as usize;
+        let caller_end = caller_start + input.len();
+
+        assert_eq!(
+            unsafe { gz_write(&mut state, input.as_ptr().cast(), input.len()) },
+            0
+        );
+        assert_eq!(state.err, Z_ERRNO);
+        assert_eq!(state.stream.avail_in, 0);
+        assert_eq!(state.stream.next_in, saved_next_in);
+        assert!(!(caller_start..caller_end).contains(&(state.stream.next_in as usize)));
     }
 
     // Map a byte string literal to a C string
