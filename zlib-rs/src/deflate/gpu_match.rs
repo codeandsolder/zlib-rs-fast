@@ -106,7 +106,36 @@ fn search(@builtin(global_invocation_id) gid: vec3<u32>) {
         visited += 1u;
         let candidate = bucket_positions[cursor];
 
+        if best_len == max_len { break; }
+        if best_len >= 3u && load_byte(position + best_len) != load_byte(candidate + best_len) {
+            continue;
+        }
+
         var length = 0u;
+        loop {
+            if length + 16u > max_len { break; }
+            var difference = load_u32(position + length) ^ load_u32(candidate + length);
+            if difference != 0u {
+                length += countTrailingZeros(difference) >> 3u;
+                break;
+            }
+            difference = load_u32(position + length + 4u) ^ load_u32(candidate + length + 4u);
+            if difference != 0u {
+                length += 4u + (countTrailingZeros(difference) >> 3u);
+                break;
+            }
+            difference = load_u32(position + length + 8u) ^ load_u32(candidate + length + 8u);
+            if difference != 0u {
+                length += 8u + (countTrailingZeros(difference) >> 3u);
+                break;
+            }
+            difference = load_u32(position + length + 12u) ^ load_u32(candidate + length + 12u);
+            if difference != 0u {
+                length += 12u + (countTrailingZeros(difference) >> 3u);
+                break;
+            }
+            length += 16u;
+        }
         loop {
             if length + 4u > max_len { break; }
             let difference = load_u32(position + length) ^ load_u32(candidate + length);
