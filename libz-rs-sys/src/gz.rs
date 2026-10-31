@@ -128,6 +128,65 @@ impl GzBuffer {
     }
 }
 
+struct GzWriteInput {
+    next: *const u8,
+    remaining: usize,
+}
+
+impl GzWriteInput {
+    /// Bind a caller-owned readable span for the duration of one gzip write operation.
+    ///
+    /// # Safety
+    /// `next` must be readable for `len` bytes when `len != 0`.
+    unsafe fn from_raw(next: *const c_void, len: usize) -> Self {
+        debug_assert!(len == 0 || !next.is_null());
+        Self {
+            next: next.cast::<u8>(),
+            remaining: len,
+        }
+    }
+
+    fn from_slice(input: &[u8]) -> Self {
+        Self {
+            next: input.as_ptr(),
+            remaining: input.len(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.remaining
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.next
+    }
+
+    fn advance(&mut self, len: usize) {
+        assert!(len <= self.remaining);
+        if len != 0 {
+            // Safety: construction guarantees the full remaining span is readable,
+            // and `len` is bounded by that remaining span.
+            self.next = unsafe { self.next.add(len) };
+            self.remaining -= len;
+        }
+    }
+
+    fn copy_to(&mut self, output: &mut [MaybeUninit<u8>]) -> usize {
+        let len = Ord::min(self.remaining, output.len());
+        if len != 0 {
+            // Safety: the input cursor guarantees `len` readable bytes and `output`
+            // provides `len` writable bytes. `copy` deliberately tolerates overlap.
+            unsafe { ptr::copy(self.next, output.as_mut_ptr().cast::<u8>(), len) };
+            self.advance(len);
+        }
+        len
+    }
+}
+
 impl Drop for GzBuffer {
     fn drop(&mut self) {
         // Safety: `ptr` was allocated by `ALLOCATOR` for exactly `capacity` bytes,
@@ -1810,9 +1869,9 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
         return 0;
     };
 
-    // Safety: We validated state above, and the caller is responsible for ensuring
-    // that buf points to at least len bytes of readable memory.
-    unsafe { gz_write(state, buf, len) }
+    // Safety: the public contract guarantees a readable caller span of `len` bytes.
+    let mut input = unsafe { GzWriteInput::from_raw(buf, len) };
+    gz_write(state, &mut input) as c_int
 }
 
 /// Compress and write `nitems` items of size `size` from `buf` to `file`, duplicating
@@ -1861,29 +1920,20 @@ pub unsafe extern "C" fn gzfwrite(
     if len == 0 {
         len
     } else {
-        // Safety: The caller is responsible for ensuring that `buf` points to at least
-        // `len = size * nitems` readable bytes.
-        (unsafe { gz_write(state, buf, len) }) as size_t / size
+        // Safety: the public contract guarantees a readable caller span of
+        // `len = size * nitems` bytes.
+        let mut input = unsafe { GzWriteInput::from_raw(buf, len) };
+        gz_write(state, &mut input) / size
     }
 }
 
-// Internal implementation of `gzwrite`.
-//
-// # Returns
-// - The number of uncompress bytes written, on success.
-// - Or 0 in case of error.
-//
-// # Safety
-//
-/// - `state` must have been properly initialized, e.g. by [`gzopen_bound`].
-/// - `buf` must point to at least `len` bytes of readable memory.
-unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) -> c_int {
-    // If len is zero, avoid unnecessary operations.
-    if len == 0 {
+// Internal implementation shared by `gzwrite` and `gzfwrite` after their raw
+// caller input has been bound to a checked cursor at the FFI boundary.
+fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
+    if input.is_empty() {
         return 0;
     }
 
-    // Allocate memory if this is the first time through.
     if state.input.is_none() && gz_init(state).is_err() {
         return 0;
     }
@@ -1895,57 +1945,54 @@ unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) 
         }
     }
 
-    let put = len as c_int;
+    let put = input.len();
 
-    // For small len, copy to input buffer, otherwise compress directly.
-    if len < state.in_size() {
-        // Copy to input buffer, compress when full.
+    if input.len() < state.in_size() {
         loop {
             if state.stream.avail_in == 0 {
                 state.stream.next_in = state.input_ptr();
             }
-            // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
             let have = state.owned_write_input_end();
-            let copy = Ord::min(state.in_size().saturating_sub(have), len);
-            // Safety: The caller is responsible for ensuring that buf points to at least len readable
-            // bytes, and copy is <= len.
-            unsafe { ptr::copy(buf, state.input_ptr().add(have).cast::<c_void>(), copy) };
+            let capacity = state.in_size().saturating_sub(have);
+            let copy = {
+                let owned = state
+                    .input
+                    .as_mut()
+                    .expect("write input must remain allocated")
+                    .usable_uninit_mut();
+                input.copy_to(&mut owned[have..have + Ord::min(capacity, input.len())])
+            };
             state.stream.avail_in += copy as c_uint;
             state.pos += copy as i64;
-            buf = unsafe { buf.add(copy) };
-            len -= copy;
-            if len != 0 && gz_comp(state, Z_NO_FLUSH).is_err() {
+            if !input.is_empty() && gz_comp(state, Z_NO_FLUSH).is_err() {
                 return 0;
             }
-            if len == 0 {
+            if input.is_empty() {
                 break;
             }
         }
     } else {
-        // Consume any data left in the input buffer.
         if state.stream.avail_in != 0 && gz_comp(state, Z_NO_FLUSH).is_err() {
             return 0;
         }
 
-        // Directly compress user buffer to file.
-        // Note: For this operation, we temporarily break the invariant that
-        // `state.stream.next_in` points to somewhere in the `state.input` buffer.
         let save_next_in = state.stream.next_in;
-        state.stream.next_in = buf.cast::<_>();
         let result = loop {
-            let n = Ord::min(len, c_uint::MAX as usize) as c_uint;
-            state.stream.avail_in = n;
+            let n = Ord::min(input.len(), c_uint::MAX as usize);
+            state.stream.next_in = input.as_ptr();
+            state.stream.avail_in = n as c_uint;
             state.pos += n as i64;
             if gz_comp(state, Z_NO_FLUSH).is_err() {
                 break Err(());
             }
-            len -= n as usize;
-            if len == 0 {
+            debug_assert_eq!(state.stream.avail_in, 0);
+            input.advance(n);
+            if input.is_empty() {
                 break Ok(());
             }
         };
-        // `next_in` temporarily borrowed caller memory above. Never let that pointer
-        // or a length describing it escape this operation, including on I/O failure.
+        // `next_in` borrowed caller memory above. Restore owned-state identity on
+        // every exit, including I/O and compression failures.
         state.stream.next_in = save_next_in;
         if result.is_err() {
             state.stream.avail_in = 0;
@@ -1953,7 +2000,6 @@ unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) 
         }
     }
 
-    // Input was all buffered or compressed.
     put
 }
 
@@ -2364,7 +2410,8 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     // No room in buffer or not initialized, use gz_write.
     let buf = [c as u8];
     // Safety: We have confirmed that `state` is valid, and `buf` contains 1 readable byte of data.
-    match unsafe { gz_write(state, buf.as_ptr().cast::<c_void>(), 1) } {
+    let mut input = GzWriteInput::from_slice(&buf);
+    match gz_write(state, &mut input) {
         1 => c & 0xff,
         _ => -1,
     }
@@ -2404,8 +2451,10 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
         gz_error(state, Some((Z_STREAM_ERROR, MSG)));
         return -1;
     }
-    let put = unsafe { gz_write(state, s.cast::<c_void>(), len) };
-    match put.cmp(&(len as i32)) {
+    // Safety: `s` was validated above as a C string containing at least `len` bytes.
+    let mut input = unsafe { GzWriteInput::from_raw(s.cast::<c_void>(), len) };
+    let put = gz_write(state, &mut input);
+    match put.cmp(&len) {
         Ordering::Less => -1,
         Ordering::Equal | Ordering::Greater => len as _,
     }
@@ -3121,7 +3170,8 @@ mod tests {
         assert_ne!(owned_input.cast_const(), saved_next_in);
 
         let input = vec![b'A'; state.in_size()];
-        let written = unsafe { gz_write(&mut state, input.as_ptr().cast(), input.len()) };
+        let mut input_cursor = GzWriteInput::from_slice(&input);
+        let written = gz_write(&mut state, &mut input_cursor);
         assert_eq!(written as usize, input.len());
         assert_eq!(state.stream.next_in, saved_next_in);
         assert_ne!(state.stream.next_in, input.as_ptr().cast_mut());
@@ -3144,10 +3194,8 @@ mod tests {
         let caller_start = input.as_ptr() as usize;
         let caller_end = caller_start + input.len();
 
-        assert_eq!(
-            unsafe { gz_write(&mut state, input.as_ptr().cast(), input.len()) },
-            0
-        );
+        let mut input_cursor = GzWriteInput::from_slice(&input);
+        assert_eq!(gz_write(&mut state, &mut input_cursor), 0);
         assert_eq!(state.err, Z_ERRNO);
         assert_eq!(state.stream.avail_in, 0);
         assert_eq!(state.stream.next_in, saved_next_in);
