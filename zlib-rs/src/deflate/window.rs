@@ -26,10 +26,12 @@ impl<'a> Window<'a> {
         }
     }
 
+    #[cfg(test)]
     pub fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr().cast()
     }
 
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.buf.len()
     }
@@ -53,8 +55,8 @@ impl<'a> Window<'a> {
         unsafe { slice.assume_init_ref() }
     }
 
-    /// Returns a mutable view of the logically initialized prefix of the window.
-    #[inline]
+    /// Returns a mutable view of the logically initialized prefix for invariant tests.
+    #[cfg(test)]
     pub fn filled_mut(&mut self) -> &mut [u8] {
         let slice = &mut self.buf.as_mut_slice()[..self.initialized];
         // SAFETY: same initialized-prefix invariant as `filled()`; the borrow is exclusive.
