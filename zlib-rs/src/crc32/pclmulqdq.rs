@@ -1,7 +1,6 @@
 use core::arch::x86_64::{
     __m128i, _mm_and_si128, _mm_clmulepi64_si128, _mm_extract_epi32, _mm_load_si128,
-    _mm_loadu_si128, _mm_or_si128, _mm_shuffle_epi8, _mm_slli_si128, _mm_srli_si128,
-    _mm_storeu_si128, _mm_xor_si128,
+    _mm_loadu_si128, _mm_or_si128, _mm_shuffle_epi8, _mm_slli_si128, _mm_srli_si128, _mm_xor_si128,
 };
 
 use crate::CRC32_INITIAL_VALUE;
@@ -40,11 +39,7 @@ impl Accumulator {
     }
 
     pub unsafe fn fold(&mut self, src: &[u8], start: u32) {
-        unsafe { self.fold_help::<false>(&mut [], src, start) }
-    }
-
-    pub unsafe fn fold_copy(&mut self, dst: &mut [u8], src: &[u8]) {
-        unsafe { self.fold_help::<true>(dst, src, 0) }
+        unsafe { self.fold_help(src, start) }
     }
 
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
@@ -197,12 +192,7 @@ impl Accumulator {
     }
 
     #[allow(clippy::needless_range_loop)]
-    unsafe fn progress<const N: usize, const COPY: bool>(
-        &mut self,
-        dst: &mut [u8],
-        src: &mut &[u8],
-        init_crc: &mut u32,
-    ) -> usize {
+    unsafe fn progress<const N: usize>(&mut self, src: &mut &[u8], init_crc: &mut u32) {
         let mut it = src.chunks_exact(16);
         let mut input: [_; N] = core::array::from_fn(|_| unsafe {
             _mm_load_si128(it.next().unwrap().as_ptr() as *const __m128i)
@@ -210,11 +200,7 @@ impl Accumulator {
 
         *src = &src[N * 16..];
 
-        if COPY {
-            for (s, d) in input[..N].iter().zip(dst.chunks_exact_mut(16)) {
-                unsafe { _mm_storeu_si128(d.as_mut_ptr() as *mut __m128i, *s) };
-            }
-        } else if *init_crc != CRC32_INITIAL_VALUE {
+        if *init_crc != CRC32_INITIAL_VALUE {
             let xmm_initial = reg([*init_crc, 0, 0, 0]);
             input[0] = unsafe { _mm_xor_si128(input[0], xmm_initial) };
             *init_crc = CRC32_INITIAL_VALUE;
@@ -225,40 +211,23 @@ impl Accumulator {
         for i in 0..N {
             self.fold[i + (4 - N)] = unsafe { _mm_xor_si128(self.fold[i + (4 - N)], input[i]) };
         }
-
-        if COPY {
-            N * 16
-        } else {
-            0
-        }
     }
 
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
-    unsafe fn fold_help<const COPY: bool>(
-        &mut self,
-        mut dst: &mut [u8],
-        mut src: &[u8],
-        mut init_crc: u32,
-    ) {
+    unsafe fn fold_help(&mut self, mut src: &[u8], mut init_crc: u32) {
         let mut xmm_crc_part = reg([0; 4]);
-
         let mut partial_buf = Align16([0u8; 16]);
 
         // Technically the CRC functions don't even call this for input < 64, but a bare minimum of 31
-        // bytes of input is needed for the aligning load that occurs.  If there's an initial CRC, to
-        // carry it forward through the folded CRC there must be 16 - src % 16 + 16 bytes available, which
-        // by definition can be up to 15 bytes + one full vector load. */
+        // bytes of input is needed for the aligning load that occurs. If there's an initial CRC, to
+        // carry it forward through the folded CRC there must be 16 - src % 16 + 16 bytes available,
+        // which by definition can be up to 15 bytes + one full vector load.
         let first = init_crc != CRC32_INITIAL_VALUE;
         assert!(src.len() >= 31 || !first);
 
-        // However due to how alignment and loads work out, the 31 minimum is too tight. We use a
-        // simpler algorithm anyway for small input because it is faster, so to prevent accidental
-        // future UB be more strict here.
+        // Due to how alignment and loads work out, the 31 minimum is too tight. We use a simpler
+        // algorithm for small input anyway, so be stricter here to prevent accidental future UB.
         assert!(src.len() >= 64 || !first);
-
-        if COPY {
-            assert_eq!(dst.len(), src.len(), "dst and src must be the same length")
-        }
 
         if src.len() < 16 {
             if src.is_empty() {
@@ -266,72 +235,53 @@ impl Accumulator {
             }
 
             partial_buf.0[..src.len()].copy_from_slice(src);
-            xmm_crc_part = unsafe { _mm_load_si128(partial_buf.0.as_mut_ptr() as *mut __m128i) };
-            if COPY {
-                dst[..src.len()].copy_from_slice(&partial_buf.0[..src.len()]);
-            }
+            xmm_crc_part = unsafe { _mm_load_si128(partial_buf.0.as_ptr() as *const __m128i) };
         } else {
-            // SAFETY: [u8; 16] can safely transmute into _m128i.
+            // SAFETY: [u8; 16] can safely transmute into __m128i.
             let (before, _, _) = unsafe { src.align_to::<__m128i>() };
 
             #[allow(unused_unsafe)] // because target features 1.1
             if !before.is_empty() {
                 xmm_crc_part = unsafe { _mm_loadu_si128(src.as_ptr() as *const __m128i) };
-                if COPY {
-                    unsafe { _mm_storeu_si128(dst.as_mut_ptr() as *mut __m128i, xmm_crc_part) };
-                    dst = &mut dst[before.len()..];
-                } else {
-                    let is_initial = init_crc == CRC32_INITIAL_VALUE;
+                let is_initial = init_crc == CRC32_INITIAL_VALUE;
 
-                    if !is_initial {
-                        let xmm_initial = reg([init_crc, 0, 0, 0]);
-                        xmm_crc_part = unsafe { _mm_xor_si128(xmm_crc_part, xmm_initial) };
-                        init_crc = CRC32_INITIAL_VALUE;
-                    }
+                if !is_initial {
+                    let xmm_initial = reg([init_crc, 0, 0, 0]);
+                    xmm_crc_part = unsafe { _mm_xor_si128(xmm_crc_part, xmm_initial) };
+                    init_crc = CRC32_INITIAL_VALUE;
+                }
 
-                    if before.len() < 4 && !is_initial {
-                        let xmm_t0 = xmm_crc_part;
-                        xmm_crc_part =
-                            unsafe { _mm_loadu_si128((src.as_ptr() as *const __m128i).add(1)) };
+                if before.len() < 4 && !is_initial {
+                    let xmm_t0 = xmm_crc_part;
+                    xmm_crc_part =
+                        unsafe { _mm_loadu_si128((src.as_ptr() as *const __m128i).add(1)) };
 
-                        unsafe { self.fold_step::<1>() };
+                    unsafe { self.fold_step::<1>() };
 
-                        self.fold[3] = unsafe { _mm_xor_si128(self.fold[3], xmm_t0) };
-                        src = &src[16..];
-                    }
+                    self.fold[3] = unsafe { _mm_xor_si128(self.fold[3], xmm_t0) };
+                    src = &src[16..];
                 }
 
                 unsafe { self.partial_fold(xmm_crc_part, before.len()) };
-
                 src = &src[before.len()..];
             }
 
             #[cfg(feature = "vpclmulqdq")]
             #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
             if src.len() >= 256 {
-                let n;
-                if COPY {
-                    n = unsafe { self.fold_16_vpclmulqdq_copy(dst, &mut src) };
-                    dst = &mut dst[n..];
-                } else {
-                    unsafe { self.fold_16_vpclmulqdq(dst, &mut src, &mut init_crc) };
-                }
+                unsafe { self.fold_16_vpclmulqdq(&mut src, &mut init_crc) };
             }
 
             while src.len() >= 64 {
-                let n = unsafe { self.progress::<4, COPY>(dst, &mut src, &mut init_crc) };
-                dst = &mut dst[n..];
+                unsafe { self.progress::<4>(&mut src, &mut init_crc) };
             }
 
             if src.len() >= 48 {
-                let n = unsafe { self.progress::<3, COPY>(dst, &mut src, &mut init_crc) };
-                dst = &mut dst[n..];
+                unsafe { self.progress::<3>(&mut src, &mut init_crc) };
             } else if src.len() >= 32 {
-                let n = unsafe { self.progress::<2, COPY>(dst, &mut src, &mut init_crc) };
-                dst = &mut dst[n..];
+                unsafe { self.progress::<2>(&mut src, &mut init_crc) };
             } else if src.len() >= 16 {
-                let n = unsafe { self.progress::<1, COPY>(dst, &mut src, &mut init_crc) };
-                dst = &mut dst[n..];
+                unsafe { self.progress::<1>(&mut src, &mut init_crc) };
             }
         }
 
@@ -339,21 +289,12 @@ impl Accumulator {
             debug_assert!(src.len() <= 16);
             unsafe {
                 // SAFETY: src and xmm_crc_part don't overlap. xmm_crc_part is statically
-                // guaranteed to be 16 bytes, and in earlier code we advanced the src slice such
-                // that it's less than 16 bytes.
+                // guaranteed to be 16 bytes, and earlier code advanced src below 16 bytes.
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr(),
                     &mut xmm_crc_part as *mut _ as *mut u8,
                     src.len(),
                 );
-                if COPY {
-                    _mm_storeu_si128(partial_buf.0.as_mut_ptr() as *mut __m128i, xmm_crc_part);
-                    core::ptr::copy_nonoverlapping(
-                        partial_buf.0.as_ptr(),
-                        dst.as_mut_ptr(),
-                        src.len(),
-                    );
-                }
                 self.partial_fold(xmm_crc_part, src.len());
             }
         }

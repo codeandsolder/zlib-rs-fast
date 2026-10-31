@@ -1,41 +1,19 @@
 use crate::CRC32_INITIAL_VALUE;
 use core::arch::x86_64::{
     __m512i, _mm512_clmulepi64_epi128, _mm512_extracti32x4_epi32, _mm512_inserti32x4,
-    _mm512_loadu_si512, _mm512_set4_epi32, _mm512_setzero_si512, _mm512_storeu_si512,
-    _mm512_ternarylogic_epi32, _mm512_xor_si512, _mm512_zextsi128_si512, _mm_cvtsi32_si128,
+    _mm512_loadu_si512, _mm512_set4_epi32, _mm512_setzero_si512, _mm512_ternarylogic_epi32,
+    _mm512_xor_si512, _mm512_zextsi128_si512, _mm_cvtsi32_si128,
 };
 
 impl super::pclmulqdq::Accumulator {
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub(super) unsafe fn fold_16_vpclmulqdq(
-        &mut self,
-        dst: &mut [u8],
-        src: &mut &[u8],
-        init_crc: &mut u32,
-    ) -> usize {
-        unsafe { self.fold_help_vpclmulqdq::<false>(dst, src, init_crc) }
+    pub(super) unsafe fn fold_16_vpclmulqdq(&mut self, src: &mut &[u8], init_crc: &mut u32) {
+        unsafe { self.fold_help_vpclmulqdq(src, init_crc) }
     }
 
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub(super) unsafe fn fold_16_vpclmulqdq_copy(
-        &mut self,
-        dst: &mut [u8],
-        src: &mut &[u8],
-    ) -> usize {
-        let mut init_crc = CRC32_INITIAL_VALUE;
-        unsafe { self.fold_help_vpclmulqdq::<true>(dst, src, &mut init_crc) }
-    }
-
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn fold_help_vpclmulqdq<const COPY: bool>(
-        &mut self,
-        mut dst: &mut [u8],
-        src: &mut &[u8],
-        init_crc: &mut u32,
-    ) -> usize {
+    unsafe fn fold_help_vpclmulqdq(&mut self, src: &mut &[u8], init_crc: &mut u32) {
         let [xmm_crc0, xmm_crc1, xmm_crc2, xmm_crc3] = &mut self.fold;
-        let start_len = src.len();
-
         unsafe {
             let zmm_fold4 =
                 _mm512_set4_epi32(0x00000001, 0x54442bd4, 0x00000001, 0xc6e41596u32 as i32);
@@ -45,7 +23,7 @@ impl super::pclmulqdq::Accumulator {
             let zmm_crc0 = _mm512_setzero_si512();
             let mut zmm_t0 = _mm512_loadu_si512(src.as_ptr().cast::<__m512i>());
 
-            if !COPY && *init_crc != CRC32_INITIAL_VALUE {
+            if *init_crc != CRC32_INITIAL_VALUE {
                 let xmm_initial = _mm_cvtsi32_si128(*init_crc as i32);
                 let zmm_initial = _mm512_zextsi128_si512(xmm_initial);
                 zmm_t0 = _mm512_xor_si512(zmm_t0, zmm_initial);
@@ -66,14 +44,6 @@ impl super::pclmulqdq::Accumulator {
             let mut z0 = _mm512_clmulepi64_epi128(zmm_crc0, zmm_fold4, 0x01);
             zmm_crc0 = _mm512_clmulepi64_epi128(zmm_crc0, zmm_fold4, 0x10);
             zmm_crc0 = _mm512_ternarylogic_epi32(zmm_crc0, z0, zmm_t0, 0x96);
-
-            if COPY {
-                _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>(), zmm_t0);
-                _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>().add(1), zmm_crc1);
-                _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>().add(2), zmm_crc2);
-                _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>().add(3), zmm_crc3);
-                dst = &mut dst[256..];
-            }
 
             *src = &src[256..];
 
@@ -99,14 +69,6 @@ impl super::pclmulqdq::Accumulator {
                 zmm_crc2 = _mm512_ternarylogic_epi32(zmm_crc2, z2, zmm_t2, 0x96);
                 zmm_crc3 = _mm512_ternarylogic_epi32(zmm_crc3, z3, zmm_t3, 0x96);
 
-                if COPY {
-                    _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>(), zmm_t0);
-                    _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>().add(1), zmm_t1);
-                    _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>().add(2), zmm_t2);
-                    _mm512_storeu_si512(dst.as_mut_ptr().cast::<__m512i>().add(3), zmm_t3);
-                    dst = &mut dst[256..];
-                }
-
                 *src = &src[256..];
             }
 
@@ -128,9 +90,6 @@ impl super::pclmulqdq::Accumulator {
             *xmm_crc1 = _mm512_extracti32x4_epi32(zmm_crc0, 1);
             *xmm_crc2 = _mm512_extracti32x4_epi32(zmm_crc0, 2);
             *xmm_crc3 = _mm512_extracti32x4_epi32(zmm_crc0, 3);
-
-            // return n bytes processed
-            start_len - src.len()
         }
     }
 }

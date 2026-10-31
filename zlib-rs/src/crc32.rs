@@ -129,33 +129,6 @@ impl Crc32Fold {
             Crc32Backend::Scalar(value) => *value = braid::crc32_braid::<5>(*value, src),
         }
     }
-    pub fn fold_copy(&mut self, dst: &mut [u8], src: &[u8]) {
-        assert!(dst.len() >= src.len(), "destination is shorter than source");
-        #[cfg(target_arch = "x86_64")]
-        if let Crc32Backend::Pclmul {
-            accumulator,
-            pending_initial,
-        } = &mut self.backend
-        {
-            let initial = pending_initial.take().unwrap_or(CRC32_INITIAL_VALUE);
-            if initial == CRC32_INITIAL_VALUE {
-                // SAFETY: selected only after runtime PCLMULQDQ/SSE4.1 detection.
-                unsafe { accumulator.fold_copy(&mut dst[..src.len()], src) };
-                return;
-            }
-            if src.len() >= 64 {
-                // The fused copy path cannot inject a non-default initial CRC.
-                unsafe { accumulator.fold(src, initial) };
-                dst[..src.len()].copy_from_slice(src);
-                return;
-            }
-            self.backend = Crc32Backend::Scalar(braid::crc32_braid::<5>(initial, src));
-            dst[..src.len()].copy_from_slice(src);
-            return;
-        }
-        self.fold(src);
-        dst[..src.len()].copy_from_slice(src);
-    }
     pub fn finish(self) -> u32 {
         #[cfg(target_arch = "x86_64")]
         return match self.backend {
@@ -298,18 +271,6 @@ mod test {
         let mut fold = Crc32Fold::new_with_initial(start);
         fold.fold(input);
         assert_eq!(fold.finish(), crc32_braid::<5>(start, input));
-    }
-
-    #[test]
-    fn fold_copy_handles_custom_initial_for_short_and_long_inputs() {
-        for input in [&INPUT[..31], &INPUT[..257]] {
-            let start = 42;
-            let mut dst = vec![0xaa; input.len()];
-            let mut fold = Crc32Fold::new_with_initial(start);
-            fold.fold_copy(&mut dst, input);
-            assert_eq!(dst, input);
-            assert_eq!(fold.finish(), crc32_braid::<5>(start, input));
-        }
     }
 
     #[test]
