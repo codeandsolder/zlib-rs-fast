@@ -7,6 +7,7 @@ use crate::{
 };
 use core::cmp::Ordering;
 use core::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use core::mem::MaybeUninit;
 use core::ptr::{self, NonNull};
 use libc::size_t; // FIXME: Switch to core::ffi::c_size_t when it's stable.
 use libc::{O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET};
@@ -113,6 +114,17 @@ impl GzBuffer {
 
     fn usable(&self) -> usize {
         self.usable
+    }
+
+    fn usable_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        // Safety: this buffer uniquely owns an allocation of at least `usable` bytes.
+        // `MaybeUninit<u8>` imposes no initialization requirement on those bytes.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.ptr.as_ptr().cast::<MaybeUninit<u8>>(),
+                self.usable,
+            )
+        }
     }
 }
 
@@ -287,6 +299,107 @@ impl GzState {
 
     fn out_size(&self) -> usize {
         self.output.as_ref().map_or(0, GzBuffer::usable)
+    }
+
+    /// Return the initialized read-mode bytes exposed through the ABI `have`/`next` prefix.
+    fn buffered_output(&self) -> &[u8] {
+        if self.have == 0 {
+            return &[];
+        }
+        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        let output = self
+            .output
+            .as_ref()
+            .expect("read output must be allocated when bytes are buffered");
+        let base = output.as_ptr();
+        // Safety: the read-mode invariant requires `next` to point into the owned output
+        // allocation whenever `have != 0`. The C `gzgetc` macro may advance `next` and
+        // reduce `have`, but preserves that invariant.
+        let offset = unsafe { self.next.offset_from(base) };
+        assert!(offset >= 0, "buffered output pointer precedes owned output");
+        let offset = offset as usize;
+        let have = self.have as usize;
+        assert!(offset <= output.usable());
+        assert!(have <= output.usable() - offset);
+        // Safety: the invariant above establishes an in-bounds initialized range.
+        unsafe { core::slice::from_raw_parts(self.next, have) }
+    }
+
+    fn consume_buffered_output(&mut self, len: usize) {
+        assert!(len <= self.buffered_output().len());
+        if len == 0 {
+            return;
+        }
+        // Safety: `len` is within the current buffered range, so advancing by it stays
+        // within (or one past) the same owned output allocation.
+        self.next = unsafe { self.next.add(len) };
+        self.have -= len as c_uint;
+    }
+
+    /// Publish an initialized range in the owned read output buffer through the ABI prefix.
+    ///
+    /// Callers must only use ranges they have just initialized through a typed output slice.
+    fn publish_buffered_output(&mut self, offset: usize, len: usize) {
+        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        let output = self
+            .output
+            .as_ref()
+            .expect("read output must be allocated before publishing bytes");
+        assert!(offset <= output.usable());
+        assert!(len <= output.usable() - offset);
+        let have = c_uint::try_from(len).expect("gzip buffered output length must fit in uInt");
+        // Safety: `offset` is in-bounds (or one-past when `len == 0`) for this allocation.
+        self.next = unsafe { output.as_ptr().add(offset) };
+        self.have = have;
+    }
+
+    fn push_back_buffered_byte(&mut self, byte: u8) -> Result<(), ()> {
+        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        let have = self.have as usize;
+        let size = self.out_size();
+        if have == size {
+            return Err(());
+        }
+
+        if have == 0 {
+            let offset = size - 1;
+            self.output
+                .as_mut()
+                .expect("read output must be allocated before pushback")
+                .usable_uninit_mut()[offset]
+                .write(byte);
+            self.publish_buffered_output(offset, 1);
+            return Ok(());
+        }
+
+        let base = self.output_ptr();
+        // Safety: `have != 0` establishes the normal read-mode invariant that `next`
+        // points into the owned output allocation.
+        let current_offset = unsafe { self.next.offset_from(base) };
+        assert!(current_offset >= 0);
+        let current_offset = current_offset as usize;
+        assert!(current_offset <= size - have);
+
+        let new_offset = if current_offset == 0 {
+            let moved_offset = size - have;
+            let output = self
+                .output
+                .as_mut()
+                .expect("read output must be allocated before pushback")
+                .usable_uninit_mut();
+            output.copy_within(0..have, moved_offset);
+            moved_offset - 1
+        } else {
+            current_offset - 1
+        };
+
+        self.output
+            .as_mut()
+            .expect("read output must be allocated before pushback")
+            .usable_uninit_mut()[new_offset]
+            .write(byte);
+        self.publish_buffered_output(new_offset, have + 1);
+        Ok(())
     }
 
     /// Compute the number of bytes of input buffered in `self`.
@@ -1113,9 +1226,16 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
         return -1;
     }
 
-    // With the initial checks passed, try the actual read.
-    // Safety: The caller is responsible for ensuring that `buf` points to >= `len` writable bytes.
-    let got = unsafe { gz_read(state, buf.cast::<u8>(), len as usize) };
+    // Bind the caller-owned output once at the FFI boundary. `MaybeUninit` accurately
+    // represents that the incoming writable bytes need not have been initialized yet.
+    let got = if len == 0 {
+        gz_read(state, &mut [])
+    } else {
+        // Safety: the caller guarantees a writable span of `len` bytes when `len != 0`.
+        let output =
+            unsafe { core::slice::from_raw_parts_mut(buf.cast::<MaybeUninit<u8>>(), len as usize) };
+        gz_read(state, output)
+    };
 
     // Check for an error
     if got == 0 && state.err != Z_OK && state.err != Z_BUF_ERROR {
@@ -1184,25 +1304,18 @@ pub unsafe extern "C" fn gzfread(
     if len == 0 {
         len
     } else {
-        // Safety: The caller is responsible for ensuring that `buf` points to at least
-        // `len = size * nitems` writable bytes.
-        (unsafe { gz_read(state, buf.cast::<u8>(), len) }) / size
+        // Safety: the caller guarantees a writable span of `len = size * nitems` bytes.
+        let output = unsafe { core::slice::from_raw_parts_mut(buf.cast::<MaybeUninit<u8>>(), len) };
+        gz_read(state, output) / size
     }
 }
 
-// Attempt to read enough bytes from the input to fill the supplied `buf`.
+// Attempt to read enough bytes from the input to fill the supplied `output`.
 //
-// # Returns
-//
-// The number of bytes read into `buf`. Note: A return value of zero means either end-of-file
-// or an error. `state.err` must be consulted to determine which.
-//
-// # Safety
-//
-// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
-// * `buf` must point to at least `len` bytes of writable memory.
-unsafe fn gz_read(state: &mut GzState, mut buf: *mut u8, mut len: usize) -> usize {
-    if len == 0 {
+// The destination is a typed uninitialized span bound once at the public FFI boundary.
+// Internal reads never construct or advance a raw caller-output pointer.
+fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
+    if output.is_empty() {
         return 0;
     }
 
@@ -1214,80 +1327,50 @@ unsafe fn gz_read(state: &mut GzState, mut buf: *mut u8, mut len: usize) -> usiz
         }
     }
 
-    // Loop until we get enough bytes or reach the end of the file.
-    let mut got = 0;
-    loop {
-        // Set n to the maximum amount of len that fits in an unsigned int.
-        let mut n = Ord::min(len, c_uint::MAX as usize);
+    let mut written = 0usize;
+    while written < output.len() {
+        let remaining = output.len() - written;
+        let mut n = Ord::min(remaining, c_uint::MAX as usize);
 
-        // First just try copying data from the output buffer. Note: The output
-        // buffer contains bytes that have been decompressed by `state.stream` and
-        // are waiting to be consumed - or, in direct mode, it contains bytes read
-        // directly from the underlying file descriptor.
         if state.have != 0 {
-            n = Ord::min(n, state.have as usize);
-            // Safety:
-            // * n <= state.have, and there are `state.have` readable bytes starting
-            //   at `state.next`.
-            // * n <= len, and the caller is responsible for ensuring that `buf`
-            //   points to at least `len` writable bytes.
-            // * `state.next` points into an internal buffer not visible outside the
-            //   `GzState`, and `buf` is supplied by the caller, so the source and
-            //   destination are guaranteed not to overlap.
-            unsafe { ptr::copy_nonoverlapping(state.next, buf, n) };
-            state.next = unsafe { state.next.add(n) };
-            state.have -= n as c_uint;
+            let available = state.buffered_output();
+            n = Ord::min(n, available.len());
+            output[written..written + n].write_copy_of_slice(&available[..n]);
+            state.consume_buffered_output(n);
         } else if state.eof && state.stream.avail_in == 0 {
-            // The output buffer is empty, and we're at the end of the file.
-            state.past = true; // Tried to read past end
+            state.past = true;
             break;
         } else if state.how == How::Look || n < state.in_size() * 2 {
-            // For small len or a new stream, load more data from the file descriptor into
-            // the output buffer. Note: If we haven't scanned the file header yet, gz_fetch
-            // will read the header and determine whether to use decompression or direct read.
             if unsafe { gz_fetch(state) }.is_err() {
                 return 0;
             }
-
-            // Now that we've tried reading, we can try to copy from the output buffer.
-            // The copy above assures that we will leave with space in the output buffer,
-            // allowing at least one gzungetc() to succeed.
             continue;
         } else if state.how == How::Copy {
-            // For a large requested read length, in copy mode (meaning that the input
-            // file is not gzip and we're returning its contents directly), bypass the
-            // output buffer and read from the file descriptor directly into buf.
-            // Safety: n <= len, and the caller is responsible for ensuring that `buf`
-            // points to at least `len` writable bytes.
-            let Ok(bytes_read) = (unsafe { gz_load(state, buf, n) }) else {
-                return 0;
+            let target = &mut output[written..written + n];
+            let (bytes_read, eof) = match load_from_fd(state.fd, target) {
+                Ok(result) => result,
+                Err(()) => {
+                    gz_error(state, Some((Z_ERRNO, "read error")));
+                    return 0;
+                }
             };
+            if eof {
+                state.eof = true;
+            }
             n = bytes_read;
         } else {
-            // We are in gzip mode, and the requested read size is large. Get more data and
-            // decompress it directly into buf, bypassing stream.output.
             debug_assert_eq!(state.how, How::Gzip);
-            state.stream.avail_out = n as c_uint;
-            state.stream.next_out = buf;
-            if unsafe { gz_decomp(state) }.is_err() {
-                return 0;
-            }
-            n = state.have as usize;
-            state.have = 0;
+            n = match gz_decomp_into(state, &mut output[written..written + n]) {
+                Ok(produced) => produced,
+                Err(()) => return 0,
+            };
         }
 
-        // Update progress
-        len -= n;
-        buf = unsafe { buf.add(n) };
-        got += n;
+        written += n;
         state.pos += n as i64;
-
-        if len == 0 {
-            break;
-        }
     }
 
-    got
+    written
 }
 
 // Given an unsigned value `x`, determine whether `x` is larger than the maximum
@@ -1320,10 +1403,7 @@ fn gz_skip(state: &mut GzState, mut len: i64) -> Result<(), ()> {
             } else {
                 state.have as usize
             };
-            state.have -= n as c_uint;
-            // Safety: `n` <= `state.have` and there are at least `state.have` accessible
-            // bytes after `state.next` in the buffer.
-            state.next = unsafe { state.next.add(n) };
+            state.consume_buffered_output(n);
             state.pos += n as i64;
             len -= n as i64;
         } else if state.eof && state.stream.avail_in == 0 {
@@ -1429,20 +1509,19 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
         return Ok(());
     }
 
-    // The file is not in gzip format, so enable direct mode, and copy all
-    // buffered input to the output.
-    // Safety:
-    // * `state.output` was allocated above.
-    // * `gz_avail` ensures that `next_in` points to at least `avail_in` readable bytes.
-    unsafe {
-        ptr::copy_nonoverlapping(
-            state.stream.next_in,
-            state.output_ptr(),
-            state.stream.avail_in as usize,
-        )
+    // The file is not in gzip format, so enable direct mode and move the buffered
+    // input into owned output storage. `gz_avail` guarantees the source span is readable.
+    let input = unsafe {
+        core::slice::from_raw_parts(state.stream.next_in, state.stream.avail_in as usize)
     };
-    state.next = state.output_ptr();
-    state.have = state.stream.avail_in;
+    let output = state
+        .output
+        .as_mut()
+        .expect("gzip read output must be allocated during header detection")
+        .usable_uninit_mut();
+    output[..input.len()].write_copy_of_slice(input);
+    let produced = input.len();
+    state.publish_buffered_output(0, produced);
     state.stream.avail_in = 0;
     state.how = How::Copy;
     state.direct = true;
@@ -1477,54 +1556,50 @@ unsafe fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
                 )
             };
         }
-        let got = unsafe {
-            gz_load(
-                state,
-                state.input_ptr().add(state.stream.avail_in as usize),
-                state.in_size() - state.stream.avail_in as usize,
-            )
-        }?;
+        let already_buffered = state.stream.avail_in as usize;
+        let load_result = {
+            let input = state
+                .input
+                .as_mut()
+                .expect("gzip input buffer must be initialized before refill");
+            let storage = input.usable_uninit_mut();
+            load_from_fd(state.fd, &mut storage[already_buffered..])
+        };
+        let (got, eof) = match load_result {
+            Ok(result) => result,
+            Err(()) => {
+                gz_error(state, Some((Z_ERRNO, "read error")));
+                return Err(());
+            }
+        };
+        if eof {
+            state.eof = true;
+        }
         state.stream.avail_in += got as uInt;
         state.stream.next_in = state.input_ptr();
     }
     Ok(state.stream.avail_in as usize)
 }
 
-// Read data from `state`'s underlying file descriptor into a buffer.
-//
-// # Returns
-//
-// * `Ok(n)` on success, where `n` is the number of bytes read.
-// * `Err` on error
-//
-// # Arguments
-//
-// * `state` - gzip file handle.
-// * `buf` - address at which the data read from the file should be stored.
-// * `size` - number of bytes to read
-//
-// # Safety
-//
-// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
-// * `buf` mut point to a writable block of at least `len` bytes.
-unsafe fn gz_load(state: &mut GzState, buf: *mut u8, len: usize) -> Result<usize, ()> {
-    let mut have = 0;
-    let mut ret = 0;
-    while have < len {
-        ret = unsafe { libc::read(state.fd, buf.add(have).cast::<_>(), (len - have) as _) };
+// Read into an uninitialized byte span from an underlying file descriptor.
+// Returns `(bytes_read, reached_eof)`. A failed system read is reported separately so
+// the gzip state can attach its source-specific error message at the caller.
+fn load_from_fd(fd: c_int, output: &mut [MaybeUninit<u8>]) -> Result<(usize, bool), ()> {
+    let mut have = 0usize;
+    let mut ret: isize = 1;
+    while have < output.len() {
+        let dst = output[have..].as_mut_ptr().cast::<u8>().cast::<c_void>();
+        ret = unsafe { libc::read(fd, dst, output.len() - have) };
         if ret <= 0 {
             break;
         }
         have += ret as usize;
     }
     if ret < 0 {
-        gz_error(state, Some((Z_ERRNO, "read error"))); // FIXME implement `zstrerror`
-        return Err(());
+        Err(())
+    } else {
+        Ok((have, ret == 0))
     }
-    if ret == 0 {
-        state.eof = true;
-    }
-    Ok(have)
 }
 
 // Fetch data and put it in the output buffer, decompressing if needed. If the header has
@@ -1541,33 +1616,48 @@ unsafe fn gz_load(state: &mut GzState, buf: *mut u8, len: usize) -> Result<usize
 //
 unsafe fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
     loop {
-        // Process the input, which may cause state transitions among Look/Gzip/Copy.
         match &state.how {
             How::Look => {
-                // -> Look, Copy (only if never Gzip), or Gzip
                 unsafe { gz_look(state) }?;
                 if state.how == How::Look {
                     return Ok(());
                 }
             }
             How::Copy => {
-                // -> Copy
-                let bytes_read = unsafe { gz_load(state, state.output_ptr(), state.out_size()) }?;
-                state.next = state.output_ptr();
-                state.have += bytes_read as uInt;
+                let load_result = {
+                    let output = state
+                        .output
+                        .as_mut()
+                        .expect("gzip read output must be allocated in copy mode");
+                    load_from_fd(state.fd, output.usable_uninit_mut())
+                };
+                let (bytes_read, eof) = match load_result {
+                    Ok(result) => result,
+                    Err(()) => {
+                        gz_error(state, Some((Z_ERRNO, "read error")));
+                        return Err(());
+                    }
+                };
+                if eof {
+                    state.eof = true;
+                }
+                state.publish_buffered_output(0, bytes_read);
                 return Ok(());
             }
             How::Gzip => {
-                // -> Gzip or Look (if at end of gzip stream)
-                state.stream.avail_out = state.out_size() as c_uint;
-                state.stream.next_out = state.output_ptr();
-                unsafe { gz_decomp(state) }?;
+                // Temporarily detach the output owner so the decompressor can borrow the
+                // rest of `state` without aliasing storage still reachable through it.
+                let mut output = state
+                    .output
+                    .take()
+                    .expect("gzip read output must be allocated in gzip mode");
+                let result = gz_decomp_into(state, output.usable_uninit_mut());
+                state.output = Some(output);
+                let produced = result?;
+                state.publish_buffered_output(0, produced);
             }
         }
 
-        // Keep trying until either:
-        // - we have some data in the output buffer (measured by state.have)
-        // - or both the input buffer and the underling file have been fully consumed.
         if state.have != 0 || (state.eof && state.stream.avail_in == 0) {
             break;
         }
@@ -1576,68 +1666,58 @@ unsafe fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
     Ok(())
 }
 
-// Decompress from input and put the result in `state`'s output buffer.
-// On return, `state.have` and `state.next` denote the just decompressed
-// data.  If the gzip stream completes, `state.how` is reset to `Look`
-// to look for the next gzip stream or raw data once the data in the output
-// buffer is consumed.
-//
-// # Returns
-//
-// * `Ok` on success.
-// * `Err` on error.
-//
-// # Safety
-//
-// * `state` must have been properly initialized, e.g. by [`gzopen_bound`].
-unsafe fn gz_decomp(state: &mut GzState) -> Result<(), ()> {
-    // Decompress into the output buffer until we run out of either input data
-    // or space in the output buffer.
-    let had = state.stream.avail_out;
-    loop {
-        // Get more input for inflate().
-        if state.stream.avail_in == 0 && unsafe { gz_avail(state) }.is_err() {
-            return Err(());
-        }
-        if state.stream.avail_in == 0 {
-            gz_error(state, Some((Z_BUF_ERROR, "unexpected end of file")));
-            break;
-        }
+// Decompress into an explicit uninitialized output span. The caller decides whether
+// that span is the owned gzip output buffer or the caller's large-read destination.
+fn gz_decomp_into(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> Result<usize, ()> {
+    let bound_avail_out = output.len() as c_uint;
+    state.stream.avail_out = bound_avail_out;
+    state.stream.next_out = output.as_mut_ptr().cast::<u8>();
 
-        // Decompress and handle errors.
-        match unsafe { inflate(&mut state.stream, Z_NO_FLUSH) } {
-            Z_STREAM_ERROR | Z_NEED_DICT => {
-                const MSG: &str = "internal error: inflate stream corrupt";
-                gz_error(state, Some((Z_STREAM_ERROR, MSG)));
+    let result = (|| -> Result<(), ()> {
+        loop {
+            if state.stream.avail_in == 0 && unsafe { gz_avail(state) }.is_err() {
                 return Err(());
             }
-            Z_MEM_ERROR => {
-                gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
-                return Err(());
-            }
-            Z_DATA_ERROR => {
-                // FIXME gz_error(state, Z_DATA_ERROR, strm->msg == NULL ? "compressed data error" : strm->msg);
-                gz_error(state, Some((Z_DATA_ERROR, "compressed data error")));
-                return Err(());
-            }
-            Z_STREAM_END => {
-                // If the gzip stream completed successfully, look for another.
-                state.how = How::Look;
+            if state.stream.avail_in == 0 {
+                gz_error(state, Some((Z_BUF_ERROR, "unexpected end of file")));
                 break;
             }
-            _ => {}
+
+            match unsafe { inflate(&mut state.stream, Z_NO_FLUSH) } {
+                Z_STREAM_ERROR | Z_NEED_DICT => {
+                    const MSG: &str = "internal error: inflate stream corrupt";
+                    gz_error(state, Some((Z_STREAM_ERROR, MSG)));
+                    return Err(());
+                }
+                Z_MEM_ERROR => {
+                    gz_error(state, Some((Z_MEM_ERROR, "out of memory")));
+                    return Err(());
+                }
+                Z_DATA_ERROR => {
+                    gz_error(state, Some((Z_DATA_ERROR, "compressed data error")));
+                    return Err(());
+                }
+                Z_STREAM_END => {
+                    state.how = How::Look;
+                    break;
+                }
+                _ => {}
+            }
+
+            if state.stream.avail_out == 0 {
+                break;
+            }
         }
+        Ok(())
+    })();
 
-        if state.stream.avail_out == 0 {
-            break;
-        }
-    }
+    let produced = (bound_avail_out - state.stream.avail_out) as usize;
+    // `next_out` is a borrowed pointer into either caller memory or detached owned output.
+    // Never let that borrow escape this operation through persistent z_stream state.
+    state.stream.next_out = ptr::null_mut();
+    state.stream.avail_out = 0;
 
-    // Update the size and start of the data in the output buffer.
-    state.have = had - state.stream.avail_out;
-    state.next = unsafe { state.stream.next_out.sub(state.have as usize) };
-
-    Ok(())
+    result.map(|()| produced)
 }
 
 /// Compress and write the len uncompressed bytes at buf to file.
@@ -2290,23 +2370,16 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
 
     // Try output buffer (no need to check for skip request).
     if state.have != 0 {
-        state.have -= 1;
+        let ret = state.buffered_output()[0];
+        state.consume_buffered_output(1);
         state.pos += 1;
-        // Safety: Since `state.have` is at least 1, `state.next` points to at least
-        // one readable byte within `state.output`.
-        let ret = unsafe { *state.next };
-        // Safety: Since `state.have` is at least 1, the byte between `state.next` and
-        // `state.next + 1` is within the bounds of the `state.output` buffer, as required
-        // by the pointer `add` method.
-        state.next = unsafe { state.next.add(1) };
         return c_int::from(ret);
     }
 
-    // Nothing there -- try gz_read.
-    let mut c = 0u8;
-    // Safety: `c` is big enough to hold `len = 1` bytes.
-    match unsafe { gz_read(state, core::slice::from_mut(&mut c).as_mut_ptr(), 1) } {
-        1 => c_int::from(c),
+    // Nothing there -- try the typed read core.
+    let mut c = [MaybeUninit::<u8>::uninit()];
+    match gz_read(state, &mut c) {
+        1 => c_int::from(unsafe { c[0].assume_init() }),
         _ => -1,
     }
 }
@@ -2351,25 +2424,19 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
         return -1;
     };
 
-    // Validate the input.
     if c < 0 {
         return -1;
     }
-
-    // Check that we're reading and that there's no (serious) error.
     if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return -1;
     }
 
-    // In case this was just opened, set up the input buffer.
     if state.how == How::Look && state.have == 0 {
-        // We have verified that `state` is valid.
         if unsafe { gz_look(state) }.is_err() {
             return -1;
         }
     }
 
-    // Process a skip request.
     if state.seek {
         state.seek = false;
         if gz_skip(state, state.skip).is_err() {
@@ -2377,57 +2444,12 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
         }
     }
 
-    // If output buffer empty, put byte at end (allows more pushing).
-    if state.have == 0 {
-        state.have = 1;
-        // Safety: because `state.have` is nonzero, the `state.output` buffer has been
-        // allocated. And because the buffer's size is `state.out_size()`, a pointer to
-        // `output + out_size - 1` points within the buffer.
-        state.next = unsafe { state.output_ptr().add(state.out_size() - 1) };
-        // Safety: from the addition above, `state.next` currently points within the
-        // `state.output` buffer.
-        unsafe { *(state.next as *mut u8) = c as u8 };
-        state.pos -= 1;
-        state.past = false;
-        return c;
-    }
-
-    // If no room, give up (must have already done a `gzungetc`).
-    if state.have as usize == state.out_size() {
+    if state.push_back_buffered_byte(c as u8).is_err() {
         const MSG: &str = "out of room to push characters";
         gz_error(state, Some((Z_DATA_ERROR, MSG)));
         return -1;
     }
 
-    // Slide output data if needed and insert byte before existing data.
-    if state.next == state.output_ptr() {
-        // There are `state.have` bytes of usable content at the front of the buffer
-        // `state.output`, which has capacity `state.out_size()`. We want to move that
-        // content to the end of the buffer, so we copy from `state.output` to
-        // `state.output + (state.out_size() - state.have)` and update `state.next`
-        // to point to the content's new location within the buffer.
-        let offset = state.out_size() - state.have as usize;
-
-        // Safety: `state.have` < `state.out_size()`, or we would have returned in the
-        // check for the == case above. Therefore, `offset`, which is `out_size - have`,
-        // is in the range `1..=(out_size - 1)`. When we add that to `output`, the result
-        // is within the buffer's allocation of `out_size` bytes.
-        let dst = unsafe { state.output_ptr().add(offset) };
-
-        // Safety: `state.next` points a sequence of `state.have` initialized bytes
-        // within the `state.output` buffer. And because `dst` was computed as
-        // `state.output + state.out_size() - state.have`, we can write `state.have`
-        // bytes starting at `dst` and they will all be within the buffer.
-        // Note that this may be an overlapping copy.
-        unsafe { ptr::copy(state.next, dst as _, state.have as _) };
-        state.next = dst;
-    }
-    state.have += 1;
-    // Safety: `state.next` > `state.output`, due to the `state.next = dst` above, so it
-    // is safe to decrease `state.next` by 1.
-    state.next = unsafe { state.next.sub(1) };
-    // Safety: `state.next` >= `state.output` following the subtraction.
-    unsafe { *(state.next as *mut u8) = c as u8 };
     state.pos -= 1;
     state.past = false;
     c
@@ -2457,7 +2479,6 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
 /// - `buf` must be null or a pointer to at least `len` writable bytes.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzgets))]
 pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *mut c_char {
-    // Check parameters.
     if buf.is_null() || len < 1 {
         return ptr::null_mut();
     }
@@ -2465,13 +2486,10 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return ptr::null_mut();
     };
-
-    // Check that we're reading and that there's no (serious) error.
     if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return ptr::null_mut();
     }
 
-    // Process a skip request.
     if state.seek {
         state.seek = false;
         if gz_skip(state, state.skip).is_err() {
@@ -2479,71 +2497,48 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
         }
     }
 
-    // Copy output bytes up to newline or `len - 1`, whichever comes first.
-    let mut left = len as usize - 1;
-    if left == 0 {
-        // The caller provided a 1-byte buffer, so write the terminating null and we're done.
-        // Safety: `len` is 1 in this block, so it's safe to write 1 byte at `*buf`.
-        unsafe { *buf = 0 };
+    // Safety: `buf` is non-null and the public contract guarantees `len` writable bytes.
+    let output =
+        unsafe { core::slice::from_raw_parts_mut(buf.cast::<MaybeUninit<u8>>(), len as usize) };
+    let payload_capacity = output.len() - 1;
+    if payload_capacity == 0 {
+        output[0].write(0);
         return buf;
     }
-    let mut dst = buf;
-    loop {
-        // Assure that something is in the output buffer.
-        // Safety: `state` is valid based on the checked cast above.
+
+    let mut written = 0usize;
+    while written < payload_capacity {
         if state.have == 0 && unsafe { gz_fetch(state) }.is_err() {
-            // Error -- couldn't read any data.
             return ptr::null_mut();
         }
         if state.have == 0 {
-            // End of file; return whatever we have.
             state.past = true;
             break;
         }
 
-        // Look for newline in current output buffer.
-        let mut n = Ord::min(left, state.have as _);
-        // Safety: `state.next` points to a block of `state.have` readable bytes. We're scanning
-        // the first `n` of those bytes, and `n <= state.have` based on the `min` calculation.
-        let eol = unsafe { libc::memchr(state.next.cast::<c_void>(), '\n' as c_int, n as _) };
-        if !eol.is_null() {
-            // Compute the number of bytes to copy, + 1 because we need to copy the newline itself.
-            // Safety: `eol` was found by `memchr` in the same buffer as `state.next`, so `offset_of`
-            // is valid. And because `memchr` only scans forward, `eol` will be at or after
-            // `state.next`, so we can cast the result of `offset_from` to an unsigned value.
-            n = unsafe { eol.cast::<u8>().offset_from(state.next) } as usize + 1;
-        }
+        let (through_eol, saw_newline) = {
+            let available = state.buffered_output();
+            let limit = Ord::min(payload_capacity - written, available.len());
+            let chunk = &available[..limit];
+            let eol = chunk.iter().position(|&byte| byte == b'\n');
+            let through_eol = eol.map_or(limit, |index| index + 1);
+            output[written..written + through_eol].write_copy_of_slice(&chunk[..through_eol]);
+            (through_eol, eol.is_some())
+        };
 
-        // Copy through end of line, or remainder if newline not found.
-        // Safety: `state.next` points to at least `n` readable bytes because `n <= state.have`,
-        // `dst` points to at least `n` writable bytes because `n <= left`, and the source
-        // and destination regions are nonoverlapping because we're copying from an internal
-        // buffer to a caller-supplied buffer.
-        unsafe { ptr::copy_nonoverlapping(state.next, dst as _, n) };
-        state.have -= n as c_uint;
-        // Safety: As described above, `state.next` pointed to at least `n` readable bytes, so
-        // when we increase it by `n` it will still point into the `output` buffer.
-        state.next = unsafe { state.next.add(n) };
-        state.pos += n as i64;
-        left -= n;
-        // Safety: `dst` pointed to at least `n` writable bytes, so when we increase it by `n`
-        // it will still point into `buf`.
-        dst = unsafe { dst.add(n) };
+        state.consume_buffered_output(through_eol);
+        state.pos += through_eol as i64;
+        written += through_eol;
 
-        if left == 0 || !eol.is_null() {
+        if saw_newline {
             break;
         }
     }
 
-    if dst == buf {
-        // Nothing was copied.
+    if written == 0 {
         ptr::null_mut()
     } else {
-        // Something was copied. Null-terminate and return the string.
-        // Safety: we copied at most `left = len - 1` bytes, and `dst` points just past
-        // the last copied byte, so `dst` is within the block of `len` writable bytes
-        // starting at `buf`.
-        unsafe { *dst = 0 };
+        output[written].write(0);
         buf
     }
 }
@@ -2710,10 +2705,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
         } else {
             state.have as usize
         };
-        state.have -= n as c_uint;
-        // Safety: `n` <= `state.have`, and `state.next` points to at least `state.have`
-        // accessible bytes within the buffer.
-        state.next = unsafe { state.next.add(n) };
+        state.consume_buffered_output(n);
         state.pos += n as i64;
         offset -= n as i64;
     }
@@ -3002,6 +2994,52 @@ mod tests {
         assert_eq!(state.in_size(), 64);
         assert_eq!(state.input.as_ref().unwrap().capacity, 128);
         assert_eq!(state.out_size(), 64);
+    }
+
+    #[test]
+    fn large_gzip_read_keeps_abi_cursor_in_owned_output() {
+        let path = std::env::temp_dir().join(format!(
+            "zlib-rs-fast-read-cursor-{}.gz",
+            std::process::id()
+        ));
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let input = vec![b'A'; 8192];
+
+        let write_mode = CString::new("w").unwrap();
+        let writer = unsafe { gzopen(path_c.as_ptr(), write_mode.as_ptr()) };
+        assert!(!writer.is_null());
+        assert_eq!(
+            unsafe { gzwrite(writer, input.as_ptr().cast(), input.len() as c_uint) },
+            input.len() as c_int
+        );
+        assert_eq!(unsafe { gzclose(writer) }, Z_OK);
+
+        let read_mode = CString::new("r").unwrap();
+        let reader = unsafe { gzopen(path_c.as_ptr(), read_mode.as_ptr()) };
+        assert!(!reader.is_null());
+        assert_eq!(unsafe { gzbuffer(reader, 64) }, 0);
+
+        let mut output = vec![0u8; 4096];
+        assert_eq!(
+            unsafe { gzread(reader, output.as_mut_ptr().cast(), output.len() as c_uint) },
+            output.len() as c_int
+        );
+        assert!(output.iter().all(|&byte| byte == b'A'));
+
+        let state = unsafe { reader.cast::<GzState>().as_ref() }.unwrap();
+        assert_eq!(state.have, 0);
+        let owned = state.output.as_ref().unwrap();
+        let owned_start = owned.as_ptr() as usize;
+        let owned_end = owned_start + owned.usable();
+        let next = state.next as usize;
+        assert!((owned_start..=owned_end).contains(&next));
+
+        let caller_start = output.as_ptr() as usize;
+        let caller_end = caller_start + output.len();
+        assert!(!(caller_start..caller_end).contains(&next));
+
+        assert_eq!(unsafe { gzclose(reader) }, Z_OK);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
