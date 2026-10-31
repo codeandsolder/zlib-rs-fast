@@ -2148,6 +2148,16 @@ pub(crate) fn fill_window_core(
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
 ) {
+    fill_window_core_with_hash_maintenance(state, input, checksum, true);
+}
+
+#[inline]
+pub(crate) fn fill_window_core_with_hash_maintenance(
+    state: &mut State<'_>,
+    input: &mut InputCursor,
+    checksum: &mut StreamChecksum,
+    maintain_hash_chain: bool,
+) {
     debug_assert!(state.lookahead < MIN_LOOKAHEAD);
 
     let wsize = state.w_size;
@@ -2172,7 +2182,9 @@ pub(crate) fn fill_window_core(
             state.block_start = state.block_start.wrapping_sub_unsigned(wsize);
             state.insert = Ord::min(state.insert, state.strstart);
 
-            self::slide_hash::slide_hash(state);
+            if maintain_hash_chain {
+                self::slide_hash::slide_hash(state);
+            }
 
             more += wsize;
         }
@@ -2204,7 +2216,7 @@ pub(crate) fn fill_window_core(
         state.lookahead += n;
 
         // Initialize the hash value now that we have some input:
-        if state.lookahead + state.insert >= STD_MIN_MATCH {
+        if maintain_hash_chain && state.lookahead + state.insert >= STD_MIN_MATCH {
             let string = state.strstart - state.insert;
             if state.max_chain_length > 1024 {
                 let v0 = state.window.filled()[string] as u32;

@@ -1,6 +1,6 @@
 use crate::{
     deflate::{
-        drain_pending_output, fill_window_core,
+        drain_pending_output, fill_window_core, fill_window_core_with_hash_maintenance,
         longest_match::{execute_match_search_batch, MatchSearchResult, MatchSearchWork},
         BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, StreamChecksum,
         MIN_LOOKAHEAD,
@@ -17,6 +17,18 @@ mod slow;
 mod stored;
 
 const LOCAL_MATCH_SEARCH_MAX_CHAIN: u16 = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MatchSourceKind {
+    HashChain,
+    External,
+}
+
+impl MatchSourceKind {
+    fn maintains_hash_chain(self) -> bool {
+        self == Self::HashChain
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InputStatus {
@@ -179,11 +191,19 @@ enum StandardProducerKind {
 }
 
 impl StandardProducer {
-    fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+    fn for_algorithm(
+        algorithm: Algorithm,
+        state: &State<'_>,
+        match_source: MatchSourceKind,
+    ) -> Option<Self> {
         let kind = match algorithm {
-            Algorithm::Fast => StandardProducerKind::Fast(fast::FastProducer::new()),
-            Algorithm::Medium => StandardProducerKind::Medium(medium::MediumProducer::new(state)),
-            Algorithm::Slow => StandardProducerKind::Slow(slow::SlowProducer::new(state)),
+            Algorithm::Fast => StandardProducerKind::Fast(fast::FastProducer::new(match_source)),
+            Algorithm::Medium => {
+                StandardProducerKind::Medium(medium::MediumProducer::new(state, match_source))
+            }
+            Algorithm::Slow => {
+                StandardProducerKind::Slow(slow::SlowProducer::new(state, match_source))
+            }
             Algorithm::Huffman => StandardProducerKind::Huffman(huff::HuffmanProducer),
             Algorithm::Rle => StandardProducerKind::Rle(rle::RleProducer),
             Algorithm::Stored | Algorithm::Quick => return None,
@@ -296,14 +316,25 @@ pub(super) struct StandardCore {
     producer: StandardProducer,
     input_phase: InputPhase,
     phase: StandardPhase,
+    match_source: MatchSourceKind,
 }
 
 impl StandardCore {
+    #[cfg(test)]
     pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+        Self::for_algorithm_with_match_source(algorithm, state, MatchSourceKind::HashChain)
+    }
+
+    pub(super) fn for_algorithm_with_match_source(
+        algorithm: Algorithm,
+        state: &State<'_>,
+        match_source: MatchSourceKind,
+    ) -> Option<Self> {
         Some(Self {
-            producer: StandardProducer::for_algorithm(algorithm, state)?,
+            producer: StandardProducer::for_algorithm(algorithm, state, match_source)?,
             input_phase: InputPhase::Open,
             phase: StandardPhase::Producing,
+            match_source,
         })
     }
 
@@ -344,6 +375,7 @@ impl StandardCore {
             checksum,
             &mut self.producer,
             demand,
+            self.match_source,
             completion,
         );
         if outcome == RefillOutcome::FinalTail {
@@ -470,8 +502,16 @@ pub(super) struct StandardDriver {
 
 impl StandardDriver {
     pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
+        Self::for_algorithm_with_match_source(algorithm, state, MatchSourceKind::HashChain)
+    }
+
+    pub(super) fn for_algorithm_with_match_source(
+        algorithm: Algorithm,
+        state: &State<'_>,
+        match_source: MatchSourceKind,
+    ) -> Option<Self> {
         Some(Self {
-            core: StandardCore::for_algorithm(algorithm, state)?,
+            core: StandardCore::for_algorithm_with_match_source(algorithm, state, match_source)?,
             pending_drain: None,
         })
     }
@@ -679,11 +719,16 @@ fn satisfy_input_demand(
     checksum: &mut StreamChecksum,
     producer: &mut StandardProducer,
     demand: InputDemand,
+    match_source: MatchSourceKind,
     completion: InputCompletion,
 ) -> RefillOutcome {
     debug_assert!(!demand.is_satisfied(state));
 
-    fill_window_core(state, input, checksum);
+    if match_source.maintains_hash_chain() {
+        fill_window_core(state, input, checksum);
+    } else {
+        fill_window_core_with_hash_maintenance(state, input, checksum, false);
+    }
     producer.after_refill(state);
 
     if demand.is_satisfied(state) {

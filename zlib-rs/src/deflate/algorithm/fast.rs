@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use super::{BlockContinuation, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN};
+use super::{
+    BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN,
+};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
@@ -19,12 +21,14 @@ enum FastPhase {
 
 pub(super) struct FastProducer {
     phase: FastPhase,
+    match_source: MatchSourceKind,
 }
 
 impl FastProducer {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(match_source: MatchSourceKind) -> Self {
         Self {
             phase: FastPhase::Ready,
+            match_source,
         }
     }
 }
@@ -44,28 +48,28 @@ impl TokenProducer for FastProducer {
                     );
 
                     state.lookahead -= match_len;
-                    if match_len <= usize::from(state.max_insert_length)
-                        && state.lookahead >= WANT_MIN_MATCH
-                    {
-                        match_len -= 1;
-                        state.strstart += 1;
-                        state.insert_string(state.strstart, match_len);
-                        state.strstart += match_len;
+                    if self.match_source == MatchSourceKind::HashChain {
+                        if match_len <= usize::from(state.max_insert_length)
+                            && state.lookahead >= WANT_MIN_MATCH
+                        {
+                            match_len -= 1;
+                            state.strstart += 1;
+                            state.insert_string(state.strstart, match_len);
+                            state.strstart += match_len;
+                        } else {
+                            state.strstart += match_len;
+
+                            // zlib-ng performs this insertion unconditionally and relies on its
+                            // high-water zero padding when fewer than STD_MIN_MATCH tail bytes remain.
+                            if state.lookahead >= STD_MIN_MATCH {
+                                StandardHashCalc::quick_insert_string(
+                                    state,
+                                    state.strstart + 2 - STD_MIN_MATCH,
+                                );
+                            }
+                        }
                     } else {
                         state.strstart += match_len;
-
-                        // zlib-ng performs this insertion unconditionally and relies on its
-                        // high-water zero padding when fewer than STD_MIN_MATCH tail bytes remain.
-                        // The key starts one byte before the new strstart, so three real lookahead
-                        // bytes are exactly what is required to form the four-byte StandardHash.
-                        // With a shorter tail the native insertion is deliberately garbage and is
-                        // never useful; do not manufacture padded input just to reproduce it.
-                        if state.lookahead >= STD_MIN_MATCH {
-                            StandardHashCalc::quick_insert_string(
-                                state,
-                                state.strstart + 2 - STD_MIN_MATCH,
-                            );
-                        }
                     }
 
                     if block_ready {
@@ -94,6 +98,12 @@ impl TokenProducer for FastProducer {
             }
 
             let literal = if state.lookahead >= WANT_MIN_MATCH {
+                if self.match_source == MatchSourceKind::External {
+                    let literal = state.window.filled()[state.strstart];
+                    self.phase = FastPhase::AwaitingSearch { literal };
+                    return ProduceStatus::MatchSearch(MatchSearchWork::external());
+                }
+
                 let value = u32::from_le_bytes(
                     state.window.filled()[state.strstart..state.strstart + 4]
                         .try_into()

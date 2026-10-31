@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{BlockContinuation, ProduceStatus, TokenProducer};
+use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
 use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
@@ -15,14 +15,16 @@ pub(super) struct SlowProducer {
     use_longest_match_slow: bool,
     match_available: bool,
     phase: SlowPhase,
+    match_source: MatchSourceKind,
 }
 
 impl SlowProducer {
-    pub(super) fn new(state: &State<'_>) -> Self {
+    pub(super) fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
         Self {
             use_longest_match_slow: state.max_chain_length > 1024,
             match_available: state.match_available,
             phase: SlowPhase::Ready,
+            match_source,
         }
     }
 }
@@ -47,25 +49,35 @@ impl TokenProducer for SlowProducer {
                         return ProduceStatus::NeedInput;
                     }
 
-                    let hash_head = if state.lookahead >= WANT_MIN_MATCH {
-                        state.quick_insert_string(state.strstart)
-                    } else {
-                        0
-                    };
-
                     state.prev_match = state.match_start;
-                    let distance = state.strstart as isize - hash_head as isize;
-                    if (1..=state.max_dist() as isize).contains(&distance)
-                        && state.prev_length < state.max_lazy_match
-                        && hash_head != 0
-                    {
-                        let kind = if self.use_longest_match_slow {
-                            MatchSearchKind::Slow
+                    if self.match_source == MatchSourceKind::External {
+                        if state.lookahead >= WANT_MIN_MATCH
+                            && state.prev_length < state.max_lazy_match
+                        {
+                            self.phase = SlowPhase::AwaitingSearch;
+                            return ProduceStatus::MatchSearch(MatchSearchWork::external());
+                        }
+                    } else {
+                        let hash_head = if state.lookahead >= WANT_MIN_MATCH {
+                            state.quick_insert_string(state.strstart)
                         } else {
-                            MatchSearchKind::Standard
+                            0
                         };
-                        self.phase = SlowPhase::AwaitingSearch;
-                        return ProduceStatus::MatchSearch(MatchSearchWork::new(hash_head, kind));
+                        let distance = state.strstart as isize - hash_head as isize;
+                        if (1..=state.max_dist() as isize).contains(&distance)
+                            && state.prev_length < state.max_lazy_match
+                            && hash_head != 0
+                        {
+                            let kind = if self.use_longest_match_slow {
+                                MatchSearchKind::Slow
+                            } else {
+                                MatchSearchKind::Standard
+                            };
+                            self.phase = SlowPhase::AwaitingSearch;
+                            return ProduceStatus::MatchSearch(MatchSearchWork::new(
+                                hash_head, kind,
+                            ));
+                        }
                     }
 
                     STD_MIN_MATCH - 1
@@ -88,7 +100,7 @@ impl TokenProducer for SlowProducer {
                 state.lookahead -= usize::from(state.prev_length);
 
                 let move_forward = usize::from(state.prev_length) - 1;
-                if max_insert > state.strstart {
+                if self.match_source == MatchSourceKind::HashChain && max_insert > state.strstart {
                     let insert_count = move_forward.min(max_insert - state.strstart);
                     state.insert_string(state.strstart + 1, insert_count);
                 }

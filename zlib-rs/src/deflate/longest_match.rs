@@ -40,18 +40,32 @@ pub(crate) struct MatchSearchResult {
 /// It carries no stream borrow. The scheduler may queue this token while the producer is paused,
 /// then materialize an immutable request from that stream's State when the search is dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchSearchWork {
-    cur_match: Pos,
-    kind: MatchSearchKind,
+pub(crate) enum MatchSearchWork {
+    HashChain {
+        cur_match: Pos,
+        kind: MatchSearchKind,
+    },
+    External,
 }
 
 impl MatchSearchWork {
     pub(crate) fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
-        Self { cur_match, kind }
+        Self::HashChain { cur_match, kind }
+    }
+
+    pub(crate) fn external() -> Self {
+        Self::External
+    }
+
+    pub(crate) fn is_external(self) -> bool {
+        matches!(self, Self::External)
     }
 
     pub(crate) fn request<'a>(self, state: &'a State<'_>) -> MatchSearchRequest<'a> {
-        MatchSearchRequest::from_state(state, self.cur_match, self.kind)
+        let Self::HashChain { cur_match, kind } = self else {
+            panic!("external match work cannot materialize a hash-chain request");
+        };
+        MatchSearchRequest::from_state(state, cur_match, kind)
     }
 }
 

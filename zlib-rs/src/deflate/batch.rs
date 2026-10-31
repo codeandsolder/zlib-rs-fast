@@ -3,9 +3,12 @@ use std::vec::Vec;
 
 #[cfg(feature = "gpu")]
 use super::gpu_match::{GpuMatchError, GpuMatchSearcher, GpuMatchTable};
+#[cfg(feature = "gpu")]
+use super::STD_MIN_MATCH;
 use super::{
     algorithm::{
-        Algorithm, EndBlockKind, StandardDriver, StandardSegmentMode, StandardTurnOutcome,
+        Algorithm, EndBlockKind, MatchSourceKind, StandardDriver, StandardSegmentMode,
+        StandardTurnOutcome,
     },
     compress_slice, deflate, end, init,
     longest_match::{
@@ -13,7 +16,7 @@ use super::{
         MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     DeflateConfig, DeflateFlush, DeflateStream, InputCursor, OutputCursor, ReturnCode, Status,
-    StreamChecksum, STD_MIN_MATCH,
+    StreamChecksum,
 };
 use crate::c_api::z_stream;
 #[cfg(feature = "gpu")]
@@ -157,7 +160,13 @@ pub fn compress_slices_batch_with_backend(
         unreachable!("scalar backends returned before scheduled compression")
     };
     let mut resolver = ScopedThreadResolver { workers };
-    compress_scheduled(jobs, config, algorithm, &mut resolver)
+    compress_scheduled(
+        jobs,
+        config,
+        algorithm,
+        MatchSourceKind::HashChain,
+        &mut resolver,
+    )
 }
 
 /// Compress complete input buffers using a persistent GPU whole-input match table.
@@ -190,7 +199,13 @@ pub fn compress_slices_batch_gpu(
         .map(|job| searcher.search_with_max_dist(job.input, search_budget, max_dist))
         .collect::<Result<Vec<_>, _>>()?;
     let mut resolver = WholeInputTableResolver { tables: &tables };
-    Ok(compress_scheduled(jobs, config, algorithm, &mut resolver))
+    Ok(compress_scheduled(
+        jobs,
+        config,
+        algorithm,
+        MatchSourceKind::External,
+        &mut resolver,
+    ))
 }
 
 fn uses_match_search(algorithm: Algorithm) -> bool {
@@ -247,6 +262,7 @@ impl MatchResolver for ScopedThreadResolver {
         work: &[(usize, MatchSearchWork)],
         results: &mut [MatchSearchResult],
     ) {
+        debug_assert!(work.iter().all(|(_, search)| !search.is_external()));
         if work.len() == 1 {
             let (runtime_index, search) = work[0];
             results[0] = runtimes[runtime_index].match_request(search).execute();
@@ -278,7 +294,8 @@ impl MatchResolver for WholeInputTableResolver<'_> {
         work: &[(usize, MatchSearchWork)],
         results: &mut [MatchSearchResult],
     ) {
-        for ((runtime_index, _), result) in work.iter().zip(results.iter_mut()) {
+        for ((runtime_index, search), result) in work.iter().zip(results.iter_mut()) {
+            debug_assert!(search.is_external());
             let runtime = &runtimes[*runtime_index];
             *result = runtime.match_from_table(&self.tables[runtime.job_index]);
         }
@@ -289,6 +306,7 @@ fn compress_scheduled(
     jobs: &mut [BatchCompressJob<'_>],
     config: DeflateConfig,
     algorithm: Algorithm,
+    match_source: MatchSourceKind,
     resolver: &mut impl MatchResolver,
 ) -> Vec<BatchCompressResult> {
     let mut results = vec![
@@ -301,7 +319,14 @@ fn compress_scheduled(
     let mut runtimes = Vec::with_capacity(jobs.len());
 
     for (job_index, job) in jobs.iter_mut().enumerate() {
-        match BatchRuntime::new(job_index, job.input, &mut *job.output, config, algorithm) {
+        match BatchRuntime::new(
+            job_index,
+            job.input,
+            &mut *job.output,
+            config,
+            algorithm,
+            match_source,
+        ) {
             Ok(runtime) => runtimes.push(runtime),
             Err(result) => results[job_index] = result,
         }
@@ -403,6 +428,7 @@ impl<'a> BatchRuntime<'a> {
         output: &'a mut [u8],
         config: DeflateConfig,
         algorithm: Algorithm,
+        match_source: MatchSourceKind,
     ) -> Result<Self, BatchCompressResult> {
         let mut raw = z_stream::default();
         let code = init(&mut raw, config);
@@ -417,8 +443,12 @@ impl<'a> BatchRuntime<'a> {
             driver: {
                 let stream = unsafe { DeflateStream::from_stream_ref(&raw) }
                     .expect("successful init creates a typed deflate stream");
-                StandardDriver::for_algorithm(algorithm, &*stream.state)
-                    .expect("batch runtime requires a standard token producer")
+                StandardDriver::for_algorithm_with_match_source(
+                    algorithm,
+                    &*stream.state,
+                    match_source,
+                )
+                .expect("batch runtime requires a standard token producer")
             },
             input_remaining: input.len(),
             output_remaining: output.len(),
