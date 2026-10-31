@@ -2442,7 +2442,6 @@ struct InflateAllocOffsets {
 
 impl InflateAllocOffsets {
     const ALIGN_SIZE: usize = 64;
-    const WINDOW_PAD_SIZE: usize = 64;
 
     fn with_window() -> Self {
         Self::new(true)
@@ -2461,7 +2460,7 @@ impl InflateAllocOffsets {
 
         let window_pos = with_window.then(|| {
             let pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
-            curr_size = pos + (1 << MAX_WBITS) + Self::WINDOW_PAD_SIZE;
+            curr_size = pos + (1 << MAX_WBITS);
             pos
         });
 
@@ -2496,7 +2495,7 @@ impl InflateAllocOffsets {
 
     /// Allocate and place one inflate state using this layout.
     ///
-    /// For the ordinary layout this also creates the owned padded history window. For the
+    /// For the ordinary layout this also creates the owned history window. For the
     /// state-only layout (used by `inflateBack`) any caller-owned back window already stored in
     /// `state` is preserved. Raw alignment, placement, and allocation metadata stay confined here.
     fn allocate_state<'a>(
@@ -2508,14 +2507,10 @@ impl InflateAllocOffsets {
 
         if let Some(window_pos) = self.window_pos {
             // SAFETY: `window_pos` is computed inside this allocation and leaves enough room for
-            // the full padded window.
+            // the complete regular history window. The backing bytes begin uninitialized; Window
+            // exposes only history proven initialized by `extend`.
             let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
-            state.window = unsafe {
-                Window::from_uninitialized_raw_parts(
-                    window_allocation,
-                    (1 << MAX_WBITS) + Self::WINDOW_PAD_SIZE,
-                )
-            };
+            state.window = unsafe { Window::from_raw_parts(window_allocation, 1 << MAX_WBITS) };
         }
 
         state.allocation_start = allocation_start.as_ptr();
@@ -2549,8 +2544,8 @@ impl InflateAllocOffsets {
 
         let (allocation_start, aligned) = self.allocate_storage(alloc)?;
         let window_pos = self.window_pos();
-        // SAFETY: the ordinary layout reserves exactly the source window's full padded backing
-        // length at `window_pos`, and the fresh destination allocation cannot overlap the source.
+        // SAFETY: the ordinary layout reserves exactly the source window backing length at
+        // `window_pos`, and the fresh destination allocation cannot overlap the source.
         let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
         let window = unsafe { source.window.clone_to(window_allocation) };
 

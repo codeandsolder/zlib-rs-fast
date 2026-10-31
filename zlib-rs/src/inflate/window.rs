@@ -1,19 +1,15 @@
 use core::mem::MaybeUninit;
 
-use crate::{
-    adler32::{adler32, adler32_fold_copy},
-    crc32::Crc32Fold,
-    weak_slice::WeakSliceMut,
-};
+use crate::{adler32::adler32, crc32::Crc32Fold, weak_slice::WeakSliceMut};
 
 // translation guide:
 //
 // wsize -> buf.capacity()
 // wnext -> buf.ptr
-// whave -> buf.filled.len()
+// whave -> have
 #[derive(Debug)]
 pub struct Window<'a> {
-    buf: WeakSliceMut<'a, u8>,
+    buf: WeakSliceMut<'a, MaybeUninit<u8>>,
 
     have: usize, // number of initialized/logically available bytes, bounded by the backing buffer
     next: usize, // write head
@@ -21,18 +17,18 @@ pub struct Window<'a> {
 
 impl<'a> Window<'a> {
     pub fn into_raw_parts(self) -> (*mut u8, usize) {
-        self.buf.into_raw_parts()
+        let (ptr, len) = self.buf.into_raw_parts();
+        (ptr.cast(), len)
     }
 
-    /// Bind fully initialized caller-owned byte storage.
+    /// Bind caller-owned history storage without assuming any byte is initialized yet.
     ///
     /// # Safety
     ///
-    /// `ptr` must address `len` initialized, writable bytes and remain uniquely owned for the
-    /// returned lifetime.
+    /// `ptr` must address `len` writable bytes and remain uniquely owned for the returned lifetime.
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
         Self {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, len) },
+            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) },
             have: 0,
             next: 0,
         }
@@ -45,27 +41,15 @@ impl<'a> Window<'a> {
         unsafe { Self::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
     }
 
-    /// Initialize an owned raw window before exposing it through typed `u8` slices.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be writable for `len` bytes and remain uniquely owned for the returned lifetime.
-    pub unsafe fn from_uninitialized_raw_parts(ptr: *mut u8, len: usize) -> Self {
-        unsafe { ptr.write_bytes(0, len) };
-        unsafe { Self::from_raw_parts(ptr, len) }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.size() == 0
     }
 
     pub fn size(&self) -> usize {
-        // `self.len == 0` is used for uninitialized buffers
-        assert!(self.buf.is_empty() || self.buf.len() >= Self::padding());
-        self.buf.len().saturating_sub(Self::padding())
+        self.buf.len()
     }
 
-    /// number of bytes in the window. Saturates at `Self::capacity`.
+    /// Number of initialized logical history bytes, saturating at `size()`.
     pub fn have(&self) -> usize {
         self.have
     }
@@ -89,15 +73,20 @@ impl<'a> Window<'a> {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        debug_assert!(self.have <= self.buf.len());
-        // SAFETY: `have` tracks exactly the initialized prefix of the backing window. In
-        // particular, inflateBack's caller-provided tail may still be uninitialized, so never
-        // materialize a typed slice over the full capacity before trimming it.
-        unsafe { core::slice::from_raw_parts(self.buf.as_ptr(), self.have) }
+        assert!(
+            self.have <= self.buf.len(),
+            "inflate history stays in-bounds"
+        );
+        if self.have < self.buf.len() {
+            assert_eq!(self.next, self.have, "partial inflate history is a prefix");
+        }
+        // SAFETY: before the circular window fills, `extend` initializes exactly `0..have` and
+        // keeps `next == have`. Once `have == len`, every byte has been initialized.
+        unsafe { self.buf.as_slice()[..self.have].assume_init_ref() }
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
+        self.buf.as_ptr().cast()
     }
 
     /// Return the logical inflate dictionary as at most two contiguous segments, oldest first.
@@ -133,100 +122,81 @@ impl<'a> Window<'a> {
         let wsize = self.size();
 
         if len >= wsize {
-            // We have to split the checksum over non-copied and copied bytes
-            let pos = len.saturating_sub(self.size());
+            let pos = len - wsize;
             let (non_window_slice, window_slice) = slice.split_at(pos);
 
             if update_checksum {
                 if flags != 0 {
                     crc_fold.fold(non_window_slice);
-                    crc_fold.fold_copy(&mut self.buf.as_mut_slice()[..wsize], window_slice);
+                    crc_fold.fold(window_slice);
                 } else {
                     *checksum = adler32(*checksum, non_window_slice);
-                    *checksum = adler32_fold_copy(*checksum, self.buf.as_mut_slice(), window_slice);
+                    *checksum = adler32(*checksum, window_slice);
                 }
-            } else {
-                self.buf.as_mut_slice()[..wsize].copy_from_slice(window_slice);
             }
-
+            self.buf.as_mut_slice()[..wsize].write_copy_of_slice(window_slice);
             self.next = 0;
-            self.have = self.size();
-        } else {
-            let dist = Ord::min(wsize - self.next, slice.len());
+            self.have = wsize;
+            return;
+        }
 
-            // the end part goes onto the end of the window. The start part wraps around and is
-            // written to the start of the window.
-            let (end_part, start_part) = slice.split_at(dist);
+        let end_len = Ord::min(wsize - self.next, len);
+        let (end_part, start_part) = slice.split_at(end_len);
 
-            if update_checksum {
-                let dst = &mut self.buf.as_mut_slice()[self.next..][..end_part.len()];
-                if flags != 0 {
-                    crc_fold.fold_copy(dst, end_part);
-                } else {
-                    *checksum = adler32_fold_copy(*checksum, dst, end_part);
-                }
+        if update_checksum {
+            if flags != 0 {
+                crc_fold.fold(end_part);
             } else {
-                self.buf.as_mut_slice()[self.next..][..end_part.len()].copy_from_slice(end_part);
+                *checksum = adler32(*checksum, end_part);
             }
+        }
+        self.buf.as_mut_slice()[self.next..][..end_part.len()].write_copy_of_slice(end_part);
 
-            if !start_part.is_empty() {
-                let dst = &mut self.buf.as_mut_slice()[..start_part.len()];
-
-                if update_checksum {
-                    if flags != 0 {
-                        crc_fold.fold_copy(dst, start_part);
-                    } else {
-                        *checksum = adler32_fold_copy(*checksum, dst, start_part);
-                    }
+        if !start_part.is_empty() {
+            if update_checksum {
+                if flags != 0 {
+                    crc_fold.fold(start_part);
                 } else {
-                    dst.copy_from_slice(start_part);
+                    *checksum = adler32(*checksum, start_part);
                 }
-
-                self.next = start_part.len();
-                self.have = self.size();
-            } else {
-                self.next += dist;
-                if self.next == self.size() {
-                    self.next = 0;
-                }
-                if self.have < self.size() {
-                    self.have += dist;
-                }
+            }
+            self.buf.as_mut_slice()[..start_part.len()].write_copy_of_slice(start_part);
+            self.next = start_part.len();
+            self.have = wsize;
+        } else {
+            self.next += end_len;
+            if self.next == wsize {
+                self.next = 0;
+            }
+            if self.have < wsize {
+                self.have += end_len;
             }
         }
     }
 
     #[cfg(test)]
     pub fn new_in(alloc: &crate::inflate::Allocator<'a>, window_bits: usize) -> Option<Self> {
-        let len = (1 << window_bits) + Self::padding();
-        let ptr = alloc.allocate_zeroed_buffer(len)?;
+        let len = 1 << window_bits;
+        let ptr = alloc.allocate_slice_raw::<u8>(len)?;
 
-        Some(Self {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.as_ptr(), len) },
-            have: 0,
-            next: 0,
-        })
+        Some(unsafe { Self::from_raw_parts(ptr.as_ptr(), len) })
     }
 
-    /// Clone this complete backing buffer into independent raw storage.
+    /// Clone only proven-initialized history into independent raw storage.
     ///
     /// # Safety
     /// `ptr` must be valid and uniquely writable for `self.buf.len()` bytes, and must not overlap
     /// this window's backing allocation.
     pub(super) unsafe fn clone_to(&self, ptr: *mut u8) -> Self {
         let len = self.buf.len();
-        unsafe { core::ptr::copy_nonoverlapping(self.buf.as_ptr(), ptr, len) };
+        let initialized = self.as_slice();
+        unsafe { core::ptr::copy_nonoverlapping(initialized.as_ptr(), ptr, initialized.len()) };
 
         Self {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, len) },
+            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) },
             have: self.have,
             next: self.next,
         }
-    }
-
-    // padding required so that SIMD operations going out-of-bounds are not a problem
-    pub fn padding() -> usize {
-        64 // very conservative
     }
 }
 
@@ -263,10 +233,11 @@ impl<'a> BackWindow<'a> {
         unsafe { Self::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
     }
 
-    pub(crate) fn from_initialized_window(window: Window<'a>) -> Self {
+    pub(crate) fn from_window_storage(window: Window<'a>) -> Self {
         let (ptr, len) = window.into_raw_parts();
-        // SAFETY: `Window` is only constructible over initialized writable storage that remains
-        // uniquely owned for its lifetime; weakening that storage to MaybeUninit is sound.
+        // SAFETY: `Window` owns this writable storage uniquely for its lifetime. Its initialized
+        // history is tracked logically, while both window types keep the backing bytes as
+        // `MaybeUninit<u8>`, so transferring the raw storage does not strengthen initialization.
         unsafe { Self::from_raw_parts(ptr, len) }
     }
 
@@ -331,15 +302,43 @@ mod test {
     }
 
     #[test]
-    fn owned_raw_constructor_initializes_backing_storage() {
+    fn raw_constructor_does_not_initialize_backing_storage() {
         use core::mem::MaybeUninit;
 
-        let mut storage = [MaybeUninit::<u8>::uninit(); 80];
-        let window = unsafe {
-            Window::from_uninitialized_raw_parts(storage.as_mut_ptr().cast::<u8>(), storage.len())
-        };
+        let mut storage = [MaybeUninit::new(0xa5u8); 80];
+        let window = unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
+        assert_eq!(window.have(), 0);
+        assert!(window.as_slice().is_empty());
 
-        assert!(window.buf.as_slice().iter().all(|byte| *byte == 0));
+        let (ptr, len) = window.into_raw_parts();
+        // SAFETY: this test initialized every backing byte to 0xa5 before constructing the window.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        assert!(bytes.iter().all(|&byte| byte == 0xa5));
+    }
+
+    #[test]
+    fn clone_copies_only_initialized_history_prefix() {
+        use core::mem::MaybeUninit;
+
+        let mut source_storage = [MaybeUninit::<u8>::uninit(); 16];
+        let mut destination_storage = [MaybeUninit::new(0x5au8); 16];
+        let mut source = unsafe {
+            Window::from_raw_parts(source_storage.as_mut_ptr().cast(), source_storage.len())
+        };
+        let mut checksum = 0;
+        source.extend_adler32(&[1, 2, 3, 4, 5], &mut checksum);
+
+        let cloned = unsafe { source.clone_to(destination_storage.as_mut_ptr().cast()) };
+        assert_eq!(cloned.have(), 5);
+        assert_eq!(cloned.next(), 5);
+        assert_eq!(cloned.size(), 16);
+        assert_eq!(cloned.as_slice(), &[1, 2, 3, 4, 5]);
+
+        // SAFETY: destination_storage was initialized to 0x5a before clone_to. The clone must not
+        // touch the uninitialized logical tail, so those initialized sentinel bytes remain intact.
+        let destination = unsafe { destination_storage.assume_init_ref() };
+        assert_eq!(&destination[..5], &[1, 2, 3, 4, 5]);
+        assert!(destination[5..].iter().all(|&byte| byte == 0x5a));
     }
 
     #[test]
@@ -353,7 +352,7 @@ mod test {
         let buffer_size = window.buf.len();
         let (ptr, len) = window.into_raw_parts();
         assert_eq!(ptr.cast_const(), start);
-        assert!(len >= size); // >= because the impl is allowed to add padding to the internal buffer
+        assert_eq!(len, size);
         unsafe { crate::allocate::RUST.deallocate(ptr, buffer_size) }
     }
 
@@ -367,15 +366,15 @@ mod test {
         assert_eq!(window.have, 5);
         assert_eq!(window.next, 5);
 
-        let slice = &window.buf.as_slice()[..window.size()];
-        assert_eq!(&[1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], slice);
+        let slice = window.as_slice();
+        assert_eq!(&[1, 1, 1, 1, 1], slice);
 
         window.extend_adler32(&[2; 7], &mut checksum);
         assert_eq!(window.have, 12);
         assert_eq!(window.next, 12);
 
-        let slice = &window.buf.as_slice()[..window.size()];
-        assert_eq!(&[1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0], slice);
+        let slice = window.as_slice();
+        assert_eq!(&[1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2], slice);
 
         assert_eq!(checksum, 6946835);
 
@@ -397,14 +396,14 @@ mod test {
         assert_eq!(window.have, 3);
         assert_eq!(window.next, 3);
 
-        let slice = &window.buf.as_slice()[..window.size()];
-        assert_eq!(&[1, 1, 1, 0], slice);
+        let slice = window.as_slice();
+        assert_eq!(&[1, 1, 1], slice);
 
         window.extend_adler32(&[2; 3], &mut checksum);
         assert_eq!(window.have, 4);
         assert_eq!(window.next, 2);
 
-        let slice = &window.buf.as_slice()[..window.size()];
+        let slice = window.as_slice();
         assert_eq!(&[2, 2, 1, 2], slice);
 
         assert_eq!(checksum, 1769481);
@@ -449,7 +448,7 @@ mod test {
         assert_eq!(window.have, 8);
         assert_eq!(window.next, 0);
 
-        let slice = &window.as_slice()[..window.size()];
+        let slice = window.as_slice();
         assert_eq!(&[2, 3, 4, 5, 6, 7, 8, 9], slice);
 
         assert_eq!(checksum, 10813485);

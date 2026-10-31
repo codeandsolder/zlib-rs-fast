@@ -16,9 +16,9 @@ use crate::traceln;
 use crate::{c_api::z_stream, inflate::writer::BackWriter, ReturnCode};
 use crate::{MAX_WBITS, MIN_WBITS};
 
-/// Initialize callback-driven inflate using an initialized caller-owned window.
+/// Initialize callback-driven inflate using caller-owned window storage.
 pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -> ReturnCode {
-    back_init_window(stream, config, BackWindow::from_initialized_window(window))
+    back_init_window(stream, config, BackWindow::from_window_storage(window))
 }
 
 pub(super) fn back_init_window(
