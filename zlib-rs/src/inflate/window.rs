@@ -1,3 +1,5 @@
+use core::mem::MaybeUninit;
+
 use crate::{
     adler32::{adler32, adler32_fold_copy},
     crc32::Crc32Fold,
@@ -22,10 +24,12 @@ impl<'a> Window<'a> {
         self.buf.into_raw_parts()
     }
 
-    /// Bind caller-owned raw storage without reading or initializing it.
+    /// Bind fully initialized caller-owned byte storage.
     ///
-    /// This is used by `inflateBack`, which writes through raw pointers and tracks the initialized
-    /// prefix explicitly before any typed reads.
+    /// # Safety
+    ///
+    /// `ptr` must address `len` initialized, writable bytes and remain uniquely owned for the
+    /// returned lifetime.
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
         Self {
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, len) },
@@ -48,13 +52,6 @@ impl<'a> Window<'a> {
         self.size() == 0
     }
 
-    /// The size of the underlying buffer. For inflate, use `size` instead. This function is used
-    /// in `inflateBack` which does not consider the padding.
-    pub fn buffer_size(&self) -> usize {
-        assert!(self.buf.len().is_power_of_two());
-        self.buf.len()
-    }
-
     pub fn size(&self) -> usize {
         // `self.len == 0` is used for uninitialized buffers
         assert!(self.buf.is_empty() || self.buf.len() >= Self::padding());
@@ -64,14 +61,6 @@ impl<'a> Window<'a> {
     /// number of bytes in the window. Saturates at `Self::capacity`.
     pub fn have(&self) -> usize {
         self.have
-    }
-
-    pub fn set_have(&mut self, have: usize) {
-        assert!(
-            have <= self.buf.len(),
-            "window initialized length stays in-bounds"
-        );
-        self.have = have;
     }
 
     /// Position where the next byte will be written
@@ -102,10 +91,6 @@ impl<'a> Window<'a> {
 
     pub fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr()
-    }
-
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
     }
 
     /// Return the logical inflate dictionary as at most two contiguous segments, oldest first.
@@ -238,6 +223,68 @@ impl<'a> Window<'a> {
     }
 }
 
+/// Caller-owned `inflateBack` output/history storage.
+///
+/// Unlike ordinary inflate's [`Window`], this backing allocation is allowed to start completely
+/// uninitialized. Keeping it as `MaybeUninit<u8>` means callback mode cannot accidentally
+/// materialize a typed byte slice over unwritten tail storage. History is represented only as
+/// "no previous full window" or "one complete previous full window"; the current output prefix is
+/// owned by `BackOutput`.
+#[derive(Debug)]
+pub(crate) struct BackWindow<'a> {
+    buf: WeakSliceMut<'a, MaybeUninit<u8>>,
+    has_full_history: bool,
+}
+
+impl<'a> BackWindow<'a> {
+    /// Bind caller-owned scratch storage without reading or initializing it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be writable for `len` bytes and remain uniquely owned for the returned lifetime.
+    pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) },
+            has_full_history: false,
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            buf: WeakSliceMut::empty(),
+            has_full_history: false,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    pub(crate) fn buffer_size(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub(crate) fn history_len(&self) -> usize {
+        if self.has_full_history {
+            self.buf.len()
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn mark_full_history(&mut self) {
+        self.has_full_history = true;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.has_full_history = false;
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut MaybeUninit<u8> {
+        self.buf.as_mut_ptr()
+    }
+}
+
 #[cfg(all(test, feature = "rust-allocator"))]
 mod test {
     use super::*;
@@ -250,30 +297,16 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "window initialized length stays in-bounds")]
-    fn initialized_prefix_cannot_exceed_backing_buffer() {
-        use core::mem::MaybeUninit;
-
+    fn back_window_tracks_only_complete_previous_history() {
         let mut storage = [MaybeUninit::<u8>::uninit(); 8];
         let mut window =
-            unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
-        window.set_have(storage.len() + 1);
-    }
+            unsafe { BackWindow::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
 
-    #[test]
-    fn raw_window_slice_exposes_only_initialized_prefix() {
-        use core::mem::MaybeUninit;
-
-        let mut storage = [MaybeUninit::<u8>::uninit(); 8];
-        storage[0].write(0x11);
-        storage[1].write(0x22);
-        storage[2].write(0x33);
-
-        let mut window =
-            unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), storage.len()) };
-        window.set_have(3);
-
-        assert_eq!(window.as_slice(), &[0x11, 0x22, 0x33]);
+        assert_eq!(window.history_len(), 0);
+        window.mark_full_history();
+        assert_eq!(window.history_len(), storage.len());
+        window.clear();
+        assert_eq!(window.history_len(), 0);
     }
 
     #[test]
@@ -281,14 +314,11 @@ mod test {
         use core::mem::MaybeUninit;
 
         let mut storage = [MaybeUninit::<u8>::uninit(); 80];
-        let mut window = unsafe {
+        let window = unsafe {
             Window::from_uninitialized_raw_parts(storage.as_mut_ptr().cast::<u8>(), storage.len())
         };
 
-        // Expose the whole logical window only after the constructor has initialized it. Under
-        // Miri this also exercises the old invalid typed-read path directly.
-        window.set_have(window.size());
-        assert!(window.as_slice().iter().all(|byte| *byte == 0));
+        assert!(window.buf.as_slice().iter().all(|byte| *byte == 0));
     }
 
     #[test]

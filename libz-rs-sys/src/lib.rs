@@ -723,11 +723,10 @@ pub unsafe extern "C" fn inflateBackInit_(
         window_bits: windowBits,
     };
 
-    // NOTE: normally we allocate a window with some additional padding. That doesn't happen here,
-    // so the `infback` function uses `Window::buffer_size` instead of `Window::size`.
-    let window = unsafe { zlib_rs::inflate::Window::from_raw_parts(window, 1usize << windowBits) };
-
-    zlib_rs::inflate::back_init(strm, config, window) as _
+    // SAFETY: the FFI contract above guarantees the caller-owned scratch window for the complete
+    // inflateBack lifetime. The core binds it as uninitialized storage rather than manufacturing
+    // an initialized Rust byte slice over memory that inflateBack is supposed to fill.
+    unsafe { zlib_rs::inflate::back_init_raw(strm, config, window) as _ }
 }
 
 /// Decompresses as much data as possible, and stops when the input buffer becomes empty or the output buffer becomes full.

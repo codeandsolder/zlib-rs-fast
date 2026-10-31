@@ -4,7 +4,7 @@ use core::ops::Range;
 
 use crate::weak_slice::WeakSliceMut;
 
-use super::window::Window;
+use super::window::BackWindow;
 
 pub struct Writer<'a> {
     buf: WeakSliceMut<'a, MaybeUninit<u8>>,
@@ -27,9 +27,8 @@ impl<'a> Writer<'a> {
     }
 
     #[inline]
-    unsafe fn new_uninit_raw(ptr: *mut u8, len: usize, capacity: usize) -> Writer<'a> {
-        let buf =
-            unsafe { WeakSliceMut::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, capacity) };
+    unsafe fn new_uninit_raw(ptr: *mut MaybeUninit<u8>, len: usize, capacity: usize) -> Writer<'a> {
+        let buf = unsafe { WeakSliceMut::from_raw_parts_mut(ptr, capacity) };
         Writer { buf, filled: len }
     }
 
@@ -166,13 +165,13 @@ pub(crate) struct BackWriter<'a> {
 
 impl<'a> BackWriter<'a> {
     #[inline(always)]
-    pub(crate) fn new(window: &'a mut Window<'_>, filled: usize) -> Self {
+    pub(crate) fn new(window: &'a mut BackWindow<'_>, filled: usize) -> Self {
         let capacity = window.buffer_size();
         assert!(
             filled <= capacity,
             "inflateBack output prefix stays in-bounds"
         );
-        let previous_history = window.have();
+        let previous_history = window.history_len();
         let ptr = window.as_mut_ptr();
 
         // SAFETY: `Window` owns a writable backing allocation of `capacity` bytes for this borrow,

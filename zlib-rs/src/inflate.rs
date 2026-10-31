@@ -27,7 +27,11 @@ use crate::{
 
 use crate::crc32::{crc32, Crc32Fold};
 
+#[cfg(feature = "__internal-api")]
+#[doc(hidden)]
+pub use self::infback::back_init_raw;
 pub use self::infback::{back, back_end, back_init};
+use self::window::BackWindow;
 pub use self::window::Window;
 use self::{
     bitreader::{BitBuffer, BitReader},
@@ -656,6 +660,9 @@ pub(crate) struct State<'a> {
 
     allocation_start: *mut u8,
     total_allocation_size: usize,
+
+    // Back-only state stays at the cold tail so regular decode field offsets do not move.
+    back_window: BackWindow<'a>,
 }
 
 impl<'a> State<'a> {
@@ -681,6 +688,7 @@ impl<'a> State<'a> {
             total: 0,
 
             window: Window::empty(),
+            back_window: BackWindow::empty(),
             head: None,
 
             lens: [0u16; 320],
@@ -719,6 +727,7 @@ impl<'a> State<'a> {
         allocation_start: *mut u8,
         total_allocation_size: usize,
     ) -> Self {
+        debug_assert!(self.back_window.is_empty());
         Self {
             kind: self.kind,
             mode: self.mode,
@@ -726,6 +735,7 @@ impl<'a> State<'a> {
             wbits: self.wbits,
             wrap: self.wrap,
             window,
+            back_window: BackWindow::empty(),
             ncode: self.ncode,
             nlen: self.nlen,
             ndist: self.ndist,
@@ -2435,8 +2445,8 @@ impl InflateAllocOffsets {
     /// Allocate and place one inflate state using this layout.
     ///
     /// For the ordinary layout this also creates the owned padded history window. For the
-    /// state-only layout (used by `inflateBack`) any caller-owned window already stored in `state`
-    /// is preserved. Raw alignment, placement, and allocation metadata stay confined here.
+    /// state-only layout (used by `inflateBack`) any caller-owned back window already stored in
+    /// `state` is preserved. Raw alignment, placement, and allocation metadata stay confined here.
     fn allocate_state<'a>(
         &self,
         alloc: &Allocator<'a>,
@@ -2474,6 +2484,7 @@ impl InflateAllocOffsets {
     ) -> Option<NonNull<State<'a>>> {
         debug_assert_eq!(source.kind, InflateStateKind::Regular);
         debug_assert_eq!(self.total_size, source.total_allocation_size);
+        debug_assert!(source.back_window.is_empty());
 
         // A regular inflate state always owns the canonical MAX_WBITS backing window. This is a
         // memory-safety invariant for the raw copy below, so keep it as a release assertion rather

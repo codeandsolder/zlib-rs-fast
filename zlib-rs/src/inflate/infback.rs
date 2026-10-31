@@ -6,9 +6,9 @@ use crate::c_api::{in_func, internal_state, out_func};
 use crate::inflate::bitreader::{BitBuffer, BitReader};
 use crate::inflate::inftrees::{inflate_table, CodeType, InflateTable};
 use crate::inflate::{
-    Codes, Flags, InflateAllocOffsets, InflateConfig, InflateStateKind, InflateStream, Mode, State,
-    Table, Window, INFLATE_FAST_MIN_HAVE, INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS,
-    MAX_DIST_EXTRA_BITS,
+    BackWindow, Codes, Flags, InflateAllocOffsets, InflateConfig, InflateStateKind, InflateStream,
+    Mode, State, Table, Window, INFLATE_FAST_MIN_HAVE, INFLATE_FAST_MIN_LEFT, INFLATE_STRICT,
+    MAX_BITS, MAX_DIST_EXTRA_BITS,
 };
 use crate::traceln;
 use crate::{c_api::z_stream, inflate::writer::BackWriter, ReturnCode};
@@ -206,7 +206,7 @@ impl BackOutput {
     }
 
     #[inline(always)]
-    fn set_len(&mut self, filled: usize, window: &Window<'_>) {
+    fn set_len(&mut self, filled: usize, window: &BackWindow<'_>) {
         assert!(
             filled <= window.buffer_size(),
             "inflateBack output stays in-bounds"
@@ -215,13 +215,13 @@ impl BackOutput {
     }
 
     #[inline(always)]
-    fn remaining(&self, window: &Window<'_>) -> usize {
+    fn remaining(&self, window: &BackWindow<'_>) -> usize {
         window.buffer_size() - self.filled
     }
 
     #[inline(always)]
-    fn history_available(&self, window: &Window<'_>) -> usize {
-        if window.have() < window.buffer_size() {
+    fn history_available(&self, window: &BackWindow<'_>) -> usize {
+        if window.history_len() == 0 {
             self.filled
         } else {
             window.buffer_size()
@@ -229,7 +229,7 @@ impl BackOutput {
     }
 
     #[inline(always)]
-    fn push(&mut self, window: &mut Window<'_>, byte: u8) {
+    fn push(&mut self, window: &mut BackWindow<'_>, byte: u8) {
         let mut writer = BackWriter::new(window, self.filled);
         assert!(
             writer.remaining() != 0,
@@ -240,7 +240,7 @@ impl BackOutput {
     }
 
     #[inline(always)]
-    fn extend(&mut self, window: &mut Window<'_>, bytes: &[u8]) {
+    fn extend(&mut self, window: &mut BackWindow<'_>, bytes: &[u8]) {
         let mut writer = BackWriter::new(window, self.filled);
         assert!(
             bytes.len() <= writer.remaining(),
@@ -252,17 +252,23 @@ impl BackOutput {
 
     /// Flush a full output window to the zlib callback and reset the cursor for reuse.
     #[inline(always)]
-    fn flush_if_full(&mut self, window: &mut Window<'_>) -> Result<(), ReturnCode> {
+    fn flush_if_full(&mut self, window: &mut BackWindow<'_>) -> Result<(), ReturnCode> {
         if self.filled != window.buffer_size() {
             return Ok(());
         }
 
         // The whole window is initialized before it is exposed to the callback or later history
         // reads.
-        window.set_have(self.filled);
+        window.mark_full_history();
         // SAFETY: `BackOutput::new` established the callback contract, and `filled == capacity`
         // proves the complete window is initialized for this callback.
-        if unsafe { (self.callback)(self.descriptor, window.as_mut_ptr(), self.filled as u32) } != 0
+        if unsafe {
+            (self.callback)(
+                self.descriptor,
+                window.as_mut_ptr().cast::<u8>(),
+                self.filled as u32,
+            )
+        } != 0
         {
             return Err(ReturnCode::BufError);
         }
@@ -270,17 +276,23 @@ impl BackOutput {
         Ok(())
     }
 
-    /// Deliver any final partial window. This intentionally does not change `window.have()`: no
-    /// later decode step consumes history after `inflateBack` starts returning.
+    /// Deliver any final partial window. This intentionally does not mark a full-history window:
+    /// no later decode step consumes history after `inflateBack` starts returning.
     #[inline(always)]
-    fn flush_remaining(&mut self, window: &mut Window<'_>) -> Result<(), ReturnCode> {
+    fn flush_remaining(&mut self, window: &mut BackWindow<'_>) -> Result<(), ReturnCode> {
         if self.filled == 0 {
             return Ok(());
         }
 
         // SAFETY: `BackOutput::new` established the callback contract and `filled` tracks exactly
         // the initialized prefix of the caller-owned window.
-        if unsafe { (self.callback)(self.descriptor, window.as_mut_ptr(), self.filled as u32) } != 0
+        if unsafe {
+            (self.callback)(
+                self.descriptor,
+                window.as_mut_ptr().cast::<u8>(),
+                self.filled as u32,
+            )
+        } != 0
         {
             return Err(ReturnCode::BufError);
         }
@@ -288,12 +300,51 @@ impl BackOutput {
     }
 }
 
-/// Initialize the stream in an inflate state
+/// Initialize callback-driven inflate using an initialized caller-owned window.
 pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -> ReturnCode {
-    assert_eq!(1 << config.window_bits, window.buffer_size());
+    let (ptr, len) = window.into_raw_parts();
+    // SAFETY: `Window` can only be constructed over initialized writable byte storage that remains
+    // uniquely owned for its lifetime. Treating those bytes as `MaybeUninit<u8>` weakens, rather
+    // than strengthens, the initialization requirement while preserving the same allocation.
+    let window = unsafe { BackWindow::from_raw_parts(ptr, len) };
+    back_init_window(stream, config, window)
+}
 
+/// Initialize callback-driven inflate directly from caller-owned scratch storage.
+///
+/// This is the raw boundary used by `libz-rs-sys::inflateBackInit_`: the caller window is allowed
+/// to begin uninitialized and therefore must not first be represented as an ordinary [`Window`].
+///
+/// # Safety
+///
+/// When non-null, `window` must be writable for `1 << config.window_bits` bytes and remain uniquely
+/// owned until `inflateBackEnd` finishes with the stream. Invalid window-bit values are rejected
+/// before the required span length is calculated.
+#[doc(hidden)]
+pub unsafe fn back_init_raw(
+    stream: &mut z_stream,
+    config: InflateConfig,
+    window: *mut u8,
+) -> ReturnCode {
+    if !(MIN_WBITS..=MAX_WBITS).contains(&config.window_bits) || window.is_null() {
+        return ReturnCode::StreamError;
+    }
+    let len = 1usize << config.window_bits;
+    // SAFETY: upheld by this function's caller contract after validating the requested length.
+    let window = unsafe { BackWindow::from_raw_parts(window, len) };
+    back_init_window(stream, config, window)
+}
+
+fn back_init_window(
+    stream: &mut z_stream,
+    config: InflateConfig,
+    window: BackWindow<'_>,
+) -> ReturnCode {
     if !(MIN_WBITS..=MAX_WBITS).contains(&config.window_bits) {
-        return ReturnCode::StreamError as _;
+        return ReturnCode::StreamError;
+    }
+    if window.buffer_size() != 1usize << config.window_bits {
+        return ReturnCode::StreamError;
     }
 
     stream.msg = core::ptr::null_mut();
@@ -318,7 +369,7 @@ pub fn back_init(stream: &mut z_stream, config: InflateConfig, window: Window) -
     let mut state = State::new(InflateStateKind::Back);
     // inflateBack uses the caller-provided window directly, so the allocation contains only State
     // plus alignment headroom.
-    state.window = window;
+    state.back_window = window;
 
     let alloc = Allocator {
         zalloc: stream.zalloc.unwrap(),
@@ -388,7 +439,7 @@ fn decode_back(
     // `Writer` views can then never alias a window still reachable through the simultaneously
     // borrowed `&mut State`. The single exit path below restores it before returning.
     let state = &mut *strm.state;
-    let mut window = core::mem::replace(&mut state.window, Window::empty());
+    let mut window = core::mem::replace(&mut state.back_window, BackWindow::empty());
     window.clear();
 
     'inf_leave: loop {
@@ -935,7 +986,7 @@ fn decode_back(
 
     strm.next_in = input.next_ptr().cast_mut();
     strm.avail_in = input.available() as u32;
-    state.window = window;
+    state.back_window = window;
 
     ret
 }
@@ -1115,14 +1166,66 @@ fn inflate_fast_back(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn back_init_rejects_invalid_window_bits_before_geometry() {
+        let mut storage = [0u8; 1];
+        let window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        let mut stream = z_stream::default();
+
+        assert_eq!(
+            back_init(
+                &mut stream,
+                InflateConfig {
+                    window_bits: MIN_WBITS - 1,
+                },
+                window,
+            ),
+            ReturnCode::StreamError,
+        );
+    }
+
+    #[test]
+    fn back_init_rejects_mismatched_window_size() {
+        let mut storage = [0u8; 1];
+        let window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        let mut stream = z_stream::default();
+
+        assert_eq!(
+            back_init(
+                &mut stream,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                window,
+            ),
+            ReturnCode::StreamError,
+        );
+    }
+
+    #[test]
+    fn back_init_raw_rejects_null_window() {
+        let mut stream = z_stream::default();
+        assert_eq!(
+            unsafe {
+                back_init_raw(
+                    &mut stream,
+                    InflateConfig {
+                        window_bits: MIN_WBITS,
+                    },
+                    core::ptr::null_mut(),
+                )
+            },
+            ReturnCode::StreamError,
+        );
+    }
 
     #[test]
     fn back_writer_match_crosses_previous_window_into_current_output() {
         let mut storage = core::array::from_fn::<_, 32, _>(|i| i as u8);
         // The current callback window has already overwritten its first four bytes.
         storage[..4].copy_from_slice(&[100, 101, 102, 103]);
-        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
-        window.set_have(storage.len());
+        let mut window = unsafe { BackWindow::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        window.mark_full_history();
 
         let mut writer = BackWriter::new(&mut window, 4);
         writer.copy_match(true, 6, 8).unwrap();
@@ -1135,8 +1238,8 @@ mod tests {
     #[test]
     fn back_writer_rejects_distance_beyond_configured_window() {
         let mut storage = [0u8; 32];
-        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
-        window.set_have(storage.len());
+        let mut window = unsafe { BackWindow::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        window.mark_full_history();
 
         let mut writer = BackWriter::new(&mut window, 4);
         assert_eq!(
@@ -1149,7 +1252,7 @@ mod tests {
     fn back_writer_rejects_history_before_first_full_window() {
         let mut storage = [0u8; 32];
         storage[..4].copy_from_slice(&[1, 2, 3, 4]);
-        let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
+        let mut window = unsafe { BackWindow::from_raw_parts(storage.as_mut_ptr(), storage.len()) };
 
         let mut writer = BackWriter::new(&mut window, 4);
         assert_eq!(
@@ -1161,6 +1264,6 @@ mod tests {
 
 pub fn back_end<'a>(strm: &'a mut InflateStream<'a>) {
     // With infback the window is user-supplied, so we mustn't try to free it.
-    let _ = core::mem::replace(&mut strm.state.window, Window::empty());
+    let _ = core::mem::replace(&mut strm.state.back_window, BackWindow::empty());
     crate::inflate::end(strm);
 }
