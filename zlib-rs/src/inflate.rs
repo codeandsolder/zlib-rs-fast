@@ -1,12 +1,13 @@
 #![allow(non_snake_case)] // TODO ultimately remove this
 #![allow(clippy::missing_safety_doc)] // obviously needs to be fixed long-term
 
-use core::ffi::{c_char, c_int, c_long, c_ulong};
+use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
 
+mod back_io;
 mod bitreader;
 mod infback;
 mod inffixed_tbl;
@@ -15,7 +16,7 @@ mod window;
 mod writer;
 
 use crate::allocate::Allocator;
-use crate::c_api::internal_state;
+use crate::c_api::{in_func, internal_state, out_func};
 use crate::output_buffer::{assume_init_prefix, WritableBytes};
 use crate::state_ptr::StatePtr;
 use crate::{
@@ -27,10 +28,7 @@ use crate::{
 
 use crate::crc32::{crc32, Crc32Fold};
 
-#[cfg(feature = "__internal-api")]
-#[doc(hidden)]
-pub use self::infback::back_init_raw;
-pub use self::infback::{back, back_end, back_init};
+pub use self::infback::{back_end, back_init};
 use self::window::BackWindow;
 pub use self::window::Window;
 use self::{
@@ -39,6 +37,60 @@ use self::{
 };
 
 const INFLATE_STRICT: bool = false;
+
+/// Initialize callback-driven inflate directly from caller-owned scratch storage.
+///
+/// This is the raw boundary used by `libz-rs-sys::inflateBackInit_`: the caller window is allowed
+/// to begin uninitialized and therefore must not first be represented as an ordinary [`Window`].
+///
+/// # Safety
+///
+/// When non-null, `window` must be writable for `1 << config.window_bits` bytes and remain uniquely
+/// owned until `inflateBackEnd` finishes with the stream. Invalid window-bit values are rejected
+/// before the required span length is calculated.
+#[cfg(any(feature = "__internal-api", test))]
+#[doc(hidden)]
+pub unsafe fn back_init_raw(
+    stream: &mut z_stream,
+    config: InflateConfig,
+    window: *mut u8,
+) -> ReturnCode {
+    if !(MIN_WBITS..=MAX_WBITS).contains(&config.window_bits) || window.is_null() {
+        return ReturnCode::StreamError;
+    }
+    let len = 1usize << config.window_bits;
+    // SAFETY: upheld by this function's caller contract after validating the requested length.
+    let window = unsafe { BackWindow::from_raw_parts(window, len) };
+    infback::back_init_window(stream, config, window)
+}
+
+/// Run callback-driven raw DEFLATE decompression.
+///
+/// # Safety
+/// The initial `strm.next_in` span must be readable for `strm.avail_in` bytes when non-null.
+/// `in_` must provide readable, unchanged spans until its next invocation or this function returns.
+/// `out` must not mutate or invalidate the caller-provided output window while this function runs.
+/// Both descriptors must remain valid for their callback's use for the duration of the call.
+pub unsafe fn back(
+    strm: &mut InflateStream,
+    in_: in_func,
+    in_desc: *mut c_void,
+    out: out_func,
+    out_desc: *mut c_void,
+) -> ReturnCode {
+    if strm.state.kind != InflateStateKind::Back {
+        return ReturnCode::StreamError;
+    }
+
+    // SAFETY: `back` inherits zlib's input-span and callback contracts from its caller for this
+    // invocation. Once bound, `decode_back` uses only safe cursor operations.
+    let input =
+        unsafe { back_io::BackInput::new(strm.next_in.cast_const(), strm.avail_in, in_, in_desc) };
+    // SAFETY: same contract for the output callback and caller-owned window.
+    let output = unsafe { back_io::BackOutput::new(out, out_desc) };
+
+    infback::decode_back(strm, input, output)
+}
 
 // SAFETY: This struct must have the same layout as [`z_stream`], so that casts and transmutations
 // between the two can work without UB.
@@ -3243,5 +3295,22 @@ mod tests {
 
         let (_decompressed, err) = decompress_slice(&mut output, &input, config);
         assert_eq!(err, ReturnCode::DataError);
+    }
+
+    #[test]
+    fn back_init_raw_rejects_null_window() {
+        let mut stream = z_stream::default();
+        assert_eq!(
+            unsafe {
+                back_init_raw(
+                    &mut stream,
+                    InflateConfig {
+                        window_bits: MIN_WBITS,
+                    },
+                    core::ptr::null_mut(),
+                )
+            },
+            ReturnCode::StreamError,
+        );
     }
 }

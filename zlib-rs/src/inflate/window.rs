@@ -38,6 +38,13 @@ impl<'a> Window<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_initialized_slice(storage: &'a mut [u8]) -> Self {
+        // SAFETY: a mutable byte slice is fully initialized, writable, and uniquely borrowed for
+        // the returned window lifetime.
+        unsafe { Self::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
+    }
+
     /// Initialize an owned raw window before exposing it through typed `u8` slices.
     ///
     /// # Safety
@@ -247,6 +254,20 @@ impl<'a> BackWindow<'a> {
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) },
             has_full_history: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_initialized_slice(storage: &'a mut [u8]) -> Self {
+        // SAFETY: representing initialized writable bytes as `MaybeUninit<u8>` only weakens the
+        // initialization guarantee while preserving the exclusive borrow.
+        unsafe { Self::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
+    }
+
+    pub(crate) fn from_initialized_window(window: Window<'a>) -> Self {
+        let (ptr, len) = window.into_raw_parts();
+        // SAFETY: `Window` is only constructible over initialized writable storage that remains
+        // uniquely owned for its lifetime; weakening that storage to MaybeUninit is sound.
+        unsafe { Self::from_raw_parts(ptr, len) }
     }
 
     pub(crate) fn empty() -> Self {
