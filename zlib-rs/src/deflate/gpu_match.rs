@@ -35,6 +35,16 @@ fn load_byte(index: u32) -> u32 {
     return (word >> ((index & 3u) * 8u)) & 0xffu;
 }
 
+fn load_u32(index: u32) -> u32 {
+    let word_index = index >> 2u;
+    let shift = (index & 3u) * 8u;
+    let low = input_words[word_index] >> shift;
+    if shift == 0u {
+        return low;
+    }
+    return low | (input_words[word_index + 1u] << (32u - shift));
+}
+
 fn hash_at(position: u32) -> u32 {
     let value = load_byte(position)
         | (load_byte(position + 1u) << 8u)
@@ -93,6 +103,15 @@ fn search(@builtin(global_invocation_id) gid: vec3<u32>) {
         let candidate = bucket_positions[cursor];
 
         var length = 0u;
+        loop {
+            if length + 4u > max_len { break; }
+            let difference = load_u32(position + length) ^ load_u32(candidate + length);
+            if difference != 0u {
+                length += countTrailingZeros(difference) >> 3u;
+                break;
+            }
+            length += 4u;
+        }
         loop {
             if length >= max_len || load_byte(position + length) != load_byte(candidate + length) {
                 break;
