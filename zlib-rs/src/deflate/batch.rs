@@ -693,6 +693,7 @@ impl Drop for BatchRuntime<'_> {
 mod tests {
     use super::*;
     use crate::deflate::{compress_bound, Method, Strategy};
+    use crate::{decompress_slice, InflateConfig};
 
     fn independent(input: &[u8], config: DeflateConfig, capacity: usize) -> (Vec<u8>, ReturnCode) {
         let mut output = vec![0u8; capacity];
@@ -738,6 +739,63 @@ mod tests {
         assert!(!uses_match_search(Algorithm::Quick));
         assert!(!uses_match_search(Algorithm::Huffman));
         assert!(!uses_match_search(Algorithm::Rle));
+    }
+
+    struct NoMatchExternalResolver;
+
+    impl MatchResolver for NoMatchExternalResolver {
+        fn resolve(
+            &mut self,
+            _runtimes: &[BatchRuntime<'_>],
+            work: &[(usize, MatchSearchWork)],
+            results: &mut [MatchSearchResult],
+        ) {
+            assert_eq!(work.len(), results.len());
+            for ((_, search), result) in work.iter().zip(results.iter_mut()) {
+                assert!(search.is_external());
+                *result = MatchSearchResult {
+                    length: 0,
+                    start: 0,
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn external_match_source_crosses_window_slides_without_hash_chain() {
+        let input = (0..120_000)
+            .map(|index| ((index * 73 + index / 19) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        for level in [2, 6, 9] {
+            let config = DeflateConfig::new(level);
+            let algorithm = configured_algorithm(config).expect("valid standard algorithm");
+            assert!(uses_match_search(algorithm));
+
+            let mut output = vec![0u8; compress_bound(input.len()) + 64];
+            let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+            let mut resolver = NoMatchExternalResolver;
+            let results = compress_scheduled(
+                &mut jobs,
+                config,
+                algorithm,
+                MatchSourceKind::External,
+                &mut resolver,
+            );
+            drop(jobs);
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].code, ReturnCode::Ok, "level {level}");
+
+            let mut decoded = vec![0u8; input.len()];
+            let (decoded, code) = decompress_slice(
+                &mut decoded,
+                &output[..results[0].written],
+                InflateConfig::default(),
+            );
+            assert_eq!(code, ReturnCode::Ok, "level {level}");
+            assert_eq!(decoded, input.as_slice(), "level {level}");
+        }
     }
 
     #[test]
