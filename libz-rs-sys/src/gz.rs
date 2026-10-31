@@ -7,7 +7,7 @@ use crate::{
 };
 use core::cmp::Ordering;
 use core::ffi::{c_char, c_int, c_uint, c_void, CStr};
-use core::ptr;
+use core::ptr::{self, NonNull};
 use libc::size_t; // FIXME: Switch to core::ffi::c_size_t when it's stable.
 use libc::{O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET};
 use zlib_rs::deflate::Strategy;
@@ -25,6 +25,40 @@ pub enum gzFile_s {}
 /// File handle for an open gzip file.
 #[allow(non_camel_case_types)]
 pub type gzFile = *mut gzFile_s;
+
+struct GzBuffer {
+    ptr: NonNull<u8>,
+    capacity: usize,
+    usable: usize,
+}
+
+impl GzBuffer {
+    fn allocate(capacity: usize, usable: usize) -> Option<Self> {
+        assert!(usable <= capacity);
+        let ptr = ALLOCATOR.allocate_slice_raw::<u8>(capacity)?;
+        Some(Self {
+            ptr,
+            capacity,
+            usable,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn usable(&self) -> usize {
+        self.usable
+    }
+}
+
+impl Drop for GzBuffer {
+    fn drop(&mut self) {
+        // Safety: `ptr` was allocated by `ALLOCATOR` for exactly `capacity` bytes,
+        // and this `GzBuffer` uniquely owns that allocation.
+        unsafe { ALLOCATOR.deallocate(self.ptr.as_ptr(), self.capacity) };
+    }
+}
 
 // The internals of a gzip file handle (the thing gzFile actually points to, with the
 // public gzFile_s part at the front for ABI compatibility).
@@ -46,12 +80,10 @@ struct GzState {
     mode: GzMode,
     fd: c_int, // file descriptor
     source: Option<Source>,
-    want: usize,     // requested buffer size, default is GZBUFSIZE
-    input: *mut u8,  // input buffer (double-sized when writing)
-    in_size: usize,  // usable size of input buffer (See [`gz_init`] for explanation.)
-    output: *mut u8, // output buffer (double-sized when reading)
-    out_size: usize, // size of *output
-    direct: bool,    // true in pass-through mode, false if processing gzip data
+    want: usize,              // requested buffer size, default is GZBUFSIZE
+    input: Option<GzBuffer>,  // input storage (double-sized when writing)
+    output: Option<GzBuffer>, // output storage (double-sized when reading)
+    direct: bool,             // true in pass-through mode, false if processing gzip data
 
     // Fields used just for reading
     how: How,
@@ -91,10 +123,8 @@ impl GzState {
             fd: -1,
             source: None,
             want: GZBUFSIZE,
-            input: ptr::null_mut(),
-            in_size: 0,
-            output: ptr::null_mut(),
-            out_size: 0,
+            input: None,
+            output: None,
             direct: false,
             how: How::Look,
             start: 0,
@@ -159,30 +189,62 @@ impl GzState {
         }
     }
 
+    fn input_ptr(&self) -> *mut u8 {
+        self.input
+            .as_ref()
+            .expect("gzip input buffer must be initialized")
+            .as_ptr()
+    }
+
+    fn output_ptr(&self) -> *mut u8 {
+        self.output
+            .as_ref()
+            .expect("gzip output buffer must be initialized")
+            .as_ptr()
+    }
+
+    fn allocate_input_buffer(&self) -> Option<GzBuffer> {
+        let capacity = self.in_capacity();
+        let usable = match self.mode {
+            GzMode::GZ_WRITE => self.want,
+            _ => capacity,
+        };
+        GzBuffer::allocate(capacity, usable)
+    }
+
+    fn allocate_output_buffer(&self) -> Option<GzBuffer> {
+        let capacity = self.out_capacity();
+        GzBuffer::allocate(capacity, capacity)
+    }
+
+    fn in_size(&self) -> usize {
+        self.input.as_ref().map_or(0, GzBuffer::usable)
+    }
+
+    fn out_size(&self) -> usize {
+        self.output.as_ref().map_or(0, GzBuffer::usable)
+    }
+
     /// Compute the number of bytes of input buffered in `self`.
     ///
     /// # Safety
     ///
-    /// Either
-    /// - `state.input` is null.
-    /// - `state.stream.next_in .. state.stream.next_in + state.stream.avail_in`
-    ///   is contained in `state.input .. state.input + state.in_size`.
+    /// `state.input` must be initialized and
+    /// `state.stream.next_in .. state.stream.next_in + state.stream.avail_in`
+    /// must be contained in the usable prefix of that input allocation.
     ///
-    /// It is almost always the case that one of those two conditions is true
-    /// inside this module. The notable exception is in a specific block within
+    /// That invariant holds whenever this helper is called. The notable temporary exception
+    /// elsewhere in this module is a specific block within
     /// `gz_write`, where we temporarily set `state.next_in` to point to a
     /// caller-supplied buffer to do a zero-copy optimization when compressing
     /// large inputs.
     unsafe fn input_len(&self) -> usize {
-        if self.input.is_null() {
-            return 0;
-        }
-
+        let input = self.input_ptr();
         // Safety: `next_in .. next_in + avail_in` is a subslice, so the preconditions hold.
         let end = unsafe { self.stream.next_in.add(self.stream.avail_in as usize) };
 
         // Safety: the caller guarantees that the input slice of `stream` is a subslice of `input`.
-        (unsafe { end.offset_from(self.input) }) as _
+        (unsafe { end.offset_from(input) }) as _
     }
 }
 
@@ -557,34 +619,18 @@ unsafe fn free_state(state: *mut GzState) {
         }
         deallocate_cstr((*state).msg.cast_mut());
     }
-    // Safety: state is a valid GzState, and free_buffers checks for null
-    // input and output pointers internally.
-    unsafe { free_buffers(state.as_mut().unwrap()) };
+    // Safety: `state` is fully initialized. Dropping it releases the owned input/output
+    // buffers through `GzBuffer::drop`; the raw source/message allocations were handled above.
+    unsafe { ptr::drop_in_place(state) };
 
     // Safety: The caller has ensured that `state` was allocated using `ALLOCATOR`.
     unsafe { ALLOCATOR.deallocate(state, 1) };
 }
 
-// Deallocate the input and output buffers in a GzState.
-//
-// # Safety
-//
-// * `state` must have been obtained from [`gzopen`] or [`gzdopen`].
-unsafe fn free_buffers(state: &mut GzState) {
-    if !state.input.is_null() {
-        // Safety: state.input is always allocated using ALLOCATOR, and
-        // its allocation size is stored in state.in_size.
-        unsafe { ALLOCATOR.deallocate(state.input, state.in_capacity()) };
-        state.input = ptr::null_mut();
-    }
-    state.in_size = 0;
-    if !state.output.is_null() {
-        // Safety: state.output is always allocated using ALLOCATOR, and
-        // its allocation size is stored in state.out_size.
-        unsafe { ALLOCATOR.deallocate(state.output, state.out_capacity()) };
-        state.output = ptr::null_mut();
-    }
-    state.out_size = 0;
+// Release any lazily allocated gzip I/O buffers while keeping the `GzState` alive.
+fn free_buffers(state: &mut GzState) {
+    state.input = None;
+    state.output = None;
 }
 
 // Free a string that was allocated with `ALLOCATOR`
@@ -659,7 +705,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
     }
 
     // Process any buffered input.
-    if state.in_size != 0 {
+    if state.input.is_some() {
         // Safety: state.stream was properly initialized as a z_stream in gzopen_help.
         unsafe { inflateEnd(&mut state.stream as *mut z_stream) };
     }
@@ -721,7 +767,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     if gz_comp(state, Z_FINISH).is_err() {
         ret = state.err;
     }
-    if state.in_size != 0 && !state.direct {
+    if state.input.is_some() && !state.direct {
         // Safety: state.stream was properly initialized as a z_stream in gzopen_help.
         unsafe { deflateEnd(&mut state.stream as *mut z_stream) };
     }
@@ -768,7 +814,7 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
     }
 
     // Make sure we haven't already allocated memory.
-    if state.in_size != 0 {
+    if state.input.is_some() {
         return -1;
     }
 
@@ -1136,7 +1182,7 @@ unsafe fn gz_read(state: &mut GzState, mut buf: *mut u8, mut len: usize) -> usiz
             // The output buffer is empty, and we're at the end of the file.
             state.past = true; // Tried to read past end
             break;
-        } else if state.how == How::Look || n < state.in_size * 2 {
+        } else if state.how == How::Look || n < state.in_size() * 2 {
             // For small len or a new stream, load more data from the file descriptor into
             // the output buffer. Note: If we haven't scanned the file header yet, gz_fetch
             // will read the header and determine whether to use decompression or direct read.
@@ -1249,28 +1295,22 @@ fn gz_skip(state: &mut GzState, mut len: i64) -> Result<(), ()> {
 // `state` must have been properly initialized, e.g. by [`gzopen_help`].
 unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
     // Allocate buffers if needed.
-    if state.input.is_null() {
-        let capacity = state.in_capacity();
-        state.in_size = capacity;
-        let Some(input) = ALLOCATOR.allocate_slice_raw::<u8>(capacity) else {
+    if state.input.is_none() {
+        let Some(input) = state.allocate_input_buffer() else {
             // Safety: The caller confirmed the validity of state.
             unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
             return Err(());
         };
-        state.input = input.as_ptr();
+        state.input = Some(input);
 
-        if state.output.is_null() {
-            let capacity = state.out_capacity();
-            state.out_size = capacity;
-            let Some(output) = ALLOCATOR.allocate_slice_raw::<u8>(capacity) else {
-                // Safety: The caller confirmed the validity of state, and free_buffers checks
-                // for null input and output pointers internally.
-                unsafe { free_buffers(state) };
+        if state.output.is_none() {
+            let Some(output) = state.allocate_output_buffer() else {
+                free_buffers(state);
                 // Safety: The caller confirmed the validity of state.
                 unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
                 return Err(());
             };
-            state.output = output.as_ptr();
+            state.output = Some(output);
         }
 
         // Allocate memory for inflate.
@@ -1287,9 +1327,7 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
             )
         } != Z_OK
         {
-            // Safety: The caller confirmed the validity of `state`, and `free_buffers` checks
-            // for null input and output pointers internally.
-            unsafe { free_buffers(state) };
+            free_buffers(state);
             // Safety: The caller confirmed the validity of `state`.
             unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
             return Err(());
@@ -1343,11 +1381,11 @@ unsafe fn gz_look(state: &mut GzState) -> Result<(), ()> {
     unsafe {
         ptr::copy_nonoverlapping(
             state.stream.next_in,
-            state.output,
+            state.output_ptr(),
             state.stream.avail_in as usize,
         )
     };
-    state.next = state.output;
+    state.next = state.output_ptr();
     state.have = state.stream.avail_in;
     state.stream.avail_in = 0;
     state.how = How::Copy;
@@ -1378,7 +1416,7 @@ unsafe fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
             unsafe {
                 ptr::copy(
                     state.stream.next_in,
-                    state.input,
+                    state.input_ptr(),
                     state.stream.avail_in as usize,
                 )
             };
@@ -1386,12 +1424,12 @@ unsafe fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
         let got = unsafe {
             gz_load(
                 state,
-                state.input.add(state.stream.avail_in as usize),
-                state.in_size - state.stream.avail_in as usize,
+                state.input_ptr().add(state.stream.avail_in as usize),
+                state.in_size() - state.stream.avail_in as usize,
             )
         }?;
         state.stream.avail_in += got as uInt;
-        state.stream.next_in = state.input;
+        state.stream.next_in = state.input_ptr();
     }
     Ok(state.stream.avail_in as usize)
 }
@@ -1458,15 +1496,15 @@ unsafe fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
             }
             How::Copy => {
                 // -> Copy
-                let bytes_read = unsafe { gz_load(state, state.output, state.out_size) }?;
-                state.next = state.output;
+                let bytes_read = unsafe { gz_load(state, state.output_ptr(), state.out_size()) }?;
+                state.next = state.output_ptr();
                 state.have += bytes_read as uInt;
                 return Ok(());
             }
             How::Gzip => {
                 // -> Gzip or Look (if at end of gzip stream)
-                state.stream.avail_out = state.out_size as c_uint;
-                state.stream.next_out = state.output;
+                state.stream.avail_out = state.out_size() as c_uint;
+                state.stream.next_out = state.output_ptr();
                 unsafe { gz_decomp(state) }?;
             }
         }
@@ -1659,7 +1697,7 @@ unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) 
     }
 
     // Allocate memory if this is the first time through.
-    if state.input.is_null() && gz_init(state).is_err() {
+    if state.input.is_none() && gz_init(state).is_err() {
         return 0;
     }
 
@@ -1673,18 +1711,18 @@ unsafe fn gz_write(state: &mut GzState, mut buf: *const c_void, mut len: usize) 
     let put = len as c_int;
 
     // For small len, copy to input buffer, otherwise compress directly.
-    if len < state.in_size {
+    if len < state.in_size() {
         // Copy to input buffer, compress when full.
         loop {
             if state.stream.avail_in == 0 {
-                state.stream.next_in = state.input;
+                state.stream.next_in = state.input_ptr();
             }
             // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
             let have = unsafe { state.input_len() };
-            let copy = Ord::min(state.in_size.saturating_sub(have), len);
+            let copy = Ord::min(state.in_size().saturating_sub(have), len);
             // Safety: The caller is responsible for ensuring that buf points to at least len readable
             // bytes, and copy is <= len.
-            unsafe { ptr::copy(buf, state.input.add(have).cast::<c_void>(), copy) };
+            unsafe { ptr::copy(buf, state.input_ptr().add(have).cast::<c_void>(), copy) };
             state.stream.avail_in += copy as c_uint;
             state.pos += copy as i64;
             buf = unsafe { buf.add(copy) };
@@ -1741,19 +1779,15 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
     // Compress `len` zeros.
     let mut first = true;
     while len != 0 {
-        let n = Ord::min(state.in_size, len);
+        let n = Ord::min(state.in_size(), len);
         if first {
-            // Safety: `state.input` is non-null here, either because it was initialized
-            // before this function was called (enabling the `state.stream.avail_in != 0`
-            // case in the check above) or because the call to `gz_comp` initialized it.
-            // All initialization paths in this module ensure that, when `state.input` is
-            // non-null, it points to `state.in_size` bytes of writable memory. Here we
-            // are writing `n` bytes, where `n` is initialized above to be <= `state.in_size`.
-            unsafe { state.input.write_bytes(0u8, n) };
+            // `gz_comp` lazily initializes the owned input buffer when needed, and `n`
+            // is bounded by its usable compression prefix.
+            unsafe { state.input_ptr().write_bytes(0u8, n) };
             first = false;
         }
         state.stream.avail_in = n as _;
-        state.stream.next_in = state.input;
+        state.stream.next_in = state.input_ptr();
         state.pos += n as i64;
         if gz_comp(state, Z_NO_FLUSH).is_err() {
             return Err(());
@@ -1764,8 +1798,7 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
     Ok(())
 }
 
-// Initialize `state` for writing a gzip file.  Mark initialization by setting
-// `state.input` to non-null.
+// Initialize the lazily owned buffers and zlib stream for writing a gzip file.
 //
 // # Returns
 //
@@ -1773,32 +1806,28 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
 // - `Err` on error.
 fn gz_init(state: &mut GzState) -> Result<(), ()> {
     // Allocate input buffer.
-    // The buffer is twice as big as state.want, but we set in_size to half the
-    // buffer size (i.e. state.in_size == state.want). The reason for this is to
+    // The buffer is twice as big as state.want, while `in_size()` exposes only half
+    // of it to ordinary compression. The reason for this is to
     // ensure that we always have state.want bytes available for exclusive use
     // by gzprintf.
-    let capacity = state.in_capacity();
-    state.in_size = capacity / 2;
-    let Some(input) = ALLOCATOR.allocate_slice_raw::<u8>(capacity) else {
+    let Some(input) = state.allocate_input_buffer() else {
         // Safety: The caller confirmed the validity of state.
         unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
         return Err(());
     };
-    state.input = input.as_ptr();
+    state.input = Some(input);
     // Note: zlib-ng fills the input buffer with zeroes here, but it's unneeded.
 
     // Only need output buffer and deflate state if compressing.
     if !state.direct {
         // Allocate output buffer.
-        let capacity = state.out_capacity();
-        state.out_size = capacity;
-        let Some(output) = ALLOCATOR.allocate_slice_raw::<u8>(capacity) else {
-            unsafe { free_buffers(state) };
+        let Some(output) = state.allocate_output_buffer() else {
+            free_buffers(state);
             // Safety: The caller confirmed the validity of state.
             unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
             return Err(());
         };
-        state.output = output.as_ptr();
+        state.output = Some(output);
 
         // Allocate deflate memory, set up for gzip compression.
         state.stream.zalloc = Some(ALLOCATOR.zalloc);
@@ -1818,7 +1847,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
             )
         } != Z_OK
         {
-            unsafe { free_buffers(state) };
+            free_buffers(state);
             // Safety: The caller confirmed the validity of state.
             unsafe { gz_error(state, Some((Z_MEM_ERROR, "out of memory"))) };
             return Err(());
@@ -1826,14 +1855,12 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
         state.stream.next_in = ptr::null_mut();
     }
 
-    // Note: zlib-ng sets state.size = state.want here to mark the state as initialized.
-    // We don't have state.size, so gz_write looks for a non-null state.input buffer
-    // (which we allocated above) to tell if the state has been initialized.
+    // Buffer presence itself is the initialization state; no separate size sentinel is needed.
 
     // Initialize write buffer if compressing.
     if !state.direct {
-        state.stream.avail_out = state.out_size as _;
-        state.stream.next_out = state.output;
+        state.stream.avail_out = state.out_size() as _;
+        state.stream.next_out = state.output_ptr();
         state.next = state.stream.next_out;
     }
 
@@ -1849,7 +1876,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
 // - `Err` on error.
 fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
     // Allocate memory if this is the first time through
-    if state.input.is_null() && gz_init(state).is_err() {
+    if state.input.is_none() && gz_init(state).is_err() {
         return Err(());
     }
 
@@ -1907,8 +1934,8 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
                 }
             }
             if state.stream.avail_out == 0 {
-                state.stream.avail_out = state.out_size as _;
-                state.stream.next_out = state.output;
+                state.stream.avail_out = state.out_size() as _;
+                state.stream.next_out = state.output_ptr();
             }
             state.next = state.stream.next_out;
         }
@@ -2118,18 +2145,18 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
         }
     }
 
-    // Try writing to input buffer for speed (state.input == null if buffer not initialized).
-    if !state.input.is_null() {
+    // Try writing to the owned input buffer for speed when it has been initialized.
+    if state.input.is_some() {
         if state.stream.avail_in == 0 {
-            state.stream.next_in = state.input;
+            state.stream.next_in = state.input_ptr();
         }
         // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
         // (This is an invariant maintained throughout this module, except for a specific
         // block within `gz_write` that does not call any function that might call `gzputc`.)
         let have = unsafe { state.input_len() };
-        if have < state.in_size {
+        if have < state.in_size() {
             // Safety: `input` has `in_size` bytes, and `have` < `in_size`.
-            unsafe { *state.input.add(have) = c as u8 };
+            unsafe { *state.input_ptr().add(have) = c as u8 };
             state.stream.avail_in += 1;
             state.pos += 1;
             return c & 0xff;
@@ -2286,7 +2313,9 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     // In case this was just opened, set up the input buffer.
     if state.how == How::Look && state.have == 0 {
         // We have verified that `state` is valid.
-        let _ = unsafe { gz_look(state) };
+        if unsafe { gz_look(state) }.is_err() {
+            return -1;
+        }
     }
 
     // Process a skip request.
@@ -2301,9 +2330,9 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     if state.have == 0 {
         state.have = 1;
         // Safety: because `state.have` is nonzero, the `state.output` buffer has been
-        // allocated. And because the buffer's size is `state.out_size`, a pointer to
+        // allocated. And because the buffer's size is `state.out_size()`, a pointer to
         // `output + out_size - 1` points within the buffer.
-        state.next = unsafe { state.output.add(state.out_size - 1) };
+        state.next = unsafe { state.output_ptr().add(state.out_size() - 1) };
         // Safety: from the addition above, `state.next` currently points within the
         // `state.output` buffer.
         unsafe { *(state.next as *mut u8) = c as u8 };
@@ -2313,7 +2342,7 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     }
 
     // If no room, give up (must have already done a `gzungetc`).
-    if state.have as usize == state.out_size {
+    if state.have as usize == state.out_size() {
         const MSG: &str = "out of room to push characters";
         // Safety: We have verified that `state` is valid.
         unsafe { gz_error(state, Some((Z_DATA_ERROR, MSG))) };
@@ -2321,23 +2350,23 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     }
 
     // Slide output data if needed and insert byte before existing data.
-    if state.next == state.output {
+    if state.next == state.output_ptr() {
         // There are `state.have` bytes of usable content at the front of the buffer
-        // `state.output`, which has capacity `state.out_size`. We want to move that
+        // `state.output`, which has capacity `state.out_size()`. We want to move that
         // content to the end of the buffer, so we copy from `state.output` to
-        // `state.output + (state.out_size - state.have)` and update `state.next`
+        // `state.output + (state.out_size() - state.have)` and update `state.next`
         // to point to the content's new location within the buffer.
-        let offset = state.out_size - state.have as usize;
+        let offset = state.out_size() - state.have as usize;
 
-        // Safety: `state.have` < `state.out_size`, or we would have returned in the
+        // Safety: `state.have` < `state.out_size()`, or we would have returned in the
         // check for the == case above. Therefore, `offset`, which is `out_size - have`,
         // is in the range `1..=(out_size - 1)`. When we add that to `output`, the result
         // is within the buffer's allocation of `out_size` bytes.
-        let dst = unsafe { state.output.add(offset) };
+        let dst = unsafe { state.output_ptr().add(offset) };
 
         // Safety: `state.next` points a sequence of `state.have` initialized bytes
         // within the `state.output` buffer. And because `dst` was computed as
-        // `state.output + state.out_size - state.have`, we can write `state.have`
+        // `state.output + state.out_size() - state.have`, we can write `state.have`
         // bytes starting at `dst` and they will all be within the buffer.
         // Note that this may be an overlapping copy.
         unsafe { ptr::copy(state.next, dst as _, state.have as _) };
@@ -2515,12 +2544,12 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
     }
 
     // Change compression parameters for subsequent input.
-    if !state.input.is_null() {
+    if state.input.is_some() {
         // Flush previous input with previous parameters before changing.
         if state.stream.avail_in != 0 && gz_comp(state, Z_BLOCK).is_err() {
             return state.err;
         }
-        // Safety: Because `state` is in write mode and `state.input` is non-null, `state.stream`
+        // Safety: Because `state` is in write mode and owns an input buffer, `state.stream`
         // was initialized using `deflateInit2` in `gz_init`.
         unsafe { super::deflateParams(&mut state.stream, level, strategy as c_int) };
     }
@@ -2765,7 +2794,7 @@ pub unsafe extern "C" fn gzvprintf(
     }
 
     // Make sure we have some buffer space.
-    if state.input.is_null() && gz_init(state).is_err() {
+    if state.input.is_none() && gz_init(state).is_err() {
         return state.err;
     }
 
@@ -2781,12 +2810,11 @@ pub unsafe extern "C" fn gzvprintf(
     // buffer is double-sized just for this function, so there is guaranteed to
     // be state.size bytes available after the current contents
     if state.stream.avail_in == 0 {
-        state.stream.next_in = state.input;
+        state.stream.next_in = state.input_ptr();
     }
 
-    // A pointer to the space that can be used by `vsnprintf`. The size of the input buffer
-    // is `2 * state.in_size`, just for this function. That means we have at least
-    // `state.in_size` bytes available.
+    // The write input allocation is twice `in_size()` specifically for this function,
+    // so at least one full `in_size()` span remains available after the current prefix.
     let next = unsafe { (state.stream.next_in).add(state.stream.avail_in as usize) }.cast_mut();
 
     // NOTE: zlib-ng writes a NULL byte to the last position of the input buffer. It must do so
@@ -2805,27 +2833,33 @@ pub unsafe extern "C" fn gzvprintf(
         ) -> c_int;
     }
 
-    // Safety: as described earlier, there are at least state.in_size bytes available starting at
+    // Safety: as described earlier, there are at least `state.in_size()` bytes available starting at
     // `next`. We forward `format` and `va`, so the caller is responsible for guarenteeing that
     // these are valid.
-    let len = unsafe { vsnprintf(next.cast::<c_char>(), state.in_size, format, va) };
+    let len = unsafe { vsnprintf(next.cast::<c_char>(), state.in_size(), format, va) };
 
     // Check that printf() results fit in buffer.
-    if len == 0 || len as usize >= state.in_size {
+    if len == 0 || len as usize >= state.in_size() {
         return 0;
     }
 
     // Update buffer and position, compress first half if past that.
     state.stream.avail_in += len as u32;
     state.pos += i64::from(len);
-    if state.stream.avail_in as usize >= state.in_size {
-        let left = state.stream.avail_in - state.in_size as u32;
-        state.stream.avail_in = state.in_size as u32;
+    if state.stream.avail_in as usize >= state.in_size() {
+        let left = state.stream.avail_in - state.in_size() as u32;
+        state.stream.avail_in = state.in_size() as u32;
         if gz_comp(state, Z_NO_FLUSH).is_err() {
             return state.err;
         }
-        unsafe { core::ptr::copy(state.input.add(state.in_size), state.input, left as usize) };
-        state.stream.next_in = state.input;
+        unsafe {
+            core::ptr::copy(
+                state.input_ptr().add(state.in_size()),
+                state.input_ptr(),
+                left as usize,
+            )
+        };
+        state.stream.next_in = state.input_ptr();
         state.stream.avail_in = left;
     }
 
@@ -2953,6 +2987,51 @@ mod tests {
         assert_eq!(state.configure(b"x"), Ok((true, false)));
         assert_eq!(state.configure(b"e"), Ok((false, true)));
         assert_eq!(state.configure(b"xe"), Ok((true, true)));
+    }
+
+    #[test]
+    fn owned_buffers_encode_mode_specific_geometry() {
+        let mut state = GzState::new();
+        state.want = 64;
+
+        state.mode = GzMode::GZ_READ;
+        state.input = Some(state.allocate_input_buffer().unwrap());
+        state.output = Some(state.allocate_output_buffer().unwrap());
+        assert_eq!(state.in_size(), 64);
+        assert_eq!(state.input.as_ref().unwrap().capacity, 64);
+        assert_eq!(state.out_size(), 128);
+        free_buffers(&mut state);
+        assert!(state.input.is_none());
+        assert!(state.output.is_none());
+
+        state.mode = GzMode::GZ_WRITE;
+        state.input = Some(state.allocate_input_buffer().unwrap());
+        state.output = Some(state.allocate_output_buffer().unwrap());
+        assert_eq!(state.in_size(), 64);
+        assert_eq!(state.input.as_ref().unwrap().capacity, 128);
+        assert_eq!(state.out_size(), 64);
+    }
+
+    #[test]
+    fn large_write_restores_owned_input_cursor_after_zero_copy() {
+        let mut state = GzState::new();
+        state.mode = GzMode::GZ_WRITE;
+        state.fd = -2;
+
+        assert!(gz_init(&mut state).is_ok());
+        let owned_input = state.input_ptr();
+        let saved_next_in = state.stream.next_in;
+        assert_ne!(owned_input.cast_const(), saved_next_in);
+
+        let input = vec![b'A'; state.in_size()];
+        let written = unsafe { gz_write(&mut state, input.as_ptr().cast(), input.len()) };
+        assert_eq!(written as usize, input.len());
+        assert_eq!(state.stream.next_in, saved_next_in);
+        assert_ne!(state.stream.next_in, input.as_ptr().cast_mut());
+
+        // Safety: `gz_init` initialized the deflate stream above. Ending without
+        // `Z_FINISH` reports `Z_DATA_ERROR`, but still releases the deflate state.
+        assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_DATA_ERROR);
     }
 
     // Map a byte string literal to a C string
