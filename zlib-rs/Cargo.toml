@@ -18,6 +18,7 @@ unsafe_op_in_unsafe_fn = "deny"
 default = ["std", "c-allocator"]
 std = ["rust-allocator"]
 parallel = ["std", "dep:rayon-core"]
+gpu-prototype = ["std"]
 c-allocator = [] # expose a malloc-based C allocator
 rust-allocator = [] # expose a rust global alloctor
 __internal-fuzz = ["arbitrary"]
@@ -39,6 +40,9 @@ rayon-core = { version = "1.13.0", optional = true }
 crc32fast = "1.3.2"
 memoffset = "0.9.1"
 quickcheck.workspace = true
+bytemuck = "1"
+pollster = "0.4"
+wgpu = { version = "29", default-features = false, features = ["std", "vulkan", "wgsl"] }
 
 [[bench]]
 name = "batch"
@@ -54,3 +58,8 @@ required-features = ["std"]
 name = "adler"
 harness = false
 required-features = ["std"]
+
+[[bench]]
+name = "gpu_match"
+harness = false
+required-features = ["gpu-prototype"]
