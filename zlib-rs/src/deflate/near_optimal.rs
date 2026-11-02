@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -144,7 +143,12 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
 
     let suffixes = SuffixRanks::new(input);
     let ranges = distance_code_ranges(max_distance);
-    let mut active: [BTreeSet<usize>; D_CODES] = core::array::from_fn(|_| BTreeSet::new());
+    const DIRECT_SCAN_MAX: usize = 8;
+    let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
+        let (min_distance, max_distance) = ranges[code];
+        (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
+            .then(|| RankSet::new(input.len()))
+    });
     let mut offsets = Vec::with_capacity(input.len() + 1);
     let mut entries = Vec::new();
     offsets.push(0);
@@ -158,38 +162,57 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                 continue;
             }
 
-            if let Some(add) = position.checked_sub(min_distance) {
-                active[code].insert(suffixes.rank[add]);
-            }
-            if let Some(remove) = position.checked_sub(max_distance + 1) {
-                active[code].remove(&suffixes.rank[remove]);
-            }
-
-            if available < STD_MIN_MATCH || active[code].is_empty() {
-                continue;
-            }
-
-            let predecessor = active[code].range(..rank).next_back().copied();
-            let successor = active[code].range(rank.saturating_add(1)..).next().copied();
             let mut best = MatchCandidate::NONE;
+            if let Some(active) = &mut active[code] {
+                if let Some(add) = position.checked_sub(min_distance) {
+                    active.insert(suffixes.rank[add]);
+                }
+                if let Some(remove) = position.checked_sub(max_distance + 1) {
+                    active.remove(suffixes.rank[remove]);
+                }
 
-            for candidate_rank in [predecessor, successor].into_iter().flatten() {
-                let candidate_position = suffixes.sa[candidate_rank];
-                let distance = position - candidate_position;
-                debug_assert!((min_distance..=max_distance).contains(&distance));
-                let length = match_compare::common_prefix_len(
-                    &input[position..position + available],
-                    &input[candidate_position..candidate_position + available],
-                );
-                if length >= STD_MIN_MATCH
-                    && (length > usize::from(best.length)
-                        || (length == usize::from(best.length)
-                            && distance < usize::from(best.distance)))
-                {
-                    best = MatchCandidate {
-                        length: length as u16,
-                        distance: distance as u16,
-                    };
+                if available < STD_MIN_MATCH || active.is_empty() {
+                    continue;
+                }
+
+                let predecessor = active.predecessor(rank);
+                let successor = active.successor(rank);
+                for candidate_rank in [predecessor, successor].into_iter().flatten() {
+                    let candidate_position = suffixes.sa[candidate_rank];
+                    let distance = position - candidate_position;
+                    debug_assert!((min_distance..=max_distance).contains(&distance));
+                    let length = match_compare::common_prefix_len(
+                        &input[position..position + available],
+                        &input[candidate_position..candidate_position + available],
+                    );
+                    if length >= STD_MIN_MATCH
+                        && (length > usize::from(best.length)
+                            || (length == usize::from(best.length)
+                                && distance < usize::from(best.distance)))
+                    {
+                        best = MatchCandidate {
+                            length: length as u16,
+                            distance: distance as u16,
+                        };
+                    }
+                }
+            } else if available >= STD_MIN_MATCH {
+                for distance in min_distance..=max_distance.min(position) {
+                    let candidate_position = position - distance;
+                    let length = match_compare::common_prefix_len(
+                        &input[position..position + available],
+                        &input[candidate_position..candidate_position + available],
+                    );
+                    if length >= STD_MIN_MATCH
+                        && (length > usize::from(best.length)
+                            || (length == usize::from(best.length)
+                                && distance < usize::from(best.distance)))
+                    {
+                        best = MatchCandidate {
+                            length: length as u16,
+                            distance: distance as u16,
+                        };
+                    }
                 }
             }
 
@@ -201,6 +224,159 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
     }
 
     MatchCandidates { offsets, entries }
+}
+
+/// Dense ordered set over suffix ranks. Each level is a bitset whose set bits identify non-empty
+/// words in the level below it, so predecessor/successor queries skip arbitrarily large empty rank
+/// intervals without pointer chasing or per-entry allocation.
+struct RankSet {
+    levels: Vec<Vec<u64>>,
+    len: usize,
+}
+
+impl RankSet {
+    fn new(universe: usize) -> Self {
+        let mut levels = Vec::new();
+        let mut words = universe.div_ceil(64).max(1);
+        levels.push(vec![0; words]);
+        while words > 1 {
+            words = words.div_ceil(64);
+            levels.push(vec![0; words]);
+        }
+        Self { levels, len: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn insert(&mut self, rank: usize) {
+        let mut index = rank;
+        for level in 0..self.levels.len() {
+            let word_index = index / 64;
+            let bit = 1u64 << (index % 64);
+            let word = &mut self.levels[level][word_index];
+            let was_empty = *word == 0;
+            let was_set = (*word & bit) != 0;
+            *word |= bit;
+            if level == 0 {
+                if was_set {
+                    return;
+                }
+                self.len += 1;
+            }
+            if !was_empty {
+                return;
+            }
+            index = word_index;
+        }
+    }
+
+    fn remove(&mut self, rank: usize) {
+        let mut index = rank;
+        for level in 0..self.levels.len() {
+            let word_index = index / 64;
+            let bit = 1u64 << (index % 64);
+            let word = &mut self.levels[level][word_index];
+            if level == 0 {
+                debug_assert_ne!(*word & bit, 0);
+                self.len -= 1;
+            }
+            *word &= !bit;
+            if *word != 0 {
+                return;
+            }
+            index = word_index;
+        }
+    }
+
+    fn predecessor(&self, rank: usize) -> Option<usize> {
+        if rank == 0 || self.len == 0 {
+            return None;
+        }
+        let before = rank;
+        let word_index = (before - 1) / 64;
+        let bits = (before - 1) % 64 + 1;
+        let mask = low_bits(bits);
+        let word = self.levels[0][word_index] & mask;
+        if word != 0 {
+            return Some(word_index * 64 + highest_bit(word));
+        }
+        let previous_word = self.previous_set_bit(1, word_index)?;
+        let word = self.levels[0][previous_word];
+        debug_assert_ne!(word, 0);
+        Some(previous_word * 64 + highest_bit(word))
+    }
+
+    fn successor(&self, rank: usize) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let start = rank.checked_add(1)?;
+        let word_index = start / 64;
+        let Some(&word) = self.levels[0].get(word_index) else {
+            return None;
+        };
+        let mask = !low_bits(start % 64);
+        let word = word & mask;
+        if word != 0 {
+            return Some(word_index * 64 + word.trailing_zeros() as usize);
+        }
+        let next_word = self.next_set_bit(1, word_index + 1)?;
+        let word = self.levels[0][next_word];
+        debug_assert_ne!(word, 0);
+        Some(next_word * 64 + word.trailing_zeros() as usize)
+    }
+
+    fn previous_set_bit(&self, level: usize, before: usize) -> Option<usize> {
+        if level >= self.levels.len() || before == 0 {
+            return None;
+        }
+        let word_index = (before - 1) / 64;
+        let bits = (before - 1) % 64 + 1;
+        let word = self.levels[level][word_index] & low_bits(bits);
+        if word != 0 {
+            return Some(word_index * 64 + highest_bit(word));
+        }
+        let previous_word = self.previous_set_bit(level + 1, word_index)?;
+        let word = self.levels[level][previous_word];
+        debug_assert_ne!(word, 0);
+        Some(previous_word * 64 + highest_bit(word))
+    }
+
+    fn next_set_bit(&self, level: usize, start: usize) -> Option<usize> {
+        if level >= self.levels.len() {
+            return None;
+        }
+        let word_index = start / 64;
+        let Some(&word) = self.levels[level].get(word_index) else {
+            return None;
+        };
+        let word = word & !low_bits(start % 64);
+        if word != 0 {
+            return Some(word_index * 64 + word.trailing_zeros() as usize);
+        }
+        let next_word = self.next_set_bit(level + 1, word_index + 1)?;
+        let word = self.levels[level][next_word];
+        debug_assert_ne!(word, 0);
+        Some(next_word * 64 + word.trailing_zeros() as usize)
+    }
+}
+
+#[inline]
+fn low_bits(bits: usize) -> u64 {
+    if bits == 0 {
+        0
+    } else if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+#[inline]
+fn highest_bit(word: u64) -> usize {
+    63 - word.leading_zeros() as usize
 }
 
 fn distance_code_ranges(max_distance: usize) -> [(usize, usize); D_CODES] {
@@ -233,43 +409,32 @@ impl SuffixRanks {
         }
 
         let mut sa = (0..input.len()).collect::<Vec<_>>();
+        let mut scratch = vec![0usize; input.len()];
         let mut rank = input
             .iter()
             .map(|&byte| usize::from(byte) + 1)
             .collect::<Vec<_>>();
         let mut next_rank = vec![0usize; input.len()];
+        let mut counts = vec![0usize; input.len().max(256) + 1];
+        let mut max_rank = rank.iter().copied().max().unwrap_or(0);
         let mut span = 1usize;
 
         loop {
-            sa.sort_unstable_by_key(|&position| {
-                (
-                    rank[position],
-                    position
-                        .checked_add(span)
-                        .filter(|&next| next < input.len())
-                        .map_or(0, |next| rank[next]),
-                )
-            });
+            // Prefix-doubling ranks are dense integers after the first round. Sort the pair
+            // (rank[pos], rank[pos + span]) with two stable counting passes instead of doing a
+            // comparison sort of all suffixes at every doubling step.
+            counting_sort_suffixes_by_second(&sa, &mut scratch, &rank, span, max_rank, &mut counts);
+            counting_sort_suffixes_by_first(&scratch, &mut sa, &rank, max_rank, &mut counts);
 
             let mut class = 1usize;
             next_rank[sa[0]] = class;
             for pair in sa.windows(2) {
                 let left = pair[0];
                 let right = pair[1];
-                let left_key = (
-                    rank[left],
-                    left.checked_add(span)
-                        .filter(|&next| next < input.len())
-                        .map_or(0, |next| rank[next]),
-                );
-                let right_key = (
-                    rank[right],
-                    right
-                        .checked_add(span)
-                        .filter(|&next| next < input.len())
-                        .map_or(0, |next| rank[next]),
-                );
-                if left_key != right_key {
+                if rank[left] != rank[right]
+                    || suffix_second_rank(&rank, left, span)
+                        != suffix_second_rank(&rank, right, span)
+                {
                     class += 1;
                 }
                 next_rank[right] = class;
@@ -279,6 +444,7 @@ impl SuffixRanks {
             if class == input.len() {
                 break;
             }
+            max_rank = class;
             span = span
                 .checked_mul(2)
                 .expect("suffix-array doubling span overflow");
@@ -291,6 +457,65 @@ impl SuffixRanks {
         }
 
         Self { sa, rank }
+    }
+}
+
+fn counting_sort_suffixes_by_second(
+    source: &[usize],
+    target: &mut [usize],
+    rank: &[usize],
+    span: usize,
+    max_rank: usize,
+    counts: &mut [usize],
+) {
+    let counts = &mut counts[..=max_rank];
+    counts.fill(0);
+    for &position in source {
+        counts[suffix_second_rank(rank, position, span)] += 1;
+    }
+    counts_to_offsets(counts);
+    for &position in source {
+        let key = suffix_second_rank(rank, position, span);
+        target[counts[key]] = position;
+        counts[key] += 1;
+    }
+}
+
+fn counting_sort_suffixes_by_first(
+    source: &[usize],
+    target: &mut [usize],
+    rank: &[usize],
+    max_rank: usize,
+    counts: &mut [usize],
+) {
+    let counts = &mut counts[..=max_rank];
+    counts.fill(0);
+    for &position in source {
+        counts[rank[position]] += 1;
+    }
+    counts_to_offsets(counts);
+    for &position in source {
+        let key = rank[position];
+        target[counts[key]] = position;
+        counts[key] += 1;
+    }
+}
+
+fn counts_to_offsets(counts: &mut [usize]) {
+    let mut offset = 0usize;
+    for count in counts {
+        let frequency = *count;
+        *count = offset;
+        offset += frequency;
+    }
+}
+
+#[inline]
+fn suffix_second_rank(rank: &[usize], position: usize, span: usize) -> usize {
+    if position < rank.len().saturating_sub(span) {
+        rank[position + span]
+    } else {
+        0
     }
 }
 
@@ -509,6 +734,21 @@ pub(crate) fn parse_range(
     let block_len = block.len();
     let mut best_cost = vec![INF; block_len + 1];
     let mut steps = vec![None; block_len + 1];
+    let mut length_bits = [0u8; STD_MAX_MATCH + 1];
+    for (length, bits) in length_bits
+        .iter_mut()
+        .enumerate()
+        .take(STD_MAX_MATCH + 1)
+        .skip(STD_MIN_MATCH)
+    {
+        let code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
+        *bits = costs.length[code] + StaticTreeDesc::EXTRA_LBITS[code];
+    }
+    let mut distance_bits = vec![0u8; 32_768 + 1];
+    for (distance, bits) in distance_bits.iter_mut().enumerate().skip(1) {
+        let code = State::d_code(distance - 1) as usize;
+        *bits = costs.distance[code] + StaticTreeDesc::EXTRA_DBITS[code];
+    }
     best_cost[0] = 0;
 
     for local_position in 0..block_len {
@@ -532,20 +772,17 @@ pub(crate) fn parse_range(
             continue;
         }
 
-        let mut distance_cost_at_max = [None::<(u64, u16)>; STD_MAX_MATCH + 1];
+        let mut distance_cost_at_max = [None::<(u8, u16)>; STD_MAX_MATCH + 1];
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
-            let distance = usize::from(candidate.distance);
-            let distance_code = State::d_code(distance - 1) as usize;
-            let distance_bits = u64::from(costs.distance[distance_code])
-                + u64::from(StaticTreeDesc::EXTRA_DBITS[distance_code]);
+            let bits = distance_bits[usize::from(candidate.distance)];
             let slot = &mut distance_cost_at_max[max_len];
-            if slot.is_none_or(|(old, _)| distance_bits < old) {
-                *slot = Some((distance_bits, candidate.distance));
+            if slot.is_none_or(|(old, _)| bits < old) {
+                *slot = Some((bits, candidate.distance));
             }
         }
 
-        let mut cheapest_capable = None::<(u64, u16)>;
+        let mut cheapest_capable = None::<(u8, u16)>;
         for length in (STD_MIN_MATCH..=available).rev() {
             if let Some(candidate) = distance_cost_at_max[length] {
                 if cheapest_capable.is_none_or(|(old, _)| candidate.0 < old) {
@@ -555,10 +792,7 @@ pub(crate) fn parse_range(
             let Some((distance_bits, distance)) = cheapest_capable else {
                 continue;
             };
-            let length_code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
-            let token_cost = u64::from(costs.length[length_code])
-                + u64::from(StaticTreeDesc::EXTRA_LBITS[length_code])
-                + distance_bits;
+            let token_cost = u64::from(length_bits[length]) + u64::from(distance_bits);
             relax(
                 &mut best_cost,
                 &mut steps,
