@@ -589,7 +589,11 @@ fn suffix_second_rank(rank: &[usize], position: usize, span: usize) -> usize {
 }
 
 const MIN_BLOCK_LENGTH: usize = 5_000;
+// Keep ordinary coarse ranges individually stored-capable. The tiny-tail rule may extend one range
+// beyond this; exact parsing then either proves the long Huffman block worthwhile and token-safe or
+// returns a split point before emission.
 const SOFT_MAX_BLOCK_LENGTH: usize = 60_000;
+pub(crate) const MAX_COARSE_BLOCK_INPUT: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1;
 const OBSERVATIONS_PER_CHECK: u32 = 512;
 const SPLIT_OBSERVATION_TYPES: usize = 10;
 // Match libdeflate level 12's near-optimal search budget for block-statistics gathering.
@@ -725,8 +729,8 @@ pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Rang
     let mut block_start = 0usize;
     let mut previous_check = None;
     let mut position = 0usize;
-    // Avoid manufacturing a tiny tail block solely because of the soft maximum. 60K + <5K is
-    // still below DEFLATE's 65,535-byte stored-block limit and our 65,535-token symbol limit.
+    // Avoid manufacturing a tiny tail solely because of the soft maximum: the final coarse range
+    // may extend by less than MIN_BLOCK_LENGTH and is capacity-checked after exact parsing.
     let mut block_limit = splitter_block_limit(input.len(), block_start);
     let mut min_split_match = splitter_min_match_len(input, block_start, block_limit);
 
@@ -819,7 +823,9 @@ pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Rang
     debug_assert_eq!(blocks[0].start, 0);
     debug_assert_eq!(blocks.last().unwrap().end, input.len());
     debug_assert!(blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
-    debug_assert!(blocks.iter().all(|block| block.len() <= u16::MAX as usize));
+    debug_assert!(blocks
+        .iter()
+        .all(|block| block.len() <= MAX_COARSE_BLOCK_INPUT));
     blocks
 }
 
@@ -1212,7 +1218,9 @@ mod tests {
         assert_eq!(blocks[0].start, 0);
         assert_eq!(blocks.last().unwrap().end, input.len());
         assert!(blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
-        assert!(blocks.iter().all(|block| block.len() <= MAX_BLOCK_INPUT));
+        assert!(blocks
+            .iter()
+            .all(|block| block.len() <= MAX_COARSE_BLOCK_INPUT));
     }
 
     #[test]
@@ -1221,7 +1229,9 @@ mod tests {
         let blocks = choose_block_ranges(&input, 32_506);
         assert_eq!(blocks[0].start, 0);
         assert_eq!(blocks.last().unwrap().end, input.len());
-        assert!(blocks.iter().all(|block| block.len() <= MAX_BLOCK_INPUT));
+        assert!(blocks
+            .iter()
+            .all(|block| block.len() <= MAX_COARSE_BLOCK_INPUT));
         assert!(blocks
             .iter()
             .take(blocks.len() - 1)
@@ -1292,11 +1302,13 @@ mod tests {
 }
 
 /// Private near-optimal states use all 65,536 symbol slots supported by the existing tree
-/// frequency representation. One slot remains reserved by `SymBuf`, so a block may contain at most
-/// 65,535 tokens; keeping the byte length at or below the same value also preserves stored-block
-/// fallback through the production encoder.
+/// frequency representation. `SymBuf` itself reserves one slot, and the literal/length Huffman tree
+/// needs one additional frequency count for EOB. Therefore at most 65,534 LZ77 tokens may enter one
+/// tree without overflowing a 16-bit internal frequency sum. Input byte length is independent: a
+/// match token can represent up to 258 bytes, so compressible blocks may legally span well beyond
+/// the 65,535-byte stored-block cap.
 pub(crate) const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
-pub(crate) const MAX_BLOCK_INPUT: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 1;
+pub(crate) const MAX_BLOCK_TOKENS: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 2;
 
 #[derive(Clone, Copy, Debug)]
 struct BlockScore {
@@ -1321,6 +1333,10 @@ impl TokenHistogram {
     }
 
     fn from_tokens(tokens: &[ParseToken]) -> Self {
+        assert!(
+            tokens.len() <= MAX_BLOCK_TOKENS,
+            "near-optimal token block exceeds symbol-buffer capacity"
+        );
         let mut histogram = Self::empty();
         for &token in tokens {
             histogram.add_token(token);
@@ -1441,6 +1457,7 @@ impl PlannedBlockSource {
         previous_model: Option<ParseModel>,
     ) -> bool {
         if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
+            self.refresh_model(state);
             return false;
         }
 
@@ -1462,6 +1479,9 @@ impl PlannedBlockSource {
 
         for _ in 0..optimization_passes {
             let reparsed = parse_range(context, &self.candidates, local_range.clone(), costs);
+            if reparsed.tokens.len() > MAX_BLOCK_TOKENS {
+                break;
+            }
             let (next_costs, reparsed_score) = costs_and_block_score(state, &reparsed.tokens);
             if reparsed_score.bits < best_score.bits {
                 best_score = reparsed_score;
@@ -1740,6 +1760,10 @@ pub(crate) fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseTok
 }
 
 pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
+    assert!(
+        tokens.len() <= MAX_BLOCK_TOKENS,
+        "near-optimal token block exceeds symbol-buffer capacity"
+    );
     for &token in tokens {
         match token {
             ParseToken::Literal(byte) => {
@@ -1845,7 +1869,7 @@ fn compressed_histogram_score(
     // block's residual bit count. Boundary optimization is intentionally limited to pairs for which
     // production would choose a Huffman-coded representation; stored-block regions keep the cheap
     // splitter's boundary unchanged.
-    (input_len + 4 > score.encoded_bytes).then_some((costs, score))
+    (input_len > super::MAX_STORED || input_len + 4 > score.encoded_bytes).then_some((costs, score))
 }
 
 const EXACT_BOUNDARY_CANDIDATES: usize = 4;
@@ -1908,12 +1932,14 @@ fn fixed_cost_shift_candidates(
 
     // Positive shift: move a prefix of the right block into the left block.
     let mut moved = 0usize;
+    let mut moved_tokens = 0usize;
     let mut delta = 0i64;
     let mut shifted_left = left_histogram.clone();
     let mut shifted_right = right_histogram.clone();
     for &token in &right.tokens {
         moved += token.input_len();
-        if left.input_len() + moved > MAX_BLOCK_INPUT
+        moved_tokens += 1;
+        if left.tokens.len() + moved_tokens > MAX_BLOCK_TOKENS
             || right.input_len().saturating_sub(moved) < MIN_BLOCK_LENGTH
         {
             break;
@@ -1932,12 +1958,14 @@ fn fixed_cost_shift_candidates(
 
     // Negative shift: move a suffix of the left block into the right block.
     moved = 0;
+    moved_tokens = 0;
     delta = 0;
     shifted_left = left_histogram.clone();
     shifted_right = right_histogram.clone();
     for &token in left.tokens.iter().rev() {
         moved += token.input_len();
-        if right.input_len() + moved > MAX_BLOCK_INPUT
+        moved_tokens += 1;
+        if right.tokens.len() + moved_tokens > MAX_BLOCK_TOKENS
             || left.input_len().saturating_sub(moved) < MIN_BLOCK_LENGTH
         {
             break;
@@ -2028,7 +2056,7 @@ pub(crate) fn optimize_token_partition(
     let mut merge_is_best = false;
 
     let merged_len = left.input_len() + right.input_len();
-    if merged_len <= MAX_BLOCK_INPUT {
+    if left.tokens.len() + right.tokens.len() <= MAX_BLOCK_TOKENS {
         let merged_histogram = TokenHistogram::merged(&left_histogram, &right_histogram);
         if let Some((_, merged_score)) =
             compressed_histogram_score(state, &merged_histogram, merged_len)
@@ -2090,12 +2118,12 @@ pub(crate) fn optimize_token_partition(
     match &outcome {
         BoundaryOptimization::Merged(merged) => {
             debug_assert_eq!(merged.token_input_len(), merged.range.len());
-            debug_assert!(merged.range.len() <= MAX_BLOCK_INPUT);
+            debug_assert!(merged.tokens.len() <= MAX_BLOCK_TOKENS);
         }
         BoundaryOptimization::Unchanged | BoundaryOptimization::Shifted => {
             debug_assert_eq!(left.range.end, right.range.start);
-            debug_assert!(left.range.len() <= MAX_BLOCK_INPUT);
-            debug_assert!(right.range.len() <= MAX_BLOCK_INPUT);
+            debug_assert!(left.tokens.len() <= MAX_BLOCK_TOKENS);
+            debug_assert!(right.tokens.len() <= MAX_BLOCK_TOKENS);
             debug_assert_eq!(left.token_input_len(), left.range.len());
             debug_assert_eq!(right.token_input_len(), right.range.len());
         }
@@ -2247,6 +2275,28 @@ mod encoded_tests {
         let (two, two_code) = super::super::compress_slice_near_optimal(&mut two_buffer, &input, 2);
         assert_eq!(two_code, ReturnCode::Ok);
         assert!(two.len() <= one_len, "{} > {one_len}", two.len());
+    }
+
+    #[test]
+    fn long_huffman_block_round_trips_beyond_stored_limit() {
+        let pattern = b"abcdefghijklmnopqrstuvwxyz012345";
+        let input = (0..120_000)
+            .map(|index| pattern[index % pattern.len()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            choose_block_ranges(&input, 32_768),
+            [0..60_000, 60_000..120_000]
+        );
+
+        let mut compressed = vec![0u8; compress_bound(input.len())];
+        let (compressed, code) =
+            super::super::compress_slice_near_optimal(&mut compressed, &input, 1);
+        assert_eq!(code, ReturnCode::Ok);
+
+        let mut decoded = vec![0u8; input.len()];
+        let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
     }
 
     #[test]

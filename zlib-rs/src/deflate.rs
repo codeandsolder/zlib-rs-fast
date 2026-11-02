@@ -3267,23 +3267,33 @@ fn emit_planned_near_optimal_block(
 ) -> bool {
     near_optimal::tally_tokens(state, &block.tokens);
 
-    // The production block chooser can still select a stored block. Only the current block bytes
-    // are needed for that fallback; LZ77 history was already accounted for while planning tokens.
     state.window.clear();
-    if !block.range.is_empty() {
-        // SAFETY: this exact block slice is initialized and readable, the state owns its window
-        // uniquely, and splitter/planner invariants cap every block below the 64 KiB allocation.
-        unsafe {
-            state
-                .window
-                .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr())
-        };
+    if block.range.len() <= MAX_STORED {
+        // Short blocks keep the production stored/static/dynamic choice. Only the current block
+        // bytes are needed for stored fallback; LZ77 history was already accounted for while
+        // planning tokens.
+        if !block.range.is_empty() {
+            // SAFETY: this exact block slice is initialized and readable, the state owns its window
+            // uniquely, and a stored-capable block is no larger than the 64 KiB window allocation.
+            unsafe {
+                state
+                    .window
+                    .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr())
+            };
+        }
+        state.block_start = 0;
+        state.strstart = block.range.len();
+        state.lookahead = 0;
+        state.encode_block(is_last);
+    } else {
+        // DEFLATE Huffman blocks have no byte-length field. A long, sufficiently compressible block
+        // can therefore span more than 65,535 input bytes as long as its token count fits SymBuf.
+        // There is no single stored-block fallback for such a span, so deliberately omit window
+        // backing and force the existing tree chooser to select static or dynamic Huffman coding.
+        let stored_len = u32::try_from(block.range.len())
+            .expect("near-optimal token capacity bounds input span below u32::MAX");
+        zng_tr_flush_block(state, None, stored_len, is_last);
     }
-
-    state.block_start = 0;
-    state.strstart = block.range.len();
-    state.lookahead = 0;
-    state.encode_block(is_last);
     drain_near_optimal_pending(state, output, produced)
 }
 
@@ -3320,7 +3330,7 @@ pub fn compress_slice_near_optimal<'a>(
         let ranges = near_optimal::choose_block_ranges(input, max_distance);
         debug_assert!(ranges
             .iter()
-            .all(|range| range.len() <= near_optimal::MAX_BLOCK_INPUT));
+            .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
 
         // Emit the wrapper while strstart still describes the true initial state. Moving this after
         // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
@@ -4299,6 +4309,62 @@ mod test {
                 ReturnCode::MemError
             );
         }
+    }
+
+    #[test]
+    fn near_optimal_partition_can_merge_beyond_stored_limit() {
+        fn repeated_tokens(mut bytes: usize) -> Vec<near_optimal::ParseToken> {
+            let mut tokens = Vec::new();
+            tokens.push(near_optimal::ParseToken::Literal(b'a'));
+            bytes -= 1;
+            while bytes >= STD_MAX_MATCH {
+                tokens.push(near_optimal::ParseToken::Match {
+                    length: STD_MAX_MATCH as u16,
+                    distance: 1,
+                });
+                bytes -= STD_MAX_MATCH;
+            }
+            if bytes >= STD_MIN_MATCH {
+                tokens.push(near_optimal::ParseToken::Match {
+                    length: bytes as u16,
+                    distance: 1,
+                });
+            } else {
+                tokens.extend(core::iter::repeat_n(
+                    near_optimal::ParseToken::Literal(b'a'),
+                    bytes,
+                ));
+            }
+            tokens
+        }
+
+        let mut raw = z_stream::default();
+        assert_eq!(
+            init_with_lit_bufsize(
+                &mut raw,
+                DeflateConfig::new(9),
+                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
+            ),
+            ReturnCode::Ok
+        );
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let mut left = near_optimal::PlannedBlock {
+            range: 0..60_000,
+            tokens: repeated_tokens(60_000),
+        };
+        let mut right = near_optimal::PlannedBlock {
+            range: 60_000..120_000,
+            tokens: repeated_tokens(60_000),
+        };
+
+        let outcome =
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+        let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
+            panic!("expected identical compressible blocks to merge");
+        };
+        assert_eq!(merged.range, 0..120_000);
+        assert!(merged.tokens.len() <= near_optimal::MAX_BLOCK_TOKENS);
+        assert!(end(stream).is_ok());
     }
 
     #[test]
