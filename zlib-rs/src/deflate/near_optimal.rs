@@ -194,9 +194,42 @@ pub(crate) struct ParseResult {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ParseStep {
-    previous: usize,
-    token: ParseToken,
+struct ParseStep(u64);
+
+impl ParseStep {
+    const MATCH_FLAG: u32 = 1 << 31;
+
+    #[inline]
+    fn new(previous: usize, token: ParseToken) -> Self {
+        debug_assert!(previous <= u32::MAX as usize);
+        let token = match token {
+            ParseToken::Literal(byte) => u32::from(byte),
+            ParseToken::Match { length, distance } => {
+                debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&usize::from(length)));
+                debug_assert_ne!(distance, 0);
+                Self::MATCH_FLAG | (u32::from(length) << 16) | u32::from(distance)
+            }
+        };
+        Self((u64::from(token) << 32) | previous as u64)
+    }
+
+    #[inline]
+    fn previous(self) -> usize {
+        (self.0 as u32) as usize
+    }
+
+    #[inline]
+    fn token(self) -> ParseToken {
+        let token = (self.0 >> 32) as u32;
+        if token & Self::MATCH_FLAG == 0 {
+            ParseToken::Literal(token as u8)
+        } else {
+            ParseToken::Match {
+                length: ((token >> 16) & 0x1ff) as u16,
+                distance: token as u16,
+            }
+        }
+    }
 }
 
 /// Build the exact useful-match frontier for a complete input.
@@ -867,7 +900,7 @@ pub(crate) fn parse_range(
     const INF: u64 = u64::MAX / 4;
     let block_len = block.len();
     let mut best_cost = vec![INF; block_len + 1];
-    let mut steps = vec![None; block_len + 1];
+    let mut steps = vec![ParseStep(0); block_len + 1];
     let mut length_costs = [0u16; STD_MAX_MATCH + 1];
     for (length, cost) in length_costs
         .iter_mut()
@@ -910,10 +943,8 @@ pub(crate) fn parse_range(
             &mut steps,
             local_position + 1,
             prefix_cost + costs.literal_cost(input[position]),
-            ParseStep {
-                previous: local_position,
-                token: ParseToken::Literal(input[position]),
-            },
+            local_position,
+            ParseToken::Literal(input[position]),
         );
 
         let available = STD_MAX_MATCH.min(block.end - position);
@@ -952,12 +983,10 @@ pub(crate) fn parse_range(
                 &mut steps,
                 local_position + length,
                 prefix_cost + token_cost,
-                ParseStep {
-                    previous: local_position,
-                    token: ParseToken::Match {
-                        length: length as u16,
-                        distance,
-                    },
+                local_position,
+                ParseToken::Match {
+                    length: length as u16,
+                    distance,
                 },
             );
         }
@@ -966,9 +995,9 @@ pub(crate) fn parse_range(
     let mut tokens = Vec::new();
     let mut cursor = block_len;
     while cursor != 0 {
-        let step = steps[cursor].expect("every reachable endpoint has a predecessor");
-        tokens.push(step.token);
-        cursor = step.previous;
+        let step = steps[cursor];
+        tokens.push(step.token());
+        cursor = step.previous();
     }
     tokens.reverse();
 
@@ -988,16 +1017,18 @@ impl MatchCandidates {
     }
 }
 
+#[inline]
 fn relax(
     best_cost: &mut [u64],
-    steps: &mut [Option<ParseStep>],
+    steps: &mut [ParseStep],
     endpoint: usize,
     cost: u64,
-    step: ParseStep,
+    previous: usize,
+    token: ParseToken,
 ) {
     if cost < best_cost[endpoint] {
         best_cost[endpoint] = cost;
-        steps[endpoint] = Some(step);
+        steps[endpoint] = ParseStep::new(previous, token);
     }
 }
 
@@ -1009,6 +1040,33 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_parse_step_round_trips_extremes() {
+        for &(previous, token) in &[
+            (0usize, ParseToken::Literal(0)),
+            (u32::MAX as usize, ParseToken::Literal(u8::MAX)),
+            (
+                1,
+                ParseToken::Match {
+                    length: STD_MIN_MATCH as u16,
+                    distance: 1,
+                },
+            ),
+            (
+                u32::MAX as usize,
+                ParseToken::Match {
+                    length: STD_MAX_MATCH as u16,
+                    distance: 32_768,
+                },
+            ),
+        ] {
+            let step = ParseStep::new(previous, token);
+            assert_eq!(step.previous(), previous);
+            assert_eq!(step.token(), token);
+        }
+        assert_eq!(core::mem::size_of::<ParseStep>(), 8);
+    }
 
     #[test]
     fn rational_seed_log2_matches_reference_costs() {
