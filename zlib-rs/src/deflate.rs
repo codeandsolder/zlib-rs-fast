@@ -3278,11 +3278,13 @@ fn emit_planned_near_optimal_block(
 /// This remains behind `__internal-api` while the cost model and splitter are being developed. It
 /// emits a normal zlib-wrapped DEFLATE stream, keeps LZ77 history across Huffman block boundaries,
 /// and reuses the production tree builder / stored-static-dynamic block chooser / bit writer.
+/// `optimization_passes` counts minimum-cost path searches per selected block; zero is retained only
+/// as a fixed-Huffman diagnostic baseline.
 #[cfg(any(test, feature = "__internal-api"))]
 pub fn compress_slice_near_optimal<'a>(
     output: &'a mut [u8],
     input: &[u8],
-    refinement_passes: usize,
+    optimization_passes: usize,
 ) -> (&'a mut [u8], ReturnCode) {
     let mut raw = z_stream::default();
     let init_result = init_with_lit_bufsize(
@@ -3320,7 +3322,7 @@ pub fn compress_slice_near_optimal<'a>(
                 input,
                 range,
                 max_distance,
-                refinement_passes,
+                optimization_passes,
             )
             .into_block()
         });
@@ -3334,7 +3336,7 @@ pub fn compress_slice_near_optimal<'a>(
                 input,
                 range,
                 max_distance,
-                refinement_passes,
+                optimization_passes,
             );
             let current_block = current
                 .as_mut()
@@ -3342,12 +3344,14 @@ pub fn compress_slice_near_optimal<'a>(
             match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
                 near_optimal::BoundaryOptimization::Merged(merged) => {
                     next.block = merged;
-                    let _ = next.reparse_with_existing_candidates(state, input, refinement_passes);
+                    let _ =
+                        next.reparse_with_existing_candidates(state, input, optimization_passes);
                     current = Some(next.into_block());
                     continue;
                 }
                 near_optimal::BoundaryOptimization::Shifted => {
-                    let _ = next.reparse_with_existing_candidates(state, input, refinement_passes);
+                    let _ =
+                        next.reparse_with_existing_candidates(state, input, optimization_passes);
                 }
                 near_optimal::BoundaryOptimization::Unchanged => {}
             }

@@ -52,11 +52,15 @@ impl MatchCandidates {
     }
 }
 
+/// Approximate parser costs use 1/16-bit fixed-point units. Final block selection always uses the
+/// exact whole-bit cost returned by the production Huffman tree builder.
+const COST_SCALE: u16 = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TokenCosts {
-    literal: [u8; 256],
-    length: [u8; LENGTH_CODES],
-    distance: [u8; D_CODES],
+    literal: [u16; 256],
+    length: [u16; LENGTH_CODES],
+    distance: [u16; D_CODES],
 }
 
 impl TokenCosts {
@@ -65,17 +69,17 @@ impl TokenCosts {
     pub(crate) fn fixed() -> Self {
         let mut literal = [0; 256];
         for (byte, cost) in literal.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_LTREE[byte].len() as u8;
+            *cost = trees_tbl::STATIC_LTREE[byte].len() as u16 * COST_SCALE;
         }
 
         let mut length = [0; LENGTH_CODES];
         for (code, cost) in length.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_LTREE[257 + code].len() as u8;
+            *cost = trees_tbl::STATIC_LTREE[257 + code].len() as u16 * COST_SCALE;
         }
 
         let mut distance = [0; D_CODES];
         for (code, cost) in distance.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_DTREE[code].len() as u8;
+            *cost = trees_tbl::STATIC_DTREE[code].len() as u16 * COST_SCALE;
         }
 
         Self {
@@ -85,27 +89,27 @@ impl TokenCosts {
         }
     }
 
-    fn literal_bits(self, byte: u8) -> u64 {
+    fn literal_cost(self, byte: u8) -> u64 {
         u64::from(self.literal[byte as usize])
     }
 
-    fn match_bits(self, length: usize, distance: usize) -> u64 {
+    fn match_cost(self, length: usize, distance: usize) -> u64 {
         debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length));
         debug_assert!(distance > 0);
 
         let length_code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
         let distance_code = State::d_code(distance - 1) as usize;
         u64::from(self.length[length_code])
-            + u64::from(StaticTreeDesc::EXTRA_LBITS[length_code])
+            + u64::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u64::from(COST_SCALE)
             + u64::from(self.distance[distance_code])
-            + u64::from(StaticTreeDesc::EXTRA_DBITS[distance_code])
+            + u64::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u64::from(COST_SCALE)
     }
 
-    fn token_bits(self, token: ParseToken) -> u64 {
+    fn token_cost(self, token: ParseToken) -> u64 {
         match token {
-            ParseToken::Literal(byte) => self.literal_bits(byte),
+            ParseToken::Literal(byte) => self.literal_cost(byte),
             ParseToken::Match { length, distance } => {
-                self.match_bits(usize::from(length), usize::from(distance))
+                self.match_cost(usize::from(length), usize::from(distance))
             }
         }
     }
@@ -128,7 +132,7 @@ impl ParseToken {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParseResult {
-    pub(crate) cost_bits: u64,
+    pub(crate) cost_x16: u64,
     pub(crate) tokens: Vec<ParseToken>,
 }
 
@@ -742,20 +746,20 @@ pub(crate) fn parse_range(
     let block_len = block.len();
     let mut best_cost = vec![INF; block_len + 1];
     let mut steps = vec![None; block_len + 1];
-    let mut length_bits = [0u8; STD_MAX_MATCH + 1];
-    for (length, bits) in length_bits
+    let mut length_costs = [0u16; STD_MAX_MATCH + 1];
+    for (length, cost) in length_costs
         .iter_mut()
         .enumerate()
         .take(STD_MAX_MATCH + 1)
         .skip(STD_MIN_MATCH)
     {
         let code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
-        *bits = costs.length[code] + StaticTreeDesc::EXTRA_LBITS[code];
+        *cost = costs.length[code] + u16::from(StaticTreeDesc::EXTRA_LBITS[code]) * COST_SCALE;
     }
-    let mut distance_bits = vec![0u8; 32_768 + 1];
-    for (distance, bits) in distance_bits.iter_mut().enumerate().skip(1) {
+    let mut distance_costs = vec![0u16; 32_768 + 1];
+    for (distance, cost) in distance_costs.iter_mut().enumerate().skip(1) {
         let code = State::d_code(distance - 1) as usize;
-        *bits = costs.distance[code] + StaticTreeDesc::EXTRA_DBITS[code];
+        *cost = costs.distance[code] + u16::from(StaticTreeDesc::EXTRA_DBITS[code]) * COST_SCALE;
     }
     best_cost[0] = 0;
 
@@ -768,7 +772,7 @@ pub(crate) fn parse_range(
             &mut best_cost,
             &mut steps,
             local_position + 1,
-            prefix_cost + costs.literal_bits(input[position]),
+            prefix_cost + costs.literal_cost(input[position]),
             ParseStep {
                 previous: local_position,
                 token: ParseToken::Literal(input[position]),
@@ -780,27 +784,27 @@ pub(crate) fn parse_range(
             continue;
         }
 
-        let mut distance_cost_at_max = [None::<(u8, u16)>; STD_MAX_MATCH + 1];
+        let mut distance_cost_at_max = [None::<(u16, u16)>; STD_MAX_MATCH + 1];
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
-            let bits = distance_bits[usize::from(candidate.distance)];
+            let cost = distance_costs[usize::from(candidate.distance)];
             let slot = &mut distance_cost_at_max[max_len];
-            if slot.is_none_or(|(old, _)| bits < old) {
-                *slot = Some((bits, candidate.distance));
+            if slot.is_none_or(|(old, _)| cost < old) {
+                *slot = Some((cost, candidate.distance));
             }
         }
 
-        let mut cheapest_capable = None::<(u8, u16)>;
+        let mut cheapest_capable = None::<(u16, u16)>;
         for length in (STD_MIN_MATCH..=available).rev() {
             if let Some(candidate) = distance_cost_at_max[length] {
                 if cheapest_capable.is_none_or(|(old, _)| candidate.0 < old) {
                     cheapest_capable = Some(candidate);
                 }
             }
-            let Some((distance_bits, distance)) = cheapest_capable else {
+            let Some((distance_cost, distance)) = cheapest_capable else {
                 continue;
             };
-            let token_cost = u64::from(length_bits[length]) + u64::from(distance_bits);
+            let token_cost = u64::from(length_costs[length]) + u64::from(distance_cost);
             relax(
                 &mut best_cost,
                 &mut steps,
@@ -831,7 +835,7 @@ pub(crate) fn parse_range(
         block_len
     );
     ParseResult {
-        cost_bits: best_cost[block_len],
+        cost_x16: best_cost[block_len],
         tokens,
     }
 }
@@ -927,7 +931,7 @@ mod tests {
         best[0] = 0;
         for position in 0..input.len() {
             best[position + 1] =
-                best[position + 1].min(best[position] + costs.literal_bits(input[position]));
+                best[position + 1].min(best[position] + costs.literal_cost(input[position]));
             let max_len = STD_MAX_MATCH.min(input.len() - position);
             for candidate in position.saturating_sub(max_distance)..position {
                 let matched = common_prefix(
@@ -937,7 +941,7 @@ mod tests {
                 for length in STD_MIN_MATCH..=matched {
                     let distance = position - candidate;
                     best[position + length] = best[position + length]
-                        .min(best[position] + costs.match_bits(length, distance));
+                        .min(best[position] + costs.match_cost(length, distance));
                 }
             }
         }
@@ -1065,12 +1069,23 @@ mod tests {
     }
 
     #[test]
+    fn fixed_point_log2_matches_seed_cost_landmarks() {
+        assert_eq!(log2_x16(1), 0);
+        assert_eq!(log2_x16(2), 16);
+        assert_eq!(log2_x16(3), 25);
+        assert_eq!(log2_x16(30), 78);
+        assert_eq!(log2_x16(58), 93);
+        assert_eq!(log2_x16(116), 109);
+        assert_eq!(log2_x16(256), 128);
+    }
+
+    #[test]
     fn minimum_cost_parse_matches_exhaustive_oracle() {
         let input = b"abcabcabcxabcaabcabcabc---abcabc";
         let table = build_match_candidates(input, 32);
         let fixed = TokenCosts::fixed();
         let parsed = parse_block(input, &table, fixed);
-        assert_eq!(parsed.cost_bits, brute_cost(input, fixed, 32));
+        assert_eq!(parsed.cost_x16, brute_cost(input, fixed, 32));
         assert_eq!(expand(&parsed.tokens), input);
     }
 
@@ -1082,14 +1097,14 @@ mod tests {
         // Deliberately make farther distance symbols cheaper than nearby ones. Keeping the longest
         // match per distance *symbol* must remain exact even when distance costs are non-monotone.
         for (code, cost) in costs.distance.iter_mut().enumerate() {
-            *cost = 15 - (code % 15) as u8;
+            *cost = (15 - (code % 15) as u16) * COST_SCALE;
         }
         for (byte, cost) in costs.literal.iter_mut().enumerate() {
-            *cost = 3 + (byte % 11) as u8;
+            *cost = (3 + (byte % 11) as u16) * COST_SCALE;
         }
 
         let parsed = parse_block(input, &table, costs);
-        assert_eq!(parsed.cost_bits, brute_cost(input, costs, 32));
+        assert_eq!(parsed.cost_x16, brute_cost(input, costs, 32));
         assert_eq!(expand(&parsed.tokens), input);
     }
 }
@@ -1235,13 +1250,13 @@ impl PlannedBlockSource {
         &mut self,
         state: &mut super::State<'_>,
         input: &[u8],
-        refinement_passes: usize,
+        optimization_passes: usize,
     ) -> bool {
         if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
             return false;
         }
 
-        if refinement_passes == 0 {
+        if optimization_passes == 0 {
             return false;
         }
 
@@ -1251,7 +1266,7 @@ impl PlannedBlockSource {
         let mut current_tokens = self.block.tokens.clone();
         let mut best_tokens = None;
 
-        for _ in 0..refinement_passes {
+        for _ in 0..optimization_passes {
             let reparsed = parse_range(context, &self.candidates, local_range.clone(), costs);
             let (next_costs, reparsed_score) = costs_and_block_score(state, &reparsed.tokens);
             if reparsed_score.bits < best_score.bits {
@@ -1275,40 +1290,142 @@ impl PlannedBlockSource {
     }
 }
 
+#[inline]
+fn log2_x16(value: usize) -> u16 {
+    debug_assert!(value > 0);
+    let integer = usize::BITS - 1 - value.leading_zeros();
+    debug_assert!(
+        integer <= 31,
+        "fixed-point seed log2 only handles small alphabets"
+    );
+    let mut normalized = (value as u64) << (31 - integer);
+    let mut fraction = 0u16;
+    for bit in (0..4).rev() {
+        normalized = (normalized * normalized) >> 31;
+        if normalized >= (2u64 << 31) {
+            normalized >>= 1;
+            fraction |= 1 << bit;
+        }
+    }
+    integer as u16 * COST_SCALE + fraction
+}
+
+fn initial_statistical_costs(
+    input: &[u8],
+    candidates: &MatchCandidates,
+    block: Range<usize>,
+) -> TokenCosts {
+    let mut literal_frequencies = [0u32; 256];
+    for &byte in &input[block.clone()] {
+        literal_frequencies[usize::from(byte)] += 1;
+    }
+    let cutoff = block.len() >> 11;
+    let used_literals = literal_frequencies
+        .iter()
+        .filter(|&&frequency| frequency as usize > cutoff)
+        .count()
+        .max(1);
+
+    // Mirror the near-optimal seed heuristic used by libdeflate: estimate the eventual literal/match
+    // mixture from a cheap greedy observation pass, but do not constrain the actual DP to this
+    // minimum match length. Our exact frontier is already resident, so this adds no match search.
+    let min_match = match used_literals {
+        0..=5 => 9,
+        6..=7 => 8,
+        8..=9 => 7,
+        10..=15 => 6,
+        16..=44 => 5,
+        45..=79 => 4,
+        _ => 3,
+    };
+    let mut literal_count = block.len();
+    let mut match_count = 0usize;
+    let mut position = block.start;
+    while position < block.end {
+        let available = block.end - position;
+        let best_length = candidates
+            .for_position(position)
+            .iter()
+            .map(|candidate| usize::from(candidate.length).min(available))
+            .max()
+            .unwrap_or(0);
+        if best_length >= min_match {
+            match_count += 1;
+            literal_count = literal_count.saturating_sub(best_length);
+            position += best_length;
+        } else {
+            position += 1;
+        }
+    }
+
+    let (literal_cost, length_cost) = if match_count > literal_count {
+        // Approximate match probability 3/4: literals share the remaining 1/4, while length symbols
+        // share the 3/4 match probability. Subtracting log2(3) gives the rational denominator in
+        // the same 1/16-bit fixed-point domain.
+        (
+            log2_x16(used_literals * 4),
+            log2_x16(LENGTH_CODES * 4) - log2_x16(3),
+        )
+    } else if match_count.saturating_mul(4) > literal_count {
+        // Approximate match probability 1/2.
+        (log2_x16(used_literals * 2), log2_x16(LENGTH_CODES * 2))
+    } else {
+        // Approximate match probability 1/4: literals share 3/4 of the mass.
+        (
+            log2_x16(used_literals * 4) - log2_x16(3),
+            log2_x16(LENGTH_CODES * 4),
+        )
+    };
+
+    TokenCosts {
+        literal: [literal_cost; 256],
+        length: [length_cost; LENGTH_CODES],
+        // Assume distance symbols are initially equiprobable; exact tree lengths replace this after
+        // the first optimization pass. Extra distance bits are added by `match_cost`.
+        distance: [log2_x16(D_CODES); D_CODES],
+    }
+}
+
 /// Reparse one selected block using code lengths learned from the previous parse.
 ///
-/// Every candidate parse is scored with the production Huffman tree builder, including the dynamic
-/// tree-description overhead. Refinement therefore cannot replace a better parse with a later,
-/// worse fixed-point iteration. Run up to the requested pass cap and stop early only when the token
-/// sequence itself has converged; a temporarily worse iteration may still lead to a better next
-/// cost model, while an identical token sequence is a true fixed point.
-pub(crate) fn refined_parse_range(
+/// The first search uses a fractional statistical cost model derived from the block's literal
+/// diversity and a cheap greedy match-frequency estimate. Later searches use actual code lengths
+/// learned from the previous path, while symbols absent from that path retain a high finite prior so
+/// they can still be introduced when worthwhile. Every path is scored with the production Huffman
+/// tree builder, including dynamic tree-description overhead, and the best exact score is retained.
+/// Stop early only when the token sequence itself converges: a temporarily worse iteration can still
+/// lead to a better next model, while an identical token sequence is a true fixed point.
+pub(crate) fn optimized_parse_range(
     state: &mut super::State<'_>,
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
-    refinement_passes: usize,
+    optimization_passes: usize,
 ) -> ParseResult {
-    let mut current = parse_range(input, candidates, block.clone(), TokenCosts::fixed());
-    let (mut costs, mut best_score) = costs_and_block_score(state, &current.tokens);
-    let mut best = current.clone();
+    if optimization_passes == 0 {
+        return parse_range(input, candidates, block, TokenCosts::fixed());
+    }
 
-    for _ in 0..refinement_passes {
+    let mut costs = initial_statistical_costs(input, candidates, block.clone());
+    let mut previous_tokens = None;
+    let mut best = None;
+    let mut best_score = usize::MAX;
+
+    for _ in 0..optimization_passes {
         let next = parse_range(input, candidates, block.clone(), costs);
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
-        if next_score.bits < best_score.bits {
-            best = next.clone();
-            best_score = next_score;
+        if next_score.bits < best_score {
+            best_score = next_score.bits;
+            best = Some(next.clone());
         }
-
-        if next.tokens == current.tokens {
+        if previous_tokens.as_ref() == Some(&next.tokens) {
             break;
         }
-        current = next;
+        previous_tokens = Some(next.tokens.clone());
         costs = next_costs;
     }
 
-    best
+    best.expect("positive optimization pass count always evaluates one parse")
 }
 
 pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
@@ -1360,21 +1477,26 @@ fn costs_and_block_score_from_histogram(
         core::mem::swap(&mut tree, &mut state.d_desc);
     }
 
-    let fixed = TokenCosts::fixed();
-    let mut costs = fixed;
+    // Keep unseen symbols available to later passes, but price them high enough that a pass does not
+    // churn the tree merely because fixed-Huffman fallback made an absent symbol look cheap.
+    let mut costs = TokenCosts {
+        literal: [13 * COST_SCALE; 256],
+        length: [13 * COST_SCALE; LENGTH_CODES],
+        distance: [10 * COST_SCALE; D_CODES],
+    };
     for (index, &used) in literal_used.iter().enumerate() {
         if used {
-            costs.literal[index] = state.l_desc.dyn_tree[index].len() as u8;
+            costs.literal[index] = state.l_desc.dyn_tree[index].len() as u16 * COST_SCALE;
         }
     }
     for (index, &used) in length_used.iter().enumerate() {
         if used {
-            costs.length[index] = state.l_desc.dyn_tree[257 + index].len() as u8;
+            costs.length[index] = state.l_desc.dyn_tree[257 + index].len() as u16 * COST_SCALE;
         }
     }
     for (index, &used) in distance_used.iter().enumerate() {
         if used {
-            costs.distance[index] = state.d_desc.dyn_tree[index].len() as u8;
+            costs.distance[index] = state.d_desc.dyn_tree[index].len() as u16 * COST_SCALE;
         }
     }
 
@@ -1483,7 +1605,7 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += left_costs.token_bits(token) as i64 - right_costs.token_bits(token) as i64;
+        delta += left_costs.token_cost(token) as i64 - right_costs.token_cost(token) as i64;
         shifted_left.add_token(token);
         shifted_right.remove_token(token);
         consider_shift_candidate(
@@ -1507,7 +1629,7 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += right_costs.token_bits(token) as i64 - left_costs.token_bits(token) as i64;
+        delta += right_costs.token_cost(token) as i64 - left_costs.token_cost(token) as i64;
         shifted_left.remove_token(token);
         shifted_right.add_token(token);
         consider_shift_candidate(
@@ -1675,14 +1797,20 @@ pub(crate) fn parse_planned_block_source(
     input: &[u8],
     range: Range<usize>,
     max_distance: usize,
-    refinement_passes: usize,
+    optimization_passes: usize,
 ) -> PlannedBlockSource {
     let history_start = range.start.saturating_sub(max_distance);
     let context_end = range.end;
     let context = &input[history_start..context_end];
     let local_range = (range.start - history_start)..context.len();
     let candidates = build_match_candidates(context, max_distance);
-    let parsed = refined_parse_range(state, context, &candidates, local_range, refinement_passes);
+    let parsed = optimized_parse_range(
+        state,
+        context,
+        &candidates,
+        local_range,
+        optimization_passes,
+    );
     let block = PlannedBlock {
         range,
         tokens: parsed.tokens,
@@ -1715,10 +1843,10 @@ mod boundary_tests {
 
         let mut left_costs = TokenCosts::fixed();
         let mut right_costs = TokenCosts::fixed();
-        left_costs.literal[b'a' as usize] = 1;
-        left_costs.literal[b'b' as usize] = 8;
-        right_costs.literal[b'a' as usize] = 8;
-        right_costs.literal[b'b' as usize] = 1;
+        left_costs.literal[b'a' as usize] = COST_SCALE;
+        left_costs.literal[b'b' as usize] = 8 * COST_SCALE;
+        right_costs.literal[b'a' as usize] = 8 * COST_SCALE;
+        right_costs.literal[b'b' as usize] = COST_SCALE;
 
         let left_histogram = TokenHistogram::from_tokens(&left.tokens);
         let right_histogram = TokenHistogram::from_tokens(&right.tokens);
@@ -1773,7 +1901,7 @@ mod encoded_tests {
     };
 
     #[test]
-    fn near_optimal_compressor_round_trips_with_refined_costs() {
+    fn near_optimal_compressor_round_trips_with_optimized_costs() {
         let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
         let mut compressed = vec![0u8; compress_bound(input.len())];
         let (compressed, code) =
@@ -1787,8 +1915,13 @@ mod encoded_tests {
     }
 
     #[test]
-    fn second_refinement_pass_never_enlarges_encoded_stream() {
-        let input = super::tests::two_distribution_input();
+    fn additional_optimization_pass_never_enlarges_single_block_stream() {
+        // Keep this below twice MIN_BLOCK_LENGTH so adaptive partitioning cannot change the block
+        // layout between runs. For a fixed range, the optimization loop retains the cheapest exact
+        // production-scored path seen so far, so an additional search must not enlarge the stream.
+        let input = super::tests::two_distribution_input()[..8_000].to_vec();
+        assert_eq!(choose_block_ranges(&input, 32_506), [0..input.len()]);
+
         let mut one_buffer = vec![0u8; compress_bound(input.len())];
         let (one, one_code) = super::super::compress_slice_near_optimal(&mut one_buffer, &input, 1);
         assert_eq!(one_code, ReturnCode::Ok);

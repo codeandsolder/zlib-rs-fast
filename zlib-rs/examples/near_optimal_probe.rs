@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .map(|value| value.parse())
         .transpose()?
-        .unwrap_or(1);
+        .unwrap_or(3);
 
     let bytes = fs::read(Path::new(&path))?;
     let limit = requested.unwrap_or(bytes.len()).min(bytes.len());
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "delta_pct={:+.5}%",
         (optimal.len() as f64 / stock.len() as f64 - 1.0) * 100.0
     );
-    println!("refinement_passes={passes}");
+    println!("optimization_passes={passes}");
     println!("near_optimal_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
     Ok(())
 }
