@@ -382,6 +382,7 @@ impl RankSet {
         }
     }
 
+    #[inline]
     fn predecessor(&self, rank: usize) -> Option<usize> {
         if rank == 0 {
             return None;
@@ -394,12 +395,17 @@ impl RankSet {
         if word != 0 {
             return Some(word_index * 64 + highest_bit(word));
         }
-        let previous_word = self.previous_set_bit(1, word_index)?;
+        let previous_word = if self.levels.len() == 3 {
+            self.previous_base_word_three_levels(word_index)?
+        } else {
+            self.previous_set_bit(1, word_index)?
+        };
         let word = self.levels[0][previous_word];
         debug_assert_ne!(word, 0);
         Some(previous_word * 64 + highest_bit(word))
     }
 
+    #[inline]
     fn successor(&self, rank: usize) -> Option<usize> {
         let start = rank.checked_add(1)?;
         let word_index = start / 64;
@@ -411,10 +417,65 @@ impl RankSet {
         if word != 0 {
             return Some(word_index * 64 + word.trailing_zeros() as usize);
         }
-        let next_word = self.next_set_bit(1, word_index + 1)?;
+        let next_word = if self.levels.len() == 3 {
+            self.next_base_word_three_levels(word_index + 1)?
+        } else {
+            self.next_set_bit(1, word_index + 1)?
+        };
         let word = self.levels[0][next_word];
         debug_assert_ne!(word, 0);
         Some(next_word * 64 + word.trailing_zeros() as usize)
+    }
+
+    #[inline]
+    fn previous_base_word_three_levels(&self, before: usize) -> Option<usize> {
+        debug_assert_eq!(self.levels.len(), 3);
+        if before == 0 {
+            return None;
+        }
+
+        let middle_word_index = (before - 1) / 64;
+        let bits = (before - 1) % 64 + 1;
+        let word = self.levels[1][middle_word_index] & low_bits(bits);
+        if word != 0 {
+            return Some(middle_word_index * 64 + highest_bit(word));
+        }
+        if middle_word_index == 0 {
+            return None;
+        }
+
+        let top = self.levels[2][0] & low_bits(middle_word_index);
+        if top == 0 {
+            return None;
+        }
+        let middle_word_index = highest_bit(top);
+        let word = self.levels[1][middle_word_index];
+        debug_assert_ne!(word, 0);
+        Some(middle_word_index * 64 + highest_bit(word))
+    }
+
+    #[inline]
+    fn next_base_word_three_levels(&self, start: usize) -> Option<usize> {
+        debug_assert_eq!(self.levels.len(), 3);
+        if start >= self.levels[0].len() {
+            return None;
+        }
+
+        let middle_word_index = start / 64;
+        let word = self.levels[1][middle_word_index] & !low_bits(start % 64);
+        if word != 0 {
+            return Some(middle_word_index * 64 + word.trailing_zeros() as usize);
+        }
+
+        let next_middle_word = middle_word_index + 1;
+        let top = self.levels[2][0] & !low_bits(next_middle_word);
+        if top == 0 {
+            return None;
+        }
+        let middle_word_index = top.trailing_zeros() as usize;
+        let word = self.levels[1][middle_word_index];
+        debug_assert_ne!(word, 0);
+        Some(middle_word_index * 64 + word.trailing_zeros() as usize)
     }
 
     #[inline]
@@ -1040,6 +1101,67 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_set_queries_match_reference_across_hierarchy_shapes() {
+        use std::collections::BTreeSet;
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        for universe in [65usize, 4_097, 262_144, 262_145, 1_000_000] {
+            let mut ranks = vec![
+                0,
+                1,
+                63,
+                64,
+                65,
+                4_095,
+                4_096,
+                4_097,
+                262_143,
+                262_144,
+                universe - 1,
+            ];
+            ranks.extend((0..512).map(|i| (i * 7_919 + i * i * 17) % universe));
+            ranks.retain(|&rank| rank < universe);
+            ranks.sort_unstable();
+            ranks.dedup();
+
+            let mut set = RankSet::new(universe);
+            let mut reference = BTreeSet::new();
+            for &rank in &ranks {
+                set.insert(rank);
+                reference.insert(rank);
+            }
+
+            let mut queries = ranks.clone();
+            queries.extend((0..512).map(|i| (i * 12_289 + i * i * 29) % universe));
+            queries.sort_unstable();
+            queries.dedup();
+
+            let check = |set: &RankSet, reference: &BTreeSet<usize>| {
+                for &query in &queries {
+                    assert_eq!(
+                        set.predecessor(query),
+                        reference.range(..query).next_back().copied()
+                    );
+                    assert_eq!(
+                        set.successor(query),
+                        reference
+                            .range((Excluded(query), Unbounded))
+                            .next()
+                            .copied()
+                    );
+                }
+            };
+            check(&set, &reference);
+
+            for &rank in ranks.iter().step_by(3) {
+                set.remove(rank);
+                reference.remove(&rank);
+            }
+            check(&set, &reference);
+        }
+    }
 
     #[test]
     fn packed_parse_step_round_trips_extremes() {
