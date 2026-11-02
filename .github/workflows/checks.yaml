@@ -39,7 +39,7 @@ jobs:
       CC_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/clang
       CXX_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/clang++
       AR_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/llvm-ar
-      CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime --dir /home/runner/work/zlib-rs/zlib-rs/test-libz-rs-sys --dir /tmp/"
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime --dir ${{ github.workspace }}/test-libz-rs-sys --dir /tmp/"
       CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS: "-Ctarget-feature=+simd128"
       BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip1: "--sysroot=/tmp/wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot"
       RUSTFLAGS: ${{ matrix.rust == 'nightly' && matrix.target == 'x86_64-unknown-linux-gnu' && '-Zsanitizer=address' || '' }}
@@ -364,9 +364,7 @@ jobs:
       - name: Install cargo fuzz
         run: cargo install cargo-fuzz
       - name: Install rustfilt
-        uses: taiki-e/install-action@56ab7930c591507f833cbaed864d201386d518a8
-        with:
-          tool: rustfilt
+        run: cargo install rustfilt --locked
       - name: Download custom decompression corpus
         if: ${{ contains(matrix.corpus, 'gzip-files') }}
         run: |
