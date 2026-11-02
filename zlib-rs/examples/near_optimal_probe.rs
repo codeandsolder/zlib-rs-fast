@@ -1,6 +1,6 @@
 use std::{env, fs, path::Path};
 
-use zlib_rs::deflate::compress_slice_near_optimal_block;
+use zlib_rs::deflate::compress_slice_near_optimal;
 use zlib_rs::{compress_bound, compress_slice, DeflateConfig, ReturnCode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,10 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(1);
 
     let bytes = fs::read(Path::new(&path))?;
-    let limit = requested
-        .unwrap_or(bytes.len().min(16_383))
-        .min(bytes.len())
-        .min(16_383);
+    let limit = requested.unwrap_or(bytes.len()).min(bytes.len());
     let input = &bytes[..limit];
 
     let mut stock_buf = vec![0u8; compress_bound(input.len())];
@@ -28,8 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut optimal_buf = vec![0u8; compress_bound(input.len())];
     let start = std::time::Instant::now();
-    let (optimal, optimal_code) =
-        compress_slice_near_optimal_block(&mut optimal_buf, input, passes);
+    let (optimal, optimal_code) = compress_slice_near_optimal(&mut optimal_buf, input, passes);
     let elapsed = start.elapsed();
     assert_eq!(optimal_code, ReturnCode::Ok);
 

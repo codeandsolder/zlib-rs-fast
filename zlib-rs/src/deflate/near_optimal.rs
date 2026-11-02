@@ -3,6 +3,7 @@
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 use super::{
     match_compare, trees_tbl, State, StaticTreeDesc, D_CODES, LENGTH_CODES, STD_MAX_MATCH,
@@ -293,40 +294,240 @@ impl SuffixRanks {
     }
 }
 
+const MIN_BLOCK_LENGTH: usize = 5_000;
+const SOFT_MAX_BLOCK_LENGTH: usize = 60_000;
+const OBSERVATIONS_PER_CHECK: u32 = 512;
+const SPLIT_OBSERVATION_TYPES: usize = 10;
+const MIN_SPLIT_MATCH: usize = 4;
+
+#[derive(Clone, Debug, Default)]
+struct BlockSplitStats {
+    old: [u32; SPLIT_OBSERVATION_TYPES],
+    recent: [u32; SPLIT_OBSERVATION_TYPES],
+    old_count: u32,
+    recent_count: u32,
+}
+
+impl BlockSplitStats {
+    fn observe_literal(&mut self, byte: u8) {
+        // Eight coarse value bands are enough to notice common useful boundaries (text/binary,
+        // low/high-valued binary regions, etc.) without turning the splitter into a compressor.
+        let class = usize::from(byte >> 5);
+        self.recent[class] += 1;
+        self.recent_count += 1;
+    }
+
+    fn observe_match(&mut self, length: usize) {
+        self.recent[8 + usize::from(length >= 16)] += 1;
+        self.recent_count += 1;
+    }
+
+    fn merge_recent(&mut self) {
+        for (old, recent) in self.old.iter_mut().zip(&mut self.recent) {
+            *old += *recent;
+            *recent = 0;
+        }
+        self.old_count += self.recent_count;
+        self.recent_count = 0;
+    }
+
+    /// Start a new block at the previous check while preserving the already-scanned recent chunk as
+    /// the first statistics for that block.
+    fn keep_recent_as_new_block(&mut self) {
+        self.old = self.recent;
+        self.old_count = self.recent_count;
+        self.recent = [0; SPLIT_OBSERVATION_TYPES];
+        self.recent_count = 0;
+    }
+
+    fn distribution_changed(&mut self, block_length: usize) -> bool {
+        if self.old_count != 0 {
+            // Compare the two normalized categorical distributions without division. `total_delta /
+            // (old_count * recent_count)` is their L1 distance, in [0, 2]. Long blocks get a
+            // gradually lower threshold because paying for a fresh Huffman tree becomes easier to
+            // justify as a block grows. The floor prevents low-amplitude noise from fragmenting a
+            // long homogeneous region indefinitely.
+            let mut total_delta = 0u64;
+            for index in 0..SPLIT_OBSERVATION_TYPES {
+                let expected = u64::from(self.old[index]) * u64::from(self.recent_count);
+                let actual = u64::from(self.recent[index]) * u64::from(self.old_count);
+                total_delta += expected.abs_diff(actual);
+            }
+            let denominator = u64::from(self.old_count) * u64::from(self.recent_count);
+            let length_discount = (block_length.min(80_000) / 512) as u64;
+            let threshold_per_mille = 480u64.saturating_sub(length_discount).max(320);
+            if total_delta * 1_000 >= denominator * threshold_per_mille {
+                return true;
+            }
+        }
+        self.merge_recent();
+        false
+    }
+}
+
+/// Pick inexpensive candidate block boundaries before running the expensive exact parser.
+///
+/// The splitter deliberately uses only a one-candidate rolling hash probe. Its job is not to choose
+/// the final token stream; it merely classifies the input into coarse literal / short-match /
+/// long-match observations and looks for distribution changes. Exact match discovery and dynamic
+/// programming happen only after a boundary has been selected.
+pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
+    if input.is_empty() {
+        return core::iter::once(0..0).collect();
+    }
+
+    const HASH_SIZE: usize = 1 << 16;
+    let mut head = vec![usize::MAX; HASH_SIZE];
+    let mut blocks = Vec::new();
+    let mut stats = BlockSplitStats::default();
+    let mut block_start = 0usize;
+    let mut previous_check = None;
+    let mut position = 0usize;
+
+    while position < input.len() {
+        let soft_end = block_start
+            .saturating_add(SOFT_MAX_BLOCK_LENGTH)
+            .min(input.len());
+        // Avoid manufacturing a tiny tail block solely because of the soft maximum. 60K + <5K is
+        // still below DEFLATE's 65,535-byte stored-block limit and our 65,535-token symbol limit.
+        let block_limit = if input.len() - soft_end < MIN_BLOCK_LENGTH {
+            input.len()
+        } else {
+            soft_end
+        };
+
+        if position >= block_limit {
+            blocks.push(block_start..position);
+            block_start = position;
+            stats = BlockSplitStats::default();
+            previous_check = None;
+            continue;
+        }
+
+        let available = STD_MAX_MATCH.min(block_limit - position);
+        let mut match_length = 0usize;
+        if available >= STD_MIN_MATCH && position + 2 < input.len() {
+            let hash = split_hash3(input, position);
+            let candidate = head[hash];
+            if candidate != usize::MAX && position - candidate <= max_distance {
+                match_length = match_compare::common_prefix_len(
+                    &input[position..position + available],
+                    &input[candidate..candidate + available],
+                );
+            }
+        }
+
+        let step = if match_length >= MIN_SPLIT_MATCH {
+            stats.observe_match(match_length);
+            match_length
+        } else {
+            stats.observe_literal(input[position]);
+            1
+        };
+
+        let next = position + step;
+        // Even bytes skipped by the splitter's cheap greedy observation become valid history for
+        // later probes. This keeps boundary detection stable without doing a full match search.
+        for inserted in position..next {
+            if inserted + 2 < input.len() {
+                head[split_hash3(input, inserted)] = inserted;
+            }
+        }
+        position = next;
+
+        if position >= block_limit {
+            continue;
+        }
+        if stats.recent_count < OBSERVATIONS_PER_CHECK
+            || position - block_start < MIN_BLOCK_LENGTH
+            || input.len() - position < MIN_BLOCK_LENGTH
+        {
+            continue;
+        }
+
+        if stats.distribution_changed(position - block_start) {
+            if let Some(boundary) = previous_check {
+                debug_assert!(boundary > block_start);
+                blocks.push(block_start..boundary);
+                block_start = boundary;
+                stats.keep_recent_as_new_block();
+            } else {
+                blocks.push(block_start..position);
+                block_start = position;
+                stats = BlockSplitStats::default();
+            }
+            previous_check = None;
+        } else {
+            previous_check = Some(position);
+        }
+    }
+
+    if block_start < input.len() {
+        blocks.push(block_start..input.len());
+    }
+    debug_assert!(!blocks.is_empty());
+    debug_assert_eq!(blocks[0].start, 0);
+    debug_assert_eq!(blocks.last().unwrap().end, input.len());
+    debug_assert!(blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
+    debug_assert!(blocks.iter().all(|block| block.len() <= u16::MAX as usize));
+    blocks
+}
+
+#[inline]
+fn split_hash3(input: &[u8], position: usize) -> usize {
+    debug_assert!(position + 2 < input.len());
+    let value = u32::from(input[position])
+        | (u32::from(input[position + 1]) << 8)
+        | (u32::from(input[position + 2]) << 16);
+    (value.wrapping_mul(2_654_435_761) >> 16) as usize
+}
+
 /// Minimum-token-cost parse for one already-selected block.
 ///
-/// The implementation is deliberately straightforward for the first correctness checkpoint: for
-/// each position it derives the cheapest distance choice capable of every length 3..=258 and relaxes
-/// those endpoints. The candidate representation is the durable API; this O(258*n) dynamic program
-/// can be replaced independently with a range-minimum implementation once its semantics are locked.
+/// `block` may start after a history prefix in `input`; candidates in the block may therefore refer
+/// to matches before `block.start`, which is exactly what multi-block DEFLATE needs. The dynamic
+/// program itself is local to the selected block and never crosses its end.
+#[cfg(test)]
 pub(crate) fn parse_block(
     input: &[u8],
     candidates: &MatchCandidates,
     costs: TokenCosts,
 ) -> ParseResult {
+    parse_range(input, candidates, 0..input.len(), costs)
+}
+
+pub(crate) fn parse_range(
+    input: &[u8],
+    candidates: &MatchCandidates,
+    block: Range<usize>,
+    costs: TokenCosts,
+) -> ParseResult {
     assert_eq!(candidates.len_for_parse(), input.len());
+    assert!(block.start <= block.end && block.end <= input.len());
 
     const INF: u64 = u64::MAX / 4;
-    let mut best_cost = vec![INF; input.len() + 1];
-    let mut steps = vec![None; input.len() + 1];
+    let block_len = block.len();
+    let mut best_cost = vec![INF; block_len + 1];
+    let mut steps = vec![None; block_len + 1];
     best_cost[0] = 0;
 
-    for position in 0..input.len() {
-        let prefix_cost = best_cost[position];
+    for local_position in 0..block_len {
+        let position = block.start + local_position;
+        let prefix_cost = best_cost[local_position];
         debug_assert_ne!(prefix_cost, INF);
 
         relax(
             &mut best_cost,
             &mut steps,
-            position + 1,
+            local_position + 1,
             prefix_cost + costs.literal_bits(input[position]),
             ParseStep {
-                previous: position,
+                previous: local_position,
                 token: ParseToken::Literal(input[position]),
             },
         );
 
-        let available = STD_MAX_MATCH.min(input.len() - position);
+        let available = STD_MAX_MATCH.min(block.end - position);
         if available < STD_MIN_MATCH {
             continue;
         }
@@ -361,10 +562,10 @@ pub(crate) fn parse_block(
             relax(
                 &mut best_cost,
                 &mut steps,
-                position + length,
+                local_position + length,
                 prefix_cost + token_cost,
                 ParseStep {
-                    previous: position,
+                    previous: local_position,
                     token: ParseToken::Match {
                         length: length as u16,
                         distance,
@@ -375,7 +576,7 @@ pub(crate) fn parse_block(
     }
 
     let mut tokens = Vec::new();
-    let mut cursor = input.len();
+    let mut cursor = block_len;
     while cursor != 0 {
         let step = steps[cursor].expect("every reachable endpoint has a predecessor");
         tokens.push(step.token);
@@ -385,10 +586,10 @@ pub(crate) fn parse_block(
 
     debug_assert_eq!(
         tokens.iter().map(|token| token.input_len()).sum::<usize>(),
-        input.len()
+        block_len
     );
     ParseResult {
-        cost_bits: best_cost[input.len()],
+        cost_bits: best_cost[block_len],
         tokens,
     }
 }
@@ -549,6 +750,78 @@ mod tests {
         }
     }
 
+    pub(super) fn two_distribution_input() -> Vec<u8> {
+        let mut state = 0x8f6e_37a1_4c92_d5b7u64;
+        let mut input = Vec::with_capacity(24_000);
+        for _ in 0..12_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            input.push(b'a' + ((state >> 32) as u8 % 26));
+        }
+        for _ in 0..12_000 {
+            state = state
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            input.push(0x80 | ((state >> 32) as u8 & 0x7f));
+        }
+        input
+    }
+
+    #[test]
+    fn splitter_detects_distribution_change_and_preserves_block_invariants() {
+        let input = two_distribution_input();
+        let blocks = choose_block_ranges(&input, 32_506);
+        assert!(
+            blocks.len() >= 2,
+            "expected a split near the data transition: {blocks:?}"
+        );
+        let first_boundary = blocks[0].end;
+        assert!(
+            (9_000..=15_000).contains(&first_boundary),
+            "unexpected first boundary {first_boundary}: {blocks:?}"
+        );
+        assert_eq!(blocks[0].start, 0);
+        assert_eq!(blocks.last().unwrap().end, input.len());
+        assert!(blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(blocks.iter().all(|block| block.len() <= MAX_BLOCK_INPUT));
+    }
+
+    #[test]
+    fn splitter_soft_limit_never_creates_an_illegal_or_tiny_tail() {
+        let input = vec![0x5a; 150_000];
+        let blocks = choose_block_ranges(&input, 32_506);
+        assert_eq!(blocks[0].start, 0);
+        assert_eq!(blocks.last().unwrap().end, input.len());
+        assert!(blocks.iter().all(|block| block.len() <= MAX_BLOCK_INPUT));
+        assert!(blocks
+            .iter()
+            .take(blocks.len() - 1)
+            .all(|block| block.len() >= MIN_BLOCK_LENGTH));
+        assert!(blocks.last().unwrap().len() >= MIN_BLOCK_LENGTH);
+    }
+
+    #[test]
+    fn range_parse_can_reference_history_before_the_block() {
+        let mut state = 0x517c_c1b7_2722_0a95u64;
+        let mut history = vec![0u8; 6_000];
+        for byte in &mut history {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = (state >> 24) as u8;
+        }
+        let mut input = history.clone();
+        input.extend_from_slice(&history);
+        let table = build_match_candidates(&input, 32_506);
+        let parsed = parse_range(&input, &table, 6_000..12_000, TokenCosts::fixed());
+        assert!(matches!(
+            parsed.tokens.first(),
+            Some(ParseToken::Match { length, distance })
+                if *length >= 32 && *distance == 6_000
+        ));
+    }
+
     #[test]
     fn minimum_cost_parse_matches_exhaustive_oracle() {
         let input = b"abcabcabcxabcaabcabcabc---abcabc";
@@ -579,30 +852,29 @@ mod tests {
     }
 }
 
-/// The default memLevel=8 symbol buffer has 16,384 entries, with one entry reserved by the
-/// ordinary block producer before it requests a flush. Keeping this first complete-buffer path to
-/// one such block lets us measure the parser without inventing a second block-splitting policy yet.
-pub(crate) const ONE_BLOCK_MAX_INPUT: usize = (1usize << (super::DEF_MEM_LEVEL as usize + 6)) - 1;
+/// Private near-optimal states use all 65,536 symbol slots supported by the existing tree
+/// frequency representation. One slot remains reserved by `SymBuf`, so a block may contain at most
+/// 65,535 tokens; keeping the byte length at or below the same value also preserves stored-block
+/// fallback through the production encoder.
+pub(crate) const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
+pub(crate) const MAX_BLOCK_INPUT: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 1;
 
-/// Reparse a block using code lengths learned from the previous parse.
-///
-/// A symbol absent from the previous parse falls back to its fixed-Huffman length rather than zero;
-/// this keeps every legal transition available and prevents an iteration from assigning imaginary
-/// zero-cost codes to symbols that simply were not used last time.
-pub(crate) fn refined_parse(
+/// Reparse one selected block using code lengths learned from the previous parse.
+pub(crate) fn refined_parse_range(
     state: &mut super::State<'_>,
     input: &[u8],
     candidates: &MatchCandidates,
+    block: Range<usize>,
     refinement_passes: usize,
 ) -> ParseResult {
     let mut costs = TokenCosts::fixed();
-    let mut parsed = parse_block(input, candidates, costs);
+    let mut parsed = parse_range(input, candidates, block.clone(), costs);
 
     for _ in 0..refinement_passes {
         tally_tokens(state, &parsed.tokens);
         costs = dynamic_costs_from_tallied_block(state);
         state.init_block();
-        parsed = parse_block(input, candidates, costs);
+        parsed = parse_range(input, candidates, block.clone(), costs);
     }
 
     parsed
@@ -646,18 +918,18 @@ fn dynamic_costs_from_tallied_block(state: &mut super::State<'_>) -> TokenCosts 
 
     let fixed = TokenCosts::fixed();
     let mut costs = fixed;
-    for index in 0..256 {
-        if literal_used[index] {
+    for (index, &used) in literal_used.iter().enumerate() {
+        if used {
             costs.literal[index] = state.l_desc.dyn_tree[index].len() as u8;
         }
     }
-    for index in 0..LENGTH_CODES {
-        if length_used[index] {
+    for (index, &used) in length_used.iter().enumerate() {
+        if used {
             costs.length[index] = state.l_desc.dyn_tree[257 + index].len() as u8;
         }
     }
-    for index in 0..D_CODES {
-        if distance_used[index] {
+    for (index, &used) in distance_used.iter().enumerate() {
+        if used {
             costs.distance[index] = state.d_desc.dyn_tree[index].len() as u8;
         }
     }
@@ -674,11 +946,31 @@ mod encoded_tests {
     };
 
     #[test]
-    fn one_block_compressor_round_trips_with_refined_costs() {
+    fn near_optimal_compressor_round_trips_with_refined_costs() {
         let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
         let mut compressed = vec![0u8; compress_bound(input.len())];
         let (compressed, code) =
-            super::super::compress_slice_near_optimal_block(&mut compressed, input, 1);
+            super::super::compress_slice_near_optimal(&mut compressed, input, 1);
+        assert_eq!(code, ReturnCode::Ok);
+
+        let mut decoded = vec![0u8; input.len()];
+        let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn adaptive_multi_block_stream_round_trips() {
+        let input = super::tests::two_distribution_input();
+        let blocks = choose_block_ranges(&input, 32_506);
+        assert!(
+            blocks.len() >= 2,
+            "test input must exercise multiple blocks"
+        );
+
+        let mut compressed = vec![0u8; compress_bound(input.len())];
+        let (compressed, code) =
+            super::super::compress_slice_near_optimal(&mut compressed, &input, 1);
         assert_eq!(code, ReturnCode::Ok);
 
         let mut decoded = vec![0u8; input.len()];

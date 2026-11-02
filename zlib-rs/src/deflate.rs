@@ -708,6 +708,14 @@ impl Default for DeflateConfig {
 }
 
 pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
+    init_with_lit_bufsize(stream, config, None)
+}
+
+fn init_with_lit_bufsize(
+    stream: &mut z_stream,
+    config: DeflateConfig,
+    lit_bufsize_override: Option<usize>,
+) -> ReturnCode {
     let DeflateConfig {
         mut level,
         method: _,
@@ -776,7 +784,14 @@ pub fn init(stream: &mut z_stream, config: DeflateConfig) -> ReturnCode {
         _marker: PhantomData,
     };
 
-    let lit_bufsize = 1 << (mem_level + 6); // 16K elements by default
+    let lit_bufsize = lit_bufsize_override.unwrap_or(1 << (mem_level + 6));
+    // The state representation and 16-bit frequency counters support at most 64K symbol slots.
+    // Ordinary zlib-compatible initialization reaches at most 32K (memLevel=9); the experimental
+    // near-optimal complete-buffer path uses the full 64K allocation so block boundaries can be
+    // chosen independently of the public memLevel buffering policy.
+    if lit_bufsize == 0 || lit_bufsize > (1 << 16) {
+        return ReturnCode::StreamError;
+    }
     let allocs = DeflateAllocOffsets::new(window_bits, lit_bufsize);
     let Some(state_allocation) = allocs.allocate_state(
         &alloc,
@@ -3206,23 +3221,44 @@ pub(crate) fn drain_pending_output(
     }
 }
 
-/// Experimental complete-buffer near-optimal compressor for one symbol-buffer-sized block.
-///
-/// This is intentionally available only through the `__internal-api` feature while the parser and
-/// block splitter are being developed. It emits a normal zlib-wrapped DEFLATE stream and reuses the
-/// production tree builder/bit writer; only token selection is new.
+/// Drain all complete bytes currently produced by the complete-buffer near-optimal path while
+/// preserving any sub-byte DEFLATE prefix for the next block.
 #[cfg(any(test, feature = "__internal-api"))]
-pub fn compress_slice_near_optimal_block<'a>(
+fn drain_near_optimal_pending(
+    state: &mut State<'_>,
+    output: &mut [u8],
+    produced: &mut usize,
+) -> bool {
+    state.bit_writer.flush_bits();
+    let pending = state.bit_writer.pending.pending();
+    let remaining = output.len().saturating_sub(*produced);
+    if pending.len() > remaining {
+        return false;
+    }
+    let len = pending.len();
+    output[*produced..*produced + len].copy_from_slice(pending);
+    state.bit_writer.pending.advance(len);
+    *produced += len;
+    true
+}
+
+/// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
+///
+/// This remains behind `__internal-api` while the cost model and splitter are being developed. It
+/// emits a normal zlib-wrapped DEFLATE stream, keeps LZ77 history across Huffman block boundaries,
+/// and reuses the production tree builder / stored-static-dynamic block chooser / bit writer.
+#[cfg(any(test, feature = "__internal-api"))]
+pub fn compress_slice_near_optimal<'a>(
     output: &'a mut [u8],
     input: &[u8],
     refinement_passes: usize,
 ) -> (&'a mut [u8], ReturnCode) {
-    if input.len() > near_optimal::ONE_BLOCK_MAX_INPUT {
-        return (&mut output[..0], ReturnCode::StreamError);
-    }
-
     let mut raw = z_stream::default();
-    let init_result = init(&mut raw, DeflateConfig::new(9));
+    let init_result = init_with_lit_bufsize(
+        &mut raw,
+        DeflateConfig::new(9),
+        Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
+    );
     if init_result != ReturnCode::Ok {
         return (&mut output[..0], init_result);
     }
@@ -3231,42 +3267,69 @@ pub fn compress_slice_near_optimal_block<'a>(
         let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }
             .expect("successful deflate init creates typed state");
         let state = &mut *stream.state;
+        let max_distance = state.max_dist();
+        let blocks = near_optimal::choose_block_ranges(input, max_distance);
+        debug_assert!(blocks
+            .iter()
+            .all(|block| block.len() <= near_optimal::MAX_BLOCK_INPUT));
 
-        let candidates = near_optimal::build_match_candidates(input, state.max_dist());
-        let parsed = near_optimal::refined_parse(state, input, &candidates, refinement_passes);
+        // Emit the wrapper while strstart still describes the true initial state. Moving this after
+        // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
+        state
+            .bit_writer
+            .pending
+            .extend(&state.header().to_be_bytes());
+        let mut produced = 0usize;
+        let mut ok = drain_near_optimal_pending(state, output, &mut produced);
 
-        // `refined_parse` leaves an empty initialized block after its final cost-model pass.
-        near_optimal::tally_tokens(state, &parsed.tokens);
+        for (block_index, block) in blocks.iter().enumerate() {
+            if !ok {
+                break;
+            }
 
-        // Preserve the original bytes so the production block chooser may still select a stored
-        // block when that is smaller than either Huffman encoding.
-        if !input.is_empty() {
-            // SAFETY: `input` is readable for exactly input.len() bytes, the freshly allocated
-            // window is uniquely owned by this state, and the one-block limit is well below its
-            // 64 KiB backing allocation.
-            unsafe {
-                state
-                    .window
-                    .copy_and_initialize(0..input.len(), input.as_ptr())
-            };
+            let history_start = block.start.saturating_sub(max_distance);
+            let context = &input[history_start..block.end];
+            let local_block = (block.start - history_start)..(block.end - history_start);
+            let candidates = near_optimal::build_match_candidates(context, max_distance);
+            let parsed = near_optimal::refined_parse_range(
+                state,
+                context,
+                &candidates,
+                local_block,
+                refinement_passes,
+            );
+
+            // `refined_parse_range` leaves an empty initialized block after its final cost-model
+            // pass. Tally the chosen path into the ordinary production trees and symbol buffer.
+            near_optimal::tally_tokens(state, &parsed.tokens);
+
+            // The production block chooser can still select a stored block. Only the current block
+            // bytes are needed for that fallback; LZ77 history lives in the candidate table, not in
+            // this temporary encoder window.
+            state.window.clear();
+            if !block.is_empty() {
+                // SAFETY: this exact block slice is initialized and readable, the state owns its
+                // window uniquely, and choose_block_ranges caps blocks below the 64 KiB allocation.
+                unsafe {
+                    state
+                        .window
+                        .copy_and_initialize(0..block.len(), input[block.clone()].as_ptr())
+                };
+            }
+
+            state.block_start = 0;
+            state.strstart = block.len();
+            state.lookahead = 0;
+            state.encode_block(block_index + 1 == blocks.len());
+            ok = drain_near_optimal_pending(state, output, &mut produced);
         }
-        let header = state.header().to_be_bytes();
-        state.bit_writer.pending.extend(&header);
 
-        state.block_start = 0;
-        state.strstart = input.len();
-        state.lookahead = 0;
-        state.encode_block(true);
-        let checksum = adler32(ADLER32_INITIAL_VALUE as u32, input);
-        state.bit_writer.pending.extend(&checksum.to_be_bytes());
-
-        let pending = state.bit_writer.pending.pending();
-        if pending.len() > output.len() {
-            None
-        } else {
-            output[..pending.len()].copy_from_slice(pending);
-            Some(pending.len())
+        if ok {
+            let checksum = adler32(ADLER32_INITIAL_VALUE as u32, input);
+            state.bit_writer.pending.extend(&checksum.to_be_bytes());
+            ok = drain_near_optimal_pending(state, output, &mut produced);
         }
+        ok.then_some(produced)
     };
 
     if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut raw) } {
