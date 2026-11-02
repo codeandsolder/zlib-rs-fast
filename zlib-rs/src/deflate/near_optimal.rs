@@ -883,6 +883,21 @@ pub(crate) fn parse_range(
         let code = State::d_code(distance - 1) as usize;
         *cost = costs.distance[code] + u16::from(StaticTreeDesc::EXTRA_DBITS[code]) * COST_SCALE;
     }
+    // One candidate can become newly capable at each maximum match length. Keep the sparse values
+    // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
+    // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
+    #[derive(Clone, Copy)]
+    struct DistanceAtMax {
+        generation: u32,
+        cost: u16,
+        distance: u16,
+    }
+    assert!(block_len <= u32::MAX as usize);
+    let mut distance_cost_at_max = [DistanceAtMax {
+        generation: 0,
+        cost: 0,
+        distance: 0,
+    }; STD_MAX_MATCH + 1];
     best_cost[0] = 0;
 
     for local_position in 0..block_len {
@@ -906,22 +921,27 @@ pub(crate) fn parse_range(
             continue;
         }
 
-        let mut distance_cost_at_max = [None::<(u16, u16)>; STD_MAX_MATCH + 1];
+        let generation = (local_position + 1) as u32;
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
             let cost = distance_costs[usize::from(candidate.distance)];
             let slot = &mut distance_cost_at_max[max_len];
-            if slot.is_none_or(|(old, _)| cost < old) {
-                *slot = Some((cost, candidate.distance));
+            if slot.generation != generation || cost < slot.cost {
+                *slot = DistanceAtMax {
+                    generation,
+                    cost,
+                    distance: candidate.distance,
+                };
             }
         }
 
         let mut cheapest_capable = None::<(u16, u16)>;
         for length in (STD_MIN_MATCH..=available).rev() {
-            if let Some(candidate) = distance_cost_at_max[length] {
-                if cheapest_capable.is_none_or(|(old, _)| candidate.0 < old) {
-                    cheapest_capable = Some(candidate);
-                }
+            let candidate = distance_cost_at_max[length];
+            if candidate.generation == generation
+                && cheapest_capable.is_none_or(|(old, _)| candidate.cost < old)
+            {
+                cheapest_capable = Some((candidate.cost, candidate.distance));
             }
             let Some((distance_cost, distance)) = cheapest_capable else {
                 continue;
