@@ -3315,14 +3315,21 @@ pub fn compress_slice_near_optimal<'a>(
 
         let mut ranges = ranges.into_iter();
         let mut current = ranges.next().map(|range| {
-            near_optimal::parse_planned_block(state, input, range, max_distance, refinement_passes)
+            near_optimal::parse_planned_block_source(
+                state,
+                input,
+                range,
+                max_distance,
+                refinement_passes,
+            )
+            .into_block()
         });
 
         for range in ranges {
             if !ok {
                 break;
             }
-            let mut next = near_optimal::parse_planned_block(
+            let mut next = near_optimal::parse_planned_block_source(
                 state,
                 input,
                 range,
@@ -3332,12 +3339,18 @@ pub fn compress_slice_near_optimal<'a>(
             let current_block = current
                 .as_mut()
                 .expect("the splitter always returns at least one block");
-            if let Some(merged) = near_optimal::try_merge_token_blocks(state, current_block, &next)
-            {
-                current = Some(merged);
-                continue;
+            match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
+                near_optimal::BoundaryOptimization::Merged(merged) => {
+                    next.block = merged;
+                    let _ = next.reparse_with_existing_candidates(state, input, refinement_passes);
+                    current = Some(next.into_block());
+                    continue;
+                }
+                near_optimal::BoundaryOptimization::Shifted => {
+                    let _ = next.reparse_with_existing_candidates(state, input, refinement_passes);
+                }
+                near_optimal::BoundaryOptimization::Unchanged => {}
             }
-            near_optimal::optimize_token_boundary(state, current_block, &mut next);
             ok = emit_planned_near_optimal_block(
                 state,
                 input,
@@ -3346,7 +3359,7 @@ pub fn compress_slice_near_optimal<'a>(
                 output,
                 &mut produced,
             );
-            current = Some(next);
+            current = Some(next.into_block());
         }
 
         if ok {

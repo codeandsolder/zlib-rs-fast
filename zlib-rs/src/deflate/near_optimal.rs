@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use super::{
-    match_compare, trees_tbl, State, StaticTreeDesc, D_CODES, LENGTH_CODES, STD_MAX_MATCH,
+    match_compare, trees_tbl, State, StaticTreeDesc, D_CODES, LENGTH_CODES, L_CODES, STD_MAX_MATCH,
     STD_MIN_MATCH,
 };
 
@@ -1107,6 +1107,99 @@ struct BlockScore {
     encoded_bytes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenHistogram {
+    literal_length: [u16; L_CODES],
+    distance: [u16; D_CODES],
+}
+
+impl TokenHistogram {
+    fn empty() -> Self {
+        let mut literal_length = [0; L_CODES];
+        literal_length[256] = 1;
+        Self {
+            literal_length,
+            distance: [0; D_CODES],
+        }
+    }
+
+    fn from_tokens(tokens: &[ParseToken]) -> Self {
+        let mut histogram = Self::empty();
+        for &token in tokens {
+            histogram.add_token(token);
+        }
+        histogram
+    }
+
+    fn add_token(&mut self, token: ParseToken) {
+        let (literal_length, distance) = Self::token_bins(token);
+        self.literal_length[literal_length] = self.literal_length[literal_length]
+            .checked_add(1)
+            .expect("near-optimal block symbol frequency fits u16");
+        if let Some(distance) = distance {
+            self.distance[distance] = self.distance[distance]
+                .checked_add(1)
+                .expect("near-optimal block distance frequency fits u16");
+        }
+    }
+
+    fn remove_token(&mut self, token: ParseToken) {
+        let (literal_length, distance) = Self::token_bins(token);
+        debug_assert_ne!(self.literal_length[literal_length], 0);
+        self.literal_length[literal_length] -= 1;
+        if let Some(distance) = distance {
+            debug_assert_ne!(self.distance[distance], 0);
+            self.distance[distance] -= 1;
+        }
+    }
+
+    fn token_bins(token: ParseToken) -> (usize, Option<usize>) {
+        match token {
+            ParseToken::Literal(byte) => (usize::from(byte), None),
+            ParseToken::Match { length, distance } => {
+                let length_code =
+                    trees_tbl::LENGTH_CODE[usize::from(length) - STD_MIN_MATCH] as usize;
+                let distance_code = State::d_code(usize::from(distance) - 1) as usize;
+                (257 + length_code, Some(distance_code))
+            }
+        }
+    }
+
+    fn merged(left: &Self, right: &Self) -> Self {
+        let mut merged = left.clone();
+        for index in 0..L_CODES {
+            if index == 256 {
+                continue;
+            }
+            merged.literal_length[index] = merged.literal_length[index]
+                .checked_add(right.literal_length[index])
+                .expect("merged near-optimal block symbol frequency fits u16");
+        }
+        for index in 0..D_CODES {
+            merged.distance[index] = merged.distance[index]
+                .checked_add(right.distance[index])
+                .expect("merged near-optimal block distance frequency fits u16");
+        }
+        merged
+    }
+
+    fn apply_to_state(&self, state: &mut super::State<'_>) {
+        state.init_block();
+        for (value, &frequency) in state.l_desc.dyn_tree[..L_CODES]
+            .iter_mut()
+            .zip(&self.literal_length)
+        {
+            *value.freq_mut() = frequency;
+        }
+        for (value, &frequency) in state.d_desc.dyn_tree[..D_CODES]
+            .iter_mut()
+            .zip(&self.distance)
+        {
+            *value.freq_mut() = frequency;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedBlock {
     pub(crate) range: Range<usize>,
@@ -1120,6 +1213,65 @@ impl PlannedBlock {
 
     fn token_input_len(&self) -> usize {
         self.tokens.iter().map(|token| token.input_len()).sum()
+    }
+}
+
+pub(crate) struct PlannedBlockSource {
+    pub(crate) block: PlannedBlock,
+    context_start: usize,
+    context_end: usize,
+    candidates: MatchCandidates,
+}
+
+impl PlannedBlockSource {
+    pub(crate) fn into_block(self) -> PlannedBlock {
+        self.block
+    }
+
+    /// Re-run only the minimum-cost parser after a boundary change. The exact match frontier built
+    /// for the original right-hand block already covers up to `max_distance` bytes of preceding
+    /// history, so most leftward shifts and every rightward shift need no new match discovery.
+    pub(crate) fn reparse_with_existing_candidates(
+        &mut self,
+        state: &mut super::State<'_>,
+        input: &[u8],
+        refinement_passes: usize,
+    ) -> bool {
+        if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
+            return false;
+        }
+
+        if refinement_passes == 0 {
+            return false;
+        }
+
+        let context = &input[self.context_start..self.context_end];
+        let local_range = (self.block.range.start - self.context_start)..context.len();
+        let (mut costs, mut best_score) = costs_and_block_score(state, &self.block.tokens);
+        let mut current_tokens = self.block.tokens.clone();
+        let mut best_tokens = None;
+
+        for _ in 0..refinement_passes {
+            let reparsed = parse_range(context, &self.candidates, local_range.clone(), costs);
+            let (next_costs, reparsed_score) = costs_and_block_score(state, &reparsed.tokens);
+            if reparsed_score.bits < best_score.bits {
+                best_score = reparsed_score;
+                best_tokens = Some(reparsed.tokens.clone());
+            }
+            if reparsed.tokens == current_tokens {
+                break;
+            }
+            current_tokens = reparsed.tokens;
+            costs = next_costs;
+        }
+
+        if let Some(tokens) = best_tokens {
+            self.block.tokens = tokens;
+            debug_assert_eq!(self.block.token_input_len(), self.block.range.len());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1177,16 +1329,23 @@ fn costs_and_block_score(
     state: &mut super::State<'_>,
     tokens: &[ParseToken],
 ) -> (TokenCosts, BlockScore) {
-    state.init_block();
-    tally_tokens(state, tokens);
+    let histogram = TokenHistogram::from_tokens(tokens);
+    costs_and_block_score_from_histogram(state, &histogram)
+}
+
+fn costs_and_block_score_from_histogram(
+    state: &mut super::State<'_>,
+    histogram: &TokenHistogram,
+) -> (TokenCosts, BlockScore) {
+    histogram.apply_to_state(state);
 
     let literal_used =
-        core::array::from_fn::<_, 256, _>(|index| state.l_desc.dyn_tree[index].freq() != 0);
+        core::array::from_fn::<_, 256, _>(|index| histogram.literal_length[index] != 0);
     let length_used = core::array::from_fn::<_, LENGTH_CODES, _>(|index| {
-        state.l_desc.dyn_tree[257 + index].freq() != 0
+        histogram.literal_length[257 + index] != 0
     });
     let distance_used =
-        core::array::from_fn::<_, D_CODES, _>(|index| state.d_desc.dyn_tree[index].freq() != 0);
+        core::array::from_fn::<_, D_CODES, _>(|index| histogram.distance[index] != 0);
 
     {
         let mut tree = super::TreeDesc::EMPTY;
@@ -1241,12 +1400,12 @@ fn costs_and_block_score(
     (costs, score)
 }
 
-fn compressed_score(
+fn compressed_histogram_score(
     state: &mut super::State<'_>,
-    tokens: &[ParseToken],
+    histogram: &TokenHistogram,
     input_len: usize,
 ) -> Option<(TokenCosts, BlockScore)> {
-    let (costs, score) = costs_and_block_score(state, tokens);
+    let (costs, score) = costs_and_block_score_from_histogram(state, histogram);
     // Stored blocks byte-align before their payload, so their exact cost depends on the preceding
     // block's residual bit count. Boundary optimization is intentionally limited to pairs for which
     // production would choose a Huffman-coded representation; stored-block regions keep the cheap
@@ -1254,19 +1413,69 @@ fn compressed_score(
     (input_len + 4 > score.encoded_bytes).then_some((costs, score))
 }
 
-fn best_fixed_cost_shift(
+const EXACT_BOUNDARY_CANDIDATES: usize = 4;
+const BOUNDARY_CANDIDATE_SEPARATION: usize = 256;
+
+#[derive(Clone, Debug)]
+struct BoundaryCandidate {
+    delta: i64,
+    shift: isize,
+    left_histogram: TokenHistogram,
+    right_histogram: TokenHistogram,
+}
+
+fn consider_shift_candidate(
+    candidates: &mut Vec<BoundaryCandidate>,
+    delta: i64,
+    shift: isize,
+    left_histogram: &TokenHistogram,
+    right_histogram: &TokenHistogram,
+) {
+    if delta >= 0 || shift == 0 {
+        return;
+    }
+
+    if let Some(existing) = candidates.iter_mut().find(|candidate| {
+        candidate.shift.signum() == shift.signum()
+            && candidate.shift.abs_diff(shift) < BOUNDARY_CANDIDATE_SEPARATION
+    }) {
+        if delta < existing.delta {
+            *existing = BoundaryCandidate {
+                delta,
+                shift,
+                left_histogram: left_histogram.clone(),
+                right_histogram: right_histogram.clone(),
+            };
+        }
+    } else {
+        candidates.push(BoundaryCandidate {
+            delta,
+            shift,
+            left_histogram: left_histogram.clone(),
+            right_histogram: right_histogram.clone(),
+        });
+    }
+
+    candidates.sort_unstable_by_key(|candidate| candidate.delta);
+    candidates.truncate(EXACT_BOUNDARY_CANDIDATES);
+}
+
+fn fixed_cost_shift_candidates(
     left: &PlannedBlock,
     right: &PlannedBlock,
     left_costs: TokenCosts,
     right_costs: TokenCosts,
-) -> isize {
+    left_histogram: &TokenHistogram,
+    right_histogram: &TokenHistogram,
+) -> Vec<BoundaryCandidate> {
     debug_assert_eq!(left.range.end, right.range.start);
-    let mut best_delta = 0i64;
-    let mut best_shift = 0isize;
+    let mut candidates = Vec::with_capacity(EXACT_BOUNDARY_CANDIDATES);
 
     // Positive shift: move a prefix of the right block into the left block.
     let mut moved = 0usize;
     let mut delta = 0i64;
+    let mut shifted_left = left_histogram.clone();
+    let mut shifted_right = right_histogram.clone();
     for &token in &right.tokens {
         moved += token.input_len();
         if left.input_len() + moved > MAX_BLOCK_INPUT
@@ -1275,15 +1484,22 @@ fn best_fixed_cost_shift(
             break;
         }
         delta += left_costs.token_bits(token) as i64 - right_costs.token_bits(token) as i64;
-        if delta < best_delta {
-            best_delta = delta;
-            best_shift = moved as isize;
-        }
+        shifted_left.add_token(token);
+        shifted_right.remove_token(token);
+        consider_shift_candidate(
+            &mut candidates,
+            delta,
+            moved as isize,
+            &shifted_left,
+            &shifted_right,
+        );
     }
 
     // Negative shift: move a suffix of the left block into the right block.
     moved = 0;
     delta = 0;
+    shifted_left = left_histogram.clone();
+    shifted_right = right_histogram.clone();
     for &token in left.tokens.iter().rev() {
         moved += token.input_len();
         if right.input_len() + moved > MAX_BLOCK_INPUT
@@ -1292,13 +1508,19 @@ fn best_fixed_cost_shift(
             break;
         }
         delta += right_costs.token_bits(token) as i64 - left_costs.token_bits(token) as i64;
-        if delta < best_delta {
-            best_delta = delta;
-            best_shift = -(moved as isize);
-        }
+        shifted_left.remove_token(token);
+        shifted_right.add_token(token);
+        consider_shift_candidate(
+            &mut candidates,
+            delta,
+            -(moved as isize),
+            &shifted_left,
+            &shifted_right,
+        );
     }
 
-    best_shift
+    candidates.sort_unstable_by_key(|candidate| candidate.delta);
+    candidates
 }
 
 fn shifted_tokens(
@@ -1332,101 +1554,133 @@ fn shifted_tokens(
     }
 }
 
-/// Remove an unnecessary coarse splitter boundary when the two existing token streams fit in one
-/// legal block and the production Huffman scorer proves that one tree is cheaper than two.
-pub(crate) fn try_merge_token_blocks(
-    state: &mut super::State<'_>,
-    left: &PlannedBlock,
-    right: &PlannedBlock,
-) -> Option<PlannedBlock> {
-    debug_assert_eq!(left.range.end, right.range.start);
-    let merged_len = left.input_len() + right.input_len();
-    if merged_len > MAX_BLOCK_INPUT {
-        return None;
-    }
-
-    let (_, left_score) = compressed_score(state, &left.tokens, left.input_len())?;
-    let (_, right_score) = compressed_score(state, &right.tokens, right.input_len())?;
-    let mut tokens = left.tokens.clone();
-    tokens.extend_from_slice(&right.tokens);
-    let (_, merged_score) = compressed_score(state, &tokens, merged_len)?;
-    if merged_score.bits >= left_score.bits + right_score.bits {
-        return None;
-    }
-
-    let merged = PlannedBlock {
-        range: left.range.start..right.range.end,
-        tokens,
-    };
-    debug_assert_eq!(merged.token_input_len(), merged.range.len());
-    Some(merged)
+#[derive(Clone, Debug)]
+pub(crate) enum BoundaryOptimization {
+    Unchanged,
+    Shifted,
+    Merged(PlannedBlock),
 }
 
-/// Improve Huffman block boundaries without rerunning match discovery or the minimum-cost parser.
+/// Choose the cheapest local Huffman partition for two adjacent parsed blocks.
 ///
-/// The parser's token stream is already valid across Huffman block boundaries: matches in a later
-/// block may refer to the full previous 32 KiB history. Therefore an existing whole token can move
-/// to the adjacent block without changing LZ77 semantics. We use the two blocks' current Huffman
-/// code lengths to find the most promising direction/amount in O(tokens), then accept that single
-/// proposal only if rebuilding both production trees proves an actual bit-cost improvement.
-pub(crate) fn optimize_token_boundary(
+/// Frozen code lengths cheaply nominate up to four distinct boundary shifts. Those shifts and the
+/// optional one-block merge are all rescored by rebuilding the production Huffman trees, then the
+/// single cheapest of unchanged / shifted / merged is applied. Match discovery and token parsing are
+/// deliberately not repeated here; a caller may use the retained right-hand candidate table for a
+/// follow-up DP-only reparse after the partition changes.
+pub(crate) fn optimize_token_partition(
     state: &mut super::State<'_>,
     left: &mut PlannedBlock,
     right: &mut PlannedBlock,
-) {
+) -> BoundaryOptimization {
     debug_assert_eq!(left.range.end, right.range.start);
 
-    let Some((left_costs, left_score)) = compressed_score(state, &left.tokens, left.input_len())
+    let left_histogram = TokenHistogram::from_tokens(&left.tokens);
+    let right_histogram = TokenHistogram::from_tokens(&right.tokens);
+    let Some((left_costs, left_score)) =
+        compressed_histogram_score(state, &left_histogram, left.input_len())
     else {
-        return;
+        return BoundaryOptimization::Unchanged;
     };
     let Some((right_costs, right_score)) =
-        compressed_score(state, &right.tokens, right.input_len())
+        compressed_histogram_score(state, &right_histogram, right.input_len())
     else {
-        return;
+        return BoundaryOptimization::Unchanged;
     };
 
-    let shift = best_fixed_cost_shift(left, right, left_costs, right_costs);
-    if shift == 0 {
-        return;
+    let mut best_total_bits = left_score.bits + right_score.bits;
+    let mut best_shift = None;
+    let mut merge_is_best = false;
+
+    let merged_len = left.input_len() + right.input_len();
+    if merged_len <= MAX_BLOCK_INPUT {
+        let merged_histogram = TokenHistogram::merged(&left_histogram, &right_histogram);
+        if let Some((_, merged_score)) =
+            compressed_histogram_score(state, &merged_histogram, merged_len)
+        {
+            if merged_score.bits < best_total_bits {
+                best_total_bits = merged_score.bits;
+                merge_is_best = true;
+            }
+        }
     }
-    let new_left_len = (left.input_len() as isize + shift) as usize;
-    let new_right_len = (right.input_len() as isize - shift) as usize;
-    let (new_left, new_right) = shifted_tokens(left, right, shift);
-    let Some((_, new_left_score)) = compressed_score(state, &new_left, new_left_len) else {
-        return;
-    };
-    let Some((_, new_right_score)) = compressed_score(state, &new_right, new_right_len) else {
-        return;
-    };
 
-    if new_left_score.bits + new_right_score.bits < left_score.bits + right_score.bits {
+    for candidate in fixed_cost_shift_candidates(
+        left,
+        right,
+        left_costs,
+        right_costs,
+        &left_histogram,
+        &right_histogram,
+    ) {
+        let new_left_len = (left.input_len() as isize + candidate.shift) as usize;
+        let new_right_len = (right.input_len() as isize - candidate.shift) as usize;
+        let Some((_, new_left_score)) =
+            compressed_histogram_score(state, &candidate.left_histogram, new_left_len)
+        else {
+            continue;
+        };
+        let Some((_, new_right_score)) =
+            compressed_histogram_score(state, &candidate.right_histogram, new_right_len)
+        else {
+            continue;
+        };
+        let total_bits = new_left_score.bits + new_right_score.bits;
+        if total_bits < best_total_bits {
+            best_total_bits = total_bits;
+            best_shift = Some(candidate.shift);
+            merge_is_best = false;
+        }
+    }
+
+    let outcome = if merge_is_best {
+        let mut tokens = left.tokens.clone();
+        tokens.extend_from_slice(&right.tokens);
+        BoundaryOptimization::Merged(PlannedBlock {
+            range: left.range.start..right.range.end,
+            tokens,
+        })
+    } else if let Some(shift) = best_shift {
         let boundary = (left.range.end as isize + shift) as usize;
+        let (new_left, new_right) = shifted_tokens(left, right, shift);
         left.range.end = boundary;
         right.range.start = boundary;
         left.tokens = new_left;
         right.tokens = new_right;
-    }
+        BoundaryOptimization::Shifted
+    } else {
+        BoundaryOptimization::Unchanged
+    };
 
-    debug_assert_eq!(left.range.end, right.range.start);
-    debug_assert!(left.range.len() <= MAX_BLOCK_INPUT);
-    debug_assert!(right.range.len() <= MAX_BLOCK_INPUT);
-    debug_assert_eq!(left.token_input_len(), left.range.len());
-    debug_assert_eq!(right.token_input_len(), right.range.len());
+    match &outcome {
+        BoundaryOptimization::Merged(merged) => {
+            debug_assert_eq!(merged.token_input_len(), merged.range.len());
+            debug_assert!(merged.range.len() <= MAX_BLOCK_INPUT);
+        }
+        BoundaryOptimization::Unchanged | BoundaryOptimization::Shifted => {
+            debug_assert_eq!(left.range.end, right.range.start);
+            debug_assert!(left.range.len() <= MAX_BLOCK_INPUT);
+            debug_assert!(right.range.len() <= MAX_BLOCK_INPUT);
+            debug_assert_eq!(left.token_input_len(), left.range.len());
+            debug_assert_eq!(right.token_input_len(), right.range.len());
+        }
+    }
+    outcome
 }
 
 /// Parse one splitter range into a production-ready token block. A caller only needs to retain two
 /// adjacent blocks at a time to optimize their shared Huffman boundary.
-pub(crate) fn parse_planned_block(
+pub(crate) fn parse_planned_block_source(
     state: &mut super::State<'_>,
     input: &[u8],
     range: Range<usize>,
     max_distance: usize,
     refinement_passes: usize,
-) -> PlannedBlock {
+) -> PlannedBlockSource {
     let history_start = range.start.saturating_sub(max_distance);
-    let context = &input[history_start..range.end];
-    let local_range = (range.start - history_start)..(range.end - history_start);
+    let context_end = range.end;
+    let context = &input[history_start..context_end];
+    let local_range = (range.start - history_start)..context.len();
     let candidates = build_match_candidates(context, max_distance);
     let parsed = refined_parse_range(state, context, &candidates, local_range, refinement_passes);
     let block = PlannedBlock {
@@ -1434,7 +1688,12 @@ pub(crate) fn parse_planned_block(
         tokens: parsed.tokens,
     };
     debug_assert_eq!(block.token_input_len(), block.range.len());
-    block
+    PlannedBlockSource {
+        block,
+        context_start: history_start,
+        context_end,
+        candidates,
+    }
 }
 
 #[cfg(test)]
@@ -1461,9 +1720,27 @@ mod boundary_tests {
         right_costs.literal[b'a' as usize] = 8;
         right_costs.literal[b'b' as usize] = 1;
 
-        let shift = best_fixed_cost_shift(&left, &right, left_costs, right_costs);
-        assert_eq!(shift, 500);
+        let left_histogram = TokenHistogram::from_tokens(&left.tokens);
+        let right_histogram = TokenHistogram::from_tokens(&right.tokens);
+        let shifts = fixed_cost_shift_candidates(
+            &left,
+            &right,
+            left_costs,
+            right_costs,
+            &left_histogram,
+            &right_histogram,
+        );
+        assert_eq!(shifts[0].shift, 500);
+        let shift = shifts[0].shift;
         let (shifted_left, shifted_right) = shifted_tokens(&left, &right, shift);
+        assert_eq!(
+            shifts[0].left_histogram,
+            TokenHistogram::from_tokens(&shifted_left)
+        );
+        assert_eq!(
+            shifts[0].right_histogram,
+            TokenHistogram::from_tokens(&shifted_right)
+        );
         assert_eq!(shifted_left.len(), 6_500);
         assert_eq!(shifted_right.len(), 5_500);
         assert_eq!(
