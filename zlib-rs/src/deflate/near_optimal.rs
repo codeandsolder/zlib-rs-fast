@@ -1332,6 +1332,36 @@ fn shifted_tokens(
     }
 }
 
+/// Remove an unnecessary coarse splitter boundary when the two existing token streams fit in one
+/// legal block and the production Huffman scorer proves that one tree is cheaper than two.
+pub(crate) fn try_merge_token_blocks(
+    state: &mut super::State<'_>,
+    left: &PlannedBlock,
+    right: &PlannedBlock,
+) -> Option<PlannedBlock> {
+    debug_assert_eq!(left.range.end, right.range.start);
+    let merged_len = left.input_len() + right.input_len();
+    if merged_len > MAX_BLOCK_INPUT {
+        return None;
+    }
+
+    let (_, left_score) = compressed_score(state, &left.tokens, left.input_len())?;
+    let (_, right_score) = compressed_score(state, &right.tokens, right.input_len())?;
+    let mut tokens = left.tokens.clone();
+    tokens.extend_from_slice(&right.tokens);
+    let (_, merged_score) = compressed_score(state, &tokens, merged_len)?;
+    if merged_score.bits >= left_score.bits + right_score.bits {
+        return None;
+    }
+
+    let merged = PlannedBlock {
+        range: left.range.start..right.range.end,
+        tokens,
+    };
+    debug_assert_eq!(merged.token_input_len(), merged.range.len());
+    Some(merged)
+}
+
 /// Improve Huffman block boundaries without rerunning match discovery or the minimum-cost parser.
 ///
 /// The parser's token stream is already valid across Huffman block boundaries: matches in a later

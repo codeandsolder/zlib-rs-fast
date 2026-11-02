@@ -3332,6 +3332,11 @@ pub fn compress_slice_near_optimal<'a>(
             let current_block = current
                 .as_mut()
                 .expect("the splitter always returns at least one block");
+            if let Some(merged) = near_optimal::try_merge_token_blocks(state, current_block, &next)
+            {
+                current = Some(merged);
+                continue;
+            }
             near_optimal::optimize_token_boundary(state, current_block, &mut next);
             ok = emit_planned_near_optimal_block(
                 state,
