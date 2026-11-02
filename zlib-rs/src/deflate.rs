@@ -1904,13 +1904,27 @@ impl<'a> State<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn tally_dist(&mut self, mut dist: usize, len: usize) -> bool {
+    pub(crate) fn tally_dist(&mut self, dist: usize, len: usize) -> bool {
+        let max_distance = self.max_dist();
+        self.tally_dist_with_limit(dist, len, max_distance)
+    }
+
+    /// Tally a match found by a complete-buffer matcher that can safely use the entire configured
+    /// DEFLATE history window rather than the streaming matchfinder's lookahead-reserved limit.
+    #[inline(always)]
+    pub(crate) fn tally_dist_full_window(&mut self, dist: usize, len: usize) -> bool {
+        let max_distance = self.w_mask() + 1;
+        self.tally_dist_with_limit(dist, len, max_distance)
+    }
+
+    #[inline(always)]
+    fn tally_dist_with_limit(&mut self, mut dist: usize, len: usize, max_distance: usize) -> bool {
         self.sym_buf.push_dist(dist as u16, len as u8);
 
         self.matches = self.matches.saturating_add(1);
         dist -= 1;
 
-        assert!(dist < self.max_dist(), "tally_dist: bad match");
+        assert!(dist < max_distance, "tally_dist: bad match");
 
         let index = self::trees_tbl::LENGTH_CODE[len] as usize + LITERALS + 1;
         *self.l_desc.dyn_tree[index].freq_mut() += 1;
@@ -3300,7 +3314,9 @@ pub fn compress_slice_near_optimal<'a>(
         let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }
             .expect("successful deflate init creates typed state");
         let state = &mut *stream.state;
-        let max_distance = state.max_dist();
+        // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
+        // reservation, so every distance representable by the configured DEFLATE window is legal.
+        let max_distance = state.w_mask() + 1;
         let ranges = near_optimal::choose_block_ranges(input, max_distance);
         debug_assert!(ranges
             .iter()
@@ -3323,35 +3339,47 @@ pub fn compress_slice_near_optimal<'a>(
                 range,
                 max_distance,
                 optimization_passes,
+                None,
             )
-            .into_block()
+            .into_parts()
         });
 
         for range in ranges {
             if !ok {
                 break;
             }
+            let previous_model = current.as_ref().map(|(_, model)| *model);
             let mut next = near_optimal::parse_planned_block_source(
                 state,
                 input,
                 range,
                 max_distance,
                 optimization_passes,
+                previous_model,
             );
-            let current_block = current
+            let (current_block, current_model) = current
                 .as_mut()
                 .expect("the splitter always returns at least one block");
             match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
                 near_optimal::BoundaryOptimization::Merged(merged) => {
                     next.block = merged;
-                    let _ =
-                        next.reparse_with_existing_candidates(state, input, optimization_passes);
-                    current = Some(next.into_block());
+                    let _ = next.reparse_with_existing_candidates(
+                        state,
+                        input,
+                        optimization_passes,
+                        None,
+                    );
+                    current = Some(next.into_parts());
                     continue;
                 }
                 near_optimal::BoundaryOptimization::Shifted => {
-                    let _ =
-                        next.reparse_with_existing_candidates(state, input, optimization_passes);
+                    *current_model = near_optimal::model_from_tokens(state, &current_block.tokens);
+                    let _ = next.reparse_with_existing_candidates(
+                        state,
+                        input,
+                        optimization_passes,
+                        Some(*current_model),
+                    );
                 }
                 near_optimal::BoundaryOptimization::Unchanged => {}
             }
@@ -3363,11 +3391,11 @@ pub fn compress_slice_near_optimal<'a>(
                 output,
                 &mut produced,
             );
-            current = Some(next.into_block());
+            current = Some(next.into_parts());
         }
 
         if ok {
-            if let Some(final_block) = current.as_ref() {
+            if let Some((final_block, _)) = current.as_ref() {
                 ok = emit_planned_near_optimal_block(
                     state,
                     input,

@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .map(|value| value.parse())
         .transpose()?
-        .unwrap_or(3);
+        .unwrap_or(10);
 
     let bytes = fs::read(Path::new(&path))?;
     let limit = requested.unwrap_or(bytes.len()).min(bytes.len());

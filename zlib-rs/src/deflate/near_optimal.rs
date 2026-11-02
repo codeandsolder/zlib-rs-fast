@@ -56,11 +56,68 @@ impl MatchCandidates {
 /// exact whole-bit cost returned by the production Huffman tree builder.
 const COST_SCALE: u16 = 16;
 
+#[inline]
+fn literal_observation_class(byte: u8) -> usize {
+    usize::from(((byte >> 5) & 0x06) | (byte & 1))
+}
+
+#[inline]
+fn match_observation_class(length: usize) -> usize {
+    8 + usize::from(length >= 9)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockObservations {
+    counts: [u32; SPLIT_OBSERVATION_TYPES],
+    total: u32,
+}
+
+impl BlockObservations {
+    fn empty() -> Self {
+        Self {
+            counts: [0; SPLIT_OBSERVATION_TYPES],
+            total: 0,
+        }
+    }
+
+    fn observe_literal(&mut self, byte: u8) {
+        // Match libdeflate's splitter observation geometry: high two value bits plus parity. This
+        // distinguishes text-like and binary distributions better than eight contiguous bands.
+        let class = literal_observation_class(byte);
+        self.counts[class] += 1;
+        self.total += 1;
+    }
+
+    fn observe_match(&mut self, length: usize) {
+        self.counts[match_observation_class(length)] += 1;
+        self.total += 1;
+    }
+
+    fn from_tokens(tokens: &[ParseToken]) -> Self {
+        let mut observations = Self::empty();
+        for &token in tokens {
+            match token {
+                ParseToken::Literal(byte) => observations.observe_literal(byte),
+                ParseToken::Match { length, .. } => {
+                    observations.observe_match(usize::from(length));
+                }
+            }
+        }
+        observations
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TokenCosts {
     literal: [u16; 256],
     length: [u16; LENGTH_CODES],
     distance: [u16; D_CODES],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParseModel {
+    costs: TokenCosts,
+    observations: BlockObservations,
 }
 
 impl TokenCosts {
@@ -535,7 +592,48 @@ const MIN_BLOCK_LENGTH: usize = 5_000;
 const SOFT_MAX_BLOCK_LENGTH: usize = 60_000;
 const OBSERVATIONS_PER_CHECK: u32 = 512;
 const SPLIT_OBSERVATION_TYPES: usize = 10;
-const MIN_SPLIT_MATCH: usize = 4;
+// Match libdeflate level 12's near-optimal search budget for block-statistics gathering.
+const SPLIT_MATCH_SEARCH_DEPTH: usize = 300;
+
+#[inline]
+fn choose_min_match_len(used_literals: usize) -> usize {
+    match used_literals {
+        0..=5 => 9,
+        6..=7 => 8,
+        8..=9 => 7,
+        10..=15 => 6,
+        16..=44 => 5,
+        45..=79 => 4,
+        _ => 3,
+    }
+}
+
+fn splitter_min_match_len(input: &[u8], block_start: usize, block_limit: usize) -> usize {
+    let sample_end = block_start
+        .saturating_add(4_096)
+        .min(block_limit)
+        .min(input.len());
+    if sample_end.saturating_sub(block_start) < 512 {
+        return STD_MIN_MATCH;
+    }
+
+    let mut used = [false; 256];
+    for &byte in &input[block_start..sample_end] {
+        used[usize::from(byte)] = true;
+    }
+    choose_min_match_len(used.into_iter().filter(|used| *used).count())
+}
+
+fn splitter_block_limit(input_len: usize, block_start: usize) -> usize {
+    let soft_end = block_start
+        .saturating_add(SOFT_MAX_BLOCK_LENGTH)
+        .min(input_len);
+    if input_len - soft_end < MIN_BLOCK_LENGTH {
+        input_len
+    } else {
+        soft_end
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct BlockSplitStats {
@@ -547,15 +645,15 @@ struct BlockSplitStats {
 
 impl BlockSplitStats {
     fn observe_literal(&mut self, byte: u8) {
-        // Eight coarse value bands are enough to notice common useful boundaries (text/binary,
-        // low/high-valued binary regions, etc.) without turning the splitter into a compressor.
-        let class = usize::from(byte >> 5);
+        // High two value bits plus parity gives eight cheap categories while still distinguishing
+        // text-like and binary distributions; this is the same geometry used by libdeflate.
+        let class = literal_observation_class(byte);
         self.recent[class] += 1;
         self.recent_count += 1;
     }
 
     fn observe_match(&mut self, length: usize) {
-        self.recent[8 + usize::from(length >= 16)] += 1;
+        self.recent[match_observation_class(length)] += 1;
         self.recent_count += 1;
     }
 
@@ -579,21 +677,24 @@ impl BlockSplitStats {
 
     fn distribution_changed(&mut self, block_length: usize) -> bool {
         if self.old_count != 0 {
-            // Compare the two normalized categorical distributions without division. `total_delta /
-            // (old_count * recent_count)` is their L1 distance, in [0, 2]. Long blocks get a
-            // gradually lower threshold because paying for a fresh Huffman tree becomes easier to
-            // justify as a block grows. The floor prevents low-amplitude noise from fragmenting a
-            // long homogeneous region indefinitely.
+            // Compare normalized categorical distributions without division. This is libdeflate's
+            // block-split criterion expressed in wider arithmetic: an L1 distance threshold of
+            // 200/512, an extra penalty for very short blocks, and a slowly increasing bias toward
+            // splitting as a block gets longer.
             let mut total_delta = 0u64;
             for index in 0..SPLIT_OBSERVATION_TYPES {
                 let expected = u64::from(self.old[index]) * u64::from(self.recent_count);
                 let actual = u64::from(self.recent[index]) * u64::from(self.old_count);
                 total_delta += expected.abs_diff(actual);
             }
-            let denominator = u64::from(self.old_count) * u64::from(self.recent_count);
-            let length_discount = (block_length.min(80_000) / 512) as u64;
-            let threshold_per_mille = 480u64.saturating_sub(length_discount).max(320);
-            if total_delta * 1_000 >= denominator * threshold_per_mille {
+
+            let num_items = u64::from(self.old_count) + u64::from(self.recent_count);
+            let mut cutoff = u64::from(self.recent_count) * 200 / 512 * u64::from(self.old_count);
+            if block_length < 10_000 && num_items < 8_192 {
+                cutoff += cutoff * (8_192 - num_items) / 8_192;
+            }
+            let length_bias = (block_length / 4_096) as u64 * u64::from(self.old_count);
+            if total_delta + length_bias >= cutoff {
                 return true;
             }
         }
@@ -604,10 +705,10 @@ impl BlockSplitStats {
 
 /// Pick inexpensive candidate block boundaries before running the expensive exact parser.
 ///
-/// The splitter deliberately uses only a one-candidate rolling hash probe. Its job is not to choose
-/// the final token stream; it merely classifies the input into coarse literal / short-match /
-/// long-match observations and looks for distribution changes. Exact match discovery and dynamic
-/// programming happen only after a boundary has been selected.
+/// The splitter uses a bounded rolling hash chain to classify the input into literal / short-match /
+/// long-match observations and detect distribution changes. This is deliberately cheaper than the
+/// exact suffix-rank frontier; exact match discovery and dynamic programming happen only after a
+/// boundary has been selected.
 pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
     if input.is_empty() {
         return core::iter::once(0..0).collect();
@@ -615,29 +716,28 @@ pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Rang
 
     const HASH_SIZE: usize = 1 << 16;
     let mut head = vec![usize::MAX; HASH_SIZE];
+    // Keep one previous-link slot for every position in the legal distance window. Unlike storing a
+    // link for the entire input, this stays bounded; a slot cannot be overwritten while its position
+    // is still reachable because the ring is one entry wider than `max_distance`.
+    let mut previous = vec![usize::MAX; max_distance + 1];
     let mut blocks = Vec::new();
     let mut stats = BlockSplitStats::default();
     let mut block_start = 0usize;
     let mut previous_check = None;
     let mut position = 0usize;
+    // Avoid manufacturing a tiny tail block solely because of the soft maximum. 60K + <5K is
+    // still below DEFLATE's 65,535-byte stored-block limit and our 65,535-token symbol limit.
+    let mut block_limit = splitter_block_limit(input.len(), block_start);
+    let mut min_split_match = splitter_min_match_len(input, block_start, block_limit);
 
     while position < input.len() {
-        let soft_end = block_start
-            .saturating_add(SOFT_MAX_BLOCK_LENGTH)
-            .min(input.len());
-        // Avoid manufacturing a tiny tail block solely because of the soft maximum. 60K + <5K is
-        // still below DEFLATE's 65,535-byte stored-block limit and our 65,535-token symbol limit.
-        let block_limit = if input.len() - soft_end < MIN_BLOCK_LENGTH {
-            input.len()
-        } else {
-            soft_end
-        };
-
         if position >= block_limit {
             blocks.push(block_start..position);
             block_start = position;
             stats = BlockSplitStats::default();
             previous_check = None;
+            block_limit = splitter_block_limit(input.len(), block_start);
+            min_split_match = splitter_min_match_len(input, block_start, block_limit);
             continue;
         }
 
@@ -645,16 +745,24 @@ pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Rang
         let mut match_length = 0usize;
         if available >= STD_MIN_MATCH && position + 2 < input.len() {
             let hash = split_hash3(input, position);
-            let candidate = head[hash];
-            if candidate != usize::MAX && position - candidate <= max_distance {
-                match_length = match_compare::common_prefix_len(
+            let mut candidate = head[hash];
+            for _ in 0..SPLIT_MATCH_SEARCH_DEPTH {
+                if candidate == usize::MAX || position - candidate > max_distance {
+                    break;
+                }
+                let length = match_compare::common_prefix_len(
                     &input[position..position + available],
                     &input[candidate..candidate + available],
                 );
+                match_length = match_length.max(length);
+                if match_length == available {
+                    break;
+                }
+                candidate = previous[candidate % previous.len()];
             }
         }
 
-        let step = if match_length >= MIN_SPLIT_MATCH {
+        let step = if match_length >= min_split_match {
             stats.observe_match(match_length);
             match_length
         } else {
@@ -667,7 +775,10 @@ pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Rang
         // later probes. This keeps boundary detection stable without doing a full match search.
         for inserted in position..next {
             if inserted + 2 < input.len() {
-                head[split_hash3(input, inserted)] = inserted;
+                let hash = split_hash3(input, inserted);
+                let slot = inserted % previous.len();
+                previous[slot] = head[hash];
+                head[hash] = inserted;
             }
         }
         position = next;
@@ -694,6 +805,8 @@ pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Rang
                 stats = BlockSplitStats::default();
             }
             previous_check = None;
+            block_limit = splitter_block_limit(input.len(), block_start);
+            min_split_match = splitter_min_match_len(input, block_start, block_limit);
         } else {
             previous_check = Some(position);
         }
@@ -867,6 +980,75 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rational_seed_log2_matches_reference_costs() {
+        assert_eq!(log2_ratio_x16(4, 3), 6);
+        assert_eq!(log2_ratio_x16(8, 3), 22);
+        assert_eq!(log2_ratio_x16(12, 3), 32);
+        assert_eq!(log2_x16(LENGTH_CODES * 4), 109);
+        assert_eq!(log2_x16(LENGTH_CODES * 2), 93);
+        assert_eq!(log2_ratio_x16(LENGTH_CODES * 4, 3), 84);
+    }
+
+    #[test]
+    fn previous_model_blend_uses_expected_weights() {
+        assert_eq!(blend_cost(80, 160, 0), 100);
+        assert_eq!(blend_cost(80, 160, 1), 120);
+        assert_eq!(blend_cost(80, 160, 2), 130);
+        assert_eq!(blend_cost(80, 160, 3), 140);
+    }
+
+    #[test]
+    fn observation_classes_match_split_geometry() {
+        let mut observations = BlockObservations::empty();
+        observations.observe_literal(0b1010_0101);
+        observations.observe_literal(0b1010_0100);
+        observations.observe_match(8);
+        observations.observe_match(9);
+        assert_eq!(observations.counts[5], 1);
+        assert_eq!(observations.counts[4], 1);
+        assert_eq!(observations.counts[8], 1);
+        assert_eq!(observations.counts[9], 1);
+        assert_eq!(observations.total, 4);
+    }
+
+    #[test]
+    fn minimum_match_heuristic_matches_reference_boundaries() {
+        for (used_literals, expected) in [
+            (0, 9),
+            (5, 9),
+            (6, 8),
+            (8, 7),
+            (10, 6),
+            (16, 5),
+            (45, 4),
+            (80, 3),
+            (256, 3),
+        ] {
+            assert_eq!(choose_min_match_len(used_literals), expected);
+        }
+    }
+
+    #[test]
+    fn exact_frontier_reaches_full_deflate_window() {
+        let mut state = 0x94d0_49bb_1331_11ebu64;
+        let mut input = vec![0u8; 32_768];
+        for byte in &mut input {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = (state >> 32) as u8;
+        }
+        let repeated = input[..STD_MAX_MATCH].to_vec();
+        input.extend_from_slice(&repeated);
+
+        let table = build_match_candidates(&input, 32_768);
+        assert!(table.for_position(32_768).iter().any(|candidate| {
+            usize::from(candidate.distance) == 32_768
+                && usize::from(candidate.length) == STD_MAX_MATCH
+        }));
+    }
 
     fn brute_frontier(input: &[u8], position: usize, max_distance: usize) -> Vec<MatchCandidate> {
         if position + STD_MIN_MATCH > input.len() {
@@ -1233,14 +1415,19 @@ impl PlannedBlock {
 
 pub(crate) struct PlannedBlockSource {
     pub(crate) block: PlannedBlock,
+    model: ParseModel,
     context_start: usize,
     context_end: usize,
     candidates: MatchCandidates,
 }
 
 impl PlannedBlockSource {
-    pub(crate) fn into_block(self) -> PlannedBlock {
-        self.block
+    pub(crate) fn into_parts(self) -> (PlannedBlock, ParseModel) {
+        (self.block, self.model)
+    }
+
+    pub(crate) fn refresh_model(&mut self, state: &mut super::State<'_>) {
+        self.model = model_from_tokens(state, &self.block.tokens);
     }
 
     /// Re-run only the minimum-cost parser after a boundary change. The exact match frontier built
@@ -1251,19 +1438,26 @@ impl PlannedBlockSource {
         state: &mut super::State<'_>,
         input: &[u8],
         optimization_passes: usize,
+        previous_model: Option<ParseModel>,
     ) -> bool {
         if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
             return false;
         }
 
         if optimization_passes == 0 {
+            self.refresh_model(state);
             return false;
         }
 
         let context = &input[self.context_start..self.context_end];
         let local_range = (self.block.range.start - self.context_start)..context.len();
-        let (mut costs, mut best_score) = costs_and_block_score(state, &self.block.tokens);
-        let mut current_tokens = self.block.tokens.clone();
+        let (_, mut best_score) = costs_and_block_score(state, &self.block.tokens);
+        let (default_costs, observations) =
+            initial_statistical_costs(context, &self.candidates, local_range.clone());
+        let mut costs = previous_model
+            .map(|previous| blend_previous_model(default_costs, observations, previous))
+            .unwrap_or(default_costs);
+        let mut current_tokens = None;
         let mut best_tokens = None;
 
         for _ in 0..optimization_passes {
@@ -1273,20 +1467,22 @@ impl PlannedBlockSource {
                 best_score = reparsed_score;
                 best_tokens = Some(reparsed.tokens.clone());
             }
-            if reparsed.tokens == current_tokens {
+            if current_tokens.as_ref() == Some(&reparsed.tokens) {
                 break;
             }
-            current_tokens = reparsed.tokens;
+            current_tokens = Some(reparsed.tokens);
             costs = next_costs;
         }
 
-        if let Some(tokens) = best_tokens {
+        let changed = if let Some(tokens) = best_tokens {
             self.block.tokens = tokens;
-            debug_assert_eq!(self.block.token_input_len(), self.block.range.len());
             true
         } else {
             false
-        }
+        };
+        self.refresh_model(state);
+        debug_assert_eq!(self.block.token_input_len(), self.block.range.len());
+        changed
     }
 }
 
@@ -1310,11 +1506,33 @@ fn log2_x16(value: usize) -> u16 {
     integer as u16 * COST_SCALE + fraction
 }
 
+#[inline]
+fn log2_ratio_x16(numerator: usize, denominator: usize) -> u16 {
+    debug_assert!(numerator >= denominator && denominator != 0);
+    // Represent the rational with 48 fractional bits before extracting four binary log2 fraction
+    // bits. The inputs here are tiny DEFLATE alphabet sizes; Q48 makes the approximation error far
+    // below a 1/16-bit boundary while preserving exact powers of two.
+    const Q_BITS: u32 = 48;
+    let q = ((numerator as u128) << Q_BITS) / denominator as u128;
+    let integer = u128::BITS - 1 - q.leading_zeros();
+    debug_assert!((Q_BITS..=63).contains(&integer));
+    let mut normalized = q << (63 - integer);
+    let mut fraction = 0u16;
+    for bit in (0..4).rev() {
+        normalized = (normalized * normalized) >> 63;
+        if normalized >= (2u128 << 63) {
+            normalized >>= 1;
+            fraction |= 1 << bit;
+        }
+    }
+    ((integer - Q_BITS) as u16) * COST_SCALE + fraction
+}
+
 fn initial_statistical_costs(
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
-) -> TokenCosts {
+) -> (TokenCosts, BlockObservations) {
     let mut literal_frequencies = [0u32; 256];
     for &byte in &input[block.clone()] {
         literal_frequencies[usize::from(byte)] += 1;
@@ -1329,17 +1547,10 @@ fn initial_statistical_costs(
     // Mirror the near-optimal seed heuristic used by libdeflate: estimate the eventual literal/match
     // mixture from a cheap greedy observation pass, but do not constrain the actual DP to this
     // minimum match length. Our exact frontier is already resident, so this adds no match search.
-    let min_match = match used_literals {
-        0..=5 => 9,
-        6..=7 => 8,
-        8..=9 => 7,
-        10..=15 => 6,
-        16..=44 => 5,
-        45..=79 => 4,
-        _ => 3,
-    };
+    let min_match = choose_min_match_len(used_literals);
     let mut literal_count = block.len();
     let mut match_count = 0usize;
+    let mut observations = BlockObservations::empty();
     let mut position = block.start;
     while position < block.end {
         let available = block.end - position;
@@ -1352,8 +1563,10 @@ fn initial_statistical_costs(
         if best_length >= min_match {
             match_count += 1;
             literal_count = literal_count.saturating_sub(best_length);
+            observations.observe_match(best_length);
             position += best_length;
         } else {
+            observations.observe_literal(input[position]);
             position += 1;
         }
     }
@@ -1364,7 +1577,7 @@ fn initial_statistical_costs(
         // the same 1/16-bit fixed-point domain.
         (
             log2_x16(used_literals * 4),
-            log2_x16(LENGTH_CODES * 4) - log2_x16(3),
+            log2_ratio_x16(LENGTH_CODES * 4, 3),
         )
     } else if match_count.saturating_mul(4) > literal_count {
         // Approximate match probability 1/2.
@@ -1372,18 +1585,90 @@ fn initial_statistical_costs(
     } else {
         // Approximate match probability 1/4: literals share 3/4 of the mass.
         (
-            log2_x16(used_literals * 4) - log2_x16(3),
+            log2_ratio_x16(used_literals * 4, 3),
             log2_x16(LENGTH_CODES * 4),
         )
     };
 
-    TokenCosts {
-        literal: [literal_cost; 256],
-        length: [length_cost; LENGTH_CODES],
-        // Assume distance symbols are initially equiprobable; exact tree lengths replace this after
-        // the first optimization pass. Extra distance bits are added by `match_cost`.
-        distance: [log2_x16(D_CODES); D_CODES],
+    (
+        TokenCosts {
+            literal: [literal_cost; 256],
+            length: [length_cost; LENGTH_CODES],
+            // Assume distance symbols are initially equiprobable; exact tree lengths replace this
+            // after the first optimization pass. Extra distance bits are added by `match_cost`.
+            distance: [log2_x16(D_CODES); D_CODES],
+        },
+        observations,
+    )
+}
+
+#[inline]
+fn blend_cost(previous: u16, default: u16, change_amount: u8) -> u16 {
+    let previous = u32::from(previous);
+    let default = u32::from(default);
+    let blended = match change_amount {
+        0 => (default + 3 * previous) / 4,
+        1 => (default + previous) / 2,
+        2 => (5 * default + 3 * previous) / 8,
+        _ => (3 * default + previous) / 4,
+    };
+    blended as u16
+}
+
+fn blend_previous_model(
+    default: TokenCosts,
+    current: BlockObservations,
+    previous: ParseModel,
+) -> TokenCosts {
+    if current.total == 0 || previous.observations.total == 0 {
+        return default;
     }
+
+    let mut total_delta = 0u64;
+    for index in 0..SPLIT_OBSERVATION_TYPES {
+        let previous_scaled =
+            u64::from(previous.observations.counts[index]) * u64::from(current.total);
+        let current_scaled =
+            u64::from(current.counts[index]) * u64::from(previous.observations.total);
+        total_delta += previous_scaled.abs_diff(current_scaled);
+    }
+    let cutoff = u64::from(previous.observations.total) * u64::from(current.total) * 200 / 512;
+    if total_delta > 3 * cutoff {
+        return default;
+    }
+    let change_amount = if 4 * total_delta > 9 * cutoff {
+        3
+    } else if 2 * total_delta > 3 * cutoff {
+        2
+    } else if 2 * total_delta > cutoff {
+        1
+    } else {
+        0
+    };
+
+    let mut blended = default;
+    for index in 0..blended.literal.len() {
+        blended.literal[index] = blend_cost(
+            previous.costs.literal[index],
+            default.literal[index],
+            change_amount,
+        );
+    }
+    for index in 0..blended.length.len() {
+        blended.length[index] = blend_cost(
+            previous.costs.length[index],
+            default.length[index],
+            change_amount,
+        );
+    }
+    for index in 0..blended.distance.len() {
+        blended.distance[index] = blend_cost(
+            previous.costs.distance[index],
+            default.distance[index],
+            change_amount,
+        );
+    }
+    blended
 }
 
 /// Reparse one selected block using code lengths learned from the previous parse.
@@ -1401,14 +1686,26 @@ pub(crate) fn optimized_parse_range(
     candidates: &MatchCandidates,
     block: Range<usize>,
     optimization_passes: usize,
-) -> ParseResult {
+    previous_model: Option<ParseModel>,
+) -> (ParseResult, ParseModel) {
     if optimization_passes == 0 {
-        return parse_range(input, candidates, block, TokenCosts::fixed());
+        let parsed = parse_range(input, candidates, block, TokenCosts::fixed());
+        let (costs, _) = costs_and_block_score(state, &parsed.tokens);
+        let model = ParseModel {
+            costs,
+            observations: BlockObservations::from_tokens(&parsed.tokens),
+        };
+        return (parsed, model);
     }
 
-    let mut costs = initial_statistical_costs(input, candidates, block.clone());
+    let (default_costs, initial_observations) =
+        initial_statistical_costs(input, candidates, block.clone());
+    let mut costs = previous_model
+        .map(|previous| blend_previous_model(default_costs, initial_observations, previous))
+        .unwrap_or(default_costs);
     let mut previous_tokens = None;
     let mut best = None;
+    let mut best_costs = None;
     let mut best_score = usize::MAX;
 
     for _ in 0..optimization_passes {
@@ -1416,6 +1713,7 @@ pub(crate) fn optimized_parse_range(
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
         if next_score.bits < best_score {
             best_score = next_score.bits;
+            best_costs = Some(next_costs);
             best = Some(next.clone());
         }
         if previous_tokens.as_ref() == Some(&next.tokens) {
@@ -1425,7 +1723,20 @@ pub(crate) fn optimized_parse_range(
         costs = next_costs;
     }
 
-    best.expect("positive optimization pass count always evaluates one parse")
+    let best = best.expect("positive optimization pass count always evaluates one parse");
+    let model = ParseModel {
+        costs: best_costs.expect("best parse always records its learned costs"),
+        observations: BlockObservations::from_tokens(&best.tokens),
+    };
+    (best, model)
+}
+
+pub(crate) fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) -> ParseModel {
+    let (costs, _) = costs_and_block_score(state, tokens);
+    ParseModel {
+        costs,
+        observations: BlockObservations::from_tokens(tokens),
+    }
 }
 
 pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
@@ -1435,8 +1746,10 @@ pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) 
                 let _ = state.tally_lit(byte);
             }
             ParseToken::Match { length, distance } => {
-                let _ =
-                    state.tally_dist(usize::from(distance), usize::from(length) - STD_MIN_MATCH);
+                let _ = state.tally_dist_full_window(
+                    usize::from(distance),
+                    usize::from(length) - STD_MIN_MATCH,
+                );
             }
         }
     }
@@ -1798,18 +2111,20 @@ pub(crate) fn parse_planned_block_source(
     range: Range<usize>,
     max_distance: usize,
     optimization_passes: usize,
+    previous_model: Option<ParseModel>,
 ) -> PlannedBlockSource {
     let history_start = range.start.saturating_sub(max_distance);
     let context_end = range.end;
     let context = &input[history_start..context_end];
     let local_range = (range.start - history_start)..context.len();
     let candidates = build_match_candidates(context, max_distance);
-    let parsed = optimized_parse_range(
+    let (parsed, model) = optimized_parse_range(
         state,
         context,
         &candidates,
         local_range,
         optimization_passes,
+        previous_model,
     );
     let block = PlannedBlock {
         range,
@@ -1818,6 +2133,7 @@ pub(crate) fn parse_planned_block_source(
     debug_assert_eq!(block.token_input_len(), block.range.len());
     PlannedBlockSource {
         block,
+        model,
         context_start: history_start,
         context_end,
         candidates,
@@ -1941,6 +2257,30 @@ mod encoded_tests {
             blocks.len() >= 2,
             "test input must exercise multiple blocks"
         );
+
+        let mut compressed = vec![0u8; compress_bound(input.len())];
+        let (compressed, code) =
+            super::super::compress_slice_near_optimal(&mut compressed, &input, 1);
+        assert_eq!(code, ReturnCode::Ok);
+
+        let mut decoded = vec![0u8; input.len()];
+        let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn full_window_distance_round_trips() {
+        let mut state = 0x94d0_49bb_1331_11ebu64;
+        let mut input = vec![0u8; 32_768];
+        for byte in &mut input {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = (state >> 32) as u8;
+        }
+        let repeated = input[..STD_MAX_MATCH].to_vec();
+        input.extend_from_slice(&repeated);
 
         let mut compressed = vec![0u8; compress_bound(input.len())];
         let (compressed, code) =
