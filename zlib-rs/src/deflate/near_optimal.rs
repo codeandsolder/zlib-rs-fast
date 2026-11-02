@@ -1094,6 +1094,12 @@ pub(crate) const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
 pub(crate) const MAX_BLOCK_INPUT: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 1;
 
 /// Reparse one selected block using code lengths learned from the previous parse.
+///
+/// Every candidate parse is scored with the production Huffman tree builder, including the dynamic
+/// tree-description overhead. Refinement therefore cannot replace a better parse with a later,
+/// worse fixed-point iteration. Run up to the requested pass cap and stop early only when the token
+/// sequence itself has converged; a temporarily worse iteration may still lead to a better next
+/// cost model, while an identical token sequence is a true fixed point.
 pub(crate) fn refined_parse_range(
     state: &mut super::State<'_>,
     input: &[u8],
@@ -1101,17 +1107,26 @@ pub(crate) fn refined_parse_range(
     block: Range<usize>,
     refinement_passes: usize,
 ) -> ParseResult {
-    let mut costs = TokenCosts::fixed();
-    let mut parsed = parse_range(input, candidates, block.clone(), costs);
+    let mut current = parse_range(input, candidates, block.clone(), TokenCosts::fixed());
+    let (mut costs, mut best_bits) = costs_and_block_bits(state, &current.tokens);
+    let mut best = current.clone();
 
     for _ in 0..refinement_passes {
-        tally_tokens(state, &parsed.tokens);
-        costs = dynamic_costs_from_tallied_block(state);
-        state.init_block();
-        parsed = parse_range(input, candidates, block.clone(), costs);
+        let next = parse_range(input, candidates, block.clone(), costs);
+        let (next_costs, next_bits) = costs_and_block_bits(state, &next.tokens);
+        if next_bits < best_bits {
+            best = next.clone();
+            best_bits = next_bits;
+        }
+
+        if next.tokens == current.tokens {
+            break;
+        }
+        current = next;
+        costs = next_costs;
     }
 
-    parsed
+    best
 }
 
 pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
@@ -1128,7 +1143,13 @@ pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) 
     }
 }
 
-fn dynamic_costs_from_tallied_block(state: &mut super::State<'_>) -> TokenCosts {
+fn costs_and_block_bits(
+    state: &mut super::State<'_>,
+    tokens: &[ParseToken],
+) -> (TokenCosts, usize) {
+    state.init_block();
+    tally_tokens(state, tokens);
+
     let literal_used =
         core::array::from_fn::<_, 256, _>(|index| state.l_desc.dyn_tree[index].freq() != 0);
     let length_used = core::array::from_fn::<_, LENGTH_CODES, _>(|index| {
@@ -1167,7 +1188,21 @@ fn dynamic_costs_from_tallied_block(state: &mut super::State<'_>) -> TokenCosts 
             costs.distance[index] = state.d_desc.dyn_tree[index].len() as u8;
         }
     }
-    costs
+
+    // Add the exact dynamic-tree representation cost. Mirror the production block chooser: it
+    // rounds static/dynamic candidates to bytes first and prefers static on a rounded tie, then emits
+    // the selected representation without byte-aligning it. Stored-block choice is parse-independent
+    // and therefore cannot make a worse token parse preferable to a better one.
+    let _ = super::build_bl_tree(state);
+    let dynamic_bytes = (state.opt_len + 3 + 7) >> 3;
+    let static_bytes = (state.static_len + 3 + 7) >> 3;
+    let block_bits = if static_bytes <= dynamic_bytes {
+        state.static_len + 3
+    } else {
+        state.opt_len + 3
+    };
+    state.init_block();
+    (costs, block_bits)
 }
 
 #[cfg(test)]
@@ -1191,6 +1226,20 @@ mod encoded_tests {
         let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
         assert_eq!(code, ReturnCode::Ok);
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn second_refinement_pass_never_enlarges_encoded_stream() {
+        let input = super::tests::two_distribution_input();
+        let mut one_buffer = vec![0u8; compress_bound(input.len())];
+        let (one, one_code) = super::super::compress_slice_near_optimal(&mut one_buffer, &input, 1);
+        assert_eq!(one_code, ReturnCode::Ok);
+        let one_len = one.len();
+
+        let mut two_buffer = vec![0u8; compress_bound(input.len())];
+        let (two, two_code) = super::super::compress_slice_near_optimal(&mut two_buffer, &input, 2);
+        assert_eq!(two_code, ReturnCode::Ok);
+        assert!(two.len() <= one_len, "{} > {one_len}", two.len());
     }
 
     #[test]
