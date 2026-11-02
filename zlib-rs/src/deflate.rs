@@ -3242,6 +3242,37 @@ fn drain_near_optimal_pending(
     true
 }
 
+#[cfg(any(test, feature = "__internal-api"))]
+fn emit_planned_near_optimal_block(
+    state: &mut State<'_>,
+    input: &[u8],
+    block: &near_optimal::PlannedBlock,
+    is_last: bool,
+    output: &mut [u8],
+    produced: &mut usize,
+) -> bool {
+    near_optimal::tally_tokens(state, &block.tokens);
+
+    // The production block chooser can still select a stored block. Only the current block bytes
+    // are needed for that fallback; LZ77 history was already accounted for while planning tokens.
+    state.window.clear();
+    if !block.range.is_empty() {
+        // SAFETY: this exact block slice is initialized and readable, the state owns its window
+        // uniquely, and splitter/planner invariants cap every block below the 64 KiB allocation.
+        unsafe {
+            state
+                .window
+                .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr())
+        };
+    }
+
+    state.block_start = 0;
+    state.strstart = block.range.len();
+    state.lookahead = 0;
+    state.encode_block(is_last);
+    drain_near_optimal_pending(state, output, produced)
+}
+
 /// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
 ///
 /// This remains behind `__internal-api` while the cost model and splitter are being developed. It
@@ -3268,10 +3299,10 @@ pub fn compress_slice_near_optimal<'a>(
             .expect("successful deflate init creates typed state");
         let state = &mut *stream.state;
         let max_distance = state.max_dist();
-        let blocks = near_optimal::choose_block_ranges(input, max_distance);
-        debug_assert!(blocks
+        let ranges = near_optimal::choose_block_ranges(input, max_distance);
+        debug_assert!(ranges
             .iter()
-            .all(|block| block.len() <= near_optimal::MAX_BLOCK_INPUT));
+            .all(|range| range.len() <= near_optimal::MAX_BLOCK_INPUT));
 
         // Emit the wrapper while strstart still describes the true initial state. Moving this after
         // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
@@ -3282,46 +3313,48 @@ pub fn compress_slice_near_optimal<'a>(
         let mut produced = 0usize;
         let mut ok = drain_near_optimal_pending(state, output, &mut produced);
 
-        for (block_index, block) in blocks.iter().enumerate() {
+        let mut ranges = ranges.into_iter();
+        let mut current = ranges.next().map(|range| {
+            near_optimal::parse_planned_block(state, input, range, max_distance, refinement_passes)
+        });
+
+        for range in ranges {
             if !ok {
                 break;
             }
-
-            let history_start = block.start.saturating_sub(max_distance);
-            let context = &input[history_start..block.end];
-            let local_block = (block.start - history_start)..(block.end - history_start);
-            let candidates = near_optimal::build_match_candidates(context, max_distance);
-            let parsed = near_optimal::refined_parse_range(
+            let mut next = near_optimal::parse_planned_block(
                 state,
-                context,
-                &candidates,
-                local_block,
+                input,
+                range,
+                max_distance,
                 refinement_passes,
             );
+            let current_block = current
+                .as_mut()
+                .expect("the splitter always returns at least one block");
+            near_optimal::optimize_token_boundary(state, current_block, &mut next);
+            ok = emit_planned_near_optimal_block(
+                state,
+                input,
+                current_block,
+                false,
+                output,
+                &mut produced,
+            );
+            current = Some(next);
+        }
 
-            // `refined_parse_range` leaves an empty initialized block after its final cost-model
-            // pass. Tally the chosen path into the ordinary production trees and symbol buffer.
-            near_optimal::tally_tokens(state, &parsed.tokens);
-
-            // The production block chooser can still select a stored block. Only the current block
-            // bytes are needed for that fallback; LZ77 history lives in the candidate table, not in
-            // this temporary encoder window.
-            state.window.clear();
-            if !block.is_empty() {
-                // SAFETY: this exact block slice is initialized and readable, the state owns its
-                // window uniquely, and choose_block_ranges caps blocks below the 64 KiB allocation.
-                unsafe {
-                    state
-                        .window
-                        .copy_and_initialize(0..block.len(), input[block.clone()].as_ptr())
-                };
+        if ok {
+            if let Some(final_block) = current.as_ref() {
+                ok = emit_planned_near_optimal_block(
+                    state,
+                    input,
+                    final_block,
+                    true,
+                    output,
+                    &mut produced,
+                );
             }
-
-            state.block_start = 0;
-            state.strstart = block.len();
-            state.lookahead = 0;
-            state.encode_block(block_index + 1 == blocks.len());
-            ok = drain_near_optimal_pending(state, output, &mut produced);
         }
 
         if ok {

@@ -89,7 +89,6 @@ impl TokenCosts {
         u64::from(self.literal[byte as usize])
     }
 
-    #[cfg(test)]
     fn match_bits(self, length: usize, distance: usize) -> u64 {
         debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length));
         debug_assert!(distance > 0);
@@ -100,6 +99,15 @@ impl TokenCosts {
             + u64::from(StaticTreeDesc::EXTRA_LBITS[length_code])
             + u64::from(self.distance[distance_code])
             + u64::from(StaticTreeDesc::EXTRA_DBITS[distance_code])
+    }
+
+    fn token_bits(self, token: ParseToken) -> u64 {
+        match token {
+            ParseToken::Literal(byte) => self.literal_bits(byte),
+            ParseToken::Match { length, distance } => {
+                self.match_bits(usize::from(length), usize::from(distance))
+            }
+        }
     }
 }
 
@@ -1093,6 +1101,28 @@ mod tests {
 pub(crate) const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
 pub(crate) const MAX_BLOCK_INPUT: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 1;
 
+#[derive(Clone, Copy, Debug)]
+struct BlockScore {
+    bits: usize,
+    encoded_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedBlock {
+    pub(crate) range: Range<usize>,
+    pub(crate) tokens: Vec<ParseToken>,
+}
+
+impl PlannedBlock {
+    fn input_len(&self) -> usize {
+        self.range.len()
+    }
+
+    fn token_input_len(&self) -> usize {
+        self.tokens.iter().map(|token| token.input_len()).sum()
+    }
+}
+
 /// Reparse one selected block using code lengths learned from the previous parse.
 ///
 /// Every candidate parse is scored with the production Huffman tree builder, including the dynamic
@@ -1108,15 +1138,15 @@ pub(crate) fn refined_parse_range(
     refinement_passes: usize,
 ) -> ParseResult {
     let mut current = parse_range(input, candidates, block.clone(), TokenCosts::fixed());
-    let (mut costs, mut best_bits) = costs_and_block_bits(state, &current.tokens);
+    let (mut costs, mut best_score) = costs_and_block_score(state, &current.tokens);
     let mut best = current.clone();
 
     for _ in 0..refinement_passes {
         let next = parse_range(input, candidates, block.clone(), costs);
-        let (next_costs, next_bits) = costs_and_block_bits(state, &next.tokens);
-        if next_bits < best_bits {
+        let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
+        if next_score.bits < best_score.bits {
             best = next.clone();
-            best_bits = next_bits;
+            best_score = next_score;
         }
 
         if next.tokens == current.tokens {
@@ -1143,10 +1173,10 @@ pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) 
     }
 }
 
-fn costs_and_block_bits(
+fn costs_and_block_score(
     state: &mut super::State<'_>,
     tokens: &[ParseToken],
-) -> (TokenCosts, usize) {
+) -> (TokenCosts, BlockScore) {
     state.init_block();
     tally_tokens(state, tokens);
 
@@ -1196,13 +1226,234 @@ fn costs_and_block_bits(
     let _ = super::build_bl_tree(state);
     let dynamic_bytes = (state.opt_len + 3 + 7) >> 3;
     let static_bytes = (state.static_len + 3 + 7) >> 3;
-    let block_bits = if static_bytes <= dynamic_bytes {
-        state.static_len + 3
+    let score = if static_bytes <= dynamic_bytes {
+        BlockScore {
+            bits: state.static_len + 3,
+            encoded_bytes: static_bytes,
+        }
     } else {
-        state.opt_len + 3
+        BlockScore {
+            bits: state.opt_len + 3,
+            encoded_bytes: dynamic_bytes,
+        }
     };
     state.init_block();
-    (costs, block_bits)
+    (costs, score)
+}
+
+fn compressed_score(
+    state: &mut super::State<'_>,
+    tokens: &[ParseToken],
+    input_len: usize,
+) -> Option<(TokenCosts, BlockScore)> {
+    let (costs, score) = costs_and_block_score(state, tokens);
+    // Stored blocks byte-align before their payload, so their exact cost depends on the preceding
+    // block's residual bit count. Boundary optimization is intentionally limited to pairs for which
+    // production would choose a Huffman-coded representation; stored-block regions keep the cheap
+    // splitter's boundary unchanged.
+    (input_len + 4 > score.encoded_bytes).then_some((costs, score))
+}
+
+fn best_fixed_cost_shift(
+    left: &PlannedBlock,
+    right: &PlannedBlock,
+    left_costs: TokenCosts,
+    right_costs: TokenCosts,
+) -> isize {
+    debug_assert_eq!(left.range.end, right.range.start);
+    let mut best_delta = 0i64;
+    let mut best_shift = 0isize;
+
+    // Positive shift: move a prefix of the right block into the left block.
+    let mut moved = 0usize;
+    let mut delta = 0i64;
+    for &token in &right.tokens {
+        moved += token.input_len();
+        if left.input_len() + moved > MAX_BLOCK_INPUT
+            || right.input_len().saturating_sub(moved) < MIN_BLOCK_LENGTH
+        {
+            break;
+        }
+        delta += left_costs.token_bits(token) as i64 - right_costs.token_bits(token) as i64;
+        if delta < best_delta {
+            best_delta = delta;
+            best_shift = moved as isize;
+        }
+    }
+
+    // Negative shift: move a suffix of the left block into the right block.
+    moved = 0;
+    delta = 0;
+    for &token in left.tokens.iter().rev() {
+        moved += token.input_len();
+        if right.input_len() + moved > MAX_BLOCK_INPUT
+            || left.input_len().saturating_sub(moved) < MIN_BLOCK_LENGTH
+        {
+            break;
+        }
+        delta += right_costs.token_bits(token) as i64 - left_costs.token_bits(token) as i64;
+        if delta < best_delta {
+            best_delta = delta;
+            best_shift = -(moved as isize);
+        }
+    }
+
+    best_shift
+}
+
+fn shifted_tokens(
+    left: &PlannedBlock,
+    right: &PlannedBlock,
+    shift: isize,
+) -> (Vec<ParseToken>, Vec<ParseToken>) {
+    if shift > 0 {
+        let mut bytes = 0usize;
+        let mut split = 0usize;
+        while split < right.tokens.len() && bytes < shift as usize {
+            bytes += right.tokens[split].input_len();
+            split += 1;
+        }
+        debug_assert_eq!(bytes, shift as usize);
+        let mut left_tokens = left.tokens.clone();
+        left_tokens.extend_from_slice(&right.tokens[..split]);
+        (left_tokens, right.tokens[split..].to_vec())
+    } else {
+        let wanted = (-shift) as usize;
+        let mut bytes = 0usize;
+        let mut split = left.tokens.len();
+        while split > 0 && bytes < wanted {
+            split -= 1;
+            bytes += left.tokens[split].input_len();
+        }
+        debug_assert_eq!(bytes, wanted);
+        let mut right_tokens = left.tokens[split..].to_vec();
+        right_tokens.extend_from_slice(&right.tokens);
+        (left.tokens[..split].to_vec(), right_tokens)
+    }
+}
+
+/// Improve Huffman block boundaries without rerunning match discovery or the minimum-cost parser.
+///
+/// The parser's token stream is already valid across Huffman block boundaries: matches in a later
+/// block may refer to the full previous 32 KiB history. Therefore an existing whole token can move
+/// to the adjacent block without changing LZ77 semantics. We use the two blocks' current Huffman
+/// code lengths to find the most promising direction/amount in O(tokens), then accept that single
+/// proposal only if rebuilding both production trees proves an actual bit-cost improvement.
+pub(crate) fn optimize_token_boundary(
+    state: &mut super::State<'_>,
+    left: &mut PlannedBlock,
+    right: &mut PlannedBlock,
+) {
+    debug_assert_eq!(left.range.end, right.range.start);
+
+    let Some((left_costs, left_score)) = compressed_score(state, &left.tokens, left.input_len())
+    else {
+        return;
+    };
+    let Some((right_costs, right_score)) =
+        compressed_score(state, &right.tokens, right.input_len())
+    else {
+        return;
+    };
+
+    let shift = best_fixed_cost_shift(left, right, left_costs, right_costs);
+    if shift == 0 {
+        return;
+    }
+    let new_left_len = (left.input_len() as isize + shift) as usize;
+    let new_right_len = (right.input_len() as isize - shift) as usize;
+    let (new_left, new_right) = shifted_tokens(left, right, shift);
+    let Some((_, new_left_score)) = compressed_score(state, &new_left, new_left_len) else {
+        return;
+    };
+    let Some((_, new_right_score)) = compressed_score(state, &new_right, new_right_len) else {
+        return;
+    };
+
+    if new_left_score.bits + new_right_score.bits < left_score.bits + right_score.bits {
+        let boundary = (left.range.end as isize + shift) as usize;
+        left.range.end = boundary;
+        right.range.start = boundary;
+        left.tokens = new_left;
+        right.tokens = new_right;
+    }
+
+    debug_assert_eq!(left.range.end, right.range.start);
+    debug_assert!(left.range.len() <= MAX_BLOCK_INPUT);
+    debug_assert!(right.range.len() <= MAX_BLOCK_INPUT);
+    debug_assert_eq!(left.token_input_len(), left.range.len());
+    debug_assert_eq!(right.token_input_len(), right.range.len());
+}
+
+/// Parse one splitter range into a production-ready token block. A caller only needs to retain two
+/// adjacent blocks at a time to optimize their shared Huffman boundary.
+pub(crate) fn parse_planned_block(
+    state: &mut super::State<'_>,
+    input: &[u8],
+    range: Range<usize>,
+    max_distance: usize,
+    refinement_passes: usize,
+) -> PlannedBlock {
+    let history_start = range.start.saturating_sub(max_distance);
+    let context = &input[history_start..range.end];
+    let local_range = (range.start - history_start)..(range.end - history_start);
+    let candidates = build_match_candidates(context, max_distance);
+    let parsed = refined_parse_range(state, context, &candidates, local_range, refinement_passes);
+    let block = PlannedBlock {
+        range,
+        tokens: parsed.tokens,
+    };
+    debug_assert_eq!(block.token_input_len(), block.range.len());
+    block
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_cost_boundary_shift_moves_whole_tokens_and_conserves_input() {
+        let left = PlannedBlock {
+            range: 0..6_000,
+            tokens: vec![ParseToken::Literal(b'a'); 6_000],
+        };
+        let mut right_tokens = vec![ParseToken::Literal(b'a'); 500];
+        right_tokens.extend(core::iter::repeat_n(ParseToken::Literal(b'b'), 5_500));
+        let right = PlannedBlock {
+            range: 6_000..12_000,
+            tokens: right_tokens,
+        };
+
+        let mut left_costs = TokenCosts::fixed();
+        let mut right_costs = TokenCosts::fixed();
+        left_costs.literal[b'a' as usize] = 1;
+        left_costs.literal[b'b' as usize] = 8;
+        right_costs.literal[b'a' as usize] = 8;
+        right_costs.literal[b'b' as usize] = 1;
+
+        let shift = best_fixed_cost_shift(&left, &right, left_costs, right_costs);
+        assert_eq!(shift, 500);
+        let (shifted_left, shifted_right) = shifted_tokens(&left, &right, shift);
+        assert_eq!(shifted_left.len(), 6_500);
+        assert_eq!(shifted_right.len(), 5_500);
+        assert_eq!(
+            shifted_left
+                .iter()
+                .map(|token| token.input_len())
+                .sum::<usize>(),
+            6_500
+        );
+        assert_eq!(
+            shifted_right
+                .iter()
+                .map(|token| token.input_len())
+                .sum::<usize>(),
+            5_500
+        );
+        assert!(shifted_left[6_000..]
+            .iter()
+            .all(|token| *token == ParseToken::Literal(b'a')));
+    }
 }
 
 #[cfg(test)]
