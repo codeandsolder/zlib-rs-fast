@@ -112,20 +112,17 @@ pub fn compress_slices_batch_parallel(
         return compress_synchronously(jobs, config);
     }
 
-    let chunk_len = jobs.len().div_ceil(workers);
+    // Independent streams vary by orders of magnitude in real workloads. Scheduling one complete
+    // stream per Rayon task lets the persistent pool steal remaining work instead of pinning an
+    // arbitrary equal-count chunk of streams to one worker and waiting for its largest member.
     rayon_core::scope(|scope| {
-        for (job_chunk, result_chunk) in jobs
-            .chunks_mut(chunk_len)
-            .zip(results.chunks_mut(chunk_len))
-        {
+        for (job, result) in jobs.iter_mut().zip(&mut results) {
             scope.spawn(move |_| {
-                for (job, result) in job_chunk.iter_mut().zip(result_chunk) {
-                    let (output, code) = compress_slice(&mut *job.output, job.input, config);
-                    *result = BatchCompressResult {
-                        written: output.len(),
-                        code,
-                    };
-                }
+                let (output, code) = compress_slice(&mut *job.output, job.input, config);
+                *result = BatchCompressResult {
+                    written: output.len(),
+                    code,
+                };
             });
         }
     });
