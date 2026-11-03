@@ -2373,7 +2373,12 @@ fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
     // The pkzip format requires that at least one distance code exists,
     // and that at least one bit should be sent even if there is only one
     // possible code. So to avoid special checks later on we force at least
-    // two codes of non zero frequency.
+    // two codes of non zero frequency. These synthetic symbols are needed to
+    // construct the tree but are never emitted, so discount their payload
+    // cost after bit lengths have been generated. Doing that afterwards also
+    // avoids the C implementation's transient unsigned underflow on empty trees.
+    let mut synthetic_opt_len = 0usize;
+    let mut synthetic_static_len = 0usize;
     while heap.heap_len < 2 {
         heap.heap_len += 1;
         let node = if max_code < 2 {
@@ -2389,9 +2394,9 @@ fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
         heap.heap[heap.heap_len] = node as u32;
         *tree[node].freq_mut() = 1;
         heap.depth[node] = 0;
-        state.opt_len -= 1;
+        synthetic_opt_len += 1;
         if !stree.is_empty() {
-            state.static_len -= stree[node].len() as usize;
+            synthetic_static_len += stree[node].len() as usize;
         }
         /* node is 0 or 1 so it does not have extra bits */
     }
@@ -2413,6 +2418,8 @@ fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
     // At this point, the fields freq and dad are set. We can now
     // generate the bit lengths.
     let bl_count = gen_bitlen(state, &mut heap, desc);
+    state.opt_len -= synthetic_opt_len;
+    state.static_len -= synthetic_static_len;
 
     // The field len is now set, we can generate the bit codes
     gen_codes(&mut desc.dyn_tree, max_code, &bl_count);

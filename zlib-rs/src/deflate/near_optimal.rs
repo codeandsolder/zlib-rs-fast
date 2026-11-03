@@ -1213,6 +1213,27 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn exact_frontier_does_not_cross_deflate_window() {
+        let mut state = 0x94d0_49bb_1331_11ebu64;
+        let mut input = vec![0u8; 32_769];
+        for byte in &mut input {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = (state >> 32) as u8;
+        }
+        let repeated = input[..STD_MAX_MATCH].to_vec();
+        assert_ne!(&input[1..=STD_MAX_MATCH], repeated.as_slice());
+        input.extend_from_slice(&repeated);
+
+        let table = build_match_candidates(&input, 32_768);
+        assert!(table
+            .for_position(32_769)
+            .iter()
+            .all(|candidate| usize::from(candidate.length) < STD_MAX_MATCH));
+    }
+
     fn brute_frontier(input: &[u8], position: usize, max_distance: usize) -> Vec<MatchCandidate> {
         if position + STD_MIN_MATCH > input.len() {
             return Vec::new();
@@ -1394,6 +1415,24 @@ mod tests {
             .take(blocks.len() - 1)
             .all(|block| block.len() >= MIN_BLOCK_LENGTH));
         assert!(blocks.last().unwrap().len() >= MIN_BLOCK_LENGTH);
+    }
+
+    #[test]
+    fn splitter_soft_limit_boundary_matrix_is_exact() {
+        for (len, expected) in [
+            (0, vec![0..0]),
+            (59_999, vec![0..59_999]),
+            (60_000, vec![0..60_000]),
+            (60_001, vec![0..60_001]),
+            (64_999, vec![0..64_999]),
+            (65_000, vec![0..60_000, 60_000..65_000]),
+            (65_001, vec![0..60_000, 60_000..65_001]),
+            (119_999, vec![0..60_000, 60_000..119_999]),
+            (120_000, vec![0..60_000, 60_000..120_000]),
+        ] {
+            let input = vec![0x5a; len];
+            assert_eq!(choose_block_ranges(&input, 32_768), expected, "len={len}");
+        }
     }
 
     #[test]
@@ -2401,18 +2440,37 @@ mod encoded_tests {
         ReturnCode,
     };
 
-    #[test]
-    fn near_optimal_compressor_round_trips_with_optimized_costs() {
-        let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
+    fn assert_round_trip(input: &[u8], optimization_passes: usize) {
         let mut compressed = vec![0u8; compress_bound(input.len())];
         let (compressed, code) =
-            super::super::compress_slice_near_optimal(&mut compressed, input, 1);
-        assert_eq!(code, ReturnCode::Ok);
+            super::super::compress_slice_near_optimal(&mut compressed, input, optimization_passes);
+        assert_eq!(
+            code,
+            ReturnCode::Ok,
+            "near-optimal compression failed for {} input bytes",
+            input.len()
+        );
 
         let mut decoded = vec![0u8; input.len()];
         let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
-        assert_eq!(code, ReturnCode::Ok);
-        assert_eq!(decoded, input);
+        assert_eq!(
+            code,
+            ReturnCode::Ok,
+            "near-optimal decompression failed for {} input bytes",
+            input.len()
+        );
+        assert_eq!(
+            decoded,
+            input,
+            "round-trip mismatch for {} bytes",
+            input.len()
+        );
+    }
+
+    #[test]
+    fn near_optimal_compressor_round_trips_with_optimized_costs() {
+        let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
+        assert_round_trip(input, 1);
     }
 
     #[test]
@@ -2445,15 +2503,7 @@ mod encoded_tests {
             [0..60_000, 60_000..120_000]
         );
 
-        let mut compressed = vec![0u8; compress_bound(input.len())];
-        let (compressed, code) =
-            super::super::compress_slice_near_optimal(&mut compressed, &input, 1);
-        assert_eq!(code, ReturnCode::Ok);
-
-        let mut decoded = vec![0u8; input.len()];
-        let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
-        assert_eq!(code, ReturnCode::Ok);
-        assert_eq!(decoded, input);
+        assert_round_trip(&input, 1);
     }
 
     #[test]
@@ -2465,15 +2515,7 @@ mod encoded_tests {
             "test input must exercise multiple blocks"
         );
 
-        let mut compressed = vec![0u8; compress_bound(input.len())];
-        let (compressed, code) =
-            super::super::compress_slice_near_optimal(&mut compressed, &input, 1);
-        assert_eq!(code, ReturnCode::Ok);
-
-        let mut decoded = vec![0u8; input.len()];
-        let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
-        assert_eq!(code, ReturnCode::Ok);
-        assert_eq!(decoded, input);
+        assert_round_trip(&input, 1);
     }
 
     #[test]
@@ -2489,14 +2531,38 @@ mod encoded_tests {
         let repeated = input[..STD_MAX_MATCH].to_vec();
         input.extend_from_slice(&repeated);
 
-        let mut compressed = vec![0u8; compress_bound(input.len())];
-        let (compressed, code) =
-            super::super::compress_slice_near_optimal(&mut compressed, &input, 1);
-        assert_eq!(code, ReturnCode::Ok);
+        assert_round_trip(&input, 1);
+    }
 
-        let mut decoded = vec![0u8; input.len()];
-        let (decoded, code) = decompress_slice(&mut decoded, compressed, InflateConfig::default());
-        assert_eq!(code, ReturnCode::Ok);
-        assert_eq!(decoded, input);
+    #[test]
+    fn every_tiny_input_length_round_trips() {
+        for len in 0..=STD_MAX_MATCH + 1 {
+            let input = (0..len)
+                .map(|index| ((index.wrapping_mul(73) ^ (index >> 3)) & 0xff) as u8)
+                .collect::<Vec<_>>();
+            assert_round_trip(&input, 0);
+        }
+    }
+
+    #[test]
+    fn block_and_stored_length_boundaries_round_trip() {
+        for len in [
+            MAX_COARSE_BLOCK_INPUT,
+            MAX_COARSE_BLOCK_INPUT + 1,
+            super::super::MAX_STORED,
+            super::super::MAX_STORED + 1,
+        ] {
+            let input = vec![0x5a; len];
+            assert_round_trip(&input, 0);
+        }
+    }
+
+    #[test]
+    fn insufficient_output_returns_no_partial_slice() {
+        let input = vec![0x5a; 8_192];
+        let mut output = [0u8; 1];
+        let (compressed, code) = super::super::compress_slice_near_optimal(&mut output, &input, 0);
+        assert_eq!(code, ReturnCode::BufError);
+        assert!(compressed.is_empty());
     }
 }
