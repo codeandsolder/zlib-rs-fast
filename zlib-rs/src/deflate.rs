@@ -4375,6 +4375,111 @@ mod test {
     }
 
     #[test]
+    fn near_optimal_partition_respects_huffman_token_capacity() {
+        fn literal_block(range: core::ops::Range<usize>) -> near_optimal::PlannedBlock {
+            near_optimal::PlannedBlock {
+                tokens: vec![near_optimal::ParseToken::Literal(b'a'); range.len()],
+                range,
+            }
+        }
+
+        let mut raw = z_stream::default();
+        assert_eq!(
+            init_with_lit_bufsize(
+                &mut raw,
+                DeflateConfig::new(9),
+                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
+            ),
+            ReturnCode::Ok
+        );
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+
+        let half = near_optimal::MAX_BLOCK_TOKENS / 2;
+        let mut left = literal_block(0..half);
+        let mut right = literal_block(half..near_optimal::MAX_BLOCK_TOKENS);
+        let outcome =
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+        let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
+            panic!("the exact 65,534-token Huffman capacity should remain mergeable");
+        };
+        assert_eq!(merged.tokens.len(), near_optimal::MAX_BLOCK_TOKENS);
+
+        let mut left = literal_block(0..half);
+        let mut right = literal_block(half..near_optimal::MAX_BLOCK_TOKENS + 1);
+        let outcome =
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+        assert!(!matches!(
+            outcome,
+            near_optimal::BoundaryOptimization::Merged(_)
+        ));
+        assert_eq!(
+            left.tokens.len() + right.tokens.len(),
+            near_optimal::MAX_BLOCK_TOKENS + 1
+        );
+        assert!(end(stream).is_ok());
+    }
+
+    #[test]
+    fn near_optimal_emits_exact_huffman_token_capacity() {
+        let input = vec![b'a'; near_optimal::MAX_BLOCK_TOKENS];
+        let block = near_optimal::PlannedBlock {
+            range: 0..input.len(),
+            tokens: vec![near_optimal::ParseToken::Literal(b'a'); input.len()],
+        };
+        let mut output = vec![0u8; compress_bound(input.len())];
+        let mut raw = z_stream::default();
+        assert_eq!(
+            init_with_lit_bufsize(
+                &mut raw,
+                DeflateConfig::new(9),
+                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
+            ),
+            ReturnCode::Ok
+        );
+
+        let produced = {
+            let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+            let state = &mut *stream.state;
+            state
+                .bit_writer
+                .pending
+                .extend(&state.header().to_be_bytes());
+            let mut produced = 0usize;
+            assert!(drain_near_optimal_pending(
+                state,
+                &mut output,
+                &mut produced
+            ));
+            assert!(emit_planned_near_optimal_block(
+                state,
+                &input,
+                &block,
+                true,
+                &mut output,
+                &mut produced,
+            ));
+            state
+                .bit_writer
+                .pending
+                .extend(&adler32(ADLER32_INITIAL_VALUE as u32, &input).to_be_bytes());
+            assert!(drain_near_optimal_pending(
+                state,
+                &mut output,
+                &mut produced
+            ));
+            produced
+        };
+
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        assert!(end(stream).is_ok());
+        let mut decoded = vec![0u8; input.len()];
+        let (decoded, code) =
+            decompress_slice(&mut decoded, &output[..produced], InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
     fn init_allocation_geometry_matches_config() {
         for (window_bits, mem_level) in [(MIN_WBITS, 1), (MAX_WBITS, MAX_MEM_LEVEL)] {
             let mut raw = z_stream::default();
