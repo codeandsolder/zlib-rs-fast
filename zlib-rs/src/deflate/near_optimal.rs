@@ -1014,8 +1014,10 @@ pub(crate) fn parse_range(
         }
 
         let generation = (local_position + 1) as u32;
+        let mut longest_match = 0usize;
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
+            longest_match = longest_match.max(max_len);
             let cost = distance_costs[usize::from(candidate.distance)];
             let slot = &mut distance_cost_at_max[max_len];
             if slot.generation != generation || cost < slot.cost {
@@ -1027,8 +1029,11 @@ pub(crate) fn parse_range(
             }
         }
 
+        if longest_match < STD_MIN_MATCH {
+            continue;
+        }
         let mut cheapest_capable = None::<(u16, u16)>;
-        for length in (STD_MIN_MATCH..=available).rev() {
+        for length in (STD_MIN_MATCH..=longest_match).rev() {
             let candidate = distance_cost_at_max[length];
             if candidate.generation == generation
                 && cheapest_capable.is_none_or(|(old, _)| candidate.cost < old)
