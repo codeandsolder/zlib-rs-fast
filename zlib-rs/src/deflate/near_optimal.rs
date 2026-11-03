@@ -575,16 +575,32 @@ impl SuffixRanks {
         }
         assert!(input.len() <= u32::MAX as usize);
 
+        const PAIR_SEED_MIN_INPUT: usize = 32 * 1024;
+        const PAIR_SEED_RADIX: u32 = 257;
+
         let mut sa = (0..input.len() as u32).collect::<Vec<_>>();
         let mut scratch = vec![0u32; input.len()];
-        let mut rank = input
-            .iter()
-            .map(|&byte| u32::from(byte) + 1)
-            .collect::<Vec<_>>();
+        let use_pair_seed = input.len() >= PAIR_SEED_MIN_INPUT;
+        let mut rank = if use_pair_seed {
+            (0..input.len())
+                .map(|position| {
+                    let first = u32::from(input[position]);
+                    let second = input
+                        .get(position + 1)
+                        .map_or(0, |&byte| u32::from(byte) + 1);
+                    first * PAIR_SEED_RADIX + second + 1
+                })
+                .collect::<Vec<_>>()
+        } else {
+            input
+                .iter()
+                .map(|&byte| u32::from(byte) + 1)
+                .collect::<Vec<_>>()
+        };
         let mut next_rank = vec![0u32; input.len()];
-        let mut counts = vec![0u32; input.len().max(256) + 1];
         let mut max_rank = rank.iter().copied().max().unwrap_or(0);
-        let mut span = 1usize;
+        let mut counts = vec![0u32; input.len().max(max_rank as usize) + 1];
+        let mut span = if use_pair_seed { 2 } else { 1 };
 
         loop {
             // Prefix-doubling ranks are dense integers after the first round. Sort the pair
@@ -1167,6 +1183,26 @@ mod tests {
                 reference.remove(&rank);
             }
             check(&set, &reference);
+        }
+    }
+
+    #[test]
+    fn two_byte_suffix_seed_preserves_lexicographic_rank_order() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut input = vec![0u8; 32 * 1024];
+        for byte in &mut input {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = ((state >> 32) as u8) & 0x1f;
+        }
+
+        let suffixes = SuffixRanks::new(&input);
+        for (rank, &position) in suffixes.sa.iter().enumerate() {
+            assert_eq!(suffixes.rank[position as usize], rank as u32);
+        }
+        for pair in suffixes.sa.windows(2) {
+            assert!(input[pair[0] as usize..] < input[pair[1] as usize..]);
         }
     }
 
