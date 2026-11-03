@@ -359,7 +359,7 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                 let rank = tile_ranks[local_position] as usize;
                 let mut best = MatchCandidate::NONE;
                 let (predecessor, successor) = active.neighbors(rank);
-                for candidate_rank in [predecessor, successor].into_iter().flatten() {
+                let mut consider_rank = |candidate_rank: usize| {
                     let candidate_position = suffixes.sa[candidate_rank] as usize;
                     let distance = position - candidate_position;
                     debug_assert!((min_distance..=max_distance).contains(&distance));
@@ -377,6 +377,12 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                             distance: distance as u16,
                         };
                     }
+                };
+                if let Some(candidate_rank) = predecessor {
+                    consider_rank(candidate_rank);
+                }
+                if let Some(candidate_rank) = successor {
+                    consider_rank(candidate_rank);
                 }
                 if best.length != 0 {
                     append_candidate(local_position, best);
