@@ -256,7 +256,7 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
     offsets.push(0);
 
     for position in 0..input.len() {
-        let rank = suffixes.rank[position];
+        let rank = suffixes.rank[position] as usize;
         let available = STD_MAX_MATCH.min(input.len() - position);
 
         for (code, &(min_distance, max_distance)) in ranges.iter().enumerate() {
@@ -272,15 +272,15 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                 let Some(add) = position.checked_sub(min_distance) else {
                     continue;
                 };
-                active.insert(suffixes.rank[add]);
+                active.insert(suffixes.rank[add] as usize);
                 if let Some(remove) = position.checked_sub(max_distance + 1) {
-                    active.remove(suffixes.rank[remove]);
+                    active.remove(suffixes.rank[remove] as usize);
                 }
 
                 let predecessor = active.predecessor(rank);
                 let successor = active.successor(rank);
                 for candidate_rank in [predecessor, successor].into_iter().flatten() {
-                    let candidate_position = suffixes.sa[candidate_rank];
+                    let candidate_position = suffixes.sa[candidate_rank] as usize;
                     let distance = position - candidate_position;
                     debug_assert!((min_distance..=max_distance).contains(&distance));
                     let length = match_compare::common_prefix_len(
@@ -561,8 +561,8 @@ fn distance_code_ranges(max_distance: usize) -> [(usize, usize); D_CODES] {
 }
 
 struct SuffixRanks {
-    sa: Vec<usize>,
-    rank: Vec<usize>,
+    sa: Vec<u32>,
+    rank: Vec<u32>,
 }
 
 impl SuffixRanks {
@@ -573,15 +573,16 @@ impl SuffixRanks {
                 rank: Vec::new(),
             };
         }
+        assert!(input.len() <= u32::MAX as usize);
 
-        let mut sa = (0..input.len()).collect::<Vec<_>>();
-        let mut scratch = vec![0usize; input.len()];
+        let mut sa = (0..input.len() as u32).collect::<Vec<_>>();
+        let mut scratch = vec![0u32; input.len()];
         let mut rank = input
             .iter()
-            .map(|&byte| usize::from(byte) + 1)
+            .map(|&byte| u32::from(byte) + 1)
             .collect::<Vec<_>>();
-        let mut next_rank = vec![0usize; input.len()];
-        let mut counts = vec![0usize; input.len().max(256) + 1];
+        let mut next_rank = vec![0u32; input.len()];
+        let mut counts = vec![0u32; input.len().max(256) + 1];
         let mut max_rank = rank.iter().copied().max().unwrap_or(0);
         let mut span = 1usize;
 
@@ -592,22 +593,22 @@ impl SuffixRanks {
             counting_sort_suffixes_by_second(&sa, &mut scratch, &rank, span, max_rank, &mut counts);
             counting_sort_suffixes_by_first(&scratch, &mut sa, &rank, max_rank, &mut counts);
 
-            let mut class = 1usize;
-            next_rank[sa[0]] = class;
+            let mut class = 1u32;
+            next_rank[sa[0] as usize] = class;
             for pair in sa.windows(2) {
                 let left = pair[0];
                 let right = pair[1];
-                if rank[left] != rank[right]
+                if rank[left as usize] != rank[right as usize]
                     || suffix_second_rank(&rank, left, span)
                         != suffix_second_rank(&rank, right, span)
                 {
                     class += 1;
                 }
-                next_rank[right] = class;
+                next_rank[right as usize] = class;
             }
 
             core::mem::swap(&mut rank, &mut next_rank);
-            if class == input.len() {
+            if class as usize == input.len() {
                 break;
             }
             max_rank = class;
@@ -619,7 +620,7 @@ impl SuffixRanks {
         // The doubling ranks are 1-based equivalence classes. The parser wants direct indices into
         // `sa`, so materialize the exact inverse suffix-array permutation once.
         for (suffix_rank, &position) in sa.iter().enumerate() {
-            rank[position] = suffix_rank;
+            rank[position as usize] = suffix_rank as u32;
         }
 
         Self { sa, rank }
@@ -627,48 +628,48 @@ impl SuffixRanks {
 }
 
 fn counting_sort_suffixes_by_second(
-    source: &[usize],
-    target: &mut [usize],
-    rank: &[usize],
+    source: &[u32],
+    target: &mut [u32],
+    rank: &[u32],
     span: usize,
-    max_rank: usize,
-    counts: &mut [usize],
+    max_rank: u32,
+    counts: &mut [u32],
 ) {
-    let counts = &mut counts[..=max_rank];
+    let counts = &mut counts[..=max_rank as usize];
     counts.fill(0);
     for &position in source {
-        counts[suffix_second_rank(rank, position, span)] += 1;
+        counts[suffix_second_rank(rank, position, span) as usize] += 1;
     }
     counts_to_offsets(counts);
     for &position in source {
-        let key = suffix_second_rank(rank, position, span);
-        target[counts[key]] = position;
+        let key = suffix_second_rank(rank, position, span) as usize;
+        target[counts[key] as usize] = position;
         counts[key] += 1;
     }
 }
 
 fn counting_sort_suffixes_by_first(
-    source: &[usize],
-    target: &mut [usize],
-    rank: &[usize],
-    max_rank: usize,
-    counts: &mut [usize],
+    source: &[u32],
+    target: &mut [u32],
+    rank: &[u32],
+    max_rank: u32,
+    counts: &mut [u32],
 ) {
-    let counts = &mut counts[..=max_rank];
+    let counts = &mut counts[..=max_rank as usize];
     counts.fill(0);
     for &position in source {
-        counts[rank[position]] += 1;
+        counts[rank[position as usize] as usize] += 1;
     }
     counts_to_offsets(counts);
     for &position in source {
-        let key = rank[position];
-        target[counts[key]] = position;
+        let key = rank[position as usize] as usize;
+        target[counts[key] as usize] = position;
         counts[key] += 1;
     }
 }
 
-fn counts_to_offsets(counts: &mut [usize]) {
-    let mut offset = 0usize;
+fn counts_to_offsets(counts: &mut [u32]) {
+    let mut offset = 0u32;
     for count in counts {
         let frequency = *count;
         *count = offset;
@@ -677,7 +678,8 @@ fn counts_to_offsets(counts: &mut [usize]) {
 }
 
 #[inline]
-fn suffix_second_rank(rank: &[usize], position: usize, span: usize) -> usize {
+fn suffix_second_rank(rank: &[u32], position: u32, span: usize) -> u32 {
+    let position = position as usize;
     if position < rank.len().saturating_sub(span) {
         rank[position + span]
     } else {
