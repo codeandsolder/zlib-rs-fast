@@ -568,8 +568,10 @@ impl ThreeLevelRankSet {
         let word_index = rank / 64;
         let raw_word = self.base[word_index];
         let bit_index = rank % 64;
-        let lower = raw_word & low_bits(bit_index);
-        let upper = raw_word & !low_bits(bit_index + 1);
+        let bit = 1u64 << bit_index;
+        let lower_mask = bit - 1;
+        let lower = raw_word & lower_mask;
+        let upper = raw_word & !(lower_mask | bit);
 
         if lower != 0 && upper != 0 {
             return (
@@ -581,15 +583,18 @@ impl ThreeLevelRankSet {
         let middle_index = word_index / 64;
         let middle_bit_index = word_index % 64;
         let middle_word = self.middle[middle_index];
+        let middle_bit = 1u64 << middle_bit_index;
+        let middle_lower_mask = middle_bit - 1;
 
         let predecessor = if lower != 0 {
             Some(word_index * 64 + highest_bit(lower))
         } else {
-            let previous_in_middle = middle_word & low_bits(middle_bit_index);
+            let previous_in_middle = middle_word & middle_lower_mask;
             let previous_word = if previous_in_middle != 0 {
                 Some(middle_index * 64 + highest_bit(previous_in_middle))
             } else if middle_index != 0 {
-                let previous_middle = self.top & low_bits(middle_index);
+                let top_bit = 1u64 << middle_index;
+                let previous_middle = self.top & (top_bit - 1);
                 (previous_middle != 0).then(|| {
                     let middle_index = highest_bit(previous_middle);
                     let word = self.middle[middle_index];
@@ -609,11 +614,12 @@ impl ThreeLevelRankSet {
         let successor = if upper != 0 {
             Some(word_index * 64 + upper.trailing_zeros() as usize)
         } else {
-            let next_in_middle = middle_word & !low_bits(middle_bit_index + 1);
+            let next_in_middle = middle_word & !(middle_lower_mask | middle_bit);
             let next_word = if next_in_middle != 0 {
                 Some(middle_index * 64 + next_in_middle.trailing_zeros() as usize)
             } else {
-                let next_middle = self.top & !low_bits(middle_index + 1);
+                let top_bit = 1u64 << middle_index;
+                let next_middle = self.top & !((top_bit - 1) | top_bit);
                 (next_middle != 0).then(|| {
                     let middle_index = next_middle.trailing_zeros() as usize;
                     let word = self.middle[middle_index];
