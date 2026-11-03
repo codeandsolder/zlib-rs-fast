@@ -450,193 +450,22 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
 /// Dense ordered set over suffix ranks. Each level is a bitset whose set bits identify non-empty
 /// words in the level below it, so predecessor/successor queries skip arbitrarily large empty rank
 /// intervals without pointer chasing or per-entry allocation.
-enum RankSet {
-    Three(ThreeLevelRankSet),
-    Generic(GenericRankSet),
-}
-
-struct ThreeLevelRankSet {
-    base: Vec<u64>,
-    middle: Vec<u64>,
-    top: u64,
-}
-
-struct GenericRankSet {
+struct RankSet {
     levels: Vec<Vec<u64>>,
 }
 
 impl RankSet {
     fn new(universe: usize) -> Self {
-        let base_words = universe.div_ceil(64).max(1);
-        if base_words <= 64 * 64 {
-            let middle_words = base_words.div_ceil(64).max(1);
-            debug_assert!(middle_words <= 64);
-            Self::Three(ThreeLevelRankSet {
-                base: vec![0; base_words],
-                middle: vec![0; middle_words],
-                top: 0,
-            })
-        } else {
-            let mut levels = Vec::new();
-            let mut words = base_words;
+        let mut levels = Vec::new();
+        let mut words = universe.div_ceil(64).max(1);
+        levels.push(vec![0; words]);
+        while words > 1 {
+            words = words.div_ceil(64);
             levels.push(vec![0; words]);
-            while words > 1 {
-                words = words.div_ceil(64);
-                levels.push(vec![0; words]);
-            }
-            Self::Generic(GenericRankSet { levels })
         }
+        Self { levels }
     }
 
-    #[inline]
-    fn insert(&mut self, rank: usize) {
-        match self {
-            Self::Three(set) => set.insert(rank),
-            Self::Generic(set) => set.insert(rank),
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, rank: usize) {
-        match self {
-            Self::Three(set) => set.remove(rank),
-            Self::Generic(set) => set.remove(rank),
-        }
-    }
-
-    #[inline]
-    fn neighbors(&self, rank: usize) -> (Option<usize>, Option<usize>) {
-        match self {
-            Self::Three(set) => set.neighbors(rank),
-            Self::Generic(set) => (set.predecessor(rank), set.successor(rank)),
-        }
-    }
-}
-
-impl ThreeLevelRankSet {
-    #[inline]
-    fn insert(&mut self, rank: usize) {
-        let base_index = rank / 64;
-        let base_bit = 1u64 << (rank % 64);
-        let base_word = &mut self.base[base_index];
-        debug_assert_eq!(
-            *base_word & base_bit,
-            0,
-            "rank is inserted only once while active"
-        );
-        let base_was_empty = *base_word == 0;
-        *base_word |= base_bit;
-        if !base_was_empty {
-            return;
-        }
-
-        let middle_index = base_index / 64;
-        let middle_bit = 1u64 << (base_index % 64);
-        let middle_word = &mut self.middle[middle_index];
-        let middle_was_empty = *middle_word == 0;
-        *middle_word |= middle_bit;
-        if middle_was_empty {
-            self.top |= 1u64 << middle_index;
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, rank: usize) {
-        let base_index = rank / 64;
-        let base_bit = 1u64 << (rank % 64);
-        let base_word = &mut self.base[base_index];
-        debug_assert_ne!(*base_word & base_bit, 0);
-        *base_word &= !base_bit;
-        if *base_word != 0 {
-            return;
-        }
-
-        let middle_index = base_index / 64;
-        let middle_bit = 1u64 << (base_index % 64);
-        let middle_word = &mut self.middle[middle_index];
-        debug_assert_ne!(*middle_word & middle_bit, 0);
-        *middle_word &= !middle_bit;
-        if *middle_word == 0 {
-            self.top &= !(1u64 << middle_index);
-        }
-    }
-
-    #[inline]
-    fn neighbors(&self, rank: usize) -> (Option<usize>, Option<usize>) {
-        let word_index = rank / 64;
-        let raw_word = self.base[word_index];
-        let bit_index = rank % 64;
-        let bit = 1u64 << bit_index;
-        let lower_mask = bit - 1;
-        let lower = raw_word & lower_mask;
-        let upper = raw_word & !(lower_mask | bit);
-
-        if lower != 0 && upper != 0 {
-            return (
-                Some(word_index * 64 + highest_bit(lower)),
-                Some(word_index * 64 + upper.trailing_zeros() as usize),
-            );
-        }
-
-        let middle_index = word_index / 64;
-        let middle_bit_index = word_index % 64;
-        let middle_word = self.middle[middle_index];
-        let middle_bit = 1u64 << middle_bit_index;
-        let middle_lower_mask = middle_bit - 1;
-
-        let predecessor = if lower != 0 {
-            Some(word_index * 64 + highest_bit(lower))
-        } else {
-            let previous_in_middle = middle_word & middle_lower_mask;
-            let previous_word = if previous_in_middle != 0 {
-                Some(middle_index * 64 + highest_bit(previous_in_middle))
-            } else if middle_index != 0 {
-                let top_bit = 1u64 << middle_index;
-                let previous_middle = self.top & (top_bit - 1);
-                (previous_middle != 0).then(|| {
-                    let middle_index = highest_bit(previous_middle);
-                    let word = self.middle[middle_index];
-                    debug_assert_ne!(word, 0);
-                    middle_index * 64 + highest_bit(word)
-                })
-            } else {
-                None
-            };
-            previous_word.map(|previous_word| {
-                let word = self.base[previous_word];
-                debug_assert_ne!(word, 0);
-                previous_word * 64 + highest_bit(word)
-            })
-        };
-
-        let successor = if upper != 0 {
-            Some(word_index * 64 + upper.trailing_zeros() as usize)
-        } else {
-            let next_in_middle = middle_word & !(middle_lower_mask | middle_bit);
-            let next_word = if next_in_middle != 0 {
-                Some(middle_index * 64 + next_in_middle.trailing_zeros() as usize)
-            } else {
-                let top_bit = 1u64 << middle_index;
-                let next_middle = self.top & !((top_bit - 1) | top_bit);
-                (next_middle != 0).then(|| {
-                    let middle_index = next_middle.trailing_zeros() as usize;
-                    let word = self.middle[middle_index];
-                    debug_assert_ne!(word, 0);
-                    middle_index * 64 + word.trailing_zeros() as usize
-                })
-            };
-            next_word.map(|next_word| {
-                let word = self.base[next_word];
-                debug_assert_ne!(word, 0);
-                next_word * 64 + word.trailing_zeros() as usize
-            })
-        };
-
-        (predecessor, successor)
-    }
-}
-
-impl GenericRankSet {
     #[inline]
     fn insert(&mut self, rank: usize) {
         let mut index = rank;
@@ -672,6 +501,11 @@ impl GenericRankSet {
             }
             index = word_index;
         }
+    }
+
+    #[inline]
+    fn neighbors(&self, rank: usize) -> (Option<usize>, Option<usize>) {
+        (self.predecessor(rank), self.successor(rank))
     }
 
     #[inline]
