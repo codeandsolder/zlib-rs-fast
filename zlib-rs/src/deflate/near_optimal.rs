@@ -194,39 +194,31 @@ pub(crate) struct ParseResult {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ParseStep(u64);
+struct ParseStep(u32);
 
 impl ParseStep {
     const MATCH_FLAG: u32 = 1 << 31;
 
     #[inline]
-    fn new(previous: usize, token: ParseToken) -> Self {
-        debug_assert!(previous <= u32::MAX as usize);
-        let token = match token {
+    fn new(token: ParseToken) -> Self {
+        Self(match token {
             ParseToken::Literal(byte) => u32::from(byte),
             ParseToken::Match { length, distance } => {
                 debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&usize::from(length)));
                 debug_assert_ne!(distance, 0);
                 Self::MATCH_FLAG | (u32::from(length) << 16) | u32::from(distance)
             }
-        };
-        Self((u64::from(token) << 32) | previous as u64)
-    }
-
-    #[inline]
-    fn previous(self) -> usize {
-        (self.0 as u32) as usize
+        })
     }
 
     #[inline]
     fn token(self) -> ParseToken {
-        let token = (self.0 >> 32) as u32;
-        if token & Self::MATCH_FLAG == 0 {
-            ParseToken::Literal(token as u8)
+        if self.0 & Self::MATCH_FLAG == 0 {
+            ParseToken::Literal(self.0 as u8)
         } else {
             ParseToken::Match {
-                length: ((token >> 16) & 0x1ff) as u16,
-                distance: token as u16,
+                length: ((self.0 >> 16) & 0x1ff) as u16,
+                distance: self.0 as u16,
             }
         }
     }
@@ -1256,7 +1248,6 @@ pub(crate) fn parse_range(
             &mut steps,
             local_position + 1,
             prefix_cost + costs.literal_cost(input[position]),
-            local_position,
             ParseToken::Literal(input[position]),
         );
 
@@ -1301,7 +1292,6 @@ pub(crate) fn parse_range(
                 &mut steps,
                 local_position + length,
                 prefix_cost + token_cost,
-                local_position,
                 ParseToken::Match {
                     length: length as u16,
                     distance,
@@ -1313,9 +1303,9 @@ pub(crate) fn parse_range(
     let mut tokens = Vec::new();
     let mut cursor = block_len;
     while cursor != 0 {
-        let step = steps[cursor];
-        tokens.push(step.token());
-        cursor = step.previous();
+        let token = steps[cursor].token();
+        tokens.push(token);
+        cursor -= token.input_len();
     }
     tokens.reverse();
 
@@ -1341,12 +1331,11 @@ fn relax(
     steps: &mut [ParseStep],
     endpoint: usize,
     cost: u64,
-    previous: usize,
     token: ParseToken,
 ) {
     if cost < best_cost[endpoint] {
         best_cost[endpoint] = cost;
-        steps[endpoint] = ParseStep::new(previous, token);
+        steps[endpoint] = ParseStep::new(token);
     }
 }
 
@@ -1440,30 +1429,23 @@ mod tests {
     }
 
     #[test]
-    fn packed_parse_step_round_trips_extremes() {
-        for &(previous, token) in &[
-            (0usize, ParseToken::Literal(0)),
-            (u32::MAX as usize, ParseToken::Literal(u8::MAX)),
-            (
-                1,
-                ParseToken::Match {
-                    length: STD_MIN_MATCH as u16,
-                    distance: 1,
-                },
-            ),
-            (
-                u32::MAX as usize,
-                ParseToken::Match {
-                    length: STD_MAX_MATCH as u16,
-                    distance: 32_768,
-                },
-            ),
+    fn packed_parse_step_round_trips_tokens() {
+        for &token in &[
+            ParseToken::Literal(0),
+            ParseToken::Literal(u8::MAX),
+            ParseToken::Match {
+                length: STD_MIN_MATCH as u16,
+                distance: 1,
+            },
+            ParseToken::Match {
+                length: STD_MAX_MATCH as u16,
+                distance: 32_768,
+            },
         ] {
-            let step = ParseStep::new(previous, token);
-            assert_eq!(step.previous(), previous);
+            let step = ParseStep::new(token);
             assert_eq!(step.token(), token);
         }
-        assert_eq!(core::mem::size_of::<ParseStep>(), 8);
+        assert_eq!(core::mem::size_of::<ParseStep>(), 4);
     }
 
     #[test]
