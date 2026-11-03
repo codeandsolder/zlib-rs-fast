@@ -51,6 +51,12 @@ jobs:
           persist-credentials: false
           ref: "${{inputs.ref}}"
           fetch-depth: 0 # ensure the base commit to compare against is available
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -82,3 +88,7 @@ jobs:
           bench-repo: "git@github.com:trifectatechfoundation/zlib-rs-bench.git"
           metric-key: "${{ matrix.name }}"
           benchmarks: "zlib_benchmarks.json"
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main

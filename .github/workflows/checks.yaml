@@ -112,6 +112,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -189,6 +195,9 @@ jobs:
           name: test
           verbose: true
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   clippy:
     name: Clippy
     strategy:
@@ -206,17 +215,18 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
           targets: ${{matrix.target}}
-      - name: Rust cache
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        with:
-            shared-key: "${{ env.RUST_TOOLCHAIN }}-${{matrix.target}}"
-
       - name: Run rustfmt and clippy
         run: |
           cargo fmt --all --check
@@ -235,6 +245,9 @@ jobs:
         run: |
           cargo doc --target ${{matrix.target}} -p libz-rs-sys
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   fuzz:
     name: Smoke-test fuzzing targets
     runs-on: ubuntu-latest
@@ -249,6 +262,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -267,6 +286,9 @@ jobs:
             RUST_BACKTRACE=1 cargo fuzz run --no-default-features --features="$features" $target -- -max_total_time=10
           done
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   fuzz-aarch64:
     name: Smoke-test fuzzing targets
     runs-on: macos-latest
@@ -281,6 +303,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -299,6 +327,9 @@ jobs:
             RUST_BACKTRACE=1 cargo fuzz run --no-default-features --features="$features" $target -- -max_total_time=10
           done
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   fuzz-code-coverage:
     name: Fuzz with code coverage
     runs-on: ubuntu-latest
@@ -318,6 +349,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -356,6 +393,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           name: fuzz
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   link-c-dynamic-library:
     name: vanilla dynamic library
     strategy:
@@ -370,6 +410,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -446,7 +492,9 @@ jobs:
           ./example
           valgrind --track-origins=yes --error-exitcode=1 ./example
 
-
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   symbol-versioning:
     name: Symbol versioning
     strategy:
@@ -461,6 +509,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -513,6 +567,9 @@ jobs:
         run: |
           abidiff --no-unreferenced-symbols --ignore-soname /tmp/zlib-ng-build/libz.so.1 target/${{matrix.target}}/release/libz_rs.versioned.so
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   cargo-c-dynamic-library:
     name: cargo-c dynamic library
     strategy:
@@ -527,6 +584,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
@@ -552,6 +615,9 @@ jobs:
           ./zpipe < Cargo.toml | ./zpipe -d > out.txt
           cmp -s Cargo.toml out.txt
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-zlib-rs:
     name: "Miri (zlib-rs)"
     runs-on: ubuntu-latest
@@ -567,6 +633,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install Miri
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --component miri
@@ -584,6 +656,9 @@ jobs:
       - name: Test with miri
         run: "cargo +${RUST_TOOLCHAIN} miri nextest run -p zlib-rs --target ${{ matrix.target }}"
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-libz-rs-sys:
     name: "Miri (libz-rs-sys)"
     runs-on: ubuntu-latest
@@ -599,6 +674,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install Miri
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --component miri
@@ -628,6 +709,9 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-no-short-fd-operations -Zmiri-disable-isolation"
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-vpclmulqdq:
     name: "Miri VPCLMULQDQ"
     runs-on: ubuntu-latest
@@ -642,6 +726,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: Install Miri
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --component miri
@@ -656,6 +746,9 @@ jobs:
         env:
           RUSTFLAGS: "-Ctarget-feature=+vpclmulqdq,+avx512f"
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-simd:
     name: "Miri SIMD"
     runs-on: ubuntu-24.04-arm # so we don't need to install gcc 
@@ -673,6 +766,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
 
       - name: Install Miri
         run: |
@@ -694,6 +793,9 @@ jobs:
         # does not have loongarch64 gcc for building our C dependencies.
         run: "cargo +${RUST_TOOLCHAIN} miri test  --target ${{ matrix.target }} -p zlib-rs -- crc32 adler32 compare256"
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   run-flate2-test-suite:
     name: run flate2 test suite
     strategy:
@@ -708,6 +810,12 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
       - name: run
         run: |
           cd ..
@@ -716,3 +824,6 @@ jobs:
           sed -i '/^libz-rs-sys =/c\libz-rs-sys = { path = "../zlib-rs/libz-rs-sys", optional = true, default-features = false, features = ["std", "rust-allocator"] }' Cargo.toml
           cargo test --no-default-features --features="zlib-rs"
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
