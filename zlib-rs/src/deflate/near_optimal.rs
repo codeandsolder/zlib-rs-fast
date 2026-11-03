@@ -358,8 +358,7 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
 
                 let rank = tile_ranks[local_position] as usize;
                 let mut best = MatchCandidate::NONE;
-                let predecessor = active.predecessor(rank);
-                let successor = active.successor(rank);
+                let (predecessor, successor) = active.neighbors(rank);
                 for candidate_rank in [predecessor, successor].into_iter().flatten() {
                     let candidate_position = suffixes.sa[candidate_rank] as usize;
                     let distance = position - candidate_position;
@@ -508,18 +507,10 @@ impl RankSet {
     }
 
     #[inline]
-    fn predecessor(&self, rank: usize) -> Option<usize> {
+    fn neighbors(&self, rank: usize) -> (Option<usize>, Option<usize>) {
         match self {
-            Self::Three(set) => set.predecessor(rank),
-            Self::Generic(set) => set.predecessor(rank),
-        }
-    }
-
-    #[inline]
-    fn successor(&self, rank: usize) -> Option<usize> {
-        match self {
-            Self::Three(set) => set.successor(rank),
-            Self::Generic(set) => set.successor(rank),
+            Self::Three(set) => set.neighbors(rank),
+            Self::Generic(set) => (set.predecessor(rank), set.successor(rank)),
         }
     }
 }
@@ -573,35 +564,34 @@ impl ThreeLevelRankSet {
     }
 
     #[inline]
-    fn predecessor(&self, rank: usize) -> Option<usize> {
-        if rank == 0 {
-            return None;
-        }
-        let word_index = (rank - 1) / 64;
-        let bits = (rank - 1) % 64 + 1;
-        let word = self.base[word_index] & low_bits(bits);
-        if word != 0 {
-            return Some(word_index * 64 + highest_bit(word));
-        }
-        let previous_word = self.previous_base_word(word_index)?;
-        let word = self.base[previous_word];
-        debug_assert_ne!(word, 0);
-        Some(previous_word * 64 + highest_bit(word))
-    }
+    fn neighbors(&self, rank: usize) -> (Option<usize>, Option<usize>) {
+        let word_index = rank / 64;
+        let raw_word = self.base[word_index];
+        let bit_index = rank % 64;
 
-    #[inline]
-    fn successor(&self, rank: usize) -> Option<usize> {
-        let start = rank.checked_add(1)?;
-        let word_index = start / 64;
-        let &raw_word = self.base.get(word_index)?;
-        let word = raw_word & !low_bits(start % 64);
-        if word != 0 {
-            return Some(word_index * 64 + word.trailing_zeros() as usize);
-        }
-        let next_word = self.next_base_word(word_index + 1)?;
-        let word = self.base[next_word];
-        debug_assert_ne!(word, 0);
-        Some(next_word * 64 + word.trailing_zeros() as usize)
+        let lower = raw_word & low_bits(bit_index);
+        let predecessor = if lower != 0 {
+            Some(word_index * 64 + highest_bit(lower))
+        } else {
+            self.previous_base_word(word_index).map(|previous_word| {
+                let word = self.base[previous_word];
+                debug_assert_ne!(word, 0);
+                previous_word * 64 + highest_bit(word)
+            })
+        };
+
+        let upper = raw_word & !low_bits(bit_index + 1);
+        let successor = if upper != 0 {
+            Some(word_index * 64 + upper.trailing_zeros() as usize)
+        } else {
+            self.next_base_word(word_index + 1).map(|next_word| {
+                let word = self.base[next_word];
+                debug_assert_ne!(word, 0);
+                next_word * 64 + word.trailing_zeros() as usize
+            })
+        };
+
+        (predecessor, successor)
     }
 
     #[inline]
@@ -1404,15 +1394,14 @@ mod tests {
             let check = |set: &RankSet, reference: &BTreeSet<usize>| {
                 for &query in &queries {
                     assert_eq!(
-                        set.predecessor(query),
-                        reference.range(..query).next_back().copied()
-                    );
-                    assert_eq!(
-                        set.successor(query),
-                        reference
-                            .range((Excluded(query), Unbounded))
-                            .next()
-                            .copied()
+                        set.neighbors(query),
+                        (
+                            reference.range(..query).next_back().copied(),
+                            reference
+                                .range((Excluded(query), Unbounded))
+                                .next()
+                                .copied(),
+                        )
                     );
                 }
             };
