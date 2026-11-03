@@ -568,23 +568,60 @@ impl ThreeLevelRankSet {
         let word_index = rank / 64;
         let raw_word = self.base[word_index];
         let bit_index = rank % 64;
-
         let lower = raw_word & low_bits(bit_index);
+        let upper = raw_word & !low_bits(bit_index + 1);
+
+        if lower != 0 && upper != 0 {
+            return (
+                Some(word_index * 64 + highest_bit(lower)),
+                Some(word_index * 64 + upper.trailing_zeros() as usize),
+            );
+        }
+
+        let middle_index = word_index / 64;
+        let middle_bit_index = word_index % 64;
+        let middle_word = self.middle[middle_index];
+
         let predecessor = if lower != 0 {
             Some(word_index * 64 + highest_bit(lower))
         } else {
-            self.previous_base_word(word_index).map(|previous_word| {
+            let previous_in_middle = middle_word & low_bits(middle_bit_index);
+            let previous_word = if previous_in_middle != 0 {
+                Some(middle_index * 64 + highest_bit(previous_in_middle))
+            } else if middle_index != 0 {
+                let previous_middle = self.top & low_bits(middle_index);
+                (previous_middle != 0).then(|| {
+                    let middle_index = highest_bit(previous_middle);
+                    let word = self.middle[middle_index];
+                    debug_assert_ne!(word, 0);
+                    middle_index * 64 + highest_bit(word)
+                })
+            } else {
+                None
+            };
+            previous_word.map(|previous_word| {
                 let word = self.base[previous_word];
                 debug_assert_ne!(word, 0);
                 previous_word * 64 + highest_bit(word)
             })
         };
 
-        let upper = raw_word & !low_bits(bit_index + 1);
         let successor = if upper != 0 {
             Some(word_index * 64 + upper.trailing_zeros() as usize)
         } else {
-            self.next_base_word(word_index + 1).map(|next_word| {
+            let next_in_middle = middle_word & !low_bits(middle_bit_index + 1);
+            let next_word = if next_in_middle != 0 {
+                Some(middle_index * 64 + next_in_middle.trailing_zeros() as usize)
+            } else {
+                let next_middle = self.top & !low_bits(middle_index + 1);
+                (next_middle != 0).then(|| {
+                    let middle_index = next_middle.trailing_zeros() as usize;
+                    let word = self.middle[middle_index];
+                    debug_assert_ne!(word, 0);
+                    middle_index * 64 + word.trailing_zeros() as usize
+                })
+            };
+            next_word.map(|next_word| {
                 let word = self.base[next_word];
                 debug_assert_ne!(word, 0);
                 next_word * 64 + word.trailing_zeros() as usize
@@ -592,51 +629,6 @@ impl ThreeLevelRankSet {
         };
 
         (predecessor, successor)
-    }
-
-    #[inline]
-    fn previous_base_word(&self, before: usize) -> Option<usize> {
-        if before == 0 {
-            return None;
-        }
-        let middle_index = (before - 1) / 64;
-        let bits = (before - 1) % 64 + 1;
-        let word = self.middle[middle_index] & low_bits(bits);
-        if word != 0 {
-            return Some(middle_index * 64 + highest_bit(word));
-        }
-        if middle_index == 0 {
-            return None;
-        }
-        let top = self.top & low_bits(middle_index);
-        if top == 0 {
-            return None;
-        }
-        let middle_index = highest_bit(top);
-        let word = self.middle[middle_index];
-        debug_assert_ne!(word, 0);
-        Some(middle_index * 64 + highest_bit(word))
-    }
-
-    #[inline]
-    fn next_base_word(&self, start: usize) -> Option<usize> {
-        if start >= self.base.len() {
-            return None;
-        }
-        let middle_index = start / 64;
-        let word = self.middle[middle_index] & !low_bits(start % 64);
-        if word != 0 {
-            return Some(middle_index * 64 + word.trailing_zeros() as usize);
-        }
-        let next_middle = middle_index + 1;
-        let top = self.top & !low_bits(next_middle);
-        if top == 0 {
-            return None;
-        }
-        let middle_index = top.trailing_zeros() as usize;
-        let word = self.middle[middle_index];
-        debug_assert_ne!(word, 0);
-        Some(middle_index * 64 + word.trailing_zeros() as usize)
     }
 }
 
