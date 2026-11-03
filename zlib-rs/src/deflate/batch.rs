@@ -78,56 +78,73 @@ pub fn compress_slices_batch(
     compress_slices_batch_with_backend(jobs, config, BatchMatchSearchBackend::Scalar)
 }
 
-/// Compress independent buffers concurrently on Rayon's persistent global worker pool.
+/// Reusable worker pool for whole-stream batch compression.
 ///
-/// This is the CPU-oriented batch path. Unlike the fine-grained match-search scheduler, each worker
-/// drives complete compression jobs, preserving per-stream cache locality and making every scheduled
-/// unit large enough to amortize pool dispatch. Output bytes and return codes match independent
-/// [`super::compress_slice`] calls job-for-job.
+/// Each scheduled task owns one complete independent stream, preserving per-stream cache locality
+/// while allowing the pool to work-steal streams with very different compression costs. The worker
+/// count is explicit and belongs to this object; no process-global Rayon pool is consulted or
+/// configured. Output bytes and return codes match independent [`super::compress_slice`] calls
+/// job-for-job.
 ///
-/// The function is available only with the optional `parallel` feature. It uses Rayon's global pool
-/// and does not create threads per compression job or per match search. Applications that need to
-/// configure that pool can do so before its first use.
+/// The pool is available only with the optional `parallel` feature. Construct it once and reuse it
+/// across batches so thread creation is not part of the compression hot path.
 #[cfg(feature = "parallel")]
-pub fn compress_slices_batch_parallel(
-    jobs: &mut [BatchCompressJob<'_>],
-    config: DeflateConfig,
-) -> Vec<BatchCompressResult> {
-    let mut results = vec![
-        BatchCompressResult {
-            written: 0,
-            code: ReturnCode::StreamError,
-        };
-        jobs.len()
-    ];
-    if jobs.is_empty() {
-        return results;
-    }
-    if jobs.len() == 1 {
-        return compress_synchronously(jobs, config);
+pub struct BatchCompressor {
+    pool: rayon_core::ThreadPool,
+}
+
+#[cfg(feature = "parallel")]
+impl BatchCompressor {
+    /// Create a reusable batch compressor with exactly `workers` worker threads.
+    pub fn new(workers: core::num::NonZeroUsize) -> Result<Self, rayon_core::ThreadPoolBuildError> {
+        rayon_core::ThreadPoolBuilder::new()
+            .num_threads(workers.get())
+            .build()
+            .map(|pool| Self { pool })
     }
 
-    let workers = rayon_core::current_num_threads().max(1).min(jobs.len());
-    if workers == 1 {
-        return compress_synchronously(jobs, config);
+    /// Number of workers owned by this compressor.
+    pub fn workers(&self) -> usize {
+        self.pool.current_num_threads()
     }
 
-    // Independent streams vary by orders of magnitude in real workloads. Scheduling one complete
-    // stream per Rayon task lets the persistent pool steal remaining work instead of pinning an
-    // arbitrary equal-count chunk of streams to one worker and waiting for its largest member.
-    rayon_core::scope(|scope| {
-        for (job, result) in jobs.iter_mut().zip(&mut results) {
-            scope.spawn(move |_| {
-                let (output, code) = compress_slice(&mut *job.output, job.input, config);
-                *result = BatchCompressResult {
-                    written: output.len(),
-                    code,
-                };
-            });
+    /// Compress several independent buffers concurrently on this compressor's worker pool.
+    pub fn compress(
+        &self,
+        jobs: &mut [BatchCompressJob<'_>],
+        config: DeflateConfig,
+    ) -> Vec<BatchCompressResult> {
+        let mut results = vec![
+            BatchCompressResult {
+                written: 0,
+                code: ReturnCode::StreamError,
+            };
+            jobs.len()
+        ];
+        if jobs.is_empty() {
+            return results;
         }
-    });
+        if jobs.len() == 1 || self.workers() == 1 {
+            return compress_synchronously(jobs, config);
+        }
 
-    results
+        // Independent streams vary by orders of magnitude in real workloads. Scheduling one complete
+        // stream per task lets the persistent pool steal remaining work instead of pinning an
+        // arbitrary equal-count chunk of streams to one worker and waiting for its largest member.
+        self.pool.scope(|scope| {
+            for (job, result) in jobs.iter_mut().zip(&mut results) {
+                scope.spawn(move |_| {
+                    let (output, code) = compress_slice(&mut *job.output, job.input, config);
+                    *result = BatchCompressResult {
+                        written: output.len(),
+                        code,
+                    };
+                });
+            }
+        });
+
+        results
+    }
 }
 
 /// Variant of [`compress_slices_batch`] with an explicit match-search executor.
@@ -952,6 +969,26 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
+    fn explicit_single_worker_batch_matches_scalar() {
+        let input = b"single-worker-batch/".repeat(4_000);
+        let config = DeflateConfig::new(9);
+        let (reference, code) = independent(&input, config, compress_bound(input.len()) + 64);
+        let mut output = vec![0u8; compress_bound(input.len()) + 64];
+        let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+        let compressor = BatchCompressor::new(core::num::NonZeroUsize::new(1).unwrap())
+            .expect("one-worker batch compressor should initialize");
+
+        let results = compressor.compress(&mut jobs, config);
+        drop(jobs);
+
+        assert_eq!(compressor.workers(), 1);
+        assert_eq!(results[0].code, code);
+        assert_eq!(results[0].written, reference.len());
+        assert_eq!(&output[..results[0].written], reference);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
     fn parallel_streams_match_independent_compression() {
         let inputs = [
             b"parallel-alpha/".repeat(8_000),
@@ -997,7 +1034,10 @@ mod tests {
                 .map(|(input, output)| BatchCompressJob::new(input, output))
                 .collect::<Vec<_>>();
 
-            let results = compress_slices_batch_parallel(&mut jobs, config);
+            let compressor = BatchCompressor::new(core::num::NonZeroUsize::new(4).unwrap())
+                .expect("four-worker batch compressor should initialize");
+            assert_eq!(compressor.workers(), 4);
+            let results = compressor.compress(&mut jobs, config);
             drop(jobs);
 
             for (index, result) in results.into_iter().enumerate() {

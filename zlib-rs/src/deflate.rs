@@ -41,7 +41,7 @@ mod window;
 #[cfg(feature = "gpu")]
 pub use batch::compress_slices_batch_gpu;
 #[cfg(feature = "parallel")]
-pub use batch::compress_slices_batch_parallel;
+pub use batch::BatchCompressor;
 #[cfg(feature = "std")]
 pub use batch::{
     compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,

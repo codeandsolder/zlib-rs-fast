@@ -5,7 +5,7 @@ use std::{
 };
 
 #[cfg(feature = "parallel")]
-use zlib_rs::compress_slices_batch_parallel;
+use zlib_rs::BatchCompressor;
 use zlib_rs::{
     compress_bound, compress_slice, compress_slices_batch, compress_slices_batch_with_backend,
     BatchCompressJob, BatchMatchSearchBackend, DeflateConfig, ReturnCode,
@@ -40,7 +40,7 @@ enum Mode {
     BatchScalar,
     Threads(usize),
     #[cfg(feature = "parallel")]
-    ParallelStreams,
+    ParallelStreams(usize),
 }
 
 impl Mode {
@@ -50,7 +50,7 @@ impl Mode {
             Self::BatchScalar => "batch-scalar".into(),
             Self::Threads(workers) => format!("threads-{workers}"),
             #[cfg(feature = "parallel")]
-            Self::ParallelStreams => "parallel-streams".into(),
+            Self::ParallelStreams(workers) => format!("parallel-streams-{workers}"),
         }
     }
 }
@@ -200,7 +200,15 @@ fn run_case(case: Case, full: bool, include_threads: bool) {
         }
     }
     #[cfg(feature = "parallel")]
-    modes.push(Mode::ParallelStreams);
+    if full {
+        modes.extend([
+            Mode::ParallelStreams(2),
+            Mode::ParallelStreams(4),
+            Mode::ParallelStreams(8),
+        ]);
+    } else {
+        modes.push(Mode::ParallelStreams(4));
+    }
     let mut rows = Vec::new();
     for mode in modes {
         rows.push((
@@ -239,6 +247,17 @@ fn bench_mode(
     config: DeflateConfig,
     full: bool,
 ) -> Stats {
+    #[cfg(feature = "parallel")]
+    let parallel_compressor = match mode {
+        Mode::ParallelStreams(workers) => Some(
+            BatchCompressor::new(
+                std::num::NonZeroUsize::new(workers).expect("parallel benchmark needs workers"),
+            )
+            .expect("parallel batch compressor should initialize"),
+        ),
+        _ => None,
+    };
+
     let capacities = inputs
         .iter()
         .map(|input| compress_bound(input.len()) + 64)
@@ -292,7 +311,10 @@ fn bench_mode(
                         BatchMatchSearchBackend::ScopedThreads { workers },
                     ),
                     #[cfg(feature = "parallel")]
-                    Mode::ParallelStreams => compress_slices_batch_parallel(&mut jobs, config),
+                    Mode::ParallelStreams(_) => parallel_compressor
+                        .as_ref()
+                        .expect("parallel mode initialized its compressor")
+                        .compress(&mut jobs, config),
                     Mode::Independent => unreachable!(),
                 };
                 results.into_iter().fold(0usize, |sink, result| {
@@ -322,7 +344,10 @@ fn bench_mode(
                         BatchMatchSearchBackend::ScopedThreads { workers },
                     ),
                     #[cfg(feature = "parallel")]
-                    Mode::ParallelStreams => compress_slices_batch_parallel(&mut jobs, config),
+                    Mode::ParallelStreams(_) => parallel_compressor
+                        .as_ref()
+                        .expect("parallel mode initialized its compressor")
+                        .compress(&mut jobs, config),
                     Mode::Independent => unreachable!(),
                 };
                 results.into_iter().fold(0usize, |sink, result| {

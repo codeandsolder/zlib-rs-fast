@@ -45,7 +45,7 @@ pub use deflate::{DeflateConfig, Method, Strategy};
 pub use inflate::InflateConfig;
 
 #[cfg(feature = "parallel")]
-pub use deflate::compress_slices_batch_parallel;
+pub use deflate::BatchCompressor;
 pub use deflate::{compress_bound, compress_slice};
 #[cfg(feature = "std")]
 pub use deflate::{
