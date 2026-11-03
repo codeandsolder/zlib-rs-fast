@@ -131,6 +131,12 @@ jobs:
           toolchain: ${{ env.MSRV || matrix.rust || 'stable' }}
           targets: "${{ matrix.target }}"
 
+      - name: Activate native ARM64 MSVC environment
+        if: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: arm64
+
       # Install dependencies
       - name: Install cargo-llvm-cov & cargo-nextest
         uses: taiki-e/install-action@d12e869b89167df346dd0ff65da342d1fb1202fb # v2.53.2
