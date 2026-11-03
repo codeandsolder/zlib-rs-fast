@@ -238,105 +238,26 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
     let suffixes = SuffixRanks::new(input);
     let ranges = distance_code_ranges(max_distance);
     const DIRECT_SCAN_MAX: usize = 8;
-    const FRONTIER_TILE_POSITIONS: usize = 512;
-    let first_rank_code = ranges
-        .iter()
-        .position(|&(min_distance, max_distance)| {
-            min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX
-        })
-        .unwrap_or(D_CODES);
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
         (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
             .then(|| RankSet::new(input.len()))
     });
-    let last_rank_code = active
-        .iter()
-        .rposition(Option::is_some)
-        .map_or(first_rank_code, |code| code + 1);
-    #[derive(Clone, Copy)]
-    struct StagedCandidate {
-        local_position: u16,
-        candidate: MatchCandidate,
-    }
-
     let mut offsets = Vec::with_capacity(input.len() + 1);
     let mut entries = Vec::new();
-    let mut counts = [0u16; FRONTIER_TILE_POSITIONS];
-    let mut starts = [0u16; FRONTIER_TILE_POSITIONS];
-    let mut tile_ranks = [0u32; FRONTIER_TILE_POSITIONS];
-    let mut tile_available = [0u16; FRONTIER_TILE_POSITIONS];
-    let mut staged = Vec::<StagedCandidate>::with_capacity(FRONTIER_TILE_POSITIONS * D_CODES);
     offsets.push(0);
 
-    for tile_start in (0..input.len()).step_by(FRONTIER_TILE_POSITIONS) {
-        let tile_end = (tile_start + FRONTIER_TILE_POSITIONS).min(input.len());
-        let tile_len = tile_end - tile_start;
-        counts[..tile_len].fill(0);
-        for local_position in 0..tile_len {
-            let position = tile_start + local_position;
-            tile_ranks[local_position] = suffixes.rank[position];
-            tile_available[local_position] = STD_MAX_MATCH.min(input.len() - position) as u16;
-        }
-        staged.clear();
-        let mut append_candidate = |local_position: usize, candidate: MatchCandidate| {
-            counts[local_position] += 1;
-            staged.push(StagedCandidate {
-                local_position: local_position as u16,
-                candidate,
-            });
-        };
+    for position in 0..input.len() {
+        let rank = suffixes.rank[position] as usize;
+        let available = STD_MAX_MATCH.min(input.len() - position);
 
-        // Keep the tiny direct-scan classes position-major: they need no RankSet locality and this
-        // lets them share per-byte state exactly as the original traversal did.
-        for local_position in 0..tile_len {
-            let position = tile_start + local_position;
-            let available = usize::from(tile_available[local_position]);
-            if available < STD_MIN_MATCH {
-                continue;
-            }
-            for &(min_distance, max_distance) in &ranges[..first_rank_code] {
-                if min_distance == 0 {
-                    continue;
-                }
-                let mut best = MatchCandidate::NONE;
-                for distance in min_distance..=max_distance.min(position) {
-                    let candidate_position = position - distance;
-                    let length = match_compare::common_prefix_len(
-                        &input[position..position + available],
-                        &input[candidate_position..candidate_position + available],
-                    );
-                    if length >= STD_MIN_MATCH
-                        && (length > usize::from(best.length)
-                            || (length == usize::from(best.length)
-                                && distance < usize::from(best.distance)))
-                    {
-                        best = MatchCandidate {
-                            length: length as u16,
-                            distance: distance as u16,
-                        };
-                    }
-                }
-                if best.length != 0 {
-                    append_candidate(local_position, best);
-                }
-            }
-        }
-
-        // Process one wide distance class across the whole tile before moving to the next class.
-        // A typical RankSet base level is ~15 KiB for a 120 KiB context, so this keeps its mutation
-        // and query state resident instead of bouncing among ~20 independent sets at every byte.
-        for code in first_rank_code..last_rank_code {
-            let (min_distance, max_distance) = ranges[code];
+        for (code, &(min_distance, max_distance)) in ranges.iter().enumerate() {
             if min_distance == 0 {
                 continue;
             }
-            let active = active[code]
-                .as_mut()
-                .expect("wide distance classes use RankSet frontier state");
-            for local_position in 0..tile_len {
-                let position = tile_start + local_position;
-                let available = usize::from(tile_available[local_position]);
+
+            let mut best = MatchCandidate::NONE;
+            if let Some(active) = &mut active[code] {
                 if available < STD_MIN_MATCH {
                     continue;
                 }
@@ -348,8 +269,6 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                     active.remove(suffixes.rank[remove] as usize);
                 }
 
-                let rank = tile_ranks[local_position] as usize;
-                let mut best = MatchCandidate::NONE;
                 let (predecessor, successor) = active.neighbors(rank);
                 let mut consider_rank = |candidate_rank: usize| {
                     let candidate_position = suffixes.sa[candidate_rank] as usize;
@@ -376,25 +295,7 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                 if let Some(candidate_rank) = successor {
                     consider_rank(candidate_rank);
                 }
-                if best.length != 0 {
-                    append_candidate(local_position, best);
-                }
-            }
-        }
-        // A deliberately truncated max_distance can leave one short direct-scan bucket after the
-        // wide RankSet interval. Emit that tail last so per-position candidate order remains the
-        // canonical ascending distance-code order.
-        for local_position in 0..tile_len {
-            let position = tile_start + local_position;
-            let available = usize::from(tile_available[local_position]);
-            if available < STD_MIN_MATCH {
-                continue;
-            }
-            for &(min_distance, max_distance) in &ranges[last_rank_code..] {
-                if min_distance == 0 {
-                    continue;
-                }
-                let mut best = MatchCandidate::NONE;
+            } else if available >= STD_MIN_MATCH {
                 for distance in min_distance..=max_distance.min(position) {
                     let candidate_position = position - distance;
                     let length = match_compare::common_prefix_len(
@@ -412,36 +313,13 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                         };
                     }
                 }
-                if best.length != 0 {
-                    append_candidate(local_position, best);
-                }
+            }
+
+            if best.length != 0 {
+                entries.push(best);
             }
         }
-        drop(append_candidate);
-
-        let mut local_offset = 0u16;
-        for local_position in 0..tile_len {
-            starts[local_position] = local_offset;
-            local_offset += counts[local_position];
-        }
-        debug_assert_eq!(usize::from(local_offset), staged.len());
-
-        let output_start = entries.len();
-        entries.resize(output_start + staged.len(), MatchCandidate::NONE);
-        let mut cursors = starts;
-        for staged_candidate in &staged {
-            let local_position = usize::from(staged_candidate.local_position);
-            let destination = output_start + usize::from(cursors[local_position]);
-            entries[destination] = staged_candidate.candidate;
-            cursors[local_position] += 1;
-        }
-
-        for &count in &counts[..tile_len] {
-            let previous = *offsets
-                .last()
-                .expect("match candidate offsets are non-empty");
-            offsets.push(previous + u32::from(count));
-        }
+        offsets.push(entries.len() as u32);
     }
 
     MatchCandidates { offsets, entries }
