@@ -2558,11 +2558,33 @@ mod encoded_tests {
     }
 
     #[test]
-    fn insufficient_output_returns_no_partial_slice() {
-        let input = vec![0x5a; 8_192];
-        let mut output = [0u8; 1];
-        let (compressed, code) = super::super::compress_slice_near_optimal(&mut output, &input, 0);
-        assert_eq!(code, ReturnCode::BufError);
-        assert!(compressed.is_empty());
+    fn insufficient_output_only_writes_a_valid_stream_prefix() {
+        let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
+        let mut full_buffer = vec![0u8; compress_bound(input.len())];
+        let (full, code) = super::super::compress_slice_near_optimal(&mut full_buffer, input, 0);
+        assert_eq!(code, ReturnCode::Ok);
+        let full = full.to_vec();
+
+        for cutoff in 0..full.len() {
+            // Complementing the expected byte makes untouched storage distinguishable from a byte
+            // that was actually emitted, even when the compressed stream contains zeroes.
+            let untouched = full[..cutoff].iter().map(|byte| !byte).collect::<Vec<_>>();
+            let mut output = untouched.clone();
+            let (compressed, code) =
+                super::super::compress_slice_near_optimal(&mut output, input, 0);
+            assert_eq!(code, ReturnCode::BufError, "cutoff={cutoff}");
+            assert!(compressed.is_empty(), "cutoff={cutoff}");
+
+            let written = output
+                .iter()
+                .zip(&full)
+                .take_while(|(actual, expected)| actual == expected)
+                .count();
+            assert_eq!(
+                &output[written..],
+                &untouched[written..],
+                "non-prefix write at cutoff={cutoff}"
+            );
+        }
     }
 }
