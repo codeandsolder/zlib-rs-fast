@@ -42,7 +42,7 @@ jobs:
       CC_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/clang
       CXX_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/clang++
       AR_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/llvm-ar
-      CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime --dir /home/runner/work/zlib-rs/zlib-rs/test-libz-rs-sys --dir /tmp/"
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime --dir ${{ github.workspace }}/test-libz-rs-sys --dir /tmp/"
       CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS: "-Ctarget-feature=+simd128"
       BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip1: "--sysroot=/tmp/wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot"
       RUSTFLAGS: ${{ matrix.sanitizer == true && '-Zsanitizer=address' || '' }}
@@ -103,7 +103,7 @@ jobs:
             codecov: false
 
           - target: "aarch64-pc-windows-msvc"
-            os: windows-11-arm
+            os: windows-11-vs2026-arm
             codecov: false
 
     steps:
@@ -117,6 +117,16 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: "${{ matrix.target }}"
+
+      - name: Activate native ARM64 MSVC environment
+        if: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: arm64
+      - name: Use Ninja for native ARM64 CMake builds
+        if: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
+        shell: bash
+        run: echo 'CMAKE_GENERATOR=Ninja' >> "$GITHUB_ENV"
 
       # Install dependencies
       - name: Install cargo-llvm-cov & cargo-nextest
@@ -316,9 +326,7 @@ jobs:
       - name: Install cargo fuzz
         run: cargo install cargo-fuzz
       - name: Install rustfilt
-        uses: taiki-e/install-action@56ab7930c591507f833cbaed864d201386d518a8
-        with:
-          tool: rustfilt
+        run: cargo install rustfilt --locked
       - name: Download custom decompression corpus
         if: ${{ contains(matrix.corpus, 'gzip-files') }}
         run: |
