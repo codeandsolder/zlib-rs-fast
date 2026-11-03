@@ -34,7 +34,6 @@ jobs:
       # loongarch64-unknown-linux-gnu
       CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER: loongarch64-linux-gnu-gcc
       CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-loongarch64 -L /usr/loongarch64-linux-gnu
-      # aarch64-pc-windows-msvc: cmake-rs cannot currently discover VS on the Windows ARM runner.
       # wasm32-wasip1 (std for wasip2 is unstable)
       WASI_SDK_PATH: /tmp/wasi-sdk-24.0-x86_64-linux
       CC_wasm32_wasip1: /tmp/wasi-sdk-24.0-x86_64-linux/bin/clang
@@ -113,7 +112,7 @@ jobs:
             codecov: false
 
           - target: "aarch64-pc-windows-msvc"
-            os: windows-11-arm
+            os: windows-11-vs2026-arm
             codecov: false
 
     steps:
