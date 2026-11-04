@@ -1,5 +1,11 @@
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
+#![expect(
+    non_camel_case_types,
+    reason = "C-facing zlib ABI type spellings must be preserved"
+)]
+#![expect(
+    non_snake_case,
+    reason = "C-facing zlib ABI field and function spellings must be preserved"
+)]
 
 use core::ffi::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
 
@@ -238,16 +244,13 @@ impl gz_header {
     //  12 - QDOS
     //  13 - Acorn RISCOS
     // 255 - unknown
-    #[allow(clippy::if_same_then_else)]
     pub const OS_CODE: u8 = {
         if cfg!(windows) {
             10
         } else if cfg!(target_os = "macos") {
             19
-        } else if cfg!(unix) {
-            3
         } else {
-            3 // assume unix
+            3 // assume Unix, matching zlib defaults
         }
     };
 

@@ -1,5 +1,3 @@
-#![allow(unpredictable_function_pointer_comparisons)]
-
 #[cfg(unix)]
 use core::ffi::c_int;
 use core::{
@@ -10,7 +8,10 @@ use core::{
     ptr::NonNull,
 };
 
-#[allow(non_camel_case_types)]
+#[expect(
+    non_camel_case_types,
+    reason = "size_t is the standard C allocator ABI type"
+)]
 type size_t = usize;
 
 const ALIGN: u8 = 64;
@@ -187,7 +188,7 @@ impl Allocator<'_> {
 
         // Special case for the Rust `alloc` backed allocator
         #[cfg(feature = "rust-allocator")]
-        if self.zalloc == RUST.zalloc {
+        if core::ptr::fn_addr_eq(self.zalloc, RUST.zalloc) {
             let ptr = unsafe { (RUST.zalloc)(self.opaque, layout.size() as _, 1) };
 
             debug_assert_eq!(ptr as usize % layout.align(), 0);
@@ -287,12 +288,13 @@ impl Allocator<'_> {
     ///
     /// - `ptr` must be allocated with this allocator
     /// - `len` must be the number of `T`s that are in this allocation
-    #[allow(unused)] // Rust needs `len` for deallocation
     pub unsafe fn deallocate<T>(&self, ptr: *mut T, len: usize) {
+        #[cfg(not(feature = "rust-allocator"))]
+        let _ = len;
         if !ptr.is_null() {
             // Special case for the Rust `alloc` backed allocator
             #[cfg(feature = "rust-allocator")]
-            if self.zfree == RUST.zfree {
+            if core::ptr::fn_addr_eq(self.zfree, RUST.zfree) {
                 assert_ne!(len, 0, "invalid size for {ptr:?}");
                 let mut size = core::mem::size_of::<T>() * len;
                 // SAFETY: The caller ensured that ptr was allocated with this allocator, and

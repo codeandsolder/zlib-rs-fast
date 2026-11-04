@@ -72,57 +72,54 @@ impl Accumulator {
          */
         let mut crc_fold = RK1_RK2;
 
-        #[allow(unused_unsafe)] // because target features 1.1
-        unsafe {
-            let x_tmp0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x10);
-            xmm_crc0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x01);
-            xmm_crc1 = _mm_xor_si128(xmm_crc1, x_tmp0);
-            xmm_crc1 = _mm_xor_si128(xmm_crc1, xmm_crc0);
+        let x_tmp0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x10);
+        xmm_crc0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x01);
+        xmm_crc1 = _mm_xor_si128(xmm_crc1, x_tmp0);
+        xmm_crc1 = _mm_xor_si128(xmm_crc1, xmm_crc0);
 
-            let x_tmp1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x10);
-            xmm_crc1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x01);
-            xmm_crc2 = _mm_xor_si128(xmm_crc2, x_tmp1);
-            xmm_crc2 = _mm_xor_si128(xmm_crc2, xmm_crc1);
+        let x_tmp1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x10);
+        xmm_crc1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x01);
+        xmm_crc2 = _mm_xor_si128(xmm_crc2, x_tmp1);
+        xmm_crc2 = _mm_xor_si128(xmm_crc2, xmm_crc1);
 
-            let x_tmp2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x10);
-            xmm_crc2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x01);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, x_tmp2);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
+        let x_tmp2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x10);
+        xmm_crc2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x01);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, x_tmp2);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
 
-            /*
-             * k5
-             */
-            crc_fold = RK5_RK6;
+        /*
+         * k5
+         */
+        crc_fold = RK5_RK6;
 
-            xmm_crc0 = xmm_crc3;
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
-            xmm_crc0 = _mm_srli_si128(xmm_crc0, 8);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
+        xmm_crc0 = xmm_crc3;
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
+        xmm_crc0 = _mm_srli_si128(xmm_crc0, 8);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
 
-            xmm_crc0 = xmm_crc3;
-            xmm_crc3 = _mm_slli_si128(xmm_crc3, 4);
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
-            xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK2);
+        xmm_crc0 = xmm_crc3;
+        xmm_crc3 = _mm_slli_si128(xmm_crc3, 4);
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
+        xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK2);
 
-            /*
-             * k7
-             */
-            xmm_crc1 = xmm_crc3;
-            xmm_crc2 = xmm_crc3;
-            crc_fold = RK7_RK8;
+        /*
+         * k7
+         */
+        xmm_crc1 = xmm_crc3;
+        xmm_crc2 = xmm_crc3;
+        crc_fold = RK7_RK8;
 
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-            xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK1);
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
+        xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK1);
 
-            xmm_crc2 = xmm_crc3;
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc1);
+        xmm_crc2 = xmm_crc3;
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc1);
 
-            !(_mm_extract_epi32(xmm_crc3, 2) as u32)
-        }
+        !(_mm_extract_epi32(xmm_crc3, 2) as u32)
     }
 
     unsafe fn fold_step<const N: usize>(&mut self) {
@@ -191,7 +188,6 @@ impl Accumulator {
         }
     }
 
-    #[allow(clippy::needless_range_loop)]
     unsafe fn progress<const N: usize>(&mut self, src: &mut &[u8], init_crc: &mut u32) {
         let mut it = src.chunks_exact(16);
         let mut input: [_; N] = core::array::from_fn(|_| unsafe {
@@ -208,8 +204,8 @@ impl Accumulator {
 
         unsafe { self.fold_step::<N>() };
 
-        for i in 0..N {
-            self.fold[i + (4 - N)] = unsafe { _mm_xor_si128(self.fold[i + (4 - N)], input[i]) };
+        for (fold, value) in self.fold[(4 - N)..].iter_mut().zip(input) {
+            *fold = unsafe { _mm_xor_si128(*fold, value) };
         }
     }
 
@@ -240,7 +236,6 @@ impl Accumulator {
             // SAFETY: [u8; 16] can safely transmute into __m128i.
             let (before, _, _) = unsafe { src.align_to::<__m128i>() };
 
-            #[allow(unused_unsafe)] // because target features 1.1
             if !before.is_empty() {
                 xmm_crc_part = unsafe { _mm_loadu_si128(src.as_ptr() as *const __m128i) };
                 let is_initial = init_crc == CRC32_INITIAL_VALUE;

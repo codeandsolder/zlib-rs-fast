@@ -537,7 +537,7 @@ fn deflate_medium_fizzle_bug() {
 }
 
 fn assert_deflate_bound_correct((config, source_len): (DeflateConfig, c_ulong)) {
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = MaybeUninit::zeroed();
 
         // first validate the config
@@ -626,7 +626,7 @@ fn deflate_bound_gzip_header_help(
     let name = name.as_ptr().cast_mut().cast::<u8>();
     let comment = comment.as_ptr().cast_mut().cast::<u8>();
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = MaybeUninit::zeroed();
 
         // first validate the config
@@ -686,7 +686,7 @@ fn gz_header_text_and_hcrc_check() {
         strategy: Strategy::Fixed,
     };
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = MaybeUninit::zeroed();
 
         // first validate the config
@@ -769,7 +769,7 @@ fn deflate_bound_gzip_header_basic() {
 fn test_compress_bound_windows() {
     let source_len = (u32::MAX - 6) as core::ffi::c_ulong;
 
-    assert_eq_rs_ng!({ compressBound(source_len as _) });
+    assert_eq_rs_ng!(unsafe { compressBound(source_len as _) });
 
     assert_eq!(
         libz_rs_sys::compressBound(source_len as _),
@@ -786,7 +786,7 @@ fn test_compress_bound() {
     ::quickcheck::quickcheck(test as fn(_) -> _);
 
     fn test(source_len: core::ffi::c_ulong) -> bool {
-        assert_eq_rs_ng!({ compressBound(source_len as _) });
+        assert_eq_rs_ng!(unsafe { compressBound(source_len as _) });
 
         assert_eq!(
             libz_rs_sys::compressBound(source_len as _),
@@ -804,7 +804,7 @@ fn test_compress_param() {
     let input =
         "Scheduling and executing async tasks is a job handled by an async runtime, such as\0";
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut output = [0; 1024];
 
         let mut strm = MaybeUninit::zeroed();
@@ -862,7 +862,7 @@ fn test_dict_deflate() {
     const DICTIONARY: &str = "hello";
     const HELLO: &str = "hello, hello!\0";
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = MaybeUninit::zeroed();
 
         // first validate the config
@@ -905,7 +905,7 @@ fn test_dict_deflate() {
 
 #[test]
 fn deflate_prime_accepts_32_bits_like_zlib_ng() {
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut raw = MaybeUninit::<z_stream>::zeroed();
         let init = deflateInit2_(
             raw.as_mut_ptr(),
@@ -1051,7 +1051,7 @@ fn test_deflate_prime() {
 fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
     let dictionary = vec![0x5a; (1 << 15) + 1];
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = MaybeUninit::<z_stream>::zeroed();
         let init = deflateInit2_(
             strm.as_mut_ptr(),
@@ -1092,7 +1092,7 @@ fn small_window() {
     let plain: [u8; 128] = std::array::from_fn(|i| i as u8);
     let dictionary1 = vec![b'a'; (1 << 9) - plain.len() / 2];
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = MaybeUninit::zeroed();
 
         // first validate the config
@@ -1599,7 +1599,7 @@ fn test_deflate_copy_large() {
 fn test_deflate_copy_help(input: &[u8]) {
     let config = DeflateConfig::default();
 
-    let _ = assert_eq_rs_ng!({
+    let _ = assert_eq_rs_ng!(unsafe {
         let mut strm_full = MaybeUninit::zeroed();
 
         let err = deflateInit2_(
@@ -1837,7 +1837,7 @@ fn version_error() {
 #[test]
 fn gzip_header_survives_deflate_resets_like_zlib_ng() {
     for reset_keep in [false, true] {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut raw = MaybeUninit::<z_stream>::zeroed();
             let init = deflateInit2_(
                 raw.as_mut_ptr(),
@@ -1904,7 +1904,7 @@ fn gzip_with_header() {
         ..Default::default()
     };
 
-    let output = assert_eq_rs_ng!({
+    let output = assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
         let err = unsafe {
@@ -1965,7 +1965,7 @@ fn gzip_with_header() {
         output
     });
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
         let err = unsafe {
@@ -2466,7 +2466,7 @@ fn issue_169() {
     const INPUT: &str = include_str!("test-data/issue-169.js");
     let buf = INPUT;
 
-    crate::assert_eq_rs_ng!({
+    crate::assert_eq_rs_ng!(unsafe {
         let mut out = [0u8; 4096];
         let mut ret;
 
@@ -2593,7 +2593,7 @@ fn flood_pending_buffer() {
     ]
     .to_vec();
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let config = DeflateConfig {
             level: Z_DEFAULT_COMPRESSION,
             method: Method::Deflated,
@@ -2745,7 +2745,7 @@ fn copy_uninitialized_window_section() {
         strategy: Strategy::Default,
     };
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut header = gz_header {
             text: 825307441,
             time: 14641,
@@ -2887,7 +2887,7 @@ fn crc32_hash_calc_uninitialized_memory() {
         strategy: Strategy::Default,
     };
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::zeroed();
 
         let err = unsafe {
@@ -2978,7 +2978,7 @@ fn crc32_hash_calc_uninitialized_memory() {
 
 #[test]
 fn test_deflate_get_dict() {
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut compr = [0u8; 1024];
 
         let mut strm = MaybeUninit::zeroed();
@@ -3034,8 +3034,8 @@ struct GzHeaderData {
 }
 
 impl GzHeaderData {
-    fn as_gz_header(&mut self) -> libz_rs_sys::gz_header {
-        libz_rs_sys::gz_header {
+    fn as_gz_header(&mut self) -> libz_sys::gz_header {
+        libz_sys::gz_header {
             text: self.text,
             time: self.time,
             xflags: 0,
@@ -3086,7 +3086,7 @@ fn test_gzip_deflate_config() {
 	    },
 	};
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let Input {
             ref source,
             config,
@@ -3115,11 +3115,9 @@ fn test_gzip_deflate_config() {
 
         let streamp = unsafe { stream.assume_init_mut() };
 
-        // Create header.
-        let mut header = unsafe {
-            #[allow(clippy::useless_transmute)]
-            core::mem::transmute::<libz_rs_sys::gz_header, gz_header>(header.as_gz_header())
-        };
+        // Build the C header explicitly rather than assuming two independent
+        // crate types have interchangeable memory layouts.
+        let mut header = header.as_gz_header();
         let err = unsafe { deflateSetHeader(streamp, &mut header as gz_headerp) };
         if err != ReturnCode::Ok as i32 {
             // Deallocate, so that we don't trigger ASAN leak detector.
@@ -3195,7 +3193,7 @@ fn test_issue_455() {
     ];
 
     assert_eq!(
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut output = [0u8; 32];
             let mut length = 32;
             compress(

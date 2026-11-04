@@ -10,7 +10,7 @@ fn edge_cases() {
 
     assert_eq!(
         assert_eq_rs_ng! {
-            {
+            unsafe {
                 let mut stream = MaybeUninit::uninit();
                 inflateBackInit_(
                     stream.as_mut_ptr(),
@@ -26,7 +26,7 @@ fn edge_cases() {
 
     assert_eq!(
         assert_eq_rs_ng! {
-            {
+            unsafe {
                 let mut stream = MaybeUninit::uninit();
                 inflateBackInit_(
                     stream.as_mut_ptr(),
@@ -44,7 +44,7 @@ fn edge_cases() {
 #[test]
 fn inflate_copy_rejects_back_init_state() {
     for force_non_null_output in [false, true] {
-        let result = assert_eq_rs_ng!({
+        let result = assert_eq_rs_ng!(unsafe {
             let mut source = MaybeUninit::<z_stream>::zeroed();
             let mut copy = MaybeUninit::<z_stream>::zeroed();
             let mut window = vec![0xAA; 1 << 15];

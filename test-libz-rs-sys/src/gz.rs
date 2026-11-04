@@ -2192,7 +2192,7 @@ mod gzprintf {
 
     #[test]
     fn test_gzprintf_buffer_too_large() {
-        let _ = crate::assert_eq_rs_ng!({
+        let _ = crate::assert_eq_rs_ng!(unsafe {
             // Use a small buffer so we can hit the limit easily.
             let path = "gzprintf-too-large.gz";
             let file = unsafe {

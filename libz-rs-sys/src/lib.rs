@@ -1,8 +1,14 @@
 #![cfg_attr(feature = "gzprintf", feature(c_variadic))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
+#![expect(
+    non_camel_case_types,
+    reason = "the public C ABI uses established zlib type names"
+)]
+#![expect(
+    non_snake_case,
+    reason = "the public C ABI uses established zlib function names"
+)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc = include_str!("../README.md")]
 
@@ -48,7 +54,6 @@ use zlib_rs::{
 
 pub use zlib_rs::c_api::*;
 
-#[allow(non_camel_case_types)]
 pub type size_t = usize;
 
 #[cfg(feature = "custom-prefix")]

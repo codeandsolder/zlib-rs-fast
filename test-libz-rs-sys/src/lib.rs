@@ -15,110 +15,91 @@ mod stable;
 mod zlib_ng_cve;
 
 #[cfg(test)]
+pub mod ng_ffi {
+    pub use libz_sys::*;
+
+    extern "C" {
+        pub fn inflateCodesUsed(strm: *mut z_stream) -> core::ffi::c_ulong;
+
+        pub fn inflateValidate(strm: *mut z_stream, check: i32) -> core::ffi::c_int;
+
+        pub fn deflateResetKeep(strm: *mut z_stream) -> core::ffi::c_int;
+
+        pub fn deflateGetDictionary(
+            strm: *const z_stream,
+            dictionary: *mut core::ffi::c_uchar,
+            dictLength: *mut core::ffi::c_uint,
+        ) -> core::ffi::c_int;
+
+        pub fn inflateGetDictionary(
+            strm: *const z_stream,
+            dictionary: *mut core::ffi::c_uchar,
+            dictLength: *mut core::ffi::c_uint,
+        ) -> core::ffi::c_int;
+
+        pub fn uncompress2(
+            dest: *mut u8,
+            destLen: *mut core::ffi::c_ulong,
+            source: *const u8,
+            sourceLen: *mut core::ffi::c_ulong,
+        ) -> core::ffi::c_int;
+
+        pub fn crc32_z(
+            crc: core::ffi::c_ulong,
+            buf: *const Bytef,
+            len: libz_rs_sys::size_t,
+        ) -> core::ffi::c_ulong;
+
+        pub fn crc32_combine64(
+            crc1: core::ffi::c_ulong,
+            crc2: core::ffi::c_ulong,
+            len2: libz_rs_sys::z_off64_t,
+        ) -> core::ffi::c_ulong;
+
+        pub fn crc32_combine_gen(len2: z_off_t) -> core::ffi::c_ulong;
+
+        pub fn crc32_combine_op(
+            crc1: core::ffi::c_ulong,
+            crc2: core::ffi::c_ulong,
+            op: core::ffi::c_ulong,
+        ) -> core::ffi::c_ulong;
+
+        pub fn adler32_z(
+            crc: core::ffi::c_ulong,
+            buf: *const Bytef,
+            len: libz_rs_sys::size_t,
+        ) -> core::ffi::c_ulong;
+
+        pub fn adler32_combine64(
+            adler1: core::ffi::c_ulong,
+            adler2: core::ffi::c_ulong,
+            len2: libz_rs_sys::z_off64_t,
+        ) -> core::ffi::c_ulong;
+
+        pub fn get_crc_table() -> *const [u32; 256];
+
+        pub fn gzbuffer(file: gzFile, size: core::ffi::c_uint) -> core::ffi::c_int;
+
+        pub fn gzprintf(
+            file: gzFile,
+            format: *const core::ffi::c_char,
+            va: ...
+        ) -> core::ffi::c_int;
+    }
+}
+
+#[cfg(test)]
 #[macro_export]
 macro_rules! assert_eq_rs_ng {
-    ($tt:tt) => {{
+    ($tt:expr) => {{
         #[cfg(not(miri))]
-        #[allow(clippy::macro_metavars_in_unsafe)]
-        #[allow(unused_braces)]
-        #[allow(unused_unsafe)]
-        let _ng = unsafe {
-            use libz_sys::*;
-
-            // this function is not exposed by `libz_sys`
-            extern "C" {
-                #[allow(unused)]
-                fn inflateCodesUsed(strm: *mut z_stream) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn inflateValidate(strm: *mut z_stream, check: i32) -> core::ffi::c_int;
-
-                #[allow(unused)]
-                fn deflateResetKeep(strm: *mut z_stream) -> core::ffi::c_int;
-
-                #[allow(unused)]
-                fn deflateGetDictionary(
-                    strm: *const z_stream,
-                    dictionary: *mut core::ffi::c_uchar,
-                    dictLength: *mut core::ffi::c_uint,
-                ) -> core::ffi::c_int;
-
-                #[allow(unused)]
-                fn inflateGetDictionary(
-                    strm: *const z_stream,
-                    dictionary: *mut core::ffi::c_uchar,
-                    dictLength: *mut core::ffi::c_uint,
-                ) -> core::ffi::c_int;
-
-                #[allow(unused)]
-                fn uncompress2(
-                    dest: *mut u8,
-                    destLen: *mut core::ffi::c_ulong,
-                    source: *const u8,
-                    sourceLen: *mut core::ffi::c_ulong,
-                ) -> core::ffi::c_int;
-
-                #[allow(unused)]
-                fn crc32_z(
-                    crc: core::ffi::c_ulong,
-                    buf: *const Bytef,
-                    len: libz_rs_sys::size_t,
-                ) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn crc32_combine64(
-                    crc1: core::ffi::c_ulong,
-                    crc2: core::ffi::c_ulong,
-                    len2: libz_rs_sys::z_off64_t,
-                ) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn crc32_combine_gen(len2: z_off_t) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn crc32_combine_op(
-                    crc1: core::ffi::c_ulong,
-                    crc2: core::ffi::c_ulong,
-                    op: core::ffi::c_ulong,
-                ) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn adler32_z(
-                    crc: core::ffi::c_ulong,
-                    buf: *const Bytef,
-                    len: libz_rs_sys::size_t,
-                ) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn adler32_combine64(
-                    adler1: core::ffi::c_ulong,
-                    adler2: core::ffi::c_ulong,
-                    len2: libz_rs_sys::z_off64_t,
-                ) -> core::ffi::c_ulong;
-
-                #[allow(unused)]
-                fn get_crc_table() -> *const [u32; 256];
-
-                #[allow(unused)]
-                fn gzbuffer(file: gzFile, size: core::ffi::c_uint) -> core::ffi::c_int;
-
-                #[allow(unused)]
-                fn gzprintf(
-                    file: gzFile,
-                    format: *const core::ffi::c_char,
-                    va: ...
-                ) -> core::ffi::c_int;
-            }
-
+        let _ng = {
+            use $crate::ng_ffi::*;
             $tt
         };
 
-        #[allow(clippy::macro_metavars_in_unsafe)]
-        #[allow(unused_braces)]
-        #[allow(unused_unsafe)]
-        let _rs = unsafe {
+        let _rs = {
             use libz_rs_sys::*;
-
             $tt
         };
 
@@ -127,18 +108,6 @@ macro_rules! assert_eq_rs_ng {
 
         _rs
     }};
-}
-
-#[cfg(test)]
-#[allow(unused)]
-macro_rules! extract_error_message {
-    ($strm:expr) => {
-        if !$strm.msg.is_null() {
-            core::ffi::CStr::from_ptr($strm.msg).to_str()
-        } else {
-            Ok("NULL")
-        }
-    };
 }
 
 /// a bit of a sanity check that nothing weird happened with symbol resolution

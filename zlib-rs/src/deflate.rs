@@ -2528,7 +2528,6 @@ fn gen_bitlen<const N: usize>(
 }
 
 /// Checks that symbol is a printing character (excluding space)
-#[allow(unused)]
 fn isgraph(c: u8) -> bool {
     (c > 0x20) && (c <= 0x7E)
 }
@@ -2818,8 +2817,7 @@ fn zng_tr_flush_block(
         static_lenb = stored_len as usize + 5;
     }
 
-    #[allow(clippy::unnecessary_unwrap)]
-    if stored_len as usize + 4 <= opt_lenb && window_offset.is_some() {
+    if let Some(window_offset) = window_offset.filter(|_| stored_len as usize + 4 <= opt_lenb) {
         /* 4: two words for the lengths
          * The test buf != NULL is only necessary if LIT_BUFSIZE > WSIZE.
          * Otherwise we can't have processed more than WSIZE input bytes since
@@ -2827,7 +2825,6 @@ fn zng_tr_flush_block(
          * successful. If LIT_BUFSIZE <= WSIZE, it is never too late to
          * transform a block into a stored block.
          */
-        let window_offset = window_offset.unwrap();
         let range = window_offset..window_offset + stored_len as usize;
         zng_tr_stored_block(state, range, last);
     } else if static_lenb == opt_lenb {

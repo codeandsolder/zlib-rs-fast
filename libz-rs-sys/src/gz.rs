@@ -1,6 +1,6 @@
 use zlib_rs::c_api::*;
 
-use crate::gz::GzMode::GZ_READ;
+use crate::gz::GzMode::Read;
 use crate::{
     deflate, deflateEnd, deflateInit2_, deflateReset, inflate, inflateEnd, inflateInit2_,
     inflateReset, prefix, z_off64_t, z_off_t, zlibVersion,
@@ -20,11 +20,17 @@ use zlib_rs::MAX_WBITS;
 // For ABI compatibility with zlib and zlib-ng, the first fields in [`GzState`] match
 // what would be in the C version of [`gzFile_s`]. But we don't want new users to rely
 // on this internal implementation, so the Rust [`gzFile_s`] is intentionally opaque.
-#[allow(non_camel_case_types)]
+#[expect(
+    non_camel_case_types,
+    reason = "gzFile_s preserves the opaque zlib handle ABI name"
+)]
 pub enum gzFile_s {}
 
 /// File handle for an open gzip file.
-#[allow(non_camel_case_types)]
+#[expect(
+    non_camel_case_types,
+    reason = "gzFile is the public zlib C handle type"
+)]
 pub type gzFile = *mut gzFile_s;
 
 struct GzCString {
@@ -254,7 +260,7 @@ impl GzState {
             have: 0,
             next: ptr::null(),
             pos: 0,
-            mode: GzMode::GZ_NONE,
+            mode: GzMode::None,
             fd: -1,
             source: None,
             want: GZBUFSIZE,
@@ -285,9 +291,9 @@ impl GzState {
                 self.level = (ch - b'0') as i8;
             } else {
                 match ch {
-                    b'r' => self.mode = GzMode::GZ_READ,
-                    b'w' => self.mode = GzMode::GZ_WRITE,
-                    b'a' => self.mode = GzMode::GZ_APPEND,
+                    b'r' => self.mode = GzMode::Read,
+                    b'w' => self.mode = GzMode::Write,
+                    b'a' => self.mode = GzMode::Append,
                     b'+' => {
                         // Read+Write mode isn't supported
                         return Err(());
@@ -311,7 +317,7 @@ impl GzState {
     // Get the number of bytes allocated for the `self.input` buffer.
     fn in_capacity(&self) -> usize {
         match self.mode {
-            GzMode::GZ_WRITE => self.want * 2,
+            GzMode::Write => self.want * 2,
             _ => self.want,
         }
     }
@@ -319,7 +325,7 @@ impl GzState {
     // Get the number of bytes allocated for the `self.output` buffer.
     fn out_capacity(&self) -> usize {
         match self.mode {
-            GzMode::GZ_READ => self.want * 2,
+            GzMode::Read => self.want * 2,
             _ => self.want,
         }
     }
@@ -341,7 +347,7 @@ impl GzState {
     fn allocate_input_buffer(&self) -> Option<GzBuffer> {
         let capacity = self.in_capacity();
         let usable = match self.mode {
-            GzMode::GZ_WRITE => self.want,
+            GzMode::Write => self.want,
             _ => capacity,
         };
         GzBuffer::allocate(capacity, usable)
@@ -365,7 +371,7 @@ impl GzState {
         if self.have == 0 {
             return &[];
         }
-        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        debug_assert_eq!(self.mode, GzMode::Read);
         let output = self
             .output
             .as_ref()
@@ -399,7 +405,7 @@ impl GzState {
     ///
     /// Callers must only use ranges they have just initialized through a typed output slice.
     fn publish_buffered_output(&mut self, offset: usize, len: usize) {
-        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        debug_assert_eq!(self.mode, GzMode::Read);
         let output = self
             .output
             .as_ref()
@@ -413,7 +419,7 @@ impl GzState {
     }
 
     fn push_back_buffered_byte(&mut self, byte: u8) -> Result<(), ()> {
-        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        debug_assert_eq!(self.mode, GzMode::Read);
         let have = self.have as usize;
         let size = self.out_size();
         if have == size {
@@ -462,7 +468,7 @@ impl GzState {
     }
 
     fn read_input_range(&self) -> core::ops::Range<usize> {
-        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        debug_assert_eq!(self.mode, GzMode::Read);
         let len = self.stream.avail_in as usize;
         if len == 0 {
             return 0..0;
@@ -497,7 +503,7 @@ impl GzState {
 
     /// Publish an initialized range in the owned read input buffer to z_stream.
     fn publish_read_input(&mut self, offset: usize, len: usize) {
-        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        debug_assert_eq!(self.mode, GzMode::Read);
         let input = self
             .input
             .as_ref()
@@ -511,7 +517,7 @@ impl GzState {
     }
 
     fn clear_read_input(&mut self) {
-        debug_assert_eq!(self.mode, GzMode::GZ_READ);
+        debug_assert_eq!(self.mode, GzMode::Read);
         self.stream.avail_in = 0;
         self.stream.next_in = self
             .input
@@ -540,7 +546,7 @@ impl GzState {
     /// The large-write zero-copy path temporarily violates this invariant, but it does
     /// not call this helper while caller memory is bound to `next_in`.
     fn owned_write_input_end(&self) -> usize {
-        debug_assert_eq!(self.mode, GzMode::GZ_WRITE);
+        debug_assert_eq!(self.mode, GzMode::Write);
         let input = self
             .input
             .as_ref()
@@ -610,13 +616,12 @@ impl Drop for GzStateOwner {
 
 // Gzip operating modes
 // NOTE: These values match what zlib-ng uses.
-#[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GzMode {
-    GZ_NONE = 0,
-    GZ_READ = 7247,
-    GZ_WRITE = 31153,
-    GZ_APPEND = 1,
+    None = 0,
+    Read = 7247,
+    Write = 31153,
+    Append = 1,
 }
 
 // gzip read strategies
@@ -761,12 +766,12 @@ fn gzopen_bound(source: Source, mode: &CStr) -> Option<GzStateOwner> {
     };
 
     // Must specify read, write, or append
-    if state.mode == GzMode::GZ_NONE {
+    if state.mode == GzMode::None {
         return None;
     }
 
     // Can't force transparent read
-    if state.mode == GzMode::GZ_READ {
+    if state.mode == GzMode::Read {
         if state.direct {
             return None;
         }
@@ -801,14 +806,14 @@ fn gzopen_bound(source: Source, mode: &CStr) -> Option<GzStateOwner> {
                 }
             }
 
-            if state.mode == GzMode::GZ_READ {
+            if state.mode == GzMode::Read {
                 oflag |= O_RDONLY;
             } else {
                 oflag |= O_WRONLY | O_CREAT;
                 if exclusive {
                     oflag |= O_EXCL;
                 }
-                if state.mode == GzMode::GZ_WRITE {
+                if state.mode == GzMode::Write {
                     oflag |= O_TRUNC;
                 } else {
                     oflag |= O_APPEND;
@@ -827,12 +832,12 @@ fn gzopen_bound(source: Source, mode: &CStr) -> Option<GzStateOwner> {
 
     // NOTE: the `lseek64` return value is ignored, an invalid file descriptor will only be
     // detected by the next `gz{read, write, seek, close}`.
-    if state.mode == GzMode::GZ_APPEND {
+    if state.mode == GzMode::Append {
         let _ = lseek64(state.fd, 0, SEEK_END); // so gzoffset() is correct
-        state.mode = GzMode::GZ_WRITE; // simplify later checks
+        state.mode = GzMode::Write; // simplify later checks
     }
 
-    if state.mode == GzMode::GZ_READ {
+    if state.mode == GzMode::Read {
         // Save the current position for rewinding
         state.start = lseek64(state.fd, 0, SEEK_CUR) as _;
         if state.start == -1 {
@@ -885,7 +890,7 @@ fn fd_path(buf: &mut [u8; 27], fd: c_int) -> &CStr {
 // its mode (read or write)
 fn gz_reset(state: &mut GzState) {
     state.have = 0; // no output data available
-    if state.mode == GzMode::GZ_READ {
+    if state.mode == GzMode::Read {
         state.eof = false; // not at end of file
         state.past = false; // have not read past end yet
         state.how = How::Look; // look for gzip header
@@ -895,7 +900,7 @@ fn gz_reset(state: &mut GzState) {
     state.seek = false; // no seek request pending
     gz_error(state, None); // clear error status
     state.pos = 0; // no uncompressed data yet
-    if state.mode == GzMode::GZ_READ {
+    if state.mode == GzMode::Read {
         state.clear_read_input();
     } else {
         state.stream.avail_in = 0; // no input data yet
@@ -979,8 +984,8 @@ pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
     };
 
     match state.mode {
-        GzMode::GZ_READ => unsafe { gzclose_r(file) },
-        GzMode::GZ_WRITE | GzMode::GZ_APPEND | GzMode::GZ_NONE => unsafe { gzclose_w(file) },
+        GzMode::Read => unsafe { gzclose_r(file) },
+        GzMode::Write | GzMode::Append | GzMode::None => unsafe { gzclose_w(file) },
     }
 }
 
@@ -1008,7 +1013,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
     let state = unsafe { state_ptr.as_ref() };
 
     // A mode mismatch must not consume the handle; the matching close operation may still use it.
-    if state.mode != GzMode::GZ_READ {
+    if state.mode != GzMode::Read {
         return Z_STREAM_ERROR;
     }
 
@@ -1062,7 +1067,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     let state = unsafe { state_ptr.as_ref() };
 
     // A mode mismatch must not consume the handle; the matching close operation may still use it.
-    if state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Write {
         return Z_STREAM_ERROR;
     }
 
@@ -1121,7 +1126,7 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
-    if state.mode != GzMode::GZ_READ && state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Read && state.mode != GzMode::Write {
         return -1;
     }
 
@@ -1181,7 +1186,7 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return ptr::null();
     };
-    if state.mode != GzMode::GZ_READ && state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Read && state.mode != GzMode::Write {
         return ptr::null();
     }
 
@@ -1217,12 +1222,12 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return;
     };
-    if state.mode != GzMode::GZ_READ && state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Read && state.mode != GzMode::Write {
         return;
     }
 
     // Clear error and EOF
-    if state.mode == GzMode::GZ_READ {
+    if state.mode == GzMode::Read {
         state.eof = false;
         state.past = false;
     }
@@ -1253,7 +1258,7 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return 0;
     };
-    if state.mode != GzMode::GZ_READ {
+    if state.mode != GzMode::Read {
         return 0;
     }
 
@@ -1297,7 +1302,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
     // direct status is determined lazily on the first read operation. If the first
     // read hasn't happened yet, we can look at the header now to determine if the
     // file is in gzip format.
-    if state.mode == GzMode::GZ_READ && state.how == How::Look && state.have == 0 {
+    if state.mode == GzMode::Read && state.how == How::Look && state.have == 0 {
         let _ = gz_look(state);
     }
 
@@ -1353,7 +1358,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
     };
 
     // Check that we're reading and that there's no (serious) error.
-    if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return -1;
     }
 
@@ -1428,7 +1433,7 @@ pub unsafe extern "C" fn gzfread(
     };
 
     // Check that we're reading and that there's no (serious) error.
-    if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return 0;
     }
 
@@ -1850,7 +1855,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
     };
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK {
+    if state.mode != GzMode::Write || state.err != Z_OK {
         return 0;
     }
 
@@ -1906,7 +1911,7 @@ pub unsafe extern "C" fn gzfwrite(
     };
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK {
+    if state.mode != GzMode::Write || state.err != Z_OK {
         return 0;
     }
 
@@ -2222,7 +2227,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
     };
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK {
+    if state.mode != GzMode::Write || state.err != Z_OK {
         return Z_STREAM_ERROR;
     }
 
@@ -2265,7 +2270,7 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
     };
 
     // Check integrity.
-    if state.mode != GzMode::GZ_READ && state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Read && state.mode != GzMode::Write {
         // Unreachable if `file` was initialized with `gzopen` or `gzdopen`.
         return -1;
     }
@@ -2318,7 +2323,7 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
     };
 
     // Check integrity.
-    if state.mode != GzMode::GZ_READ && state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Read && state.mode != GzMode::Write {
         // Unreachable if `file` was initialized with `gzopen` or `gzdopen`.
         return -1;
     }
@@ -2331,8 +2336,8 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
 
     // When reading, don't count buffered input.
     match state.mode {
-        GzMode::GZ_READ => offset - state.stream.avail_in as z_off64_t,
-        GzMode::GZ_NONE | GzMode::GZ_WRITE | GzMode::GZ_APPEND => offset,
+        GzMode::Read => offset - state.stream.avail_in as z_off64_t,
+        GzMode::None | GzMode::Write | GzMode::Append => offset,
     }
 }
 
@@ -2373,7 +2378,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     };
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK {
+    if state.mode != GzMode::Write || state.err != Z_OK {
         return -1;
     }
 
@@ -2440,7 +2445,7 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
     }
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK {
+    if state.mode != GzMode::Write || state.err != Z_OK {
         return -1;
     }
 
@@ -2480,7 +2485,7 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
     };
 
     // Check that we're reading and that there's no (serious) error.
-    if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return -1;
     }
 
@@ -2543,7 +2548,7 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     if c < 0 {
         return -1;
     }
-    if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return -1;
     }
 
@@ -2602,7 +2607,7 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return ptr::null_mut();
     };
-    if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return ptr::null_mut();
     }
 
@@ -2687,7 +2692,7 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
     };
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK || state.direct {
+    if state.mode != GzMode::Write || state.err != Z_OK || state.direct {
         return Z_STREAM_ERROR;
     }
 
@@ -2745,7 +2750,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
-    if state.mode != GzMode::GZ_READ && state.mode != GzMode::GZ_WRITE {
+    if state.mode != GzMode::Read && state.mode != GzMode::Write {
         // Unreachable if `file` was initialized with `gzopen` or `gzdopen`.
         return -1;
     }
@@ -2793,7 +2798,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
     // Calculate the skip amount. If we're seeking backwards in a compressed file, we'll
     // need to rewind to the start and decompress content until we arrive at the right spot.
     if offset < 0 {
-        if state.mode != GzMode::GZ_READ {
+        if state.mode != GzMode::Read {
             // Can't go backwards when writing.
             return -1;
         }
@@ -2811,7 +2816,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
     }
 
     // If reading, skip what's in output buffer. (This simplifies `gzgetc`.)
-    if state.mode == GzMode::GZ_READ {
+    if state.mode == GzMode::Read {
         // For consistency with zlib-ng, we use `gt_off` to check whether the value
         // of `state.have` is too large to be represented as a signed 64-bit offset.
         // This case can be triggered only if the platform has 64-bit C ints and
@@ -2884,7 +2889,7 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
 
 unsafe fn gzrewind_help(state: &mut GzState) -> c_int {
     // Check that we're reading and that there's no error.
-    if state.mode != GzMode::GZ_READ || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return -1;
     }
 
@@ -2946,7 +2951,7 @@ pub unsafe extern "C" fn gzvprintf(
     };
 
     // Check that we're writing and that there's no error.
-    if state.mode != GzMode::GZ_WRITE || state.err != Z_OK {
+    if state.mode != GzMode::Write || state.err != Z_OK {
         return Z_STREAM_ERROR;
     }
 
@@ -3029,7 +3034,7 @@ fn lseek64(fd: c_int, offset: z_off64_t, origin: c_int) -> z_off64_t {
         return unsafe { libc::lseek64(fd, offset as _, origin) as z_off64_t };
     }
 
-    #[allow(unused)]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
     {
         (unsafe { libc::lseek(fd, offset as _, origin) }) as z_off64_t
     }
@@ -3057,11 +3062,11 @@ mod tests {
         let mut state = GzState::new();
 
         state.configure(b"r").unwrap();
-        assert_eq!(state.mode, GzMode::GZ_READ);
+        assert_eq!(state.mode, GzMode::Read);
         state.configure(b"rw").unwrap();
-        assert_eq!(state.mode, GzMode::GZ_WRITE);
+        assert_eq!(state.mode, GzMode::Write);
         state.configure(b"wr").unwrap();
-        assert_eq!(state.mode, GzMode::GZ_READ);
+        assert_eq!(state.mode, GzMode::Read);
 
         state.configure(b"4").unwrap();
         assert_eq!(state.level, 4);
@@ -3094,7 +3099,7 @@ mod tests {
         let mut state = GzState::new();
         state.want = 64;
 
-        state.mode = GzMode::GZ_READ;
+        state.mode = GzMode::Read;
         state.input = Some(state.allocate_input_buffer().unwrap());
         state.output = Some(state.allocate_output_buffer().unwrap());
         assert_eq!(state.in_size(), 64);
@@ -3104,7 +3109,7 @@ mod tests {
         assert!(state.input.is_none());
         assert!(state.output.is_none());
 
-        state.mode = GzMode::GZ_WRITE;
+        state.mode = GzMode::Write;
         state.input = Some(state.allocate_input_buffer().unwrap());
         state.output = Some(state.allocate_output_buffer().unwrap());
         assert_eq!(state.in_size(), 64);
@@ -3161,7 +3166,7 @@ mod tests {
     #[test]
     fn large_write_restores_owned_input_cursor_after_zero_copy() {
         let mut state = GzState::new();
-        state.mode = GzMode::GZ_WRITE;
+        state.mode = GzMode::Write;
         state.fd = -2;
 
         assert!(gz_init(&mut state).is_ok());
@@ -3184,7 +3189,7 @@ mod tests {
     #[test]
     fn large_write_error_does_not_retain_caller_input() {
         let mut state = GzState::new();
-        state.mode = GzMode::GZ_WRITE;
+        state.mode = GzMode::Write;
         state.direct = true;
         state.fd = -2;
 
@@ -3340,7 +3345,7 @@ mod tests {
     fn gz_error_preserves_non_utf8_path_bytes() {
         let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").unwrap();
         let mut state = GzState::new();
-        state.mode = GzMode::GZ_READ;
+        state.mode = GzMode::Read;
         state.source = Some(Source::Path(GzCString::clone_from_c_str(path).unwrap()));
 
         gz_error(&mut state, Some((Z_ERRNO, "read error")));
@@ -3601,10 +3606,10 @@ mod tests {
             )
         };
         // Temporarily put the file handle in a stat that isn't read or write. gzbuffer should fail.
-        unsafe { file.cast::<GzState>().as_mut().unwrap().mode = GzMode::GZ_NONE };
+        unsafe { file.cast::<GzState>().as_mut().unwrap().mode = GzMode::None };
         assert_eq!(unsafe { gzbuffer(file, 1024) }, -1);
         // Put the file handle back in read mode, and now gzbuffer should work.
-        unsafe { file.cast::<GzState>().as_mut().unwrap().mode = GzMode::GZ_READ };
+        unsafe { file.cast::<GzState>().as_mut().unwrap().mode = GzMode::Read };
         assert_eq!(unsafe { gzbuffer(file, 1024) }, 0);
         assert_eq!(
             unsafe { file.cast::<GzState>().as_ref().unwrap().want },

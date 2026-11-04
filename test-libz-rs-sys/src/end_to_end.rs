@@ -55,9 +55,7 @@ pub fn test(data: &[u8], config: DeflateConfig) -> bool {
         let path = std::env::temp_dir().join("deflate.txt");
         std::fs::write(&path, data).unwrap();
         let path = std::env::temp_dir().join("inflate.txt");
-        // see https://github.com/rust-lang/rust-clippy/pull/12892
-        #[allow(clippy::needless_borrows_for_generic_args)]
-        std::fs::write(&path, &deflated_rs).unwrap();
+        std::fs::write(&path, deflated_rs).unwrap();
         eprintln!("saved deflated file to {path:?}");
     }
 
@@ -72,9 +70,7 @@ pub fn test(data: &[u8], config: DeflateConfig) -> bool {
         let path = std::env::temp_dir().join("deflate.txt");
         std::fs::write(&path, data).unwrap();
         let path = std::env::temp_dir().join("inflate.txt");
-        // see https://github.com/rust-lang/rust-clippy/pull/12892
-        #[allow(clippy::needless_borrows_for_generic_args)]
-        std::fs::write(&path, &deflated_rs).unwrap();
+        std::fs::write(&path, deflated_rs).unwrap();
         eprintln!("saved deflated file to {path:?}");
     }
 

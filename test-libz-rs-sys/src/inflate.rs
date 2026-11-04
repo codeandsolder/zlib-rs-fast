@@ -1101,7 +1101,7 @@ fn hello_world_uncompressed() {
 
 #[test]
 fn copy_direct_from_next_in_to_next_out() {
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let input = [120, 1, 1, 2, 0, 253, 255, 6, 10, 0, 24, 0, 17];
         let output = [6u8, 10];
         let mut dest_vec = vec![0u8; 1 << 16];
@@ -1470,7 +1470,7 @@ fn gzip_header_fields_insufficient_space() {
     let err = unsafe { libz_rs_sys::deflateEnd(stream) };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
         const VERSION: *const c_char = libz_rs_sys::zlibVersion();
@@ -1682,7 +1682,6 @@ fn gzip_chunked(chunk_size: usize) {
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
     {
-        #[allow(unused_imports)] // to switch to libz_ng_sys easily
         use libz_rs_sys::{
             gz_header, inflate, inflateEnd, inflateGetHeader, inflateInit2_, z_stream,
         };
@@ -1866,7 +1865,7 @@ fn issue_109() {
 
     let window_bits = -15;
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut output: Vec<u8> = Vec::with_capacity(1 << 15);
 
         let mut buf = [0; 8192];
@@ -1916,7 +1915,7 @@ fn window_match_bug() {
 
     let window_bits = -10;
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut output: Vec<u8> = Vec::with_capacity(1 << 15);
         let mut buf = [0; 402];
 
@@ -1968,7 +1967,7 @@ fn op_len_edge_case() {
 
     let input = &include_bytes!("test-data/op-len-edge-case.zraw");
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut output: Vec<u8> = Vec::with_capacity(1 << 15);
 
         let mut buf = [0; 266];
@@ -2136,7 +2135,7 @@ fn issue_172() {
         45, 1, 0, 176, 1, 57, 179, 15, 0, 0, 0,
     ];
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut exitcode = 0;
         for chunk in 1..BUF.len() {
             let mut ret;
@@ -2185,7 +2184,7 @@ fn issue_172() {
 fn header_configured_but_no_gzip() {
     let input: &[u8] = &[0x63, 0x18, 0x68, 0x30, 0xd0, 0x0, 0x0];
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
         let init_err = unsafe { inflateInit2_(stream.as_mut_ptr(), 47, VERSION, STREAM_SIZE) };
@@ -2391,7 +2390,7 @@ fn blow_up_the_stack_2() {
 #[test]
 fn codes_used() {
     // -1 is returned on NULL
-    assert_eq_rs_ng!({ inflateCodesUsed(core::ptr::null_mut()) });
+    assert_eq_rs_ng!(unsafe { inflateCodesUsed(core::ptr::null_mut()) });
     assert_eq!(
         unsafe { libz_rs_sys::inflateCodesUsed(core::ptr::null_mut()) },
         c_ulong::MAX
@@ -2413,7 +2412,7 @@ fn codes_used() {
     ];
 
     for input in inputs {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut output: Vec<u8> = vec![0u8; 1 << 15];
             let mut codes_used = Vec::new();
 
@@ -2466,7 +2465,7 @@ fn test_dict_inflate() {
     let mut dictionary = *b"hello\0";
     let mut hello = *b"hello\0";
 
-    let (compr, dict_id) = assert_eq_rs_ng!({
+    let (compr, dict_id) = assert_eq_rs_ng!(unsafe {
         let mut compr = [0u8; 1024];
 
         let mut strm = MaybeUninit::zeroed();
@@ -2507,7 +2506,7 @@ fn test_dict_inflate() {
         (compr, dict_id)
     });
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut compr = compr;
         let mut uncompr = *b"garbage garbage garbage\0";
 
@@ -2788,7 +2787,7 @@ unsafe extern "C" fn pull(desc: *mut c_void, buf: *mut *const c_uchar) -> c_uint
 fn cover_back() {
     let mut window = [0u8; 32768];
 
-    let ret = assert_eq_rs_ng!({
+    let ret = assert_eq_rs_ng!(unsafe {
         inflateBackInit_(
             core::ptr::null_mut(),
             0,
@@ -2799,7 +2798,7 @@ fn cover_back() {
     });
     assert_eq!(ret, Z_VERSION_ERROR);
 
-    let ret = assert_eq_rs_ng!({
+    let ret = assert_eq_rs_ng!(unsafe {
         inflateBackInit_(
             core::ptr::null_mut(),
             0,
@@ -2821,7 +2820,7 @@ fn cover_back() {
     };
     assert_eq!(ret, Z_STREAM_ERROR);
 
-    let ret = assert_eq_rs_ng!({ inflateBackEnd(core::ptr::null_mut(),) });
+    let ret = assert_eq_rs_ng!(unsafe { inflateBackEnd(core::ptr::null_mut(),) });
     assert_eq!(ret, Z_STREAM_ERROR);
 
     unsafe {
@@ -2897,7 +2896,7 @@ fn done_state_returns_stream_end() {
         200, 0, 179, 33, 36, 68, 4, 89, 28, 137, 13, 0, 181, 147, 9, 162, 53, 0, 0, 0,
     ];
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut out: [u8; 64] = [0; 64];
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
@@ -2937,7 +2936,7 @@ fn done_state_returns_stream_end() {
 
 #[test]
 fn inflate_copy_does_not_require_live_io_pointers() {
-    let result = assert_eq_rs_ng!({
+    let result = assert_eq_rs_ng!(unsafe {
         let mut source = MaybeUninit::<z_stream>::zeroed();
         let ret = inflateInit_(
             source.as_mut_ptr(),
@@ -2968,7 +2967,7 @@ fn inflate_copy_does_not_require_live_io_pointers() {
 fn inflate_copy_after_half_input() {
     let input = include_bytes!("test-data/compression-corpus/The fastest WASM zlib.md.gzip-9.gz");
 
-    let _ = assert_eq_rs_ng!({
+    let _ = assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
         let ret = unsafe {
             inflateInit2_(
@@ -3091,7 +3090,7 @@ fn inflate_validate_toggles_checksum_update() {
     // - decompress normally, the checksum should update
     // - toggle, the checksum should not update
     // - toggle again, the checksum should update
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
         let ret = inflateInit2_(
             stream.as_mut_ptr(),

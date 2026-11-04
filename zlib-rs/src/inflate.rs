@@ -1,5 +1,7 @@
-#![allow(non_snake_case)] // TODO ultimately remove this
-#![allow(clippy::missing_safety_doc)] // obviously needs to be fixed long-term
+#![expect(
+    non_snake_case,
+    reason = "inflate state mode names preserve the zlib state-machine spellings"
+)]
 
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 use core::marker::PhantomData;
@@ -145,6 +147,10 @@ pub const INFLATE_STATE_SIZE: usize = core::mem::size_of::<crate::inflate::State
 
 #[cfg(feature = "__internal-test")]
 #[doc(hidden)]
+/// # Safety
+///
+/// The stream must be initialized for inflate, and its state pointer must
+/// refer to a live, exclusively borrowed inflate State allocation.
 pub unsafe fn set_mode_dict(strm: &mut z_stream) {
     unsafe {
         (*(strm.state as *mut State)).mode = Mode::Dict;
@@ -153,6 +159,10 @@ pub unsafe fn set_mode_dict(strm: &mut z_stream) {
 
 #[cfg(feature = "__internal-test")]
 #[doc(hidden)]
+/// # Safety
+///
+/// The pointer must be non-null, aligned, and valid for exclusive access
+/// to a live initialized inflate stream and its state allocation.
 pub unsafe fn set_mode_sync(strm: *mut z_stream) {
     unsafe {
         (*((*strm).state as *mut State)).mode = Mode::Sync;
@@ -205,18 +215,33 @@ impl<'a> InflateStream<'a> {
 
     /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
     #[inline(always)]
+    /// # Safety
+    ///
+    /// If non-null, the stream pointer must be valid, initialized for inflate,
+    /// and remain alive for the returned lifetime. There must be no concurrent
+    /// exclusive access to the returned stream view.
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
         unsafe { Self::from_stream_ref_kind(strm, InflateStateKind::Regular) }
     }
 
     /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
     #[inline(always)]
+    /// # Safety
+    ///
+    /// If non-null, the stream pointer must reference a live, initialized
+    /// inflate stream for which the caller guarantees exclusive access
+    /// throughout the returned lifetime.
     pub unsafe fn from_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
         unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Regular) }
     }
 
     /// Convert an `inflateBackInit*` stream. Regular inflate streams are rejected.
     #[inline(always)]
+    /// # Safety
+    ///
+    /// If non-null, the pointer must reference a valid initialized BackInit
+    /// stream and callback-owned window. The caller must preserve both
+    /// lifetimes and exclusive access while the returned view is borrowed.
     pub unsafe fn from_back_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
         unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Back) }
     }
@@ -439,11 +464,10 @@ pub enum Mode {
 }
 
 #[derive(Default, Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
 enum Codes {
     #[default]
     Fixed,
-    Codes,
+    CodeLengths,
     Len,
     Dist,
 }
@@ -821,7 +845,7 @@ impl<'a> State<'a> {
     fn len_table_ref(&self) -> &[Code] {
         match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX,
-            Codes::Codes => &self.codes_codes,
+            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         }
@@ -830,7 +854,7 @@ impl<'a> State<'a> {
     fn dist_table_ref(&self) -> &[Code] {
         match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX,
-            Codes::Codes => &self.codes_codes,
+            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         }
@@ -1131,14 +1155,14 @@ impl State<'_> {
 
         let len_table = match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
-            Codes::Codes => &self.codes_codes,
+            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
 
         let dist_table = match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX[..],
-            Codes::Codes => &self.codes_codes,
+            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
@@ -1956,7 +1980,7 @@ impl State<'_> {
                         };
 
                         self.next = used;
-                        self.len_table.codes = Codes::Codes;
+                        self.len_table.codes = Codes::CodeLengths;
                         self.len_table.bits = root;
 
                         self.have = 0;
