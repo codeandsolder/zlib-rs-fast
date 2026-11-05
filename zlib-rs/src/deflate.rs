@@ -2284,9 +2284,11 @@ pub fn fill_window_core_with_hash_maintenance(
         // Initialize the hash value now that we have some input:
         if maintain_hash_chain && state.lookahead + state.insert >= STD_MIN_MATCH {
             let string = state.strstart - state.insert;
-            if state.max_chain_length > 1024 {
-                let v0 = state.window.filled()[string] as u32;
-                let v1 = state.window.filled()[string + 1] as u32;
+            // The rolling seed must match the hash representation used to index
+            // the live head/prev tables, not the current (possibly tuned) chain budget.
+            if matches!(state.hash_calc_variant, HashCalcVariant::Roll) {
+                let v0 = u32::from(state.window.filled()[string]);
+                let v1 = u32::from(state.window.filled()[string + 1]);
                 state.ins_h = state.update_hash(v0, v1);
             } else if string >= 1 {
                 state.quick_insert_string(string + 2 - STD_MIN_MATCH);
@@ -4291,6 +4293,35 @@ mod test {
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
         }
+    }
+
+    #[test]
+    fn window_refill_seeds_hash_by_history_representation_not_tuned_chain(
+    ) -> Result<(), &'static str> {
+        let source = b"ABCDABCD0123456789".repeat(32);
+        let rolling_seed = RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]));
+
+        for (level, chain, expected_seed) in [
+            (7, 4_096, 0),
+            (7, 128, 0),
+            (9, 128, rolling_seed),
+            (9, 4_096, rolling_seed),
+        ] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
+            let mut input = InputCursor::from_slice(&source, stream.total_in)
+                .ok_or("test source length must fit zlib uInt")?;
+            let mut checksum = StreamChecksum::from_stream(&stream);
+            fill_window_core(&mut stream.state, &mut input, &mut checksum);
+            assert_eq!(input.avail_in, 0, "the refill should consume all the input");
+            assert_eq!(
+                stream.state.ins_h, expected_seed,
+                "level {level}, tuned chain {chain}, hash mode {:?}",
+                stream.state.hash_calc_variant
+            );
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
     }
 
     #[test]
