@@ -20,6 +20,12 @@ on: # zizmor: ignore[cache-poisoning] not actually used for releases
     branches:
       - main
 
+# Superseded PR revisions must not keep a full 33-job matrix running.
+# Keep push, scheduled, and merge-queue validations independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build and test
