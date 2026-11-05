@@ -519,6 +519,86 @@ fn test_deflate_tune() {
 }
 
 #[test]
+fn deflate_tune_wide_parameters_round_trip_with_zlib_ng() -> Result<(), &'static str> {
+    let input: Vec<u8> = (0..8_192usize)
+        .map(|i| {
+            let offset = i / 157;
+            let position = i % 157;
+            ((position * 19 + offset % 7 * 13) ^ (position / 5)).to_le_bytes()[0]
+        })
+        .collect();
+    let input_abi_len = c_uint::try_from(input.len()).map_err(|_| "test input exceeds uInt")?;
+    let output_abi_len =
+        c_uint::try_from(input.len() * 2).map_err(|_| "test output exceeds uInt")?;
+
+    // Bounds above 16 bits must not wrap to zero: the actual DEFLATE match length
+    // and reachable hash-chain length are much smaller than these tuning values.
+    for params in [
+        (8, 16, 128, 129),
+        (65_536, 65_536, 65_536, 65_536),
+        (65_537, 65_537, 65_537, 65_537),
+        (-1, -1, -1, -1),
+    ] {
+        let compressed = assert_eq_rs_ng!({
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
+            // SAFETY: valid zlib ABI version and stream size for initialization.
+            assert_eq!(
+                unsafe {
+                    deflateInit_(
+                        raw.as_mut_ptr(),
+                        9,
+                        zlibVersion(),
+                        core::mem::size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK,
+            );
+            // SAFETY: successful initialization establishes a live stream.
+            let stream = unsafe { raw.assume_init_mut() };
+            // SAFETY: deflateTune consumes only scalar parameters and a valid initialized stream.
+            let status = unsafe { deflateTune(stream, params.0, params.1, params.2, params.3) };
+            let mut output = vec![0u8; input.len() * 2];
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = input_abi_len;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output_abi_len;
+            // SAFETY: input and output buffers are disjoint, valid, and allocated for the call.
+            let code = unsafe { deflate(stream, Z_FINISH) };
+            let consumed = stream.avail_in;
+            let written = output.len() - stream.avail_out as usize;
+            output.truncate(written);
+            // SAFETY: stream was initialized once, and is finalized exactly once.
+            let end = unsafe { deflateEnd(stream) };
+            // Tuned zlib-rs and zlib-ng can choose different, valid DEFLATE matches.
+            // Compare ABI outcomes and validate each emitted stream independently.
+            let mut recovered = vec![0u8; input.len()];
+            let (decoded, rc) =
+                zlib_rs::decompress_slice(&mut recovered, &output, InflateConfig::default());
+            (
+                status,
+                code,
+                consumed,
+                end,
+                rc == ReturnCode::Ok && decoded == input,
+            )
+        });
+        assert_eq!(compressed.0, Z_OK, "tune params {params:?}");
+        assert_eq!(
+            compressed.1,
+            libz_rs_sys::Z_STREAM_END,
+            "tune params {params:?}"
+        );
+        assert_eq!(compressed.2, 0, "tune params {params:?}");
+        assert_eq!(compressed.3, Z_OK, "tune params {params:?}");
+        assert!(
+            compressed.4,
+            "compression did not round-trip for {params:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn deflate_medium_fizzle_bug() {
     const EXPECTED: &[u8] = &[
         120, 156, 99, 96, 128, 3, 73, 6, 26, 3, 71, 218, 2, 28, 182, 214, 17, 225, 50, 85, 100, 14,

@@ -1145,14 +1145,21 @@ pub fn tune(
     nice_length: usize,
     max_chain: usize,
 ) -> ReturnCode {
-    stream.state.good_match = good_length as u16;
+    // These are comparison thresholds and maximum chain-search budgets, not bitfields:
+    // - no DEFLATE match length exceeds 258;
+    // - no window search has more than 32,768 distinct candidate positions.
+    // A larger tuning parameter therefore has the same effect as u16::MAX; wrapping
+    // it to zero would instead disable matching or change compression decisions.
+    let bound = |value| u16::try_from(value).unwrap_or(u16::MAX);
+    stream.state.good_match = bound(good_length);
     stream.state.medium_next_match = MatchCandidate::EMPTY;
     // zlib exposes one tuning knob for both historical uses of max_lazy. Keep the
     // public contract while representing the two internal concepts independently.
-    stream.state.max_insert_length = max_lazy as u16;
-    stream.state.max_lazy_match = max_lazy as u16;
-    stream.state.nice_match = nice_length as u16;
-    stream.state.max_chain_length = max_chain as u16;
+    let lazy = bound(max_lazy);
+    stream.state.max_insert_length = lazy;
+    stream.state.max_lazy_match = lazy;
+    stream.state.nice_match = bound(nice_length);
+    stream.state.max_chain_length = bound(max_chain);
 
     ReturnCode::Ok
 }
@@ -4280,6 +4287,34 @@ mod test {
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
         }
+    }
+
+    #[test]
+    fn tune_wide_parameters_do_not_wrap_to_zero() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::new(9)), ReturnCode::Ok);
+        // SAFETY: init succeeded and its state is live, uniquely borrowed by this test.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("deflate state missing after init")?;
+
+        // All four tunables are upper bounds or comparison thresholds. A positive
+        // value beyond u16 range must not become zero after narrowing.
+        assert_eq!(tune(stream, 65_536, 65_536, 65_536, 65_536), ReturnCode::Ok);
+        assert_eq!(stream.state.good_match, u16::MAX);
+        assert_eq!(stream.state.max_lazy_match, u16::MAX);
+        assert_eq!(stream.state.max_insert_length, u16::MAX);
+        assert_eq!(stream.state.nice_match, u16::MAX);
+        assert_eq!(stream.state.max_chain_length, u16::MAX);
+
+        // A negative C i32 forwarded by the C wrapper becomes a large usize.
+        // It must remain a high threshold rather than wrapping into a short one.
+        assert_eq!(
+            tune(stream, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+            ReturnCode::Ok
+        );
+        assert_eq!(stream.state.max_chain_length, u16::MAX);
+        assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
