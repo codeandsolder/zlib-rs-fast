@@ -599,6 +599,90 @@ fn deflate_tune_wide_parameters_round_trip_with_zlib_ng() -> Result<(), &'static
 }
 
 #[test]
+fn deflate_tune_hash_strategy_after_history_matches_zlib_ng_contract() -> Result<(), &'static str> {
+    let input: Vec<u8> = (0..45_000usize)
+        .map(|i| ((i % 317 * 7 + i / 997 * 13) ^ (i % 53)).to_le_bytes()[0])
+        .collect();
+    let output_cap = input.len() * 2;
+    let output_abi_len = c_uint::try_from(output_cap).map_err(|_| "test output exceeds uInt")?;
+
+    for (level, chain) in [(7, 4_096), (7, 128), (9, 128), (9, 4_096)] {
+        for first_len in [0usize, 12_288] {
+            let first_abi_len =
+                c_uint::try_from(first_len).map_err(|_| "test split exceeds uInt")?;
+            let remaining_abi_len =
+                c_uint::try_from(input.len() - first_len).map_err(|_| "test input exceeds uInt")?;
+
+            let outcome = assert_eq_rs_ng!({
+                let mut raw = MaybeUninit::<z_stream>::zeroed();
+                // SAFETY: use a correctly sized z_stream and the valid zlib version.
+                assert_eq!(
+                    unsafe {
+                        deflateInit_(
+                            raw.as_mut_ptr(),
+                            level,
+                            zlibVersion(),
+                            core::mem::size_of::<z_stream>() as c_int,
+                        )
+                    },
+                    Z_OK
+                );
+                // SAFETY: successful initialization owns a live z_stream.
+                let stream = unsafe { raw.assume_init_mut() };
+                let mut output = vec![0u8; output_cap];
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = output_abi_len;
+                let mut first_status = Z_OK;
+
+                if first_len != 0 {
+                    stream.next_in = input.as_ptr().cast_mut();
+                    stream.avail_in = first_abi_len;
+                    // SAFETY: current input and output spans remain live and disjoint.
+                    first_status = unsafe { deflate(stream, Z_NO_FLUSH) };
+                }
+                let first_left = stream.avail_in;
+                // SAFETY: stream remains initialized and deflateTune reads only scalar parameters.
+                let tune_status = unsafe { deflateTune(stream, 8, 16, 128, chain) };
+                stream.next_in = input[first_len..].as_ptr().cast_mut();
+                stream.avail_in = remaining_abi_len;
+                // SAFETY: both buffers remain live and disjoint until this call completes.
+                let finish_status = unsafe { deflate(stream, Z_FINISH) };
+                let finish_left = stream.avail_in;
+                let produced = output.len() - stream.avail_out as usize;
+                output.truncate(produced);
+                // SAFETY: initialized stream is finalized exactly once.
+                let end_status = unsafe { deflateEnd(stream) };
+
+                let mut decoded_buf = vec![0u8; input.len()];
+                let (decoded, decode_status) =
+                    zlib_rs::decompress_slice(&mut decoded_buf, &output, InflateConfig::default());
+                (
+                    first_status,
+                    first_left,
+                    tune_status,
+                    finish_status,
+                    finish_left,
+                    end_status,
+                    decode_status == ReturnCode::Ok && decoded == input,
+                )
+            });
+
+            assert_eq!(
+                outcome.0, Z_OK,
+                "level {level}, chain {chain}, split {first_len}"
+            );
+            assert_eq!(outcome.1, 0, "first input not consumed");
+            assert_eq!(outcome.2, Z_OK, "tune rejected");
+            assert_eq!(outcome.3, libz_rs_sys::Z_STREAM_END, "finish unsuccessful");
+            assert_eq!(outcome.4, 0, "final input not consumed");
+            assert_eq!(outcome.5, Z_OK, "stream cleanup failed");
+            assert!(outcome.6, "invalid compressed stream");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn deflate_medium_fizzle_bug() {
     const EXPECTED: &[u8] = &[
         120, 156, 99, 96, 128, 3, 73, 6, 26, 3, 71, 218, 2, 28, 182, 214, 17, 225, 50, 85, 100, 14,

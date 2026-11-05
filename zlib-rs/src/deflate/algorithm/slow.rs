@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
+use crate::deflate::hash_calc::HashCalcVariant;
 use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
@@ -19,9 +20,13 @@ pub(super) struct SlowProducer {
 }
 
 impl SlowProducer {
-    pub(super) fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
+    pub(super) const fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
         Self {
-            use_longest_match_slow: state.max_chain_length > 1024,
+            // The specialized search probes rolling-hash buckets for shifted matches.
+            // deflateTune may cross the chain threshold after hash history was built;
+            // never reinterpret a Standard-hash table as a rolling-hash table.
+            use_longest_match_slow: state.max_chain_length > 1024
+                && matches!(state.hash_calc_variant, HashCalcVariant::Roll),
             match_available: state.match_available,
             phase: SlowPhase::Ready,
             match_source,
@@ -158,5 +163,31 @@ impl TokenProducer for SlowProducer {
             self.match_available = false;
         }
         state.strstart.min(STD_MIN_MATCH - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deflate::{end, tune, DeflateConfig, DeflateStream};
+    use crate::ReturnCode;
+
+    #[test]
+    fn specialized_search_requires_rolling_hash_history() {
+        for (level, chain, expected_specialized) in [
+            (7, 4_096, false), // tune a Standard-hash stream above the usual chain limit
+            (7, 128, false),
+            (9, 4_096, true),
+            (9, 128, false),
+        ] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
+            assert_eq!(
+                SlowProducer::new(&stream.state, MatchSourceKind::HashChain).use_longest_match_slow,
+                expected_specialized,
+                "level {level}, tuned chain {chain}",
+            );
+            assert!(end(&mut stream).is_ok());
+        }
     }
 }
