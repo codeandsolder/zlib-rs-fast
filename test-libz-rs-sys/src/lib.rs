@@ -783,6 +783,69 @@ mod null {
     }
 
     #[test]
+    fn inflate_prime_raw_stream_preserves_input_cursor() {
+        let source: Vec<u8> = (0..16 * 1024)
+            .map(|i| ((i * 31 + i / 97) % 251) as u8)
+            .collect();
+        let mut compressed_storage = vec![0; zlib_rs::compress_bound(source.len())];
+        let (compressed, ret) = zlib_rs::compress_slice(
+            &mut compressed_storage,
+            &source,
+            zlib_rs::DeflateConfig {
+                window_bits: -15,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ret, zlib_rs::ReturnCode::Ok);
+        assert!(compressed.len() >= 32);
+
+        // Prime one or two 16-bit chunks of an actual raw DEFLATE stream, then decode
+        // the rest from the caller-provided input. Compare both implementations.
+        for prime_bytes in [2, 4] {
+            // SAFETY: the stream is initialized before use; compressed input and initialized
+            // output buffers stay live for the call, with disjoint storage and valid lengths.
+            assert_eq_rs_ng!(unsafe {
+                let mut raw = MaybeUninit::<z_stream>::zeroed();
+                assert_eq!(
+                    inflateInit2_(
+                        raw.as_mut_ptr(),
+                        -15,
+                        zlibVersion(),
+                        i32::try_from(core::mem::size_of::<z_stream>()).unwrap_or(i32::MAX),
+                    ),
+                    Z_OK
+                );
+                let stream = raw.assume_init_mut();
+                for chunk in compressed[..prime_bytes].as_chunks::<2>().0 {
+                    let bits = u16::from_le_bytes(*chunk);
+                    assert_eq!(inflatePrime(stream, 16, i32::from(bits)), Z_OK);
+                }
+                let mut output = vec![0u8; source.len() + 64];
+                stream.next_in = compressed[prime_bytes..].as_ptr().cast_mut();
+                stream.avail_in = u32::try_from(compressed.len() - prime_bytes).unwrap_or(u32::MAX);
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = u32::try_from(output.len()).unwrap_or(u32::MAX);
+                let code = inflate(stream, Z_FINISH);
+                let total = stream.total_out;
+                output.truncate(source.len());
+                let remaining = stream.avail_in;
+                let consumed = stream.total_in;
+                let end = inflateEnd(stream);
+                assert_eq!(code, Z_STREAM_END);
+                assert_eq!(end, Z_OK);
+                assert_eq!(usize::try_from(total).ok(), Some(source.len()));
+                assert_eq!(output, source);
+                assert_eq!(remaining, 0);
+                assert_eq!(
+                    usize::try_from(consumed).ok(),
+                    Some(compressed.len() - prime_bytes)
+                );
+                (code, consumed, remaining, output, end)
+            });
+        }
+    }
+
+    #[test]
     fn inflate_prime() {
         assert_eq_rs_ng!(unsafe { inflatePrime(core::ptr::null_mut(), 1, 2) });
     }
