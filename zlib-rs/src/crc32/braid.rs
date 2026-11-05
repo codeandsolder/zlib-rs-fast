@@ -164,7 +164,7 @@ mod test {
     #[test]
     fn words_endianness() {
         let v = [0, 0, 0, 0, 0, 16, 0, 1];
-        let start = 1534327806;
+        let start = 1_534_327_806;
 
         let mut h = crc32fast::Hasher::new_with_initial(start);
         h.update(&v[..]);
@@ -173,7 +173,7 @@ mod test {
 
     #[test]
     fn crc32_naive_inner_endianness_and_alignment() {
-        assert_eq!(crc32_naive_inner(&[0, 1], 0), 1996959894);
+        assert_eq!(crc32_naive_inner(&[0, 1], 0), 1_996_959_894);
 
         let v: Vec<_> = (0..1024).map(|i| i as u8).collect();
         let start = 0;

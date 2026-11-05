@@ -226,7 +226,7 @@ mod test {
             &[0],
         ];
 
-        const START: u32 = 2380683574;
+        const START: u32 = 2_380_683_574;
 
         let mut in_chunks = START;
         for chunk in INPUT {
@@ -241,7 +241,7 @@ mod test {
 
     #[test]
     fn nasty_alignment() {
-        const START: u32 = 2380683574;
+        const START: u32 = 2_380_683_574;
 
         const FLAT: &[u8] = &[
             116, 111, 107, 105, 111, 44, 32, 97, 115, 121, 110, 99, 45, 115, 116, 100, 44, 32, 97,
@@ -261,7 +261,7 @@ mod test {
         let flat = &flat[i..];
 
         assert_eq!(crc32_braid::<5>(START, flat), crc32(START, flat));
-        assert_eq!(crc32(2380683574, flat), 1175758345);
+        assert_eq!(crc32(2_380_683_574, flat), 1_175_758_345);
     }
 
     #[test]

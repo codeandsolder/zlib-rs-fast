@@ -27,10 +27,10 @@ pub(crate) struct Accumulator {
 
 #[cfg(target_arch = "x86_64")]
 impl Accumulator {
-    const XMM_FOLD4: __m128i = reg([0xc6e41596u32, 0x00000001u32, 0x54442bd4u32, 0x00000001u32]);
+    const XMM_FOLD4: __m128i = reg([0xc6e4_1596u32, 0x0000_0001u32, 0x5444_2bd4u32, 0x0000_0001u32]);
 
     pub const fn new() -> Self {
-        let xmm_crc0 = reg([0x9db42487, 0, 0, 0]);
+        let xmm_crc0 = reg([0x9db4_2487, 0, 0, 0]);
         let xmm_zero = reg([0, 0, 0, 0]);
 
         Self {
@@ -45,24 +45,24 @@ impl Accumulator {
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
     pub unsafe fn finish(self) -> u32 {
         const CRC_MASK1: __m128i =
-            reg([0xFFFFFFFFu32, 0xFFFFFFFFu32, 0x00000000u32, 0x00000000u32]);
+            reg([0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0x0000_0000u32, 0x0000_0000u32]);
 
         const CRC_MASK2: __m128i =
-            reg([0x00000000u32, 0xFFFFFFFFu32, 0xFFFFFFFFu32, 0xFFFFFFFFu32]);
+            reg([0x0000_0000u32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32]);
 
         const RK1_RK2: __m128i = reg([
-            0xccaa009e, 0x00000000, /* rk1 */
-            0x751997d0, 0x00000001, /* rk2 */
+            0xccaa_009e, 0x0000_0000, /* rk1 */
+            0x7519_97d0, 0x0000_0001, /* rk2 */
         ]);
 
         const RK5_RK6: __m128i = reg([
-            0xccaa009e, 0x00000000, /* rk5 */
-            0x63cd6124, 0x00000001, /* rk6 */
+            0xccaa_009e, 0x0000_0000, /* rk5 */
+            0x63cd_6124, 0x0000_0001, /* rk6 */
         ]);
 
         const RK7_RK8: __m128i = reg([
-            0xf7011640, 0x00000001, /* rk7 */
-            0xdb710640, 0x00000001, /* rk8 */
+            0xf701_1640, 0x0000_0001, /* rk7 */
+            0xdb71_0640, 0x0000_0001, /* rk8 */
         ]);
 
         let [mut xmm_crc0, mut xmm_crc1, mut xmm_crc2, mut xmm_crc3] = self.fold;
@@ -141,26 +141,26 @@ impl Accumulator {
 
     unsafe fn partial_fold(&mut self, xmm_crc_part: __m128i, len: usize) {
         const PSHUFB_SHF_TABLE: [__m128i; 15] = [
-            reg([0x84838281, 0x88878685, 0x8c8b8a89, 0x008f8e8d]), /* shl 15 (16 - 1)/shr1 */
-            reg([0x85848382, 0x89888786, 0x8d8c8b8a, 0x01008f8e]), /* shl 14 (16 - 3)/shr2 */
-            reg([0x86858483, 0x8a898887, 0x8e8d8c8b, 0x0201008f]), /* shl 13 (16 - 4)/shr3 */
-            reg([0x87868584, 0x8b8a8988, 0x8f8e8d8c, 0x03020100]), /* shl 12 (16 - 4)/shr4 */
-            reg([0x88878685, 0x8c8b8a89, 0x008f8e8d, 0x04030201]), /* shl 11 (16 - 5)/shr5 */
-            reg([0x89888786, 0x8d8c8b8a, 0x01008f8e, 0x05040302]), /* shl 10 (16 - 6)/shr6 */
-            reg([0x8a898887, 0x8e8d8c8b, 0x0201008f, 0x06050403]), /* shl  9 (16 - 7)/shr7 */
-            reg([0x8b8a8988, 0x8f8e8d8c, 0x03020100, 0x07060504]), /* shl  8 (16 - 8)/shr8 */
-            reg([0x8c8b8a89, 0x008f8e8d, 0x04030201, 0x08070605]), /* shl  7 (16 - 9)/shr9 */
-            reg([0x8d8c8b8a, 0x01008f8e, 0x05040302, 0x09080706]), /* shl  6 (16 -10)/shr10*/
-            reg([0x8e8d8c8b, 0x0201008f, 0x06050403, 0x0a090807]), /* shl  5 (16 -11)/shr11*/
-            reg([0x8f8e8d8c, 0x03020100, 0x07060504, 0x0b0a0908]), /* shl  4 (16 -12)/shr12*/
-            reg([0x008f8e8d, 0x04030201, 0x08070605, 0x0c0b0a09]), /* shl  3 (16 -13)/shr13*/
-            reg([0x01008f8e, 0x05040302, 0x09080706, 0x0d0c0b0a]), /* shl  2 (16 -14)/shr14*/
-            reg([0x0201008f, 0x06050403, 0x0a090807, 0x0e0d0c0b]), /* shl  1 (16 -15)/shr15*/
+            reg([0x8483_8281, 0x8887_8685, 0x8c8b_8a89, 0x008f_8e8d]), /* shl 15 (16 - 1)/shr1 */
+            reg([0x8584_8382, 0x8988_8786, 0x8d8c_8b8a, 0x0100_8f8e]), /* shl 14 (16 - 3)/shr2 */
+            reg([0x8685_8483, 0x8a89_8887, 0x8e8d_8c8b, 0x0201_008f]), /* shl 13 (16 - 4)/shr3 */
+            reg([0x8786_8584, 0x8b8a_8988, 0x8f8e_8d8c, 0x0302_0100]), /* shl 12 (16 - 4)/shr4 */
+            reg([0x8887_8685, 0x8c8b_8a89, 0x008f_8e8d, 0x0403_0201]), /* shl 11 (16 - 5)/shr5 */
+            reg([0x8988_8786, 0x8d8c_8b8a, 0x0100_8f8e, 0x0504_0302]), /* shl 10 (16 - 6)/shr6 */
+            reg([0x8a89_8887, 0x8e8d_8c8b, 0x0201_008f, 0x0605_0403]), /* shl  9 (16 - 7)/shr7 */
+            reg([0x8b8a_8988, 0x8f8e_8d8c, 0x0302_0100, 0x0706_0504]), /* shl  8 (16 - 8)/shr8 */
+            reg([0x8c8b_8a89, 0x008f_8e8d, 0x0403_0201, 0x0807_0605]), /* shl  7 (16 - 9)/shr9 */
+            reg([0x8d8c_8b8a, 0x0100_8f8e, 0x0504_0302, 0x0908_0706]), /* shl  6 (16 -10)/shr10*/
+            reg([0x8e8d_8c8b, 0x0201_008f, 0x0605_0403, 0x0a09_0807]), /* shl  5 (16 -11)/shr11*/
+            reg([0x8f8e_8d8c, 0x0302_0100, 0x0706_0504, 0x0b0a_0908]), /* shl  4 (16 -12)/shr12*/
+            reg([0x008f_8e8d, 0x0403_0201, 0x0807_0605, 0x0c0b_0a09]), /* shl  3 (16 -13)/shr13*/
+            reg([0x0100_8f8e, 0x0504_0302, 0x0908_0706, 0x0d0c_0b0a]), /* shl  2 (16 -14)/shr14*/
+            reg([0x0201_008f, 0x0605_0403, 0x0a09_0807, 0x0e0d_0c0b]), /* shl  1 (16 -15)/shr15*/
         ];
 
         unsafe {
             let xmm_shl = PSHUFB_SHF_TABLE[len - 1];
-            let xmm_shr = _mm_xor_si128(xmm_shl, reg([0x80808080u32; 4]));
+            let xmm_shr = _mm_xor_si128(xmm_shl, reg([0x8080_8080u32; 4]));
 
             let xmm_a0 = Self::step(_mm_shuffle_epi8(self.fold[0], xmm_shl));
 

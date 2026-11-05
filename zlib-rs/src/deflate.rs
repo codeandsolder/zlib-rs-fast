@@ -1938,7 +1938,7 @@ impl<'a> State<'a> {
     fn detect_data_type(dyn_tree: &[Value]) -> DataType {
         // set bits 0..6, 14..25, and 28..31
         // 0xf3ffc07f = binary 11110011111111111100000001111111
-        const NON_TEXT: u64 = 0xf3ffc07f;
+        const NON_TEXT: u64 = 0xf3ff_c07f;
         let mut mask = NON_TEXT;
 
         /* Check for non-textual bytes. */

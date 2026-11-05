@@ -376,7 +376,7 @@ mod test {
         let slice = window.as_slice();
         assert_eq!(&[1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2], slice);
 
-        assert_eq!(checksum, 6946835);
+        assert_eq!(checksum, 6_946_835);
 
         unsafe {
             crate::allocate::RUST.deallocate(
@@ -406,7 +406,7 @@ mod test {
         let slice = window.as_slice();
         assert_eq!(&[2, 2, 1, 2], slice);
 
-        assert_eq!(checksum, 1769481);
+        assert_eq!(checksum, 1_769_481);
 
         unsafe {
             crate::allocate::RUST.deallocate(
@@ -451,7 +451,7 @@ mod test {
         let slice = window.as_slice();
         assert_eq!(&[2, 3, 4, 5, 6, 7, 8, 9], slice);
 
-        assert_eq!(checksum, 10813485);
+        assert_eq!(checksum, 10_813_485);
 
         unsafe {
             crate::allocate::RUST

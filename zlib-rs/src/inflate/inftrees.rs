@@ -151,7 +151,7 @@ pub(crate) fn inflate_table(
         } else {
             Code {
                 bits: (len - drop_) as u8,
-                op: 0b01100000,
+                op: 0b0110_0000,
                 val: 0,
             }
         };
@@ -171,7 +171,7 @@ pub(crate) fn inflate_table(
         }
 
         // backwards increment the len-bit code huff
-        reversed_huff = reversed_huff.wrapping_add(0x80000000u32 >> (len - 1));
+        reversed_huff = reversed_huff.wrapping_add(0x8000_0000u32 >> (len - 1));
         huff = reversed_huff.reverse_bits() as usize;
 
         // go to next symbol, update count, len
