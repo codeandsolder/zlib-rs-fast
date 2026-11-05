@@ -1,6 +1,5 @@
 use zlib_rs::c_api::*;
 
-use crate::gz::GzMode::Read;
 use crate::{
     deflate, deflateEnd, deflateInit2_, deflateReset, inflate, inflateEnd, inflateInit2_,
     inflateReset, prefix, z_off64_t, z_off_t, zlibVersion,
@@ -2403,10 +2402,12 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
         return -1;
     }
 
-    // Return position.
-    match state.seek {
-        true => (state.pos + state.skip) as z_off64_t,
-        false => state.pos as z_off64_t,
+    // The logical position includes any lazy skip, but must always fit the
+    // signed C offset type even for an internally inconsistent stream.
+    if state.seek {
+        state.pos.checked_add(state.skip).unwrap_or(-1)
+    } else {
+        state.pos
     }
 }
 
@@ -2893,79 +2894,94 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
         return -1;
     }
 
-    let mut offset: i64 = offset as _;
-
-    // Normalize offset to a SEEK_CUR specification (i.e., relative to current position).
-    if whence == SEEK_SET {
-        offset -= state.pos;
-    } else if state.seek {
-        offset += state.skip;
+    // Resolve the requested absolute logical position before changing any
+    // pending seek state. i128 covers all combinations of i64 position, skip
+    // and offset without risking a panic in this C ABI entry point.
+    let current = i128::from(state.pos)
+        + if state.seek {
+            i128::from(state.skip)
+        } else {
+            0
+        };
+    let target = if whence == SEEK_SET {
+        i128::from(offset)
+    } else {
+        current + i128::from(offset)
+    };
+    let Ok(target) = i64::try_from(target) else {
+        return -1;
+    };
+    if target < 0 {
+        return -1;
     }
-    state.seek = false;
 
-    // If we are reading non-compressed content, just lseek to the right location.
-    if state.mode == Read && state.how == How::Copy && state.pos + offset >= 0 {
-        let ret = lseek64(
-            state.fd,
-            offset as z_off64_t - state.have as z_off64_t,
-            SEEK_CUR,
-        );
-        if ret == -1 {
+    // Direct reads can seek in the underlying file without reconstructing
+    // decompressor state. Account for the bytes still exposed via have.
+    if state.mode == GzMode::Read && state.how == How::Copy {
+        let disk_delta = i128::from(target) - i128::from(state.pos) - i128::from(state.have);
+        let Ok(disk_delta) = z_off64_t::try_from(disk_delta) else {
+            return -1;
+        };
+        if lseek64(state.fd, disk_delta, SEEK_CUR) == -1 {
             return -1;
         }
         state.have = 0;
         state.eof = false;
         state.past = false;
         state.seek = false;
+        state.skip = 0;
         gz_error(state, None);
         state.stream.avail_in = 0;
-        state.pos += offset;
-        return state.pos as _;
+        state.pos = target;
+        return target;
     }
 
-    // Calculate the skip amount. If we're seeking backwards in a compressed file, we'll
-    // need to rewind to the start and decompress content until we arrive at the right spot.
-    if offset < 0 {
-        if state.mode != GzMode::Read {
-            // Can't go backwards when writing.
+    // A write cannot undo already-committed uncompressed bytes, even if an
+    // earlier seek is still pending.
+    if state.mode == GzMode::Write {
+        let Some(ahead) = target.checked_sub(state.pos) else {
             return -1;
-        }
-        offset += state.pos;
-        if offset < 0 {
-            // Before start of file!
-            return -1;
-        }
-
-        // Rewind, then skip to offset.
-        // Safety: `file` points to an initialized `GzState`.
-        if unsafe { gzrewind_help(state) } == -1 {
-            return -1;
-        }
-    }
-
-    // If reading, skip what's in output buffer. (This simplifies `gzgetc`.)
-    if state.mode == GzMode::Read {
-        // For consistency with zlib-ng, we use `gt_off` to check whether the value
-        // of `state.have` is too large to be represented as a signed 64-bit offset.
-        // This case can be triggered only if the platform has 64-bit C ints and
-        // `state.have` is >= 2^63.
-        let n = if gt_off!(state.have) || state.have as i64 > offset {
-            offset as usize
-        } else {
-            state.have as usize
         };
-        state.consume_buffered_output(n);
-        state.pos += n as i64;
-        offset -= n as i64;
+        if ahead < 0 {
+            return -1;
+        }
+        state.seek = ahead != 0;
+        state.skip = ahead;
+        return target;
     }
 
-    // Request skip (if not zero). The actual seek will happen on the next read or write operation.
-    if offset != 0 {
-        state.seek = true;
-        state.skip = offset;
+    // For compressed reads, a backward seek needs a rewind and subsequent
+    // forward decoding. Rewind first, and do not discard a pending seek if
+    // the underlying descriptor refuses the operation.
+    if target < state.pos && gzrewind_help(state) == -1 {
+        return -1;
+    }
+    let Some(mut ahead) = target.checked_sub(state.pos) else {
+        return -1;
+    };
+
+    // Consume already-decoded bytes before scheduling the remaining distance.
+    // The C have field is bounded by the owned output buffer's uInt length.
+    let buffered = u64::from(state.have);
+    let Ok(ahead_unsigned) = u64::try_from(ahead) else {
+        return -1;
+    };
+    let take = buffered.min(ahead_unsigned);
+    let Ok(take) = usize::try_from(take) else {
+        return -1;
+    };
+    if take != 0 {
+        state.consume_buffered_output(take);
+        let Ok(take_signed) = i64::try_from(take) else {
+            return -1;
+        };
+        state.pos += take_signed;
+        ahead -= take_signed;
     }
 
-    (state.pos + offset) as _
+    state.seek = ahead != 0;
+    state.skip = ahead;
+    target
 }
 
 /// Set the starting position to `offset` relative to `whence` for the next [`gzread`]
@@ -3012,10 +3028,10 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
         return -1;
     };
 
-    unsafe { gzrewind_help(state) }
+    gzrewind_help(state)
 }
 
-unsafe fn gzrewind_help(state: &mut GzState) -> c_int {
+fn gzrewind_help(state: &mut GzState) -> c_int {
     // Check that we're reading and that there's no error.
     if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
         return -1;
@@ -3174,6 +3190,17 @@ mod tests {
     use std::ffi::CString;
     use std::path::Path;
 
+    fn test_seek(state: &mut GzState, offset: i64, whence: c_int) -> i64 {
+        // SAFETY: the state remains live, initialized and uniquely borrowed
+        // for the duration of this C ABI call.
+        unsafe { gzseek64(core::ptr::from_mut(state).cast(), offset, whence) }
+    }
+
+    fn test_tell(state: &GzState) -> i64 {
+        // SAFETY: gztell64 only observes this live initialized state.
+        unsafe { gztell64(core::ptr::from_ref(state).cast_mut().cast()) }
+    }
+
     // Generate a file path relative to the project's root
     fn crate_path(file: &str) -> String {
         path(Path::new(env!("CARGO_MANIFEST_DIR")), file)
@@ -3326,6 +3353,66 @@ mod tests {
         assert_eq!(state.in_size(), 64);
         assert_eq!(state.input.as_ref().unwrap().capacity, 128);
         assert_eq!(state.out_size(), 64);
+    }
+
+    #[test]
+    fn gzip_seek_checks_signed_bounds_without_losing_pending_offsets() {
+        // Use a live internal state without allocating or writing the huge
+        // virtual skip. The C ABI paths may be called before the first write.
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        assert_eq!(test_seek(&mut state, i64::MAX - 3, SEEK_SET), i64::MAX - 3);
+        assert_eq!(test_tell(&state), i64::MAX - 3);
+        assert_eq!(state.skip, i64::MAX - 3);
+        assert!(state.seek);
+
+        // A relative offset must not wrap the virtual position, nor discard
+        // the already-pending seek when the new request is invalid.
+        assert_eq!(test_seek(&mut state, 7, SEEK_CUR), -1);
+        assert_eq!(test_tell(&state), i64::MAX - 3);
+        assert!(state.seek);
+        assert_eq!(state.skip, i64::MAX - 3);
+
+        assert_eq!(test_seek(&mut state, -2, SEEK_CUR), i64::MAX - 5);
+        assert_eq!(test_tell(&state), i64::MAX - 5);
+        assert_eq!(test_seek(&mut state, i64::MIN, SEEK_SET), -1);
+        assert_eq!(test_tell(&state), i64::MAX - 5);
+        assert_eq!(test_seek(&mut state, 0, SEEK_SET), 0);
+        assert!(!state.seek);
+        assert_eq!(test_tell(&state), 0);
+        assert_eq!(test_seek(&mut state, -1, SEEK_CUR), -1);
+        assert_eq!(test_tell(&state), 0);
+
+        // The same upper-bound invariant applies to the read-mode cursor;
+        // this remains lazy and does not perform any filesystem access.
+        state.mode = GzMode::Read;
+        state.how = How::Gzip;
+        state.pos = i64::MAX - 2;
+        assert_eq!(test_seek(&mut state, 3, SEEK_CUR), -1);
+        assert_eq!(test_tell(&state), i64::MAX - 2);
+        assert_eq!(test_seek(&mut state, i64::MAX, SEEK_SET), i64::MAX);
+        assert_eq!(test_tell(&state), i64::MAX);
+        assert_eq!(test_seek(&mut state, -1, SEEK_CUR), i64::MAX - 1);
+        assert_eq!(test_tell(&state), i64::MAX - 1);
+
+        // A direct (uncompressed) read needs a real descriptor seek. When it
+        // fails, the preceding lazy seek must remain available for a retry.
+        state.mode = GzMode::Read;
+        state.how = How::Copy;
+        state.pos = 0;
+        state.seek = true;
+        state.skip = 20;
+        state.fd = -1;
+        assert_eq!(test_seek(&mut state, 1, SEEK_CUR), -1);
+        assert!(state.seek);
+        assert_eq!(state.skip, 20);
+        assert_eq!(test_tell(&state), 20);
+
+        // Even a corrupted internal cursor cannot make the public C getter
+        // panic through signed overflow.
+        state.pos = i64::MAX;
+        state.skip = 1;
+        assert_eq!(test_tell(&state), -1);
     }
 
     #[test]
