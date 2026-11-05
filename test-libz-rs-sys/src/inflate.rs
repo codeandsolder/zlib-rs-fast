@@ -544,6 +544,103 @@ fn cover_wrap() {
 }
 
 #[test]
+fn inflate_mark_is_independent_of_unbound_io_buffers() {
+    // inflateMark examines the initialized decode state. It does not require
+    // the stream's caller-owned input/output buffers to remain attached between calls.
+    let observed = assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: pass the correct ABI version and stream size to initialize the stream.
+        assert_eq!(
+            unsafe {
+                inflateInit_(
+                    raw.as_mut_ptr(),
+                    zlibVersion(),
+                    core::mem::size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        // SAFETY: inflateInit_ initialized the stream successfully.
+        let stream = unsafe { raw.assume_init_mut() };
+        // SAFETY: the initialized inflate state is live; inflateMark only observes it.
+        let before = unsafe { inflateMark(stream) };
+        let compressed = [0x78u8, 0x9c, 0x03, 0, 0, 0, 0, 1];
+        let mut output = [0u8; 8];
+        stream.next_in = compressed.as_ptr().cast_mut();
+        stream.avail_in = c_uint::try_from(compressed.len()).unwrap_or(c_uint::MAX);
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = c_uint::try_from(output.len()).unwrap_or(c_uint::MAX);
+
+        // SAFETY: the input and output buffers remain valid and disjoint.
+        let decode_code = unsafe { inflate(stream, Z_NO_FLUSH) };
+        // SAFETY: the initialized inflate state remains live; inflateMark is read-only.
+        let with_io = unsafe { inflateMark(stream) };
+
+        // Marking a live decoder after the caller buffers have been detached
+        // must not change its answer, just like zlib-ng.
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        stream.next_out = core::ptr::null_mut();
+        stream.avail_out = 0;
+        // SAFETY: the initialized decoder state remains live; marking does not dereference I/O.
+        let without_io = unsafe { inflateMark(stream) };
+        // SAFETY: terminate the successfully initialized stream exactly once.
+        let end_code = unsafe { inflateEnd(stream) };
+        (before, decode_code, with_io, without_io, end_code)
+    });
+    assert_eq!(observed.0, -65_536);
+    assert_eq!(observed.1, Z_STREAM_END);
+    assert_eq!(observed.2, observed.3);
+    assert_eq!(observed.4, Z_OK);
+}
+
+#[test]
+fn inflate_mark_reports_unfinished_stored_block_without_io_buffers() {
+    // Valid zlib header followed by a final stored block with 20 payload bytes.
+    // Stop immediately after the block header: inflateMark must report the
+    // remaining copy length even after pointers to caller buffers are detached.
+    let observed = assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: correct version and ABI stream size for initialization.
+        assert_eq!(
+            unsafe {
+                inflateInit_(
+                    raw.as_mut_ptr(),
+                    zlibVersion(),
+                    core::mem::size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        // SAFETY: initialization succeeded.
+        let stream = unsafe { raw.assume_init_mut() };
+        let compressed_prefix = [0x78u8, 0x01, 0x01, 20, 0, 235, 255];
+        let mut output = [0u8; 32];
+        stream.next_in = compressed_prefix.as_ptr().cast_mut();
+        stream.avail_in = c_uint::try_from(compressed_prefix.len()).unwrap_or(c_uint::MAX);
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = c_uint::try_from(output.len()).unwrap_or(c_uint::MAX);
+        // SAFETY: both caller buffers are live, valid, and disjoint.
+        let status = unsafe { inflate(stream, Z_NO_FLUSH) };
+        // SAFETY: the initialized inflate state remains live; inflateMark is read-only.
+        let with_io = unsafe { inflateMark(stream) };
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        stream.next_out = core::ptr::null_mut();
+        stream.avail_out = 0;
+        // SAFETY: marking only inspects the initialized stream state.
+        let without_io = unsafe { inflateMark(stream) };
+        // SAFETY: finalizes the initialized stream once.
+        let end_status = unsafe { inflateEnd(stream) };
+        (status, with_io, without_io, end_status)
+    });
+    assert_eq!(observed.0, Z_OK);
+    assert_eq!(observed.1, -65_536 + 20);
+    assert_eq!(observed.1, observed.2);
+    assert_eq!(observed.3, Z_OK);
+}
+
+#[test]
 fn bad_gzip_method() {
     inf(
         &[0x1f, 0x8b, 0x00, 0x00],

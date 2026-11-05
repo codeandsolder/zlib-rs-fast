@@ -1,4 +1,4 @@
-use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+use core::ffi::{c_char, c_int, c_long, c_void};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
@@ -2979,11 +2979,10 @@ pub fn validate(stream: &mut InflateStream, check: bool) -> ReturnCode {
     ReturnCode::Ok
 }
 
+#[must_use]
 pub fn mark(stream: &InflateStream) -> c_long {
-    if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
-        return c_long::MIN;
-    }
-
+    // inflateMark inspects only the initialized state machine. The caller may
+    // legitimately detach or replace input/output buffers between inflate calls.
     let state = &*stream.state;
 
     let length = match state.mode {
@@ -2992,7 +2991,21 @@ pub fn mark(stream: &InflateStream) -> c_long {
         _ => 0,
     };
 
-    (((state.back as c_long) as c_ulong) << 16) as c_long + length as c_long
+    // The high part is a count of bits back, with usize::MAX representing -1
+    // before the first block. Valid code lengths and stored-block lengths fit
+    // in the low 16 bits, regardless of the platform's C long width.
+    let back = if state.back == usize::MAX {
+        -1
+    } else {
+        let Ok(back) = c_long::try_from(state.back) else {
+            return -65_536;
+        };
+        back
+    };
+    let Ok(length) = c_long::try_from(length) else {
+        return -65_536;
+    };
+    back.wrapping_shl(16).wrapping_add(length)
 }
 
 pub fn set_dictionary(stream: &mut InflateStream, dictionary: &[u8]) -> ReturnCode {
