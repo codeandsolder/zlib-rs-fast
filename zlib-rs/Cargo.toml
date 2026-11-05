@@ -18,6 +18,7 @@ unsafe_op_in_unsafe_fn = "deny"
 default = ["std", "c-allocator"]
 std = ["rust-allocator"]
 parallel = ["std", "dep:rayon-core"]
+near-optimal = ["rust-allocator"] # opt-in full-buffer high-effort Deflate
 gpu = ["std", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
 c-allocator = [] # expose a malloc-based C allocator
 rust-allocator = [] # expose a rust global alloctor

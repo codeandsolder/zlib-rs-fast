@@ -29,7 +29,7 @@ mod gpu_match;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, feature = "__internal-api", feature = "near-optimal"))]
 mod near_optimal;
 mod pending;
 mod slide_hash;
@@ -3244,7 +3244,7 @@ pub(crate) fn drain_pending_output(
 
 /// Drain all complete bytes currently produced by the complete-buffer near-optimal path while
 /// preserving any sub-byte DEFLATE prefix for the next block.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, feature = "__internal-api", feature = "near-optimal"))]
 fn drain_near_optimal_pending(
     state: &mut State<'_>,
     output: &mut [u8],
@@ -3263,7 +3263,7 @@ fn drain_near_optimal_pending(
     true
 }
 
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, feature = "__internal-api", feature = "near-optimal"))]
 fn emit_planned_near_optimal_block(
     state: &mut State<'_>,
     input: &[u8],
@@ -3304,14 +3304,20 @@ fn emit_planned_near_optimal_block(
     drain_near_optimal_pending(state, output, produced)
 }
 
-/// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
+/// Compress complete input with adaptive Deflate blocks and near-optimal LZ77 parsing.
 ///
-/// This remains behind `__internal-api` while the cost model and splitter are being developed. It
-/// emits a normal zlib-wrapped DEFLATE stream, keeps LZ77 history across Huffman block boundaries,
-/// and reuses the production tree builder / stored-static-dynamic block chooser / bit writer.
-/// `optimization_passes` counts minimum-cost path searches per selected block; zero is retained only
-/// as a fixed-Huffman diagnostic baseline.
-#[cfg(any(test, feature = "__internal-api"))]
+/// Enabled through the near-optimal feature. This produces standard zlib-wrapped
+/// DEFLATE streams and can allocate more memory than the streaming compressor.
+/// Use it for explicitly high-effort, bounded inputs, not low-latency streaming.
+///
+/// The pass count controls repeated minimum-cost parses per block; three passes
+/// are a useful quality/CPU starting point. Zero is a fixed-Huffman diagnostic.
+///
+/// A successful call returns a valid compressed subslice and ReturnCode::Ok.
+/// If the output capacity is insufficient it returns an empty slice and
+/// ReturnCode::BufError; an incomplete prefix may have been written to output.
+/// Allocate compress_bound(input.len()) bytes to guarantee sufficient space.
+#[cfg(any(test, feature = "__internal-api", feature = "near-optimal"))]
 pub fn compress_slice_near_optimal<'a>(
     output: &'a mut [u8],
     input: &[u8],
