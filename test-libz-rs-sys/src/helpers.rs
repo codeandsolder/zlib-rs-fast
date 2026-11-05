@@ -22,7 +22,7 @@ pub fn compress_slice_with_flush_ng<'a>(
     final_flush: DeflateFlush,
 ) -> (&'a mut [u8], ReturnCode) {
     let mut stream = libz_ng_sys::z_stream {
-        next_in: input.as_ptr() as *mut u8,
+        next_in: input.as_ptr().cast_mut(),
         avail_in: 0, // for special logic in the first  iteration
         total_in: 0,
         next_out: output.as_mut_ptr(),
@@ -40,7 +40,7 @@ pub fn compress_slice_with_flush_ng<'a>(
 
     let err = unsafe {
         libz_ng_sys::deflateInit2_(
-            &mut stream,
+            &raw mut stream,
             config.level,
             config.method as i32,
             config.window_bits,
@@ -77,7 +77,7 @@ pub fn compress_slice_with_flush_ng<'a>(
             final_flush
         };
 
-        let err = unsafe { libz_ng_sys::deflate(&mut stream, flush as i32) };
+        let err = unsafe { libz_ng_sys::deflate(&raw mut stream, flush as i32) };
 
         if err != libz_ng_sys::Z_OK {
             break err;
@@ -85,7 +85,7 @@ pub fn compress_slice_with_flush_ng<'a>(
     };
 
     // may DataError if there was insufficient output space
-    let _ = unsafe { libz_ng_sys::deflateEnd(&mut stream) };
+    let _ = unsafe { libz_ng_sys::deflateEnd(&raw mut stream) };
     let return_code: ReturnCode = match ReturnCode::from(err) {
         ReturnCode::StreamEnd => ReturnCode::Ok,
         other => other,
@@ -100,7 +100,7 @@ pub fn uncompress_slice_ng<'a>(
     config: InflateConfig,
 ) -> (&'a mut [u8], ReturnCode) {
     let mut stream = libz_ng_sys::z_stream {
-        next_in: input.as_ptr() as *mut u8,
+        next_in: input.as_ptr().cast_mut(),
         avail_in: input.len() as _,
         total_in: 0,
         next_out: output.as_mut_ptr(),
@@ -136,7 +136,7 @@ pub fn uncompress_slice_ng<'a>(
 
     let err = unsafe {
         libz_ng_sys::inflateInit2_(
-            &mut stream,
+            &raw mut stream,
             config.window_bits,
             libz_ng_sys::zlibVersion(),
             std::mem::size_of::<libz_ng_sys::z_stream>() as i32,
@@ -151,16 +151,16 @@ pub fn uncompress_slice_ng<'a>(
 
     let err = loop {
         if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, u32::MAX as u64) as u32;
-            left -= stream.avail_out as u64;
+            stream.avail_out = Ord::min(left, u64::from(u32::MAX)) as u32;
+            left -= u64::from(stream.avail_out);
         }
 
         if stream.avail_out == 0 {
-            stream.avail_in = Ord::min(len, u32::MAX as u64) as u32;
-            len -= stream.avail_in as u64;
+            stream.avail_in = Ord::min(len, u64::from(u32::MAX)) as u32;
+            len -= u64::from(stream.avail_in);
         }
 
-        let err = unsafe { libz_ng_sys::inflate(&mut stream, InflateFlush::NoFlush as _) };
+        let err = unsafe { libz_ng_sys::inflate(&raw mut stream, InflateFlush::NoFlush as _) };
         let err = ReturnCode::from(err);
 
         if err != ReturnCode::Ok {
@@ -174,12 +174,12 @@ pub fn uncompress_slice_ng<'a>(
         left = 1;
     }
 
-    unsafe { libz_ng_sys::inflateEnd(&mut stream) };
+    unsafe { libz_ng_sys::inflateEnd(&raw mut stream) };
 
     let ret = match err {
         ReturnCode::StreamEnd => ReturnCode::Ok,
         ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if (left + stream.avail_out as u64) != 0 => ReturnCode::DataError,
+        ReturnCode::BufError if (left + u64::from(stream.avail_out)) != 0 => ReturnCode::DataError,
         _ => err,
     };
 

@@ -2023,7 +2023,7 @@ fn gzip_with_header() {
             if stream.msg.is_null() {
                 None
             } else {
-                Some({ CStr::from_ptr(stream.msg) })
+                Some(CStr::from_ptr(stream.msg))
             }
         );
 

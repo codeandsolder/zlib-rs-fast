@@ -37,7 +37,10 @@ fn main() {
 }
 
 fn decompress_files_rs<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
-    use libz_rs_sys::*;
+    use libz_rs_sys::{
+        inflate, inflateEnd, inflateInit2_, inflateReset, z_stream, zlibVersion, Z_NO_FLUSH, Z_OK,
+        Z_STREAM_END,
+    };
 
     let mut outbuf = vec![0u8; 1 << 20];
 
@@ -53,7 +56,7 @@ fn decompress_files_rs<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
         let stream = stream.assume_init_mut();
 
         for input in inputs {
-            stream.next_in = input.as_ptr() as *mut u8;
+            stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = input.len() as u32;
             stream.next_out = outbuf.as_mut_ptr();
             stream.avail_out = outbuf.len() as u32;
@@ -71,7 +74,9 @@ fn decompress_files_rs<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
 }
 
 fn decompress_files_ng<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
-    use libz_ng_sys::*;
+    use libz_ng_sys::{
+        inflate, inflateEnd, inflateInit2_, inflateReset, z_stream, zlibVersion, Z_FINISH, Z_OK,
+    };
 
     let mut outbuf = vec![0u8; 1 << 20];
 
@@ -87,7 +92,7 @@ fn decompress_files_ng<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
         let stream = stream.assume_init_mut();
 
         for input in inputs {
-            stream.next_in = input.as_ptr() as *mut u8;
+            stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = input.len() as u32;
             stream.next_out = outbuf.as_mut_ptr();
             stream.avail_out = outbuf.len() as u32;

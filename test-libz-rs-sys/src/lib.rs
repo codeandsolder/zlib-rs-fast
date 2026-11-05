@@ -1715,7 +1715,7 @@ fn deflate_chunked_input_all_levels() {
         let mut outputs = Vec::new();
 
         for level in -1..=9 {
-            outputs.push((level, 4, run::<{ 4 }>(level)));
+            outputs.push((level, 4, run::<4>(level)));
             outputs.push((level, 1 << 10, run::<{ 1 << 10 }>(level)));
             outputs.push((level, 1 << 12, run::<{ 1 << 12 }>(level)));
             outputs.push((level, 1 << 14, run::<{ 1 << 14 }>(level)));

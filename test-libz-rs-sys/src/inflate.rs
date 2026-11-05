@@ -3028,13 +3028,13 @@ fn inflate_copy_after_half_input() {
 
         // The original stream already has next_out pointing at out[prefix_len].
         // For the copy, we need to point it at the corresponding location in out_copy.
-        copy.next_out = { out_copy.as_mut_ptr().add(prefix_len) };
+        copy.next_out = out_copy.as_mut_ptr().add(prefix_len);
         copy.avail_out = (out_copy.len() - prefix_len) as _;
 
         // Now feed the *remainder* of the compressed input to both streams.
         let remaining = input.len() - half;
         if remaining > 0 {
-            stream.next_in = { input.as_ptr().add(half) as *mut _ };
+            stream.next_in = input.as_ptr().add(half) as *mut _;
             stream.avail_in = remaining as _;
 
             copy.next_in = stream.next_in;

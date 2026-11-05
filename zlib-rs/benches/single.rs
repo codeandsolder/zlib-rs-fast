@@ -237,7 +237,7 @@ fn run_case(case: Case, full: bool) {
     );
 }
 
-fn benchmark_shape(full: bool) -> (Duration, usize) {
+const fn benchmark_shape(full: bool) -> (Duration, usize) {
     if full {
         (FULL_SAMPLE_TARGET, FULL_SAMPLES)
     } else {

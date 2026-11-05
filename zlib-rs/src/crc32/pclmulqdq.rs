@@ -27,7 +27,12 @@ pub(crate) struct Accumulator {
 
 #[cfg(target_arch = "x86_64")]
 impl Accumulator {
-    const XMM_FOLD4: __m128i = reg([0xc6e4_1596u32, 0x0000_0001u32, 0x5444_2bd4u32, 0x0000_0001u32]);
+    const XMM_FOLD4: __m128i = reg([
+        0xc6e4_1596u32,
+        0x0000_0001u32,
+        0x5444_2bd4u32,
+        0x0000_0001u32,
+    ]);
 
     pub const fn new() -> Self {
         let xmm_crc0 = reg([0x9db4_2487, 0, 0, 0]);
@@ -44,25 +49,39 @@ impl Accumulator {
 
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
     pub unsafe fn finish(self) -> u32 {
-        const CRC_MASK1: __m128i =
-            reg([0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0x0000_0000u32, 0x0000_0000u32]);
+        const CRC_MASK1: __m128i = reg([
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32,
+            0x0000_0000u32,
+            0x0000_0000u32,
+        ]);
 
-        const CRC_MASK2: __m128i =
-            reg([0x0000_0000u32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32]);
+        const CRC_MASK2: __m128i = reg([
+            0x0000_0000u32,
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32,
+        ]);
 
         const RK1_RK2: __m128i = reg([
-            0xccaa_009e, 0x0000_0000, /* rk1 */
-            0x7519_97d0, 0x0000_0001, /* rk2 */
+            0xccaa_009e,
+            0x0000_0000, /* rk1 */
+            0x7519_97d0,
+            0x0000_0001, /* rk2 */
         ]);
 
         const RK5_RK6: __m128i = reg([
-            0xccaa_009e, 0x0000_0000, /* rk5 */
-            0x63cd_6124, 0x0000_0001, /* rk6 */
+            0xccaa_009e,
+            0x0000_0000, /* rk5 */
+            0x63cd_6124,
+            0x0000_0001, /* rk6 */
         ]);
 
         const RK7_RK8: __m128i = reg([
-            0xf701_1640, 0x0000_0001, /* rk7 */
-            0xdb71_0640, 0x0000_0001, /* rk8 */
+            0xf701_1640,
+            0x0000_0001, /* rk7 */
+            0xdb71_0640,
+            0x0000_0001, /* rk8 */
         ]);
 
         let [mut xmm_crc0, mut xmm_crc1, mut xmm_crc2, mut xmm_crc3] = self.fold;

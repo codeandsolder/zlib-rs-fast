@@ -76,7 +76,8 @@ fn main() {
             let source = input.as_ptr();
             let source_len = input.len() as _;
 
-            let err = unsafe { libz_ng_sys::uncompress(dest, &mut dest_len, source, source_len) };
+            let err =
+                unsafe { libz_ng_sys::uncompress(dest, &raw mut dest_len, source, source_len) };
             assert_eq!(err, 0);
         }
         "rs" => {
@@ -86,7 +87,8 @@ fn main() {
             let source = input.as_ptr();
             let source_len = input.len() as _;
 
-            let err = unsafe { ::libz_rs_sys::uncompress(dest, &mut dest_len, source, source_len) };
+            let err =
+                unsafe { ::libz_rs_sys::uncompress(dest, &raw mut dest_len, source, source_len) };
             assert_eq!(err, 0);
         }
         "ng-chunked" => {

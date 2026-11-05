@@ -10,6 +10,7 @@ fn end_to_end() {
     );
 }
 
+#[must_use]
 pub fn test(data: &[u8], config: DeflateConfig) -> bool {
     if !(0..32).contains(&config.window_bits) {
         // lower is raw, higher is gzip
@@ -22,7 +23,7 @@ pub fn test(data: &[u8], config: DeflateConfig) -> bool {
     if err != ReturnCode::Ok {
         return true;
     }
-    unsafe { libz_rs_sys::deflateEnd(&mut stream) };
+    unsafe { libz_rs_sys::deflateEnd(&raw mut stream) };
 
     const LENGTH: usize = 1 << 17;
 
