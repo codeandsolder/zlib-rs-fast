@@ -196,6 +196,13 @@ impl Inflate {
         self.total_in += (self.inner.next_in as usize - start_in as usize) as u64;
         self.total_out += (self.inner.next_out as usize - start_out as usize) as u64;
 
+        // The caller's input and output borrows end at this method boundary.
+        // Keep internal inflate state, but never retain pointers to their buffers.
+        self.inner.next_in = core::ptr::null_mut();
+        self.inner.next_out = core::ptr::null_mut();
+        self.inner.avail_in = 0;
+        self.inner.avail_out = 0;
+
         match ret {
             ReturnCode::Ok => Ok(Status::Ok),
             ReturnCode::StreamEnd => Ok(Status::StreamEnd),
@@ -433,5 +440,146 @@ impl Deflate {
 impl Drop for Deflate {
     fn drop(&mut self) {
         let _ = crate::deflate::end(&mut self.inner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_no_caller_buffers_attached(inflate: &Inflate) {
+        assert!(inflate.inner.next_in.is_null());
+        assert!(inflate.inner.next_out.is_null());
+        assert_eq!(inflate.inner.avail_in, 0);
+        assert_eq!(inflate.inner.avail_out, 0);
+    }
+
+    #[test]
+    fn safe_inflate_detaches_buffers_with_bounded_output() -> Result<(), &'static str> {
+        let source = b"quick brown fox jumps over the lazy dog; ".repeat(36);
+        let mut encoder = Deflate::new(6, true, 15);
+        let mut compressed = vec![0u8; source.len() + 128];
+        assert_eq!(
+            encoder.compress(&source, &mut compressed, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        let compressed_bytes =
+            usize::try_from(encoder.total_out()).map_err(|_| "compressed size exceeds usize")?;
+        compressed.truncate(compressed_bytes);
+
+        let mut decoder = Inflate::new(true, 15);
+        let mut recovered = vec![0u8; source.len()];
+        let mut reached_end = false;
+        for _ in 0..source.len() {
+            let prev_in = decoder.total_in();
+            let prev_out = decoder.total_out();
+            let old_in = usize::try_from(prev_in).map_err(|_| "input offset exceeds usize")?;
+            let old_out = usize::try_from(prev_out).map_err(|_| "output offset exceeds usize")?;
+            let end_out = (old_out + 7).min(recovered.len());
+            let result = decoder.decompress(
+                &compressed[old_in..],
+                &mut recovered[old_out..end_out],
+                InflateFlush::NoFlush,
+            );
+            assert_no_caller_buffers_attached(&decoder);
+            assert!(matches!(
+                result,
+                Ok(Status::Ok | Status::BufError | Status::StreamEnd)
+            ));
+            if result == Ok(Status::StreamEnd) {
+                reached_end = true;
+                break;
+            }
+            assert!(
+                decoder.total_in() != prev_in || decoder.total_out() != prev_out,
+                "decompression made no progress with available input and output"
+            );
+        }
+        assert!(
+            reached_end,
+            "decompression never reported the end of stream"
+        );
+        assert_eq!(
+            decoder.total_in(),
+            u64::try_from(compressed.len()).map_err(|_| "compressed length exceeds u64")?
+        );
+        assert_eq!(
+            decoder.total_out(),
+            u64::try_from(source.len()).map_err(|_| "plain length exceeds u64")?
+        );
+        assert_eq!(recovered, source);
+        Ok(())
+    }
+
+    #[test]
+    fn safe_inflate_dictionary_resume_after_detaching_buffers() -> Result<(), &'static str> {
+        let dictionary = b"recurring input history - useful to decoder";
+        let source = b"recurring input history - useful to decoder, again";
+        let mut encoder = Deflate::new(6, true, 15);
+        assert!(encoder.set_dictionary(dictionary).is_ok());
+        let mut compressed_stream = [0u8; 256];
+        assert_eq!(
+            encoder.compress(source, &mut compressed_stream, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        let compressed_len = usize::try_from(encoder.total_out())
+            .map_err(|_| "compressed_stream size exceeds usize")?;
+
+        let mut decoder = Inflate::new(true, 15);
+        let mut recovered = [0u8; 128];
+        let first = decoder.decompress(
+            &compressed_stream[..compressed_len],
+            &mut recovered,
+            InflateFlush::NoFlush,
+        );
+        assert!(matches!(first, Err(InflateError::NeedDict { .. })));
+        assert_no_caller_buffers_attached(&decoder);
+
+        // The decompressor retains its format/history state, not a reference
+        // to the old caller input or output slices.
+        assert!(decoder.set_dictionary(dictionary).is_ok());
+        let consumed = usize::try_from(decoder.total_in())
+            .map_err(|_| "dictionary-header consumption exceeds usize")?;
+        assert_eq!(
+            decoder.decompress(
+                &compressed_stream[consumed..compressed_len],
+                &mut recovered,
+                InflateFlush::Finish,
+            ),
+            Ok(Status::StreamEnd)
+        );
+        assert_no_caller_buffers_attached(&decoder);
+        assert_eq!(&recovered[..source.len()], source);
+        Ok(())
+    }
+
+    #[test]
+    fn safe_inflate_drops_caller_buffer_pointers_between_calls() {
+        // RFC1950 empty stream. A partial feed must not leave pointers to the
+        // temporary caller slices alive while waiting for the next chunk.
+        let compressed = [0x78u8, 0x9c, 0x03, 0, 0, 0, 0, 1];
+        let mut inflate = Inflate::new(true, 15);
+        let mut output = [0u8; 8];
+
+        let partial = inflate.decompress(&compressed[..2], &mut output, InflateFlush::NoFlush);
+        assert!(matches!(partial, Ok(Status::Ok | Status::BufError)));
+        assert_no_caller_buffers_attached(&inflate);
+        assert_eq!(inflate.total_in(), 2);
+
+        assert_eq!(
+            inflate.decompress(&compressed[2..], &mut output, InflateFlush::Finish),
+            Ok(Status::StreamEnd),
+        );
+        assert_no_caller_buffers_attached(&inflate);
+        assert_eq!(inflate.total_in(), 8);
+        assert_eq!(inflate.total_out(), 0);
+
+        inflate.reset(true);
+        let mut bad_output = [MaybeUninit::<u8>::uninit(); 8];
+        assert_eq!(
+            inflate.decompress_uninit(&[0xff, 0xff], &mut bad_output, InflateFlush::NoFlush),
+            Err(InflateError::DataError),
+        );
+        assert_no_caller_buffers_attached(&inflate);
     }
 }

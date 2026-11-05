@@ -1237,8 +1237,6 @@ impl State<'_> {
                             mode = Mode::Bad;
                             {
                                 let msg: &'static str = "invalid literal/length code\0";
-                                #[cfg(all(feature = "std", test))]
-                                dbg!(msg);
                                 self.error_message = Some(msg);
                                 return LenDecodeOutcome::break_with(
                                     mode,
@@ -2137,8 +2135,6 @@ impl State<'_> {
                     }
                     Mode::Bad => {
                         let msg = "repeated call with bad state\0";
-                        #[cfg(all(feature = "std", test))]
-                        dbg!(msg);
                         self.error_message = Some(msg);
 
                         break 'label ReturnCode::DataError;
@@ -2174,16 +2170,14 @@ impl State<'_> {
         Ok((mode, ret))
     }
 
-    fn bad(&mut self, msg: &'static str) -> ReturnCode {
-        #[cfg(all(feature = "std", test))]
-        dbg!(msg);
+    const fn bad(&mut self, msg: &'static str) -> ReturnCode {
         self.error_message = Some(msg);
         ReturnCode::DataError
     }
 
     /// Stored in the `z_stream.data_type` field
     fn decoding_state(&self) -> i32 {
-        let bit_reader_bits = self.bit_buffer.bits_in_buffer() as i32;
+        let bit_reader_bits = i32::from(self.bit_buffer.bits_in_buffer());
         debug_assert!(bit_reader_bits < 64);
 
         let last = if self.flags.contains(Flags::IS_LAST_BLOCK) {
