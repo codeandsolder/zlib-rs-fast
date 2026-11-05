@@ -5,7 +5,7 @@ use core::marker::PhantomData;
 /// stacked borrows rule when that slice is deallocated. By only materializing the slice when
 /// needed for data access, hence bounding the lifetime more tightly, this restriction is circumvented.
 #[derive(Debug)]
-pub(crate) struct WeakSliceMut<'a, T> {
+pub struct WeakSliceMut<'a, T> {
     ptr: *mut T,
     len: usize,
     _marker: PhantomData<&'a mut [T]>,
@@ -68,7 +68,7 @@ impl<'a, T> WeakSliceMut<'a, T> {
 }
 
 #[derive(Debug)]
-pub(crate) struct WeakArrayMut<'a, T, const N: usize> {
+pub struct WeakArrayMut<'a, T, const N: usize> {
     ptr: *mut [T; N],
     _marker: PhantomData<&'a mut [T; N]>,
 }

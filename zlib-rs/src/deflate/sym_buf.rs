@@ -3,7 +3,7 @@
 
 use crate::weak_slice::WeakSliceMut;
 
-pub(crate) struct SymBuf<'a> {
+pub struct SymBuf<'a> {
     buf: WeakSliceMut<'a, u8>,
     filled: usize,
 }

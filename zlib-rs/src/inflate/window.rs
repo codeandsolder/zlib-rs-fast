@@ -208,7 +208,7 @@ impl<'a> Window<'a> {
 /// "no previous full window" or "one complete previous full window"; the current output prefix is
 /// owned by `BackOutput`.
 #[derive(Debug)]
-pub(crate) struct BackWindow<'a> {
+pub struct BackWindow<'a> {
     buf: WeakSliceMut<'a, MaybeUninit<u8>>,
     has_full_history: bool,
 }

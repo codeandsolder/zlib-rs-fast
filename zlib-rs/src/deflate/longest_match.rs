@@ -24,13 +24,13 @@ impl SearchCursor {
 
 /// Which chain-walking heuristic to use for one immutable match search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchSearchKind {
+pub enum MatchSearchKind {
     Standard,
     Slow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchSearchResult {
+pub struct MatchSearchResult {
     pub(crate) length: usize,
     pub(crate) start: Pos,
 }
@@ -40,7 +40,7 @@ pub(crate) struct MatchSearchResult {
 /// It carries no stream borrow. The scheduler may queue this token while the producer is paused,
 /// then materialize an immutable request from that stream's State when the search is dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchSearchWork {
+pub enum MatchSearchWork {
     HashChain {
         cur_match: Pos,
         kind: MatchSearchKind,
@@ -76,7 +76,7 @@ impl MatchSearchWork {
 /// expensive search a detachable unit for future scoped CPU batches or device submission.
 /// Borrowed immutable storage shared by one or more match-search descriptions.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MatchSearchResources<'a> {
+pub struct MatchSearchResources<'a> {
     initialized: &'a [u8],
     prev: &'a [Pos],
     head: &'a [Pos],
@@ -87,7 +87,7 @@ pub(crate) struct MatchSearchResources<'a> {
 /// Keep these in their native host types for now. A future device backend can define a checked
 /// packed representation at its own boundary instead of silently narrowing compressor indexes here.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MatchSearchParams {
+pub struct MatchSearchParams {
     cur_match: Pos,
     strstart: usize,
     lookahead: usize,
@@ -104,7 +104,7 @@ pub(crate) struct MatchSearchParams {
 }
 
 #[derive(Debug)]
-pub(crate) struct MatchSearchRequest<'a> {
+pub struct MatchSearchRequest<'a> {
     resources: MatchSearchResources<'a>,
     params: MatchSearchParams,
 }
@@ -186,7 +186,7 @@ fn execute_slow(
 /// Backends may parallelize or offload execution, but must preserve request/result indexing and may
 /// not mutate compressor state. Request lifetimes bound any borrowed window/hash snapshot to the
 /// dispatch scope.
-pub(crate) trait MatchSearchBackend {
+pub trait MatchSearchBackend {
     fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]);
 }
 
@@ -239,7 +239,7 @@ impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
     }
 }
 
-pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
+pub fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
     backend: &B,
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
@@ -256,7 +256,7 @@ pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?S
 ///
 /// The default remains allocation-free and synchronous. Backend choice is deliberately outside the
 /// token producers so later CPU/device executors do not contaminate compression semantics.
-pub(crate) fn execute_match_search_batch(
+pub fn execute_match_search_batch(
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
 ) {

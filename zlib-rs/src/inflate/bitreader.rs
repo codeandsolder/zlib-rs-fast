@@ -3,7 +3,7 @@
 use crate::ReturnCode;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct BitBuffer {
+pub struct BitBuffer {
     bit_buffer: u64,
     bits_used: u8,
 }
@@ -77,7 +77,7 @@ impl BitBuffer {
 /// of each public inflate call. This keeps caller-buffer lifetime and pointer arithmetic out of the
 /// decoder state machine.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BitReader<'input> {
+pub struct BitReader<'input> {
     input: &'input [u8],
     position: usize,
     bits: BitBuffer,

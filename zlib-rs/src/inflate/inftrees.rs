@@ -2,7 +2,7 @@
 
 use crate::{Code, ENOUGH_DISTS, ENOUGH_LENS};
 
-pub(crate) enum CodeType {
+pub enum CodeType {
     Codes,
     Lens,
     Dists,
@@ -33,13 +33,13 @@ const DEXT: [u8; 32] = [
 
 #[repr(i32)]
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InflateTable {
+pub enum InflateTable {
     EnoughIsNotEnough = 1,
     Success { root: usize, used: usize } = 0,
     InvalidCode = -1,
 }
 
-pub(crate) fn inflate_table(
+pub fn inflate_table(
     codetype: CodeType,
     lens: &[u16],
     table: &mut [Code],

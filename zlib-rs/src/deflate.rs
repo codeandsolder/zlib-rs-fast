@@ -50,7 +50,7 @@ pub use batch::{
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 
-pub(crate) type Pos = u16;
+pub type Pos = u16;
 
 // SAFETY: This struct must have the same layout as [`z_stream`], so that casts and transmutations
 // between the two can work without UB.
@@ -98,7 +98,7 @@ const _: () = {
 };
 
 #[derive(Clone, Copy)]
-pub(crate) struct InputCursor {
+pub struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
@@ -185,7 +185,7 @@ impl InputCursor {
 /// Keeping that ABI-visible value explicit prevents input cursors from silently carrying stream
 /// state unrelated to byte traversal.
 #[derive(Clone, Copy)]
-pub(crate) struct StreamChecksum(crate::c_api::z_checksum);
+pub struct StreamChecksum(crate::c_api::z_checksum);
 
 impl StreamChecksum {
     fn from_stream(stream: &DeflateStream<'_>) -> Self {
@@ -298,7 +298,7 @@ impl<'a> GzipHeaderRef<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct OutputCursor {
+pub struct OutputCursor {
     next_out: *mut crate::c_api::Bytef,
     pub(crate) avail_out: crate::c_api::uInt,
     pub(crate) total_out: crate::c_api::z_size,
@@ -371,7 +371,7 @@ impl OutputCursor {
 /// `DeflateStream` is constrained by the public zlib ABI. Algorithms operate on this
 /// Rust-owned view instead: compression state is borrowed separately from independent input and
 /// output cursors, which are committed back to the ABI shell when the algorithm returns.
-pub(crate) struct Compressor<'a, 'state> {
+pub struct Compressor<'a, 'state> {
     pub(crate) state: &'a mut State<'state>,
     pub(crate) input: InputCursor,
     pub(crate) output: OutputCursor,
@@ -599,7 +599,7 @@ impl<'a> DeflateStream<'a> {
 }
 
 /// number of elements in hash table
-pub(crate) const HASH_SIZE: usize = 65536;
+pub const HASH_SIZE: usize = 65536;
 /// log2(HASH_SIZE)
 const HASH_BITS: usize = 16;
 
@@ -1135,7 +1135,7 @@ pub fn tune(
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Value {
+pub struct Value {
     a: u16,
     b: u16,
 }
@@ -1183,16 +1183,16 @@ impl Value {
 }
 
 /// number of length codes, not counting the special END_BLOCK code
-pub(crate) const LENGTH_CODES: usize = 29;
+pub const LENGTH_CODES: usize = 29;
 
 /// number of literal bytes 0..255
 const LITERALS: usize = 256;
 
 /// number of Literal or Length codes, including the END_BLOCK code
-pub(crate) const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
+pub const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
 
 /// number of distance codes
-pub(crate) const D_CODES: usize = 30;
+pub const D_CODES: usize = 30;
 
 /// number of codes used to transfer the bit lengths
 const BL_CODES: usize = 19;
@@ -1206,7 +1206,7 @@ const MAX_BITS: usize = 15;
 /// Bit length codes must not exceed MAX_BL_BITS bits
 const MAX_BL_BITS: usize = 7;
 
-pub(crate) const DIST_CODE_LEN: usize = 512;
+pub const DIST_CODE_LEN: usize = 512;
 
 struct BitWriter<'a> {
     pub(crate) pending: Pending<'a>, // output still pending
@@ -1559,7 +1559,7 @@ impl<'a> BitWriter<'a> {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidate {
+pub struct MatchCandidate {
     pub(crate) match_start: u16,
     pub(crate) match_length: u16,
     pub(crate) strstart: u16,
@@ -1576,7 +1576,7 @@ impl MatchCandidate {
 }
 
 #[repr(C, align(64))]
-pub(crate) struct State<'a> {
+pub struct State<'a> {
     status: Status,
 
     last_flush: i8, /* value of flush param for previous deflate call */
@@ -2085,7 +2085,7 @@ const fn rank_flush(f: i8) -> i8 {
 }
 
 #[derive(Debug)]
-pub(crate) enum BlockState {
+pub enum BlockState {
     /// block not completed, need more input or more output
     NeedMore = 0,
     /// block flush performed
@@ -2097,7 +2097,7 @@ pub(crate) enum BlockState {
 }
 
 // Maximum stored block length in deflate format (not including header).
-pub(crate) const MAX_STORED: usize = 65535; // so u16::max
+pub const MAX_STORED: usize = 65535; // so u16::max
 
 fn read_buf_window_core(
     state: &mut State<'_>,
@@ -2126,13 +2126,13 @@ fn read_buf_window_core(
     len
 }
 
-pub(crate) enum BlockType {
+pub enum BlockType {
     StoredBlock = 0,
     StaticTrees = 1,
     DynamicTrees = 2,
 }
 
-pub(crate) fn zng_tr_stored_block(
+pub fn zng_tr_stored_block(
     state: &mut State,
     window_range: core::ops::Range<usize>,
     is_last: bool,
@@ -2164,17 +2164,17 @@ pub(crate) fn zng_tr_stored_block(
 }
 
 /// The minimum match length mandated by the deflate standard
-pub(crate) const STD_MIN_MATCH: usize = 3;
+pub const STD_MIN_MATCH: usize = 3;
 /// The maximum match length mandated by the deflate standard
-pub(crate) const STD_MAX_MATCH: usize = 258;
+pub const STD_MAX_MATCH: usize = 258;
 
 /// The minimum wanted match length, affects deflate_quick, deflate_fast, deflate_medium and deflate_slow
-pub(crate) const WANT_MIN_MATCH: usize = 4;
+pub const WANT_MIN_MATCH: usize = 4;
 
-pub(crate) const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
+pub const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
 
 #[inline]
-pub(crate) fn fill_window_core(
+pub fn fill_window_core(
     state: &mut State<'_>,
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
@@ -2183,7 +2183,7 @@ pub(crate) fn fill_window_core(
 }
 
 #[inline]
-pub(crate) fn fill_window_core_with_hash_maintenance(
+pub fn fill_window_core_with_hash_maintenance(
     state: &mut State<'_>,
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
@@ -2280,7 +2280,7 @@ pub(crate) fn fill_window_core_with_hash_maintenance(
     );
 }
 
-pub(crate) struct StaticTreeDesc {
+pub struct StaticTreeDesc {
     /// static tree or NULL
     pub(crate) static_tree: &'static [Value],
     /// extra bits for each code or NULL
@@ -2348,7 +2348,7 @@ impl StaticTreeDesc {
 }
 
 #[derive(Clone)]
-pub(crate) struct TreeDesc<const N: usize> {
+pub struct TreeDesc<const N: usize> {
     dyn_tree: [Value; N],
     max_code: usize,
     stat_desc: &'static StaticTreeDesc,
@@ -3210,7 +3210,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DrainOutcome {
+pub enum DrainOutcome {
     Ready,
     OutputFull,
 }
@@ -3219,10 +3219,7 @@ pub(crate) enum DrainOutcome {
 ///
 /// `OutputFull` deliberately mirrors zlib's streaming boundary: callers return once the supplied
 /// output buffer reaches zero, even when that write happened to consume the final pending byte.
-pub(crate) fn drain_pending_output(
-    state: &mut State<'_>,
-    output: &mut OutputCursor,
-) -> DrainOutcome {
+pub fn drain_pending_output(state: &mut State<'_>, output: &mut OutputCursor) -> DrainOutcome {
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();

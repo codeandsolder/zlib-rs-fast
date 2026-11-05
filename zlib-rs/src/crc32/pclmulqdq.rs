@@ -21,7 +21,7 @@ const fn reg(input: [u32; 4]) -> __m128i {
 /// instruction, and SSE2 and SSE4.1 instruction sets.
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_arch = "x86_64")]
-pub(crate) struct Accumulator {
+pub struct Accumulator {
     pub(super) fold: [__m128i; 4],
 }
 

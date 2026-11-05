@@ -8,7 +8,7 @@ type Bytes = Simd<u8, LANES>;
 /// Full 32-byte chunks use portable SIMD; the final partial chunk is compared scalar so callers
 /// preserve their exact logical lookahead without padding or over-reading.
 #[inline]
-pub(crate) fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+pub fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
     assert_eq!(
         left.len(),
         right.len(),
@@ -30,7 +30,7 @@ pub(crate) fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 
 /// Length of the prefix made entirely from `byte`.
 #[inline]
-pub(crate) fn repeated_prefix_len(byte: u8, src: &[u8]) -> usize {
+pub fn repeated_prefix_len(byte: u8, src: &[u8]) -> usize {
     let repeated = Bytes::splat(byte);
     let vector_len = src.len() / LANES * LANES;
 

@@ -510,7 +510,7 @@ impl Flags {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InflateStateKind {
+pub enum InflateStateKind {
     Regular,
     Back,
 }
@@ -651,7 +651,7 @@ impl GzipHeaderOutput {
 }
 
 #[repr(C, align(64))]
-pub(crate) struct State<'a> {
+pub struct State<'a> {
     kind: InflateStateKind,
     /// Current inflate mode
     mode: Mode,

@@ -7,7 +7,7 @@ use core::ops::{Deref, DerefMut};
 /// long-lived Rust `&mut` reference. Rust references are materialized only for the duration of a
 /// borrow through `Deref`/`DerefMut`.
 #[repr(transparent)]
-pub(crate) struct StatePtr<T>(*mut T);
+pub struct StatePtr<T>(*mut T);
 
 impl<T> StatePtr<T> {
     /// # Safety

@@ -9,7 +9,7 @@
 // We are assuming little-endianness so we process the input
 // LSB-first. We need to use the "reversed" value from e.g
 // https://en.wikipedia.org/wiki/Cyclic_redundancy_check#Polynomial_representations.
-pub(crate) const CRC32_LSB_POLY: usize = 0xedb8_8320usize;
+pub const CRC32_LSB_POLY: usize = 0xedb8_8320usize;
 
 const W: usize = core::mem::size_of::<usize>();
 
@@ -24,7 +24,7 @@ static CRC32_BYTE_TABLE: [[u32; 256]; 1] = build_crc32_table::<256, 1, 1>();
 static CRC32_WORD_TABLE: [[u32; 256]; W] = build_crc32_table::<256, W, 1>();
 
 // FIXME: make const fn when msrv allows.
-pub(crate) fn get_crc_table() -> &'static [u32; 256] {
+pub fn get_crc_table() -> &'static [u32; 256] {
     &CRC32_BYTE_TABLE[0]
 }
 

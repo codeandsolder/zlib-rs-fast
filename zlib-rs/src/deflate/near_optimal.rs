@@ -15,7 +15,7 @@ use super::{
 /// all distances have the same encoded bit length (the extra-bit *value* differs, but its width
 /// does not), so only the longest available match in that bucket can ever be useful to a parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidate {
+pub struct MatchCandidate {
     pub(crate) length: u16,
     pub(crate) distance: u16,
 }
@@ -34,7 +34,7 @@ impl MatchCandidate {
 /// symbols. This boundary is rich enough for arbitrary Huffman cost models without forcing ordinary
 /// Fast/Medium/Slow parsing to consume more than its current single-best projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidates {
+pub struct MatchCandidates {
     offsets: Vec<u32>,
     entries: Vec<MatchCandidate>,
 }
@@ -108,14 +108,14 @@ impl BlockObservations {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TokenCosts {
+pub struct TokenCosts {
     literal: [u16; 256],
     length: [u16; LENGTH_CODES],
     distance: [u16; D_CODES],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ParseModel {
+pub struct ParseModel {
     costs: TokenCosts,
     observations: BlockObservations,
 }
@@ -173,7 +173,7 @@ impl TokenCosts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ParseToken {
+pub enum ParseToken {
     Literal(u8),
     Match { length: u16, distance: u16 },
 }
@@ -188,7 +188,7 @@ impl ParseToken {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseResult {
+pub struct ParseResult {
     pub(crate) cost_x16: u64,
     pub(crate) tokens: Vec<ParseToken>,
 }
@@ -231,7 +231,7 @@ impl ParseStep {
 /// symbol's distance interval. The lexicographic predecessor or successor of the current suffix
 /// maximizes LCP over that set, so two probes recover the longest match for the whole distance class.
 /// Retaining that one maximum per class is lossless for arbitrary DEFLATE Huffman code lengths.
-pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandidates {
+pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandidates {
     assert!(max_distance <= u16::MAX as usize);
     assert!(input.len() <= u32::MAX as usize);
 
@@ -630,7 +630,7 @@ const MIN_BLOCK_LENGTH: usize = 5_000;
 // beyond this; exact parsing then either proves the long Huffman block worthwhile and token-safe or
 // returns a split point before emission.
 const SOFT_MAX_BLOCK_LENGTH: usize = 60_000;
-pub(crate) const MAX_COARSE_BLOCK_INPUT: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1;
+pub const MAX_COARSE_BLOCK_INPUT: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1;
 const OBSERVATIONS_PER_CHECK: u32 = 512;
 const SPLIT_OBSERVATION_TYPES: usize = 10;
 // Match libdeflate level 12's near-optimal search budget for block-statistics gathering.
@@ -750,7 +750,7 @@ impl BlockSplitStats {
 /// long-match observations and detect distribution changes. This is deliberately cheaper than the
 /// exact suffix-rank frontier; exact match discovery and dynamic programming happen only after a
 /// boundary has been selected.
-pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
+pub fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
     if input.is_empty() {
         return core::iter::once(0..0).collect();
     }
@@ -881,15 +881,11 @@ fn split_hash3(input: &[u8], position: usize) -> usize {
 /// to matches before `block.start`, which is exactly what multi-block DEFLATE needs. The dynamic
 /// program itself is local to the selected block and never crosses its end.
 #[cfg(test)]
-pub(crate) fn parse_block(
-    input: &[u8],
-    candidates: &MatchCandidates,
-    costs: TokenCosts,
-) -> ParseResult {
+pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: TokenCosts) -> ParseResult {
     parse_range(input, candidates, 0..input.len(), costs)
 }
 
-pub(crate) fn parse_range(
+pub fn parse_range(
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
@@ -1503,8 +1499,8 @@ mod tests {
 /// tree without overflowing a 16-bit internal frequency sum. Input byte length is independent: a
 /// match token can represent up to 258 bytes, so compressible blocks may legally span well beyond
 /// the 65,535-byte stored-block cap.
-pub(crate) const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
-pub(crate) const MAX_BLOCK_TOKENS: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 2;
+pub const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
+pub const MAX_BLOCK_TOKENS: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 2;
 
 #[derive(Clone, Copy, Debug)]
 struct BlockScore {
@@ -1610,7 +1606,7 @@ impl TokenHistogram {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlannedBlock {
+pub struct PlannedBlock {
     pub(crate) range: Range<usize>,
     pub(crate) tokens: Vec<ParseToken>,
 }
@@ -1625,7 +1621,7 @@ impl PlannedBlock {
     }
 }
 
-pub(crate) struct PlannedBlockSource {
+pub struct PlannedBlockSource {
     pub(crate) block: PlannedBlock,
     model: ParseModel,
     context_start: usize,
@@ -1896,7 +1892,7 @@ fn blend_previous_model(
 /// tree builder, including dynamic tree-description overhead, and the best exact score is retained.
 /// Stop early only when the token sequence itself converges: a temporarily worse iteration can still
 /// lead to a better next model, while an identical token sequence is a true fixed point.
-pub(crate) fn optimized_parse_range(
+pub fn optimized_parse_range(
     state: &mut super::State<'_>,
     input: &[u8],
     candidates: &MatchCandidates,
@@ -1947,7 +1943,7 @@ pub(crate) fn optimized_parse_range(
     (best, model)
 }
 
-pub(crate) fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) -> ParseModel {
+pub fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) -> ParseModel {
     let (costs, _) = costs_and_block_score(state, tokens);
     ParseModel {
         costs,
@@ -1955,7 +1951,7 @@ pub(crate) fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseTok
     }
 }
 
-pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
+pub fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
     assert!(
         tokens.len() <= MAX_BLOCK_TOKENS,
         "near-optimal token block exceeds symbol-buffer capacity"
@@ -2214,7 +2210,7 @@ fn shifted_tokens(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BoundaryOptimization {
+pub enum BoundaryOptimization {
     Unchanged,
     Shifted,
     Merged(PlannedBlock),
@@ -2227,7 +2223,7 @@ pub(crate) enum BoundaryOptimization {
 /// single cheapest of unchanged / shifted / merged is applied. Match discovery and token parsing are
 /// deliberately not repeated here; a caller may use the retained right-hand candidate table for a
 /// follow-up DP-only reparse after the partition changes.
-pub(crate) fn optimize_token_partition(
+pub fn optimize_token_partition(
     state: &mut super::State<'_>,
     left: &mut PlannedBlock,
     right: &mut PlannedBlock,
@@ -2329,7 +2325,7 @@ pub(crate) fn optimize_token_partition(
 
 /// Parse one splitter range into a production-ready token block. A caller only needs to retain two
 /// adjacent blocks at a time to optimize their shared Huffman boundary.
-pub(crate) fn parse_planned_block_source(
+pub fn parse_planned_block_source(
     state: &mut super::State<'_>,
     input: &[u8],
     range: Range<usize>,

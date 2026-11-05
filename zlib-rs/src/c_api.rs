@@ -125,8 +125,8 @@ impl z_stream {
 }
 
 // // zlib stores Adler-32 and CRC-32 checksums in unsigned long; zlib-ng uses uint32_t.
-pub(crate) type z_size = c_ulong;
-pub(crate) type z_checksum = c_ulong;
+pub type z_size = c_ulong;
+pub type z_checksum = c_ulong;
 
 // opaque to the user
 pub enum internal_state {}

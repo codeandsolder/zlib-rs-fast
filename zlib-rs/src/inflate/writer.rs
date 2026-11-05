@@ -158,7 +158,7 @@ impl<'a> Writer<'a> {
 /// are being written. `previous_history` snapshots how much of the previous callback window is
 /// valid; current output always starts again at index zero after a flush, so Back mode does not need
 /// the ordinary circular-window `next` cursor.
-pub(crate) struct BackWriter<'a> {
+pub struct BackWriter<'a> {
     writer: Writer<'a>,
     previous_history: usize,
 }
