@@ -31,11 +31,12 @@ concurrency:
 jobs:
   # Every PR, main push, and scheduled check gets one current-Rust Linux lane.
   primary:
-    name: Current Rust 1.99 Linux
+    name: Current nightly Rust Linux
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
     with:
-      rust-toolchain: "1.99.1"
-      command: cargo +1.99.1 test --locked -p zlib-rs -p libz-rs-sys --lib
+      # zlib-rs uses #![feature(portable_simd)], so stable 1.99 cannot compile it.
+      rust-toolchain: "nightly-2026-11-03"
+      command: cargo +nightly-2026-11-03 test --locked -p zlib-rs -p libz-rs-sys --lib
 
   # Full cross-platform, Miri, fuzz, and alternative-feature matrices only
   # run when pushing a release tag.
