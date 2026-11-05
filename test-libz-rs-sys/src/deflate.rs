@@ -1117,28 +1117,38 @@ fn test_deflate_prime() {
 fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
     let dictionary = vec![0x5a; (1 << 15) + 1];
 
-    assert_eq_rs_ng!(unsafe {
-        let mut strm = MaybeUninit::<z_stream>::zeroed();
-        let init = deflateInit2_(
-            strm.as_mut_ptr(),
-            6,
-            Z_DEFLATED,
-            15,
-            8,
-            Z_DEFAULT_STRATEGY,
-            zlibVersion(),
-            core::mem::size_of::<z_stream>() as _,
-        );
-        let strm = strm.assume_init_mut();
-        let set = deflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
-        let total_in = strm.total_in;
-        let adler = strm.adler;
-        let mut dictionary_len = 0;
-        let get = deflateGetDictionary(strm, core::ptr::null_mut(), &mut dictionary_len);
-        let end = deflateEnd(strm);
+    for initial_total_in in [0, c_ulong::MAX - 1] {
+        let result = assert_eq_rs_ng!(unsafe {
+            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let init = deflateInit2_(
+                strm.as_mut_ptr(),
+                6,
+                Z_DEFLATED,
+                15,
+                8,
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as _,
+            );
+            let strm = strm.assume_init_mut();
+            strm.total_in = initial_total_in;
+            let set = deflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
+            let total_in = strm.total_in;
+            let adler = strm.adler;
+            let mut dictionary_len = 0;
+            let get = deflateGetDictionary(strm, core::ptr::null_mut(), &mut dictionary_len);
+            let end = deflateEnd(strm);
 
-        (init, set, total_in, adler, get, dictionary_len, end)
-    });
+            (init, set, total_in, adler, get, dictionary_len, end)
+        });
+        assert_eq!(result.0, Z_OK);
+        assert_eq!(result.1, Z_OK);
+        assert_eq!(
+            result.2,
+            initial_total_in.wrapping_add((1 << 15) as c_ulong),
+            "only the retained dictionary tail contributes to total_in"
+        );
+    }
 }
 
 #[test]
@@ -1365,6 +1375,65 @@ fn test_deflate_used() {
 }
 
 /// The stored (level 0) implementation has some custom logic for `bits_used`.
+/// Stored-block direct copies must retain exactly the current input call's tail as history.
+///
+/// A first small input call primes the window. The next large call crosses multiple
+/// 65535-byte stored blocks and exercises the fast path that copies caller input directly
+/// into output, then restores the recent history from that call's input buffer.
+#[test]
+fn stored_direct_copy_history_across_input_calls_matches_zlib_ng() {
+    let input: Vec<u8> = (0..145_000)
+        .map(|i: usize| (i * 73 + i / 251).to_le_bytes()[0])
+        .collect();
+
+    for split in [1_024, 32_000, 32_769] {
+        let compressed = assert_eq_rs_ng!({
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
+            // SAFETY: the zlib stream receives the correct ABI version and size.
+            assert_eq!(
+                unsafe {
+                    deflateInit_(
+                        raw.as_mut_ptr(),
+                        0,
+                        zlibVersion(),
+                        core::mem::size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK,
+            );
+            // SAFETY: initialization succeeded.
+            let strm = unsafe { raw.assume_init_mut() };
+            let mut output = vec![0u8; input.len() + 2_048];
+            strm.next_out = output.as_mut_ptr();
+            strm.avail_out =
+                c_uint::try_from(output.len()).expect("test output is less than uInt::MAX");
+
+            strm.next_in = input.as_ptr().cast_mut();
+            strm.avail_in = c_uint::try_from(split).expect("test split fits in uInt");
+            // SAFETY: current input and output spans are disjoint and remain allocated.
+            assert_eq!(unsafe { deflate(strm, Z_NO_FLUSH) }, Z_OK);
+            assert_eq!(strm.avail_in, 0);
+
+            strm.next_in = input[split..].as_ptr().cast_mut();
+            strm.avail_in =
+                c_uint::try_from(input.len() - split).expect("test second input span fits in uInt");
+            // SAFETY: updated input and remaining output spans remain disjoint and allocated.
+            assert_eq!(unsafe { deflate(strm, Z_FINISH) }, Z_STREAM_END);
+            assert_eq!(strm.avail_in, 0);
+            let written = output.len() - strm.avail_out as usize;
+            output.truncate(written);
+            // SAFETY: terminate a successfully initialized stream exactly once.
+            assert_eq!(unsafe { deflateEnd(strm) }, Z_OK);
+            output
+        });
+        let mut decoded = vec![0u8; input.len()];
+        let (result, code) =
+            zlib_rs::decompress_slice(&mut decoded, &compressed, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok, "split {split}");
+        assert_eq!(result, input, "split {split}");
+    }
+}
+
 #[test]
 fn test_deflate_used_stored() {
     let config = DeflateConfig {

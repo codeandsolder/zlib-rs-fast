@@ -102,29 +102,37 @@ pub struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
+    // Only bytes consumed during this Compressor invocation can be reread from behind next_in.
+    // A prior invocation's buffer may already have been freed by the caller.
+    initial_capacity: crate::c_api::uInt,
 }
 
 impl InputCursor {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             next_in: stream.next_in,
             avail_in: stream.avail_in,
             total_in: stream.total_in,
+            initial_capacity: stream.avail_in,
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.next_in = self.next_in;
         stream.avail_in = self.avail_in;
         stream.total_in = self.total_in;
     }
 
-    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Self {
-        Self {
-            next_in: bytes.as_ptr() as *mut u8,
-            avail_in: bytes.len() as crate::c_api::uInt,
+    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Option<Self> {
+        // The caller supplies the retained dictionary tail (at most 32 KiB). Keep this
+        // conversion fallible so a future general slice caller cannot silently truncate it.
+        let avail_in = crate::c_api::uInt::try_from(bytes.len()).ok()?;
+        Some(Self {
+            next_in: bytes.as_ptr().cast_mut(),
+            avail_in,
             total_in,
-        }
+            initial_capacity: avail_in,
+        })
     }
 
     /// Copy live caller input into initialized window storage and consume it.
@@ -154,6 +162,11 @@ impl InputCursor {
         copied
     }
 
+    /// Bytes advanced through this cursor since it was bound to the current caller input.
+    const fn consumed_here(&self) -> usize {
+        (self.initial_capacity - self.avail_in) as usize
+    }
+
     /// Copy bytes immediately preceding the current input cursor into the LZ history window.
     ///
     /// # Safety
@@ -165,6 +178,12 @@ impl InputCursor {
         bytes_back: usize,
     ) {
         assert!(destination.len() <= bytes_back);
+        // C callers can replace or free their previous input between deflate calls.
+        // Stored-mode history recovery must never traverse back into that old buffer.
+        assert!(
+            bytes_back <= self.consumed_here(),
+            "stored history must originate from input consumed in this call"
+        );
         let source = self.next_in.wrapping_sub(bytes_back);
         // SAFETY: required by this method's caller; `Window` validates the destination range.
         unsafe { window.copy_and_initialize(destination, source) };
@@ -173,7 +192,9 @@ impl InputCursor {
     fn consume(&mut self, len: usize) {
         debug_assert!(len <= self.avail_in as usize);
         self.next_in = self.next_in.wrapping_add(len);
-        self.avail_in -= len as crate::c_api::uInt;
+        let len = crate::c_api::uInt::try_from(len)
+            .expect("input consumption is bounded by the caller's uInt availability");
+        self.avail_in -= len;
         self.total_in = self.total_in.wrapping_add(len as crate::c_api::z_size);
     }
 }
@@ -305,7 +326,7 @@ pub struct OutputCursor {
 }
 
 impl OutputCursor {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             next_out: stream.next_out,
             avail_out: stream.avail_out,
@@ -313,7 +334,7 @@ impl OutputCursor {
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.next_out = self.next_out;
         stream.avail_out = self.avail_out;
         stream.total_out = self.total_out;
@@ -361,7 +382,9 @@ impl OutputCursor {
     fn advance(&mut self, len: usize) {
         debug_assert!(len <= self.avail_out as usize);
         self.next_out = self.next_out.wrapping_add(len);
-        self.avail_out -= len as crate::c_api::uInt;
+        let len = crate::c_api::uInt::try_from(len)
+            .expect("output emission is bounded by the caller's uInt availability");
+        self.avail_out -= len;
         // The public zlib total_out is an unsigned C counter and wraps at its ABI width.
         self.total_out = self.total_out.wrapping_add(len as crate::c_api::z_size);
     }
@@ -887,31 +910,31 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     }
 
     let state = &mut *stream.state;
-    // avoid computing Adler-32 in read_buf
-    state.wrap = 0;
-
-    // if dictionary would fill window, just replace the history
-    if dictionary.len() >= state.w_size {
-        if wrap == 0 {
-            // clear the hash table
-            state.head.as_mut_slice().fill(0);
-
-            state.strstart = 0;
-            state.block_start = 0;
-            state.insert = 0;
-            state.window.clear();
-        } else {
-            /* already empty otherwise */
-        }
-
-        // use the tail
+    let replace_history = dictionary.len() >= state.w_size;
+    if replace_history {
         dictionary = &dictionary[dictionary.len() - state.w_size..];
     }
 
-    // Feed the dictionary through the ordinary window-refill core without impersonating caller
-    // input in the public z_stream. zlib counts retained dictionary bytes in total_in, but next_in
-    // and avail_in remain exactly the caller's values across deflateSetDictionary.
-    let mut dictionary_input = InputCursor::from_slice(dictionary, stream.total_in);
+    // A general input cursor cannot represent more than uInt::MAX bytes in a single call.
+    // This retained dictionary tail is bounded by the window, but validate before mutating
+    // the compressor state so even an invalid future caller gets a clean error.
+    let Some(mut dictionary_input) = InputCursor::from_slice(dictionary, stream.total_in) else {
+        return ReturnCode::StreamError;
+    };
+
+    if replace_history && wrap == 0 {
+        state.head.as_mut_slice().fill(0);
+        state.strstart = 0;
+        state.block_start = 0;
+        state.insert = 0;
+        state.window.clear();
+    }
+
+    // Adler-32 above covered the complete dictionary before retaining only its window tail.
+    // Feed that tail through the ordinary window-refill core without impersonating
+    // caller input in the public z_stream. Retained bytes count in total_in; the caller's
+    // next_in and avail_in remain unchanged across deflateSetDictionary.
+    state.wrap = 0;
     fill_window_core(state, &mut dictionary_input, &mut checksum);
 
     while state.lookahead >= STD_MIN_MATCH {
@@ -4257,6 +4280,26 @@ mod test {
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
         }
+    }
+
+    #[test]
+    fn input_cursor_history_is_scoped_to_current_call() -> Result<(), &'static str> {
+        let source = b"two separate caller buffers";
+        let mut first = InputCursor::from_slice(&source[..8], crate::c_api::z_size::MAX - 1)
+            .ok_or("the eight-byte input must fit in zlib uInt")?;
+        assert_eq!(first.consumed_here(), 0);
+        first.consume(5);
+        assert_eq!(first.consumed_here(), 5);
+        assert_eq!(first.avail_in, 3);
+        assert_eq!(first.total_in, 3);
+
+        // Changing the caller input buffer resets the readable history budget, even
+        // though total_in carries the wrapped counter from the previous invocation.
+        let next = InputCursor::from_slice(&source[8..], first.total_in)
+            .ok_or("the second input must fit in zlib uInt")?;
+        assert_eq!(next.consumed_here(), 0);
+        assert_eq!(next.total_in, 3);
+        Ok(())
     }
 
     #[test]
