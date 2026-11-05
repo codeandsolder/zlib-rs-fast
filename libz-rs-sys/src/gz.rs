@@ -152,9 +152,10 @@ impl GzWriteInput {
     /// Bind a caller-owned readable span for the duration of one gzip write operation.
     ///
     /// # Safety
-    /// `next` must be readable for `len` bytes when `len != 0`.
+    /// `next` must be readable for `len` bytes when `len != 0`.\n    /// The entire span must also be no longer than `isize::MAX` bytes.
     unsafe fn from_raw(next: *const c_void, len: usize) -> Self {
         debug_assert!(len == 0 || !next.is_null());
+        debug_assert!(len <= isize::MAX.unsigned_abs());
         Self {
             next: next.cast::<u8>(),
             remaining: len,
@@ -1454,6 +1455,30 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
     }
 }
 
+// A Rust slice or raw cursor must not span more than isize::MAX bytes,
+// even when a size_t product itself is representable. Keep the check here,
+// before either FFI entry point forms a caller-memory view.
+fn checked_gz_transfer_len(state: &mut GzState, size: size_t, nitems: size_t) -> Option<usize> {
+    let Some(len) = size.checked_mul(nitems) else {
+        gz_error(
+            state,
+            Some((Z_STREAM_ERROR, "request does not fit in a size_t")),
+        );
+        return None;
+    };
+    if len > isize::MAX.unsigned_abs() {
+        gz_error(
+            state,
+            Some((
+                Z_STREAM_ERROR,
+                "request exceeds the maximum addressable byte span",
+            )),
+        );
+        return None;
+    }
+    Some(len)
+}
+
 /// Read and decompress up to `nitems` items of size `size` from `file` into `buf`,
 /// otherwise operating as [`gzread`] does. This duplicates the interface of
 /// C stdio's `fread()`, with `size_t` request and return types.
@@ -1463,7 +1488,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
 /// there was an error.  [`gzerror`] must be consulted if zero is returned in
 /// order to determine if there was an error.  If the multiplication of `size` and
 /// `nitems` overflows, i.e. the product does not fit in a `size_t`, then nothing
-/// is read, zero is returned, and the error state is set to `Z_STREAM_ERROR`.
+/// is read, zero is returned, and the error state is set to `Z_STREAM_ERROR`.\n/// An otherwise representable product exceeding `isize::MAX` bytes is also rejected.
 ///
 /// In the event that the end of file is reached and only a partial item is
 /// available at the end, i.e. the remaining uncompressed data length is not a
@@ -1503,10 +1528,8 @@ pub unsafe extern "C" fn gzfread(
         return 0;
     }
 
-    // Compute the number of bytes to read, and make sure it fits in a size_t.
-    let Some(len) = size.checked_mul(nitems) else {
-        const MSG: &str = "request does not fit in a size_t";
-        gz_error(state, Some((Z_STREAM_ERROR, MSG)));
+    // Validate before constructing a Rust caller-output slice.
+    let Some(len) = checked_gz_transfer_len(state, size, nitems) else {
         return 0;
     };
 
@@ -2078,7 +2101,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
 ///
 /// Note: If the multiplication of `size` and `nitems` overflows, i.e. the product does
 /// not fit in a `size_t`, then nothing is written, zero is returned, and the error state
-/// is set to `Z_STREAM_ERROR`.
+/// is set to `Z_STREAM_ERROR`. The same applies to products exceeding\n/// `isize::MAX` bytes.
 ///
 /// # Safety
 ///
@@ -2104,10 +2127,8 @@ pub unsafe extern "C" fn gzfwrite(
         return 0;
     }
 
-    // Compute the number of bytes to write, and make sure it fits in a size_t.
-    let Some(len) = size.checked_mul(nitems) else {
-        const MSG: &str = "request does not fit in a size_t";
-        gz_error(state, Some((Z_STREAM_ERROR, MSG)));
+    // Validate before binding the caller-owned raw input cursor.
+    let Some(len) = checked_gz_transfer_len(state, size, nitems) else {
         return 0;
     };
 
@@ -3587,6 +3608,73 @@ mod tests {
         assert_eq!(gz_zero(&mut zeros, 2), Err(()));
         assert_eq!(zeros.pos, i64::MAX - 1);
         assert!(zeros.input.is_none());
+    }
+
+    #[test]
+    fn gzip_item_transfer_rejects_unrepresentable_raw_spans() {
+        for mode in [GzMode::Read, GzMode::Write] {
+            let mut state = GzState::new();
+            state.mode = mode;
+            let too_long = (isize::MAX.unsigned_abs()) + 1;
+            let oversized_products = [
+                (too_long, 1usize),
+                (too_long / 2, 3usize),
+                (usize::MAX, 1usize),
+                (usize::MAX, 2usize),
+            ];
+            for (size, nitems) in oversized_products {
+                gz_error(&mut state, None);
+                assert_eq!(checked_gz_transfer_len(&mut state, size, nitems), None);
+                assert_eq!(state.err, Z_STREAM_ERROR);
+            }
+            gz_error(&mut state, None);
+            assert_eq!(
+                checked_gz_transfer_len(&mut state, isize::MAX.unsigned_abs(), 1),
+                Some(isize::MAX.unsigned_abs())
+            );
+            assert_eq!(checked_gz_transfer_len(&mut state, usize::MAX, 0), Some(0));
+            assert_eq!(checked_gz_transfer_len(&mut state, 0, usize::MAX), Some(0));
+            assert_eq!(state.err, Z_OK);
+        }
+    }
+
+    #[test]
+    fn gzip_item_ffi_rejects_oversized_spans_before_touching_caller_data() {
+        let mut state = GzState::new();
+        state.mode = GzMode::Read;
+        let mut data = [0u8; 1];
+        let too_long = (isize::MAX.unsigned_abs()) + 1;
+        // SAFETY: the FFI operation rejects the invalid length before forming
+        // any slice or accessing data. The byte array is a live valid pointer.
+        let read = unsafe {
+            gzfread(
+                data.as_mut_ptr().cast(),
+                too_long,
+                1,
+                core::ptr::from_mut(&mut state).cast(),
+            )
+        };
+        assert_eq!(read, 0);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+        assert!(state.input.is_none());
+        assert!(state.output.is_none());
+
+        state.mode = GzMode::Write;
+        gz_error(&mut state, None);
+        // SAFETY: the positive invalid span is rejected before a raw input
+        // cursor is formed; no bytes are read from the byte array.
+        let written = unsafe {
+            gzfwrite(
+                data.as_ptr().cast(),
+                too_long,
+                1,
+                core::ptr::from_mut(&mut state).cast(),
+            )
+        };
+        assert_eq!(written, 0);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+        assert!(state.input.is_none());
+        assert!(state.output.is_none());
     }
 
     #[test]
