@@ -3522,18 +3522,18 @@ fn compress_into<O: WritableBytes + ?Sized>(
         return (0, err);
     }
 
-    let max = core::ffi::c_uint::MAX as usize;
     let mut left = output_len;
     let mut source_len = input.len();
 
     let return_code = loop {
         if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, max) as _;
+            stream.avail_out = core::ffi::c_uint::try_from(left).unwrap_or(core::ffi::c_uint::MAX);
             left -= stream.avail_out as usize;
         }
 
         if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(source_len, max) as _;
+            stream.avail_in =
+                core::ffi::c_uint::try_from(source_len).unwrap_or(core::ffi::c_uint::MAX);
             source_len -= stream.avail_in as usize;
         }
 
@@ -3556,11 +3556,9 @@ fn compress_into<O: WritableBytes + ?Sized>(
         }
     };
 
-    let produced = stream.total_out as usize;
-    assert!(
-        produced <= output_len,
-        "deflate reported output beyond caller storage"
-    );
+    // The public zlib total_out counter may wrap on 64-bit Windows (32-bit c_ulong).
+    // Recover the exact Rust-slice length from caller output budgets instead.
+    let produced = crate::output_buffer::written_from_budget(output_len, left, stream.avail_out);
 
     // may DataError if insufficient output space
     if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {

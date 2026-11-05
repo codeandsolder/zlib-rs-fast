@@ -551,7 +551,7 @@ pub unsafe extern "C" fn uncompress2_z(
     let config = InflateConfig::default();
     let (consumed, output, err) = zlib_rs::inflate::uncompress2(output, input, config);
 
-    *sourceLen -= consumed as usize;
+    *sourceLen = consumed;
     *destLen = output.len();
 
     err as c_int

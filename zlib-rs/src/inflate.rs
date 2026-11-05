@@ -322,11 +322,14 @@ pub fn uncompress<'a>(
     (output, ret)
 }
 
+/// Decompress into caller-owned storage, returning the number of *input bytes consumed*.
+///
+/// Any bytes after the end of the compressed stream are excluded from the count.
 pub fn uncompress2<'a>(
     output: &'a mut [MaybeUninit<u8>],
     input: &[u8],
     config: InflateConfig,
-) -> (u64, &'a mut [u8], ReturnCode) {
+) -> (usize, &'a mut [u8], ReturnCode) {
     let (consumed, produced, ret) = uncompress2_into(output, input, config);
     // SAFETY: `uncompress2_into` reports only bytes initialized by the inflate output cursor.
     let output = unsafe { assume_init_prefix(output, produced) };
@@ -337,22 +340,17 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     output: &mut O,
     input: &[u8],
     config: InflateConfig,
-) -> (u64, usize, ReturnCode) {
+) -> (usize, usize, ReturnCode) {
     let output_len = output.len();
-    let mut dest_len = output_len as z_checksum;
 
-    // for detection of incomplete stream when *destLen == 0
-    let mut buf = [0u8];
-
-    let mut left;
-    let mut len = input.len() as u64;
-
+    // For zero-capacity output, zlib needs one scratch byte to distinguish an empty
+    // stream from a stream that would produce data. This byte is never exposed to Rust.
+    let mut scratch = [0u8];
+    let mut left = if output_len == 0 { 1 } else { output_len };
+    let mut len = input.len();
     let dest = if output_len == 0 {
-        left = 1;
-        buf.as_mut_ptr()
+        scratch.as_mut_ptr()
     } else {
-        left = output_len as u64;
-        dest_len = 0;
         output.byte_ptr()
     };
 
@@ -381,13 +379,13 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
 
     let err = loop {
         if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, u32::MAX as u64) as u32;
-            left -= stream.avail_out as u64;
+            stream.avail_out = u32::try_from(left).unwrap_or(u32::MAX);
+            left -= stream.avail_out as usize;
         }
 
         if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(len, u32::MAX as u64) as u32;
-            len -= stream.avail_in as u64;
+            stream.avail_in = u32::try_from(len).unwrap_or(u32::MAX);
+            len -= stream.avail_in as usize;
         }
 
         let err = unsafe { inflate(stream, InflateFlush::NoFlush) };
@@ -397,10 +395,19 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
         }
     };
 
-    let consumed = len + u64::from(stream.avail_in);
-    if output_len != 0 {
-        dest_len = stream.total_out;
-    } else if stream.total_out != 0 && err == ReturnCode::BufError {
+    // `len` and `avail_in` are the unconsumed input, not bytes consumed. The
+    // Rust-facing API returns the actual prefix processed, including on errors.
+    let consumed = input.len() - len - stream.avail_in as usize;
+    // Preserve the full Rust slice length even if z_stream.total_out wraps.
+    let produced = if output_len == 0 {
+        0
+    } else {
+        crate::output_buffer::written_from_budget(output_len, left, stream.avail_out)
+    };
+
+    // A filled scratch byte proves a zero-capacity destination was too small.
+    // Retain the legacy Z_DATA_ERROR distinction for that special case.
+    if output_len == 0 && stream.total_out != 0 && err == ReturnCode::BufError {
         left = 1;
     }
 
@@ -410,15 +417,10 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     let ret = match err {
         ReturnCode::StreamEnd => ReturnCode::Ok,
         ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if (left + avail_out as u64) != 0 => ReturnCode::DataError,
+        ReturnCode::BufError if left + avail_out as usize != 0 => ReturnCode::DataError,
         _ => err,
     };
 
-    let produced = dest_len as usize;
-    assert!(
-        produced <= output_len,
-        "inflate reported output beyond caller storage"
-    );
     (consumed, produced, ret)
 }
 
@@ -3082,6 +3084,27 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncompress2_reports_bytes_consumed_including_with_trailing_input() {
+        let plain = b"input accounting must report bytes consumed, not bytes remaining";
+        let mut storage = vec![0; crate::compress_bound(plain.len())];
+        let (compressed, code) =
+            crate::compress_slice(&mut storage, plain, crate::DeflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        let compressed = compressed.to_vec();
+
+        for trailing in [0, 3, 13] {
+            let mut input = compressed.clone();
+            input.extend(core::iter::repeat_n(0xa5, trailing));
+            let mut storage = vec![MaybeUninit::<u8>::uninit(); plain.len()];
+            let (consumed, decoded, code) =
+                uncompress2(&mut storage, &input, InflateConfig::default());
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(decoded, plain);
+            assert_eq!(consumed, compressed.len(), "trailing {trailing} bytes");
+        }
+    }
 
     #[test]
     fn end_leaves_null_abi_state_pointer() {

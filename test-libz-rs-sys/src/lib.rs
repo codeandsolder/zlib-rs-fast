@@ -783,6 +783,39 @@ mod null {
     }
 
     #[test]
+    fn uncompress2_reports_consumed_prefix_with_trailing_data() {
+        let plain = b"zlib uncompress2 returns consumed source bytes, excluding any trailing data";
+        let mut storage = vec![0u8; zlib_rs::compress_bound(plain.len())];
+        let (compressed, code) =
+            zlib_rs::compress_slice(&mut storage, plain, zlib_rs::DeflateConfig::default());
+        assert_eq!(code, zlib_rs::ReturnCode::Ok);
+        let compressed_len = compressed.len();
+
+        let mut input = compressed.to_vec();
+        input.extend_from_slice(b"NOT-PART-OF-THE-STREAM");
+
+        // SAFETY: the input and output slices remain allocated throughout the call, are
+        // disjoint and their exact valid sizes are supplied via sourceLen/destLen.
+        assert_eq_rs_ng!(unsafe {
+            let mut output = vec![0u8; plain.len() + 16];
+            let mut output_len = core::ffi::c_ulong::try_from(output.len()).unwrap_or(0);
+            let mut input_len = core::ffi::c_ulong::try_from(input.len()).unwrap_or(0);
+            let status = uncompress2(
+                output.as_mut_ptr(),
+                &mut output_len,
+                input.as_ptr(),
+                &mut input_len,
+            );
+            assert_eq!(status, Z_OK);
+            assert_eq!(input_len as usize, compressed_len);
+            assert_eq!(output_len as usize, plain.len());
+            output.truncate(plain.len());
+            assert_eq!(output, plain);
+            (status, input_len, output_len, output)
+        });
+    }
+
+    #[test]
     fn inflate_prime_raw_stream_preserves_input_cursor() {
         let source: Vec<u8> = (0..16 * 1024)
             .map(|i| ((i * 31 + i / 97) % 251) as u8)
