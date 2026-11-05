@@ -11,6 +11,8 @@ on: # zizmor: ignore[cache-poisoning] not actually used for releases
     branches:
       - main
       - 'release/**'
+    tags:
+      - 'v*'
   pull_request:
     branches-ignore:
       - 'release/**'
@@ -27,8 +29,19 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Every PR, main push, and scheduled check gets one current-Rust Linux lane.
+  primary:
+    name: Current Rust 1.99 Linux
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+    with:
+      rust-toolchain: "1.99.1"
+      command: cargo +1.99.1 test --locked -p zlib-rs -p libz-rs-sys --lib
+
+  # Full cross-platform, Miri, fuzz, and alternative-feature matrices only
+  # run when pushing a release tag.
   build:
     name: Build and test
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: "${{ matrix.os }}"
     env:
       RUST_BACKTRACE: 1
@@ -206,6 +219,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   clippy:
     name: Clippy
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
         include:
@@ -256,6 +270,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   fuzz:
     name: Smoke-test fuzzing targets
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -297,6 +312,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   fuzz-aarch64:
     name: Smoke-test fuzzing targets
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: macos-latest
     strategy:
       matrix:
@@ -338,6 +354,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   fuzz-code-coverage:
     name: Fuzz with code coverage
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -404,6 +421,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   link-c-dynamic-library:
     name: vanilla dynamic library
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
         include:
@@ -503,6 +521,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   symbol-versioning:
     name: Symbol versioning
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
         include:
@@ -578,6 +597,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   cargo-c-dynamic-library:
     name: cargo-c dynamic library
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
         include:
@@ -626,6 +646,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-zlib-rs:
     name: "Miri (zlib-rs)"
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -667,6 +688,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-libz-rs-sys:
     name: "Miri (libz-rs-sys)"
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -720,6 +742,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-vpclmulqdq:
     name: "Miri VPCLMULQDQ"
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -757,6 +780,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   miri-simd:
     name: "Miri SIMD"
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-24.04-arm # so we don't need to install gcc 
     strategy:
       matrix:
@@ -804,6 +828,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
   run-flate2-test-suite:
     name: run flate2 test suite
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
         include:
