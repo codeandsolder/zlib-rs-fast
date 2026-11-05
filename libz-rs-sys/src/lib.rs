@@ -532,20 +532,41 @@ pub unsafe extern "C" fn uncompress2_z(
 ) -> c_int {
     // stock zlib will just dereference a NULL pointer: that's UB.
     // Hence us returning an error value is compatible
+    // SAFETY: the FFI contract requires a non-null destLen to be uniquely writable.
     let Some(destLen) = (unsafe { destLen.as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
+    // SAFETY: the caller provides a live writable source-length output.
     let Some(sourceLen) = (unsafe { sourceLen.as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
-    let Some(output) = (unsafe { slice_from_raw_parts_uninit_mut(dest, *destLen) }) else {
-        return ReturnCode::StreamError as _;
+    // Zero-capacity output does not require caller backing storage. The inflate
+    // core already uses its own scratch byte to distinguish an empty stream
+    // from one that would produce output.
+    let output = if *destLen == 0 {
+        &mut [][..]
+    } else {
+        // SAFETY: the contract guarantees a writable, disjoint destination
+        // span of this nonzero length whenever the pointer is non-null.
+        let Some(output) = (unsafe { slice_from_raw_parts_uninit_mut(dest, *destLen) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        output
     };
 
-    let Some(input) = (unsafe { slice_from_raw_parts(source, *sourceLen) }) else {
-        return ReturnCode::StreamError as _;
+    // A NULL source with zero length is an empty input span. Nonzero
+    // lengths still require a readable caller-owned buffer.
+    let input = if *sourceLen == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the contract guarantees a readable input span of this
+        // nonzero length whenever the pointer is non-null.
+        let Some(input) = (unsafe { slice_from_raw_parts(source, *sourceLen) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        input
     };
 
     let config = InflateConfig::default();
@@ -1455,7 +1476,7 @@ pub unsafe extern "C" fn compress_z(
 ///
 ///`sourceLen` is the byte length of the source buffer.
 /// Upon entry, `destLen` is the total size of the destination buffer,
-/// which must be at least the value returned by [`compressBound`]`(sourceLen)`.
+/// which must be at least the value returned by `compressBound(sourceLen)`.
 /// Upon exit, `destLen` is the actual size of the compressed data.
 ///
 /// A call to [`compress`] is equivalent to [`compress2`] with a level parameter of [`Z_DEFAULT_COMPRESSION`].
@@ -1541,16 +1562,27 @@ pub unsafe extern "C" fn compress2_z(
 ) -> c_int {
     // stock zlib will just dereference a NULL pointer: that's UB.
     // Hence us returning an error value is compatible
+    // SAFETY: the FFI contract requires a non-null destLen to be writable.
     let Some(destLen) = (unsafe { destLen.as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
+    // SAFETY: the caller owns a writable, disjoint output span of
+    // this length when dest is non-null.
     let Some(output) = (unsafe { slice_from_raw_parts_uninit_mut(dest, *destLen) }) else {
         return ReturnCode::StreamError as _;
     };
 
-    let Some(input) = (unsafe { slice_from_raw_parts(source, sourceLen) }) else {
-        return ReturnCode::StreamError as _;
+    // An empty source has no backing buffer requirement. A positive length
+    // still requires a non-null readable pointer.
+    let input = if sourceLen == 0 {
+        &[][..]
+    } else {
+        // SAFETY: non-null source is guaranteed readable for sourceLen bytes.
+        let Some(input) = (unsafe { slice_from_raw_parts(source, sourceLen) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        input
     };
 
     let config = DeflateConfig::new(level);
@@ -1566,7 +1598,7 @@ pub unsafe extern "C" fn compress2_z(
 /// The level parameter has the same meaning as in [`deflateInit_`].
 /// `sourceLen` is the byte length of the source buffer.
 /// Upon entry, `destLen` is the total size of the destination buffer,
-/// which must be at least the value returned by [`compressBound`]`(sourceLen)`.
+/// which must be at least the value returned by `compressBound(sourceLen)`.
 /// Upon exit, `destLen` is the actual size of the compressed data.
 ///
 /// # Returns

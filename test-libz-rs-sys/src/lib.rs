@@ -816,6 +816,184 @@ mod null {
     }
 
     #[test]
+    fn uncompress2_accepts_null_zero_capacity_destination() {
+        // An empty destination may have a NULL pointer. The decoder uses a
+        // private scratch byte to distinguish empty from nonempty streams.
+        for plain in [&[][..], &b"nonempty output requires space"[..]] {
+            let mut storage = vec![0u8; zlib_rs::compress_bound(plain.len())];
+            let (compressed, code) =
+                zlib_rs::compress_slice(&mut storage, plain, zlib_rs::DeflateConfig::default());
+            assert_eq!(code, zlib_rs::ReturnCode::Ok);
+
+            // SAFETY: NULL is valid when the caller-supplied destination
+            // capacity is zero. Compressed input remains readable and live.
+            let (result, produced, consumed) = assert_eq_rs_ng!(unsafe {
+                let mut output_len: core::ffi::c_ulong = 0;
+                let mut input_len = core::ffi::c_ulong::try_from(compressed.len()).unwrap_or(0);
+                let code = uncompress2(
+                    core::ptr::null_mut(),
+                    &mut output_len,
+                    compressed.as_ptr(),
+                    &mut input_len,
+                );
+                (code, output_len, input_len)
+            });
+            assert_eq!(produced, 0);
+            assert_eq!(
+                result,
+                if plain.is_empty() {
+                    libz_rs_sys::Z_OK
+                } else {
+                    libz_rs_sys::Z_DATA_ERROR
+                },
+                "zero-capacity destination of a {}-byte stream",
+                plain.len()
+            );
+            assert!(consumed > 0);
+
+            let mut output_len = 0usize;
+            let mut input_len = compressed.len();
+            // SAFETY: a null output pointer with zero requested capacity
+            // requires no external storage; input remains valid for this call.
+            let direct = unsafe {
+                libz_rs_sys::uncompress2_z(
+                    core::ptr::null_mut(),
+                    &mut output_len,
+                    compressed.as_ptr(),
+                    &mut input_len,
+                )
+            };
+            assert_eq!(direct, result);
+            assert_eq!(output_len, 0);
+            assert_eq!(usize::try_from(consumed).ok(), Some(input_len));
+
+            let mut invalid_capacity = 1usize;
+            let mut invalid_source_len = compressed.len();
+            // SAFETY: a NULL destination with nonzero capacity is rejected
+            // before it could be dereferenced.
+            assert_eq!(
+                unsafe {
+                    libz_rs_sys::uncompress2_z(
+                        core::ptr::null_mut(),
+                        &mut invalid_capacity,
+                        compressed.as_ptr(),
+                        &mut invalid_source_len,
+                    )
+                },
+                libz_rs_sys::Z_STREAM_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn uncompress2_accepts_null_zero_length_source() {
+        for capacity in [0usize, 16] {
+            // With no input there is no valid zlib header, but an empty span
+            // may be represented with a NULL pointer without being invalid.
+            // SAFETY: zero length never dereferences source; destination is
+            // either valid storage or NULL with zero output capacity.
+            let observed = assert_eq_rs_ng!(unsafe {
+                let mut output = [0u8; 16];
+                let output_ptr = if capacity == 0 {
+                    core::ptr::null_mut()
+                } else {
+                    output.as_mut_ptr()
+                };
+                let mut output_len = core::ffi::c_ulong::try_from(capacity).unwrap_or(0);
+                let mut input_len: core::ffi::c_ulong = 0;
+                let code = uncompress2(
+                    output_ptr,
+                    &mut output_len,
+                    core::ptr::null(),
+                    &mut input_len,
+                );
+                (code, output_len, input_len)
+            });
+            assert_eq!(observed.0, libz_rs_sys::Z_DATA_ERROR);
+            assert_eq!(observed.1, 0);
+            assert_eq!(observed.2, 0);
+
+            let mut output = [0u8; 16];
+            let mut output_len = output.len();
+            let mut invalid_input_len = 1usize;
+            // SAFETY: a NULL source with a nonzero length is rejected
+            // without being dereferenced.
+            assert_eq!(
+                unsafe {
+                    libz_rs_sys::uncompress2_z(
+                        output.as_mut_ptr(),
+                        &mut output_len,
+                        core::ptr::null(),
+                        &mut invalid_input_len,
+                    )
+                },
+                libz_rs_sys::Z_STREAM_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn compress2_accepts_null_zero_length_source() {
+        // An empty input needs no backing buffer, including at the C ABI.
+        // SAFETY: the source length is zero, so the NULL source is never read;
+        // the destination is a valid, independently owned writable array.
+        let status = assert_eq_rs_ng!(unsafe {
+            let mut output = [0u8; 64];
+            let mut output_len = core::ffi::c_ulong::try_from(output.len()).unwrap_or(0);
+            let status = compress2(
+                output.as_mut_ptr(),
+                &mut output_len,
+                core::ptr::null(),
+                0,
+                6,
+            );
+            if status == Z_OK {
+                let mut decoded = [0u8; 1];
+                let (plain, code) = zlib_rs::decompress_slice(
+                    &mut decoded,
+                    &output[..usize::try_from(output_len).unwrap_or(0)],
+                    zlib_rs::InflateConfig::default(),
+                );
+                assert_eq!(code, zlib_rs::ReturnCode::Ok);
+                assert!(plain.is_empty());
+            }
+            status
+        });
+        assert_eq!(status, libz_rs_sys::Z_OK);
+
+        let mut output = [0u8; 64];
+        let mut output_len = output.len();
+        // SAFETY: NULL denotes zero readable source bytes, and output is live.
+        let direct = unsafe {
+            libz_rs_sys::compress2_z(
+                output.as_mut_ptr(),
+                &mut output_len,
+                core::ptr::null(),
+                0,
+                6,
+            )
+        };
+        assert_eq!(direct, libz_rs_sys::Z_OK);
+
+        let mut invalid_output = [0u8; 64];
+        let mut invalid_capacity = invalid_output.len();
+        // SAFETY: NULL with a positive source length is an invalid span;
+        // the wrapper rejects it before reading the source.
+        assert_eq!(
+            unsafe {
+                libz_rs_sys::compress2_z(
+                    invalid_output.as_mut_ptr(),
+                    &mut invalid_capacity,
+                    core::ptr::null(),
+                    1,
+                    6,
+                )
+            },
+            libz_rs_sys::Z_STREAM_ERROR
+        );
+    }
+
+    #[test]
     fn inflate_prime_raw_stream_preserves_input_cursor() {
         let source: Vec<u8> = (0..16 * 1024)
             .map(|i| ((i * 31 + i / 97) % 251) as u8)
