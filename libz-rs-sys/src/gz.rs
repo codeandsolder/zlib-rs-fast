@@ -1703,22 +1703,124 @@ fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
 // Read into an uninitialized byte span from an underlying file descriptor.
 // Returns `(bytes_read, reached_eof)`. A failed system read is reported separately so
 // the gzip state can attach its source-specific error message at the caller.
-fn load_from_fd(fd: c_int, output: &mut [MaybeUninit<u8>]) -> Result<(usize, bool), ()> {
-    let mut have = 0usize;
-    let mut ret: isize = 1;
-    while have < output.len() {
-        let dst = output[have..].as_mut_ptr().cast::<u8>().cast::<c_void>();
-        ret = unsafe { libc::read(fd, dst, output.len() - have) };
-        if ret <= 0 {
-            break;
+// Consume the whole byte span even when the OS performs short writes.
+// Both direct gzip passthrough and compressed output use this same loop.
+// Keep the syscall injectable so partial and zero-progress writes are testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoAttemptError {
+    Interrupted,
+    Failed,
+}
+
+// errno is thread-local and must be inspected immediately after a failed syscall.
+// The accessor differs by C runtime. Unsupported targets still report genuine
+// I/O failure; the platforms below also retry EINTR.
+fn last_io_attempt_error() -> IoAttemptError {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "fuchsia",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))]
+    // SAFETY: the C runtime supplies a live pointer to this thread's errno.
+    let code = unsafe { *libc::__errno_location() };
+
+    #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+    // SAFETY: the C runtime supplies a live pointer to this thread's errno.
+    let code = unsafe { *libc::__errno() };
+
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+    // SAFETY: the C runtime supplies a live pointer to this thread's errno.
+    let code = unsafe { *libc::__error() };
+
+    #[cfg(windows)]
+    let code = {
+        unsafe extern "C" {
+            fn _errno() -> *mut c_int;
         }
-        have += ret as usize;
-    }
-    if ret < 0 {
-        Err(())
+        // SAFETY: the CRT supplies the current thread's errno storage.
+        unsafe { *_errno() }
+    };
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "fuchsia",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        windows
+    )))]
+    let code = 0;
+
+    if code == libc::EINTR {
+        IoAttemptError::Interrupted
     } else {
-        Ok((have, ret == 0))
+        IoAttemptError::Failed
     }
+}
+
+fn write_all_with(
+    mut remaining: &[u8],
+    mut write_some: impl FnMut(&[u8]) -> Result<usize, IoAttemptError>,
+) -> Result<(), ()> {
+    while !remaining.is_empty() {
+        match write_some(remaining) {
+            Err(IoAttemptError::Interrupted) => {}
+            Err(IoAttemptError::Failed) | Ok(0) => return Err(()),
+            Ok(written) if written > remaining.len() => return Err(()),
+            Ok(written) => remaining = &remaining[written..],
+        }
+    }
+    Ok(())
+}
+
+fn write_all_to_fd(fd: c_int, input: &[u8]) -> Result<(), ()> {
+    write_all_with(input, |remaining| {
+        // On some platforms write(2) cannot accept lengths exceeding SSIZE_MAX.
+        let len = remaining.len().min(isize::MAX as usize);
+        // SAFETY: the initialized input slice stays live across this syscall
+        // and the request cannot exceed its size.
+        let written = unsafe { libc::write(fd, remaining.as_ptr().cast::<c_void>(), len) };
+        usize::try_from(written).map_err(|_| last_io_attempt_error())
+    })
+}
+
+fn read_with(
+    output: &mut [MaybeUninit<u8>],
+    mut read_some: impl FnMut(&mut [MaybeUninit<u8>]) -> Result<usize, IoAttemptError>,
+) -> Result<(usize, bool), ()> {
+    let mut have = 0usize;
+    while have < output.len() {
+        let remaining = &mut output[have..];
+        match read_some(remaining) {
+            Err(IoAttemptError::Interrupted) => {}
+            Err(IoAttemptError::Failed) => return Err(()),
+            Ok(0) => return Ok((have, true)),
+            Ok(n) if n > remaining.len() => return Err(()),
+            Ok(n) => have += n,
+        }
+    }
+    Ok((have, false))
+}
+
+fn load_from_fd(fd: c_int, output: &mut [MaybeUninit<u8>]) -> Result<(usize, bool), ()> {
+    read_with(output, |remaining| {
+        let len = remaining.len().min(isize::MAX as usize);
+        // SAFETY: the output is writable uninitialized storage for len
+        // bytes, and stays live across this syscall.
+        let got = unsafe { libc::read(fd, remaining.as_mut_ptr().cast::<c_void>(), len) };
+        usize::try_from(got).map_err(|_| last_io_attempt_error())
+    })
 }
 
 // Fetch data and put it in the output buffer, decompressing if needed. If the header has
@@ -2123,19 +2225,17 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
 
     // Write directly if requested.
     if state.direct {
-        let got = unsafe {
-            libc::write(
-                state.fd,
-                state.stream.next_in.cast::<c_void>(),
-                state.stream.avail_in as _,
-            )
-        };
-        if got < 0 || got as c_uint != state.stream.avail_in {
-            // FIXME implement zstrerror and use it instead of a hard-coded error message here.
-            gz_error(state, Some((Z_ERRNO, "write error")));
-            return Err(());
-        }
         let consumed = state.stream.avail_in as usize;
+        if consumed != 0 {
+            // SAFETY: the current gzip write input cursor is bound to
+            // consumed initialized bytes, either owned or caller-borrowed
+            // for this operation. No slice is formed for NULL + zero length.
+            let input = unsafe { core::slice::from_raw_parts(state.stream.next_in, consumed) };
+            if write_all_to_fd(state.fd, input).is_err() {
+                gz_error(state, Some((Z_ERRNO, "write error")));
+                return Err(());
+            }
+        }
         // Safety: the direct-write contract above established a readable span of
         // exactly `avail_in` bytes starting at `next_in`.
         state.stream.next_in = unsafe { state.stream.next_in.add(consumed) };
@@ -2165,15 +2265,19 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
         {
             // Safety: Within this gz module, `state.stream.next` and `state.stream.next_out`
             // always point within the same allocated object, `state.stream.output`.
-            let have = unsafe { state.stream.next_out.offset_from(state.next) };
-            if have < 0 {
+            // SAFETY: the two cursors belong to the same live owned
+            // compression output buffer, maintained by gz_comp.
+            let signed_have = unsafe { state.stream.next_out.offset_from(state.next) };
+            let Ok(have) = usize::try_from(signed_have) else {
                 const MSG: &str = "corrupt internal state in gz_comp";
                 gz_error(state, Some((Z_STREAM_ERROR, MSG)));
                 return Err(());
-            }
+            };
             if have != 0 {
-                let ret = unsafe { libc::write(state.fd, state.next.cast::<c_void>(), have as _) };
-                if ret != have as _ {
+                // SAFETY: the pending prefix from next to next_out consists
+                // entirely of initialized compressed bytes in owned output.
+                let bytes = unsafe { core::slice::from_raw_parts(state.next, have) };
+                if write_all_to_fd(state.fd, bytes).is_err() {
                     gz_error(state, Some((Z_ERRNO, "write error")));
                     return Err(());
                 }
@@ -3055,6 +3159,89 @@ mod tests {
         let mut path_buf = prefix.to_path_buf();
         path_buf.push(file);
         path_buf.as_path().to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn short_writes_do_not_drop_unwritten_bytes() -> Result<(), ()> {
+        let input: Vec<u8> = (0u8..91).collect();
+        let mut output = Vec::new();
+        let mut steps = 0usize;
+        write_all_with(&input, |remaining| {
+            steps += 1;
+            let count = remaining.len().min(steps % 7 + 1);
+            output.extend_from_slice(&remaining[..count]);
+            Ok(count)
+        })?;
+        assert!(steps > 1);
+        assert_eq!(output, input);
+
+        // No-progress and impossible writer responses must not spin.
+        assert_eq!(write_all_with(&input, |_| Ok(0)), Err(()));
+        assert_eq!(write_all_with(&input, |bytes| Ok(bytes.len() + 1)), Err(()));
+        assert_eq!(
+            write_all_with(&input, |_| Err(IoAttemptError::Failed)),
+            Err(())
+        );
+        assert_eq!(write_all_with(&[], |_| Err(IoAttemptError::Failed)), Ok(()));
+        let mut retries = 0;
+        let mut written = Vec::new();
+        write_all_with(&input, |remaining| {
+            retries += 1;
+            if retries < 4 {
+                return Err(IoAttemptError::Interrupted);
+            }
+            written.extend_from_slice(remaining);
+            Ok(remaining.len())
+        })?;
+        assert_eq!(written, input);
+        assert_eq!(retries, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_partial_reads_preserve_initialized_prefix() -> Result<(), ()> {
+        let mut output = [MaybeUninit::<u8>::uninit(); 19];
+        let mut calls = 0usize;
+        let mut next = 0u8;
+        let (read, eof) = read_with(&mut output, |dst| {
+            calls += 1;
+            if calls % 3 == 1 {
+                return Err(IoAttemptError::Interrupted);
+            }
+            let count = dst.len().min(4);
+            for byte in &mut dst[..count] {
+                byte.write(next);
+                next += 1;
+            }
+            Ok(count)
+        })?;
+        assert_eq!(read, output.len());
+        assert!(!eof);
+        assert!(calls > 5);
+        for (index, byte) in output.iter().enumerate() {
+            // SAFETY: every byte in output was initialized before we reached
+            // full length, as asserted above.
+            let actual = unsafe { byte.assume_init() };
+            assert_eq!(actual, u8::try_from(index).map_err(|_| ())?);
+        }
+
+        let mut partial = [MaybeUninit::<u8>::uninit(); 5];
+        let mut calls = 0usize;
+        let (read, eof) = read_with(&mut partial, |dst| {
+            calls += 1;
+            if calls == 1 {
+                dst[0].write(42);
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        })?;
+        assert_eq!((read, eof), (1, true));
+        assert_eq!(
+            read_with(&mut partial, |_| Err(IoAttemptError::Failed)),
+            Err(())
+        );
+        Ok(())
     }
 
     #[test]
