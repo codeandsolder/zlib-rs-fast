@@ -1112,8 +1112,10 @@ fn lm_init(state: &mut State) {
     // zlib uses CLEAR_HASH here
     state.head.as_mut_slice().fill(0);
 
-    // Set the default configuration parameters:
+    // Hashes are a property of the live history representation, not a tunable
+    // search budget. Choose the representation only while the history is empty.
     lm_set_level(state, state.level);
+    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
 
     state.strstart = 0;
     state.block_start = 0;
@@ -1134,7 +1136,9 @@ fn lm_set_level(state: &mut State, level: i8) {
     state.nice_match = config.nice_length;
     state.max_chain_length = config.max_chain;
 
-    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
+    // Do not change the hash representation here. deflateParams() may update the
+    // level while a nonempty head/prev table still describes earlier input.
+    // Reinterpreting those buckets with a different hash algorithm breaks searches.
     state.level = level;
 }
 
@@ -4286,6 +4290,31 @@ mod test {
         // Existing zlib-sized requests keep exactly their historical bound.
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn level_changes_preserve_live_hash_table_representation() {
+        let dictionary: Vec<u8> = (0..4_096usize)
+            .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
+            .collect();
+
+        for (old_level, new_level, expected_roll) in [(7, 9, false), (9, 7, true), (6, 9, false)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(old_level));
+            assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
+            assert!(stream.state.strstart > 0);
+            assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
+            assert_eq!(
+                params(&mut stream, new_level, Strategy::Default),
+                ReturnCode::Ok
+            );
+
+            assert_eq!(
+                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
+                expected_roll,
+                "level change {old_level} to {new_level} reinterpreted existing hash history",
+            );
+            assert!(end(&mut stream).is_ok());
         }
     }
 

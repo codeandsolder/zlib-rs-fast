@@ -683,6 +683,96 @@ fn deflate_tune_hash_strategy_after_history_matches_zlib_ng_contract() -> Result
 }
 
 #[test]
+fn deflate_params_preserves_hashed_history_across_levels() -> Result<(), &'static str> {
+    let input: Vec<u8> = (0..45_000usize)
+        .map(|i| ((i % 509 * 19 + i / 1_019 * 11) ^ (i % 41)).to_le_bytes()[0])
+        .collect();
+    let first_len = 12_288;
+    let input_first_len =
+        c_uint::try_from(first_len).map_err(|_| "test split too large for zlib uInt")?;
+    let input_rest_len = c_uint::try_from(input.len() - first_len)
+        .map_err(|_| "test tail too large for zlib uInt")?;
+    let output_cap = input.len() * 2;
+    let output_abi_len =
+        c_uint::try_from(output_cap).map_err(|_| "test output too large for zlib uInt")?;
+
+    for (old_level, new_level) in [(7, 9), (9, 7), (6, 9)] {
+        let outcome = assert_eq_rs_ng!({
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
+            // SAFETY: the ABI stream version and size correspond to the initialized library.
+            assert_eq!(
+                unsafe {
+                    deflateInit_(
+                        raw.as_mut_ptr(),
+                        old_level,
+                        zlibVersion(),
+                        core::mem::size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK
+            );
+            // SAFETY: initialization succeeded and the stream is live.
+            let stream = unsafe { raw.assume_init_mut() };
+            let mut output = vec![0u8; output_cap];
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output_abi_len;
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = input_first_len;
+            // SAFETY: the caller's input and output spans remain valid and disjoint.
+            let first_status = unsafe { deflate(stream, Z_NO_FLUSH) };
+            let first_left = stream.avail_in;
+
+            // SAFETY: the stream is still initialized and has a writable output span.
+            let params_status =
+                unsafe { deflateParams(stream, new_level, libz_rs_sys::Z_DEFAULT_STRATEGY) };
+            stream.next_in = input[first_len..].as_ptr().cast_mut();
+            stream.avail_in = input_rest_len;
+            // SAFETY: the new input span remains live and disjoint from output.
+            let finish_status = unsafe { deflate(stream, Z_FINISH) };
+            let finish_left = stream.avail_in;
+            let produced = output.len() - stream.avail_out as usize;
+            output.truncate(produced);
+            // SAFETY: the initialized stream is finalized exactly once.
+            let end_status = unsafe { deflateEnd(stream) };
+
+            let mut decoded_buf = vec![0u8; input.len()];
+            let (decoded, decoded_status) =
+                zlib_rs::decompress_slice(&mut decoded_buf, &output, InflateConfig::default());
+            (
+                first_status,
+                first_left,
+                params_status,
+                finish_status,
+                finish_left,
+                end_status,
+                decoded_status == ReturnCode::Ok && decoded == input,
+            )
+        });
+        assert_eq!(
+            outcome.0, Z_OK,
+            "first deflate failed for {old_level} -> {new_level}"
+        );
+        assert_eq!(outcome.1, 0, "first input not consumed");
+        assert_eq!(
+            outcome.2, Z_OK,
+            "deflateParams failed for {old_level} -> {new_level}"
+        );
+        assert_eq!(
+            outcome.3,
+            libz_rs_sys::Z_STREAM_END,
+            "finish failed for {old_level} -> {new_level}"
+        );
+        assert_eq!(outcome.4, 0, "tail input not consumed");
+        assert_eq!(outcome.5, Z_OK, "end failed");
+        assert!(
+            outcome.6,
+            "stream did not round-trip for {old_level} -> {new_level}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn deflate_medium_fizzle_bug() {
     const EXPECTED: &[u8] = &[
         120, 156, 99, 96, 128, 3, 73, 6, 26, 3, 71, 218, 2, 28, 182, 214, 17, 225, 50, 85, 100, 14,
