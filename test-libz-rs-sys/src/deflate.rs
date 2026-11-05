@@ -556,7 +556,7 @@ fn assert_deflate_bound_correct((config, source_len): (DeflateConfig, c_ulong)) 
 
         let bound = deflateBound(strm.as_mut_ptr(), source_len);
 
-        let ret = unsafe { deflateEnd(strm.as_mut_ptr()) };
+        let ret = { deflateEnd(strm.as_mut_ptr()) };
         assert_eq!(ret, Z_OK);
 
         bound
@@ -769,7 +769,9 @@ fn deflate_bound_gzip_header_basic() {
 fn test_compress_bound_windows() {
     let source_len = (u32::MAX - 6) as core::ffi::c_ulong;
 
-    assert_eq_rs_ng!(unsafe { compressBound(source_len as _) });
+    assert_eq_rs_ng!(unsafe { compressBound(source_len as _) }, {
+        compressBound(source_len as _)
+    });
 
     assert_eq!(
         libz_rs_sys::compressBound(source_len as _),
@@ -786,7 +788,9 @@ fn test_compress_bound() {
     ::quickcheck::quickcheck(test as fn(_) -> _);
 
     fn test(source_len: core::ffi::c_ulong) -> bool {
-        assert_eq_rs_ng!(unsafe { compressBound(source_len as _) });
+        assert_eq_rs_ng!(unsafe { compressBound(source_len as _) }, {
+            compressBound(source_len as _)
+        });
 
         assert_eq!(
             libz_rs_sys::compressBound(source_len as _),
@@ -1904,7 +1908,7 @@ fn gzip_with_header() {
         ..Default::default()
     };
 
-    let output = assert_eq_rs_ng!(unsafe {
+    let output = assert_eq_rs_ng!({
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
         let err = unsafe {
@@ -1968,7 +1972,7 @@ fn gzip_with_header() {
     assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let err = unsafe {
+        let err = {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 config.window_bits,
@@ -1978,7 +1982,7 @@ fn gzip_with_header() {
         };
         assert_eq!(err, 0);
 
-        let stream = unsafe { stream.assume_init_mut() };
+        let stream = { stream.assume_init_mut() };
 
         let mut input = output.clone();
         stream.next_in = input.as_mut_ptr() as _;
@@ -2008,10 +2012,10 @@ fn gzip_with_header() {
             done: 0,
         };
 
-        let err = unsafe { inflateGetHeader(stream, &mut header) };
+        let err = { inflateGetHeader(stream, &mut header) };
         assert_eq!(err, 0);
 
-        let err = unsafe { inflate(stream, DeflateFlush::NoFlush as _) };
+        let err = { inflate(stream, DeflateFlush::NoFlush as _) };
         assert_eq!(
             err,
             ReturnCode::StreamEnd as i32,
@@ -2019,7 +2023,7 @@ fn gzip_with_header() {
             if stream.msg.is_null() {
                 None
             } else {
-                Some(unsafe { CStr::from_ptr(stream.msg) })
+                Some({ CStr::from_ptr(stream.msg) })
             }
         );
 
@@ -2028,25 +2032,19 @@ fn gzip_with_header() {
 
         assert!(!header.comment.is_null());
         assert_eq!(
-            unsafe { CStr::from_ptr(header.comment.cast()) }
-                .to_str()
-                .unwrap(),
+            { CStr::from_ptr(header.comment.cast()) }.to_str().unwrap(),
             comment.trim_end_matches('\0')
         );
 
         assert!(!header.name.is_null());
         assert_eq!(
-            unsafe { CStr::from_ptr(header.name.cast()) }
-                .to_str()
-                .unwrap(),
+            { CStr::from_ptr(header.name.cast()) }.to_str().unwrap(),
             name.trim_end_matches('\0')
         );
 
         assert!(!header.extra.is_null());
         assert_eq!(
-            unsafe { CStr::from_ptr(header.extra.cast()) }
-                .to_str()
-                .unwrap(),
+            { CStr::from_ptr(header.extra.cast()) }.to_str().unwrap(),
             extra.trim_end_matches('\0')
         );
     });
@@ -2593,7 +2591,7 @@ fn flood_pending_buffer() {
     ]
     .to_vec();
 
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let config = DeflateConfig {
             level: Z_DEFAULT_COMPRESSION,
             method: Method::Deflated,
@@ -2745,7 +2743,7 @@ fn copy_uninitialized_window_section() {
         strategy: Strategy::Default,
     };
 
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let mut header = gz_header {
             text: 825307441,
             time: 14641,
@@ -2890,7 +2888,7 @@ fn crc32_hash_calc_uninitialized_memory() {
     assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::zeroed();
 
-        let err = unsafe {
+        let err = {
             deflateInit2_(
                 stream.as_mut_ptr(),
                 config.level,
@@ -2904,9 +2902,9 @@ fn crc32_hash_calc_uninitialized_memory() {
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        let stream = unsafe { stream.assume_init_mut() };
+        let stream = { stream.assume_init_mut() };
 
-        let buf_size = unsafe { deflateBound(stream, source.len() as _) };
+        let buf_size = { deflateBound(stream, source.len() as _) };
 
         let mut dest = vec![0; buf_size as usize];
         let chunk = 2u32;
@@ -2918,12 +2916,12 @@ fn crc32_hash_calc_uninitialized_memory() {
         stream.avail_out = dest.len().try_into().unwrap();
 
         // Deflate first chunk.
-        let err = unsafe { deflate(stream, flush as i32) };
+        let err = { deflate(stream, flush as i32) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         // Change the parameters.
         let new_level = 4;
-        let err = unsafe { deflateParams(stream, new_level, config.strategy as _) };
+        let err = { deflateParams(stream, new_level, config.strategy as _) };
         match ReturnCode::from(err) {
             ReturnCode::Ok => {}
             ReturnCode::BufError => {
@@ -2936,7 +2934,7 @@ fn crc32_hash_calc_uninitialized_memory() {
                 stream.next_out = dest.as_mut_ptr();
                 stream.avail_out += add_space;
 
-                let err = unsafe { deflateParams(stream, new_level, config.strategy as _) };
+                let err = { deflateParams(stream, new_level, config.strategy as _) };
                 assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
             }
             err => panic!("fatal {err:?}"),
@@ -2948,7 +2946,7 @@ fn crc32_hash_calc_uninitialized_memory() {
             // Write the chunk.
             let avail = Ord::min(chunk, left);
             stream.avail_in = avail;
-            let err = unsafe { deflate(stream, flush as i32) };
+            let err = { deflate(stream, flush as i32) };
             match ReturnCode::from(err) {
                 ReturnCode::Ok => {
                     left -= avail;
@@ -2978,7 +2976,7 @@ fn crc32_hash_calc_uninitialized_memory() {
 
 #[test]
 fn test_deflate_get_dict() {
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let mut compr = [0u8; 1024];
 
         let mut strm = MaybeUninit::zeroed();
@@ -3033,23 +3031,39 @@ struct GzHeaderData {
     hcrc: i32,
 }
 
-impl GzHeaderData {
-    fn as_gz_header(&mut self) -> libz_sys::gz_header {
-        libz_sys::gz_header {
-            text: self.text,
-            time: self.time,
-            xflags: 0,
-            os: self.os,
-            extra: self.extra.as_mut_ptr(),
-            extra_len: self.extra.len().try_into().unwrap(),
-            extra_max: 0,                              // doesn't matter for writing.
-            name: self.name.as_ptr() as *mut u8, // hack: UB if written to, but we shouldn't write during deflate.
-            name_max: 0,                         // doesn't matter for writing.
-            comment: self.comment.as_ptr() as *mut u8, // hack: UB if written to, but we shouldn't write during deflate.
-            comm_max: 0,                               // doesn't matter for writing.
-            hcrc: self.hcrc,
-            done: 0, // doesn't matter for writing.
+trait GzHeaderFromData {
+    fn from_data(data: &mut GzHeaderData) -> Self;
+}
+
+macro_rules! impl_gz_header_from_data {
+    ($ty:path) => {
+        impl GzHeaderFromData for $ty {
+            fn from_data(data: &mut GzHeaderData) -> Self {
+                Self {
+                    text: data.text,
+                    time: data.time,
+                    xflags: 0,
+                    os: data.os,
+                    extra: data.extra.as_mut_ptr(),
+                    extra_len: data.extra.len().try_into().unwrap(),
+                    extra_max: 0,
+                    name: data.name.as_ptr().cast_mut().cast(),
+                    name_max: 0,
+                    comment: data.comment.as_ptr().cast_mut().cast(),
+                    comm_max: 0,
+                    hcrc: data.hcrc,
+                    done: 0,
+                }
+            }
         }
+    };
+}
+impl_gz_header_from_data!(libz_sys::gz_header);
+impl_gz_header_from_data!(libz_rs_sys::gz_header);
+
+impl GzHeaderData {
+    fn as_gz_header<T: GzHeaderFromData>(&mut self) -> T {
+        T::from_data(self)
     }
 }
 
@@ -3086,7 +3100,7 @@ fn test_gzip_deflate_config() {
 	    },
 	};
 
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let Input {
             ref source,
             config,
@@ -3117,7 +3131,7 @@ fn test_gzip_deflate_config() {
 
         // Build the C header explicitly rather than assuming two independent
         // crate types have interchangeable memory layouts.
-        let mut header = header.as_gz_header();
+        let mut header: gz_header = header.as_gz_header();
         let err = unsafe { deflateSetHeader(streamp, &mut header as gz_headerp) };
         if err != ReturnCode::Ok as i32 {
             // Deallocate, so that we don't trigger ASAN leak detector.

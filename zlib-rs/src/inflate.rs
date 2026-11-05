@@ -1,8 +1,3 @@
-#![expect(
-    non_snake_case,
-    reason = "inflate state mode names preserve the zlib state-machine spellings"
-)]
-
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;

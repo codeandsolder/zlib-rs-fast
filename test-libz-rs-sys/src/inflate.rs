@@ -1101,7 +1101,7 @@ fn hello_world_uncompressed() {
 
 #[test]
 fn copy_direct_from_next_in_to_next_out() {
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let input = [120, 1, 1, 2, 0, 253, 255, 6, 10, 0, 24, 0, 17];
         let output = [6u8, 10];
         let mut dest_vec = vec![0u8; 1 << 16];
@@ -1470,7 +1470,7 @@ fn gzip_header_fields_insufficient_space() {
     let err = unsafe { libz_rs_sys::deflateEnd(stream) };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
         const VERSION: *const c_char = libz_rs_sys::zlibVersion();
@@ -1872,7 +1872,7 @@ fn issue_109() {
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let err = unsafe {
+        let err = {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 window_bits,
@@ -1882,7 +1882,7 @@ fn issue_109() {
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        let stream = unsafe { stream.assume_init_mut() };
+        let stream = { stream.assume_init_mut() };
 
         stream.next_in = input.as_ptr() as *mut u8;
         stream.avail_in = input.len() as _;
@@ -1891,7 +1891,7 @@ fn issue_109() {
             stream.next_out = buf.as_mut_ptr();
             stream.avail_out = buf.len() as _;
 
-            let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+            let err = { inflate(stream, InflateFlush::NoFlush as _) };
 
             if ReturnCode::from(err) == ReturnCode::BufError {
                 output.extend(&buf[..stream.avail_out as usize]);
@@ -1921,7 +1921,7 @@ fn window_match_bug() {
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let err = unsafe {
+        let err = {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 window_bits,
@@ -1931,7 +1931,7 @@ fn window_match_bug() {
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        let stream = unsafe { stream.assume_init_mut() };
+        let stream = { stream.assume_init_mut() };
 
         stream.next_in = input.as_ptr() as *mut u8;
         stream.avail_in = input.len() as _;
@@ -1940,7 +1940,7 @@ fn window_match_bug() {
             stream.next_out = buf.as_mut_ptr();
             stream.avail_out = buf.len() as _;
 
-            let err = unsafe { inflate(stream, InflateFlush::Finish as _) };
+            let err = { inflate(stream, InflateFlush::Finish as _) };
 
             output.extend(&buf[..buf.len() - stream.avail_out as usize]);
 
@@ -1974,7 +1974,7 @@ fn op_len_edge_case() {
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let err = unsafe {
+        let err = {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 window_bits,
@@ -1984,7 +1984,7 @@ fn op_len_edge_case() {
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        let stream = unsafe { stream.assume_init_mut() };
+        let stream = { stream.assume_init_mut() };
 
         stream.next_in = input.as_ptr() as *mut u8;
         stream.avail_in = input.len() as _;
@@ -1993,7 +1993,7 @@ fn op_len_edge_case() {
             stream.next_out = buf.as_mut_ptr();
             stream.avail_out = buf.len() as _;
 
-            let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+            let err = { inflate(stream, InflateFlush::NoFlush as _) };
 
             if ReturnCode::from(err) == ReturnCode::BufError {
                 output.extend(&buf[..stream.avail_out as usize]);
@@ -2187,7 +2187,7 @@ fn header_configured_but_no_gzip() {
     assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let init_err = unsafe { inflateInit2_(stream.as_mut_ptr(), 47, VERSION, STREAM_SIZE) };
+        let init_err = { inflateInit2_(stream.as_mut_ptr(), 47, VERSION, STREAM_SIZE) };
         assert_eq!(init_err, Z_OK);
 
         let stream = stream.assume_init_mut();
@@ -2208,7 +2208,7 @@ fn header_configured_but_no_gzip() {
             done: 123,
         };
 
-        let ret = unsafe { inflateGetHeader(stream, &mut header) };
+        let ret = { inflateGetHeader(stream, &mut header) };
         assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
         stream.avail_in = input.len() as _;
@@ -2218,10 +2218,10 @@ fn header_configured_but_no_gzip() {
         stream.avail_out = out.len() as _;
         stream.next_out = out.as_mut_ptr();
 
-        let ret = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+        let ret = { inflate(stream, InflateFlush::NoFlush as _) };
         assert_eq!(ReturnCode::from(ret), ReturnCode::DataError);
 
-        let ret = unsafe { inflateEnd(stream) };
+        let ret = { inflateEnd(stream) };
         assert_eq!(ret, Z_OK);
 
         // we did set a gzip header, but the data is not gzip.
@@ -2418,7 +2418,7 @@ fn codes_used() {
 
             let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-            let err = unsafe {
+            let err = {
                 inflateInit2_(
                     stream.as_mut_ptr(),
                     16 + 15,
@@ -2428,7 +2428,7 @@ fn codes_used() {
             };
             assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-            let stream = unsafe { stream.assume_init_mut() };
+            let stream = { stream.assume_init_mut() };
             codes_used.push(inflateCodesUsed(stream));
 
             stream.next_out = output.as_mut_ptr();
@@ -2438,7 +2438,7 @@ fn codes_used() {
                 stream.next_in = chunk.as_ptr().cast_mut();
                 stream.avail_in = chunk.len() as _;
 
-                let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+                let err = { inflate(stream, InflateFlush::NoFlush as _) };
                 codes_used.push(inflateCodesUsed(stream));
 
                 if err == ReturnCode::StreamEnd as i32 {
@@ -2465,7 +2465,7 @@ fn test_dict_inflate() {
     let mut dictionary = *b"hello\0";
     let mut hello = *b"hello\0";
 
-    let (compr, dict_id) = assert_eq_rs_ng!(unsafe {
+    let (compr, dict_id) = assert_eq_rs_ng!({
         let mut compr = [0u8; 1024];
 
         let mut strm = MaybeUninit::zeroed();
@@ -2512,7 +2512,7 @@ fn test_dict_inflate() {
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let err = unsafe {
+        let err = {
             inflateInit_(
                 stream.as_mut_ptr(),
                 zlibVersion(),
@@ -2533,7 +2533,7 @@ fn test_dict_inflate() {
         let mut check_dictionary = [0i8; MAX_DICTIONARY_SIZE];
 
         loop {
-            let mut err = unsafe { inflate(d_stream, Z_NO_FLUSH) };
+            let mut err = { inflate(d_stream, Z_NO_FLUSH) };
 
             if err == Z_STREAM_END {
                 break;
@@ -2543,7 +2543,7 @@ fn test_dict_inflate() {
                 if d_stream.adler != dict_id {
                     panic!("unexpected dictionary");
                 }
-                err = unsafe {
+                err = {
                     inflateSetDictionary(d_stream, dictionary.as_mut_ptr(), dictionary.len() as _)
                 };
             }
@@ -2552,16 +2552,15 @@ fn test_dict_inflate() {
         }
 
         let mut check_dictionary_len = 0;
-        let err = unsafe {
-            inflateGetDictionary(d_stream, core::ptr::null_mut(), &mut check_dictionary_len)
-        };
+        let err =
+            { inflateGetDictionary(d_stream, core::ptr::null_mut(), &mut check_dictionary_len) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         if (check_dictionary_len as usize) < dictionary.len() {
             panic!("bad dictionary length");
         }
 
-        let err = unsafe {
+        let err = {
             inflateGetDictionary(
                 d_stream,
                 check_dictionary.as_mut_ptr().cast(),
@@ -2575,7 +2574,7 @@ fn test_dict_inflate() {
             &check_dictionary.map(|c| c as u8)[..dictionary.len()]
         );
 
-        let err = unsafe { inflateEnd(d_stream) };
+        let err = { inflateEnd(d_stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         assert_eq!(uncompr[..hello.len()], hello);
@@ -2901,7 +2900,7 @@ fn done_state_returns_stream_end() {
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let ret = unsafe {
+        let ret = {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 15 + 16,
@@ -2920,7 +2919,7 @@ fn done_state_returns_stream_end() {
         stream.next_out = out.as_mut_ptr();
 
         // The mode will be Mode::Done at this point.
-        assert_eq!(unsafe { inflate(stream, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!({ inflate(stream, Z_NO_FLUSH) }, Z_STREAM_END);
 
         // A second call to inflate returns StreamEnd
         stream.avail_in = input.len() as _;
@@ -2928,9 +2927,11 @@ fn done_state_returns_stream_end() {
         stream.avail_out = out.len() as _;
         stream.next_out = out.as_mut_ptr();
 
-        assert_eq!(unsafe { inflate(stream, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!({ inflate(stream, Z_FINISH) }, Z_STREAM_END);
 
-        unsafe { inflateEnd(stream) }
+        {
+            inflateEnd(stream)
+        }
     });
 }
 
@@ -2969,7 +2970,7 @@ fn inflate_copy_after_half_input() {
 
     let _ = assert_eq_rs_ng!(unsafe {
         let mut stream = MaybeUninit::<z_stream>::zeroed();
-        let ret = unsafe {
+        let ret = {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 16 + 15,
@@ -2991,7 +2992,7 @@ fn inflate_copy_after_half_input() {
         stream.avail_out = out.len() as _;
 
         loop {
-            let ret = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+            let ret = { inflate(stream, InflateFlush::NoFlush as _) };
 
             assert!(
                 matches!(ret, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
@@ -3017,7 +3018,7 @@ fn inflate_copy_after_half_input() {
 
         // Make a copy of the inflate state *after* half the input has been processed.
         let mut copy = MaybeUninit::<z_stream>::zeroed();
-        let ret = unsafe { inflateCopy(copy.as_mut_ptr(), stream) };
+        let ret = { inflateCopy(copy.as_mut_ptr(), stream) };
         let copy = copy.assume_init_mut();
         assert_eq!(ret, Z_OK);
 
@@ -3027,13 +3028,13 @@ fn inflate_copy_after_half_input() {
 
         // The original stream already has next_out pointing at out[prefix_len].
         // For the copy, we need to point it at the corresponding location in out_copy.
-        copy.next_out = unsafe { out_copy.as_mut_ptr().add(prefix_len) };
+        copy.next_out = { out_copy.as_mut_ptr().add(prefix_len) };
         copy.avail_out = (out_copy.len() - prefix_len) as _;
 
         // Now feed the *remainder* of the compressed input to both streams.
         let remaining = input.len() - half;
         if remaining > 0 {
-            stream.next_in = unsafe { input.as_ptr().add(half) as *mut _ };
+            stream.next_in = { input.as_ptr().add(half) as *mut _ };
             stream.avail_in = remaining as _;
 
             copy.next_in = stream.next_in;
@@ -3042,8 +3043,8 @@ fn inflate_copy_after_half_input() {
 
         // Decompress the remainder in lockstep on both the original and the copy.
         loop {
-            let ret1 = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
-            let ret2 = unsafe { inflate(copy, InflateFlush::NoFlush as _) };
+            let ret1 = { inflate(stream, InflateFlush::NoFlush as _) };
+            let ret2 = { inflate(copy, InflateFlush::NoFlush as _) };
 
             // Both streams should behave identically
             assert_eq!(ret1, ret2);
@@ -3069,8 +3070,8 @@ fn inflate_copy_after_half_input() {
             }
         }
 
-        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
-        assert_eq!(unsafe { inflateEnd(copy) }, Z_OK);
+        assert_eq!({ inflateEnd(stream) }, Z_OK);
+        assert_eq!({ inflateEnd(copy) }, Z_OK);
 
         let total = stream.total_out as usize;
         assert_eq!(total, copy.total_out as usize);

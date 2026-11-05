@@ -2528,6 +2528,7 @@ fn gen_bitlen<const N: usize>(
 }
 
 /// Checks that symbol is a printing character (excluding space)
+#[cfg(feature = "ZLIB_DEBUG")]
 fn isgraph(c: u8) -> bool {
     (c > 0x20) && (c <= 0x7E)
 }

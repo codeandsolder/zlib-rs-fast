@@ -2776,7 +2776,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
     state.seek = false;
 
     // If we are reading non-compressed content, just lseek to the right location.
-    if state.mode == GZ_READ && state.how == How::Copy && state.pos + offset >= 0 {
+    if state.mode == Read && state.how == How::Copy && state.pos + offset >= 0 {
         let ret = lseek64(
             state.fd,
             offset as z_off64_t - state.have as z_off64_t,

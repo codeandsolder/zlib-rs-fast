@@ -91,16 +91,16 @@ pub mod ng_ffi {
 #[cfg(test)]
 #[macro_export]
 macro_rules! assert_eq_rs_ng {
-    ($tt:expr) => {{
+    ($ng:expr, $rs:expr) => {{
         #[cfg(not(miri))]
         let _ng = {
             use $crate::ng_ffi::*;
-            $tt
+            $ng
         };
 
         let _rs = {
             use libz_rs_sys::*;
-            $tt
+            $rs
         };
 
         #[cfg(not(miri))]
@@ -108,6 +108,9 @@ macro_rules! assert_eq_rs_ng {
 
         _rs
     }};
+    ($both:expr) => {
+        $crate::assert_eq_rs_ng!($both, $both)
+    };
 }
 
 /// a bit of a sanity check that nothing weird happened with symbol resolution
@@ -163,29 +166,39 @@ mod null {
 
     #[test]
     fn adler() {
-        assert_eq_rs_ng!({ adler32(0, core::ptr::null(), 0) });
-        assert_eq_rs_ng!({ adler32(1, core::ptr::null(), 0) });
-        assert_eq_rs_ng!({ adler32(2, core::ptr::null(), 32) });
+        assert_eq_rs_ng!(unsafe { adler32(0, core::ptr::null(), 0) });
+        assert_eq_rs_ng!(unsafe { adler32(1, core::ptr::null(), 0) });
+        assert_eq_rs_ng!(unsafe { adler32(2, core::ptr::null(), 32) });
     }
 
     #[test]
     fn adler32_combine_negative() {
-        assert_eq_rs_ng!({ adler32_combine(0, 123, 16) });
-        assert_eq_rs_ng!({ adler32_combine(1, 123, 16) });
-        assert_eq_rs_ng!({ adler32_combine(2, 123, -16) });
+        assert_eq_rs_ng!(unsafe { adler32_combine(0, 123, 16) }, {
+            adler32_combine(0, 123, 16)
+        });
+        assert_eq_rs_ng!(unsafe { adler32_combine(1, 123, 16) }, {
+            adler32_combine(1, 123, 16)
+        });
+        assert_eq_rs_ng!(unsafe { adler32_combine(2, 123, -16) }, {
+            adler32_combine(2, 123, -16)
+        });
     }
 
     #[test]
     fn crc32() {
-        assert_eq_rs_ng!({ crc32(0, core::ptr::null(), 0) });
-        assert_eq_rs_ng!({ crc32(1, core::ptr::null(), 0) });
-        assert_eq_rs_ng!({ crc32(2, core::ptr::null(), 32) });
+        assert_eq_rs_ng!(unsafe { crc32(0, core::ptr::null(), 0) });
+        assert_eq_rs_ng!(unsafe { crc32(1, core::ptr::null(), 0) });
+        assert_eq_rs_ng!(unsafe { crc32(2, core::ptr::null(), 32) });
     }
 
     #[test]
     fn crc32_combine_negative() {
-        assert_eq_rs_ng!({ crc32_combine(0, 123, 16) });
-        assert_eq_rs_ng!({ crc32_combine(1, 123, 16) });
+        assert_eq_rs_ng!(unsafe { crc32_combine(0, 123, 16) }, {
+            crc32_combine(0, 123, 16)
+        });
+        assert_eq_rs_ng!(unsafe { crc32_combine(1, 123, 16) }, {
+            crc32_combine(1, 123, 16)
+        });
 
         // interestingly, stock zlib just loops infinitely for this input
         // assert_eq_rs_ng!({ crc32_combine(2, 123, -16) });
@@ -205,7 +218,7 @@ mod null {
 
             let buf_size = Ord::max(buf_len, 1) as usize;
 
-            assert_eq_rs_ng!({
+            assert_eq_rs_ng!(unsafe {
                 let crc0 = 0;
                 let mut crc1 = crc0;
                 let mut crc2 = crc0;
@@ -248,7 +261,7 @@ mod null {
         let mut dest = [0; 64];
         let source = [1, 2, 3];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             uncompress(
                 dest.as_mut_ptr(),
                 &mut (dest.len() as _),
@@ -270,7 +283,7 @@ mod null {
             libz_rs_sys::Z_STREAM_ERROR
         );
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             uncompress(
                 core::ptr::null_mut(),
                 &mut (dest.len() as _),
@@ -279,7 +292,7 @@ mod null {
             )
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             uncompress(
                 dest.as_mut_ptr(),
                 &mut (dest.len() as _),
@@ -288,7 +301,7 @@ mod null {
             )
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             uncompress(
                 core::ptr::null_mut(),
                 &mut (dest.len() as _),
@@ -322,7 +335,7 @@ mod null {
         let dest = [0; 64];
         let source = [1, 2, 3];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             compress(
                 core::ptr::null_mut(),
                 &mut (dest.len() as _),
@@ -337,7 +350,7 @@ mod null {
         let mut dest = [0; 64];
         let source = [1, 2, 3];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             compress(
                 dest.as_mut_ptr(),
                 &mut (dest.len() as _),
@@ -352,7 +365,7 @@ mod null {
         let dest = [0; 64];
         let source = [1, 2, 3];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             compress(
                 core::ptr::null_mut(),
                 &mut (dest.len() as _),
@@ -364,7 +377,7 @@ mod null {
 
     #[test]
     fn inflate_init() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             inflateInit_(
                 core::ptr::null_mut(),
                 zlibVersion(),
@@ -372,7 +385,7 @@ mod null {
             )
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateInit_(
                 strm.as_mut_ptr(),
@@ -384,7 +397,7 @@ mod null {
 
     #[test]
     fn inflate_init2() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             inflateInit2_(
                 core::ptr::null_mut(),
                 15,
@@ -393,7 +406,7 @@ mod null {
             )
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateInit2_(
                 strm.as_mut_ptr(),
@@ -406,13 +419,13 @@ mod null {
 
     #[test]
     fn inflate() {
-        assert_eq_rs_ng!({ inflate(core::ptr::null_mut(), Z_NO_FLUSH) });
+        assert_eq_rs_ng!(unsafe { inflate(core::ptr::null_mut(), Z_NO_FLUSH) });
     }
 
     #[test]
     fn inflate_end() {
-        assert_eq_rs_ng!({ inflateEnd(core::ptr::null_mut()) });
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe { inflateEnd(core::ptr::null_mut()) });
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateEnd(strm.as_mut_ptr())
         });
@@ -457,11 +470,11 @@ mod null {
 
     #[test]
     fn inflate_copy() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateCopy(core::ptr::null_mut(), strm.as_mut_ptr())
         });
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateCopy(strm.as_mut_ptr(), core::ptr::null_mut())
         });
@@ -469,7 +482,7 @@ mod null {
 
     #[test]
     fn inflate_get_header() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             let mut head = MaybeUninit::<gz_header>::zeroed();
 
@@ -509,7 +522,7 @@ mod null {
             ..Default::default()
         };
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut extra = *b"banana\0";
             let mut name = *b"apple\0";
             let mut comment = *b"pear\0";
@@ -566,7 +579,7 @@ mod null {
             assert_eq!(&buf[..strm.total_out as usize], FERRIS_BYTES_GZ_WITH_HEADER);
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             fn initialize_header_null() -> MaybeUninit<gz_header> {
@@ -766,30 +779,30 @@ mod null {
 
     #[test]
     fn inflate_mark() {
-        assert_eq_rs_ng!({ inflateMark(core::ptr::null_mut()) });
+        assert_eq_rs_ng!(unsafe { inflateMark(core::ptr::null_mut()) });
     }
 
     #[test]
     fn inflate_prime() {
-        assert_eq_rs_ng!({ inflatePrime(core::ptr::null_mut(), 1, 2) });
+        assert_eq_rs_ng!(unsafe { inflatePrime(core::ptr::null_mut(), 1, 2) });
     }
 
     #[test]
     fn inflate_reset() {
-        assert_eq_rs_ng!({ inflateReset(core::ptr::null_mut()) });
-        assert_eq_rs_ng!({ inflateReset2(core::ptr::null_mut(), 10) });
+        assert_eq_rs_ng!(unsafe { inflateReset(core::ptr::null_mut()) });
+        assert_eq_rs_ng!(unsafe { inflateReset2(core::ptr::null_mut(), 10) });
     }
 
     #[test]
     fn inflate_set_dictionary() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateInit_(
                 strm.as_mut_ptr(),
                 zlibVersion(),
                 core::mem::size_of::<z_stream>() as _,
             );
-            let strm = unsafe { strm.assume_init_mut() };
+            let strm = { strm.assume_init_mut() };
 
             let dictionary = b"foobarbaz";
 
@@ -809,14 +822,14 @@ mod null {
 
     #[test]
     fn inflate_empty_input_preserves_null_next_in() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             let init = inflateInit_(
                 strm.as_mut_ptr(),
                 zlibVersion(),
                 core::mem::size_of::<z_stream>() as _,
             );
-            let strm = unsafe { strm.assume_init_mut() };
+            let strm = { strm.assume_init_mut() };
             let mut output = [0u8; 1];
             strm.next_in = core::ptr::null_mut();
             strm.avail_in = 0;
@@ -832,19 +845,19 @@ mod null {
 
     #[test]
     fn inflate_sync() {
-        assert_eq_rs_ng!({ inflateSync(core::ptr::null_mut()) });
+        assert_eq_rs_ng!(unsafe { inflateSync(core::ptr::null_mut()) });
     }
 
     #[test]
     fn inflate_sync_discards_partial_reservoir_bits() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             let init = inflateInit_(
                 strm.as_mut_ptr(),
                 zlibVersion(),
                 core::mem::size_of::<z_stream>() as _,
             );
-            let strm = unsafe { strm.assume_init_mut() };
+            let strm = { strm.assume_init_mut() };
             let prime_partial = inflatePrime(strm, 3, 0b101);
             let prime_zeros = inflatePrime(strm, 16, 0);
             let mut input = [0xffu8, 0xff];
@@ -858,14 +871,14 @@ mod null {
 
     #[test]
     fn inflate_sync_allows_null_for_empty_input_with_buffered_bits() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             let init = inflateInit_(
                 strm.as_mut_ptr(),
                 zlibVersion(),
                 core::mem::size_of::<z_stream>() as _,
             );
-            let strm = unsafe { strm.assume_init_mut() };
+            let strm = { strm.assume_init_mut() };
             let prime = inflatePrime(strm, 16, 0);
             strm.next_in = core::ptr::null_mut();
             strm.avail_in = 0;
@@ -894,7 +907,7 @@ mod null {
 
     #[test]
     fn deflate_init() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             deflateInit_(
                 core::ptr::null_mut(),
                 6,
@@ -903,7 +916,7 @@ mod null {
             )
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             deflateInit_(
                 strm.as_mut_ptr(),
@@ -916,13 +929,13 @@ mod null {
 
     #[test]
     fn deflate() {
-        assert_eq_rs_ng!({ deflate(core::ptr::null_mut(), Z_NO_FLUSH) });
+        assert_eq_rs_ng!(unsafe { deflate(core::ptr::null_mut(), Z_NO_FLUSH) });
     }
 
     #[test]
     fn deflate_end() {
-        assert_eq_rs_ng!({ deflateEnd(core::ptr::null_mut()) });
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe { deflateEnd(core::ptr::null_mut()) });
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             deflateEnd(strm.as_mut_ptr())
         });
@@ -930,11 +943,11 @@ mod null {
 
     #[test]
     fn deflate_copy() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             deflateCopy(core::ptr::null_mut(), strm.as_mut_ptr())
         });
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             deflateCopy(strm.as_mut_ptr(), core::ptr::null_mut())
         });
@@ -946,7 +959,7 @@ mod null {
         ignore = "we don't support DFLTCC, which changes the bounds in zlib-ng"
     )]
     fn deflate_bound() {
-        assert_eq_rs_ng!({ deflateBound(core::ptr::null_mut(), 1024) });
+        assert_eq_rs_ng!(unsafe { deflateBound(core::ptr::null_mut(), 1024) });
 
         unsafe {
             assert_eq!(
@@ -958,9 +971,9 @@ mod null {
 
     #[test]
     fn deflate_params() {
-        assert_eq_rs_ng!({ deflateParams(core::ptr::null_mut(), 6, 0) });
+        assert_eq_rs_ng!(unsafe { deflateParams(core::ptr::null_mut(), 6, 0) });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             deflateInit_(
                 strm.as_mut_ptr(),
@@ -981,18 +994,18 @@ mod null {
 
     #[test]
     fn deflate_tune() {
-        assert_eq_rs_ng!({ deflateTune(core::ptr::null_mut(), 1, 2, 3, 4) });
+        assert_eq_rs_ng!(unsafe { deflateTune(core::ptr::null_mut(), 1, 2, 3, 4) });
     }
 
     #[test]
     fn deflate_set_header() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut head = MaybeUninit::<gz_header>::zeroed();
 
             deflateSetHeader(core::ptr::null_mut(), head.as_mut_ptr())
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             deflateInit_(
@@ -1014,7 +1027,7 @@ mod null {
     fn deflate_set_dictionary() {
         let dictionary = b"foobarbaz";
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             deflateSetDictionary(
                 core::ptr::null_mut(),
                 dictionary.as_ptr(),
@@ -1022,7 +1035,7 @@ mod null {
             )
         });
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             deflateInit_(
                 strm.as_mut_ptr(),
@@ -1030,7 +1043,7 @@ mod null {
                 zlibVersion(),
                 core::mem::size_of::<z_stream>() as _,
             );
-            let strm = unsafe { strm.assume_init_mut() };
+            let strm = { strm.assume_init_mut() };
 
             let a = deflateSetDictionary(strm, core::ptr::null(), dictionary.len() as _);
             let b = deflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
@@ -1043,12 +1056,12 @@ mod null {
 
     #[test]
     fn deflate_reset() {
-        assert_eq_rs_ng!({ deflateReset(core::ptr::null_mut()) });
+        assert_eq_rs_ng!(unsafe { deflateReset(core::ptr::null_mut()) });
     }
 
     #[test]
     fn deflate_prime() {
-        assert_eq_rs_ng!({ deflatePrime(core::ptr::null_mut(), 1, 2) });
+        assert_eq_rs_ng!(unsafe { deflatePrime(core::ptr::null_mut(), 1, 2) });
     }
 
     #[test]
@@ -1092,7 +1105,7 @@ mod null {
         let input = b"Ferris";
         let mut buf = [0; 64];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             let err = deflateInit_(
@@ -1125,7 +1138,7 @@ mod null {
 
     #[test]
     fn inflate_reset_after_inflate() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             let err = inflateInit_(
@@ -1354,12 +1367,12 @@ mod coverage {
     #[test]
     fn adler32() {
         let input = [1, 2, 3, 4];
-        assert_eq_rs_ng!({ adler32(0, input.as_ptr(), input.len() as _) });
+        assert_eq_rs_ng!(unsafe { adler32(0, input.as_ptr(), input.len() as _) });
     }
 
     #[test]
     fn deflate_init2_() {
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::zeroed();
 
             let a = deflateInit2_(
@@ -1379,7 +1392,7 @@ mod coverage {
         });
 
         // invalid method
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::zeroed();
 
             deflateInit2_(
@@ -1395,7 +1408,7 @@ mod coverage {
         });
 
         // invalid strategy
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::zeroed();
 
             deflateInit2_(
@@ -1411,7 +1424,7 @@ mod coverage {
         });
 
         // configure an explicit allocator
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             core::ptr::write(
@@ -1472,7 +1485,7 @@ mod coverage {
         let input = b"Ferris";
         let mut buf = [0; 64];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut dest_len = buf.len() as _;
             buf.fill(0);
             let err = compress2(
@@ -1492,7 +1505,7 @@ mod coverage {
         let input = b"Ferris";
         let mut buf = [0; 64];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             let err = deflateInit_(
@@ -1525,7 +1538,7 @@ mod coverage {
         let input = b"Ferris";
         let mut buf = [0; 5];
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             let err = deflateInit_(
@@ -1559,7 +1572,7 @@ mod coverage {
     fn deflate_reset_after_deflate() {
         let input = b"Ferris";
 
-        assert_eq_rs_ng!({
+        assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             let err = deflateInit_(
@@ -1905,9 +1918,9 @@ fn deflate_stored_window_out_of_bounds() {
     ]
     .to_vec();
 
-    assert_eq_rs_ng!({
+    assert_eq_rs_ng!(unsafe {
         let mut strm = std::mem::MaybeUninit::<z_stream>::zeroed();
-        let err = unsafe {
+        let err = {
             deflateInit2_(
                 strm.as_mut_ptr(),
                 0,
@@ -1923,7 +1936,7 @@ fn deflate_stored_window_out_of_bounds() {
 
         let strm = strm.assume_init_mut();
 
-        let buf_size = unsafe { deflateBound(strm, source.len() as _) };
+        let buf_size = { deflateBound(strm, source.len() as _) };
 
         let mut dest = vec![0; buf_size as usize];
         let chunk = 305u32;
@@ -1935,13 +1948,13 @@ fn deflate_stored_window_out_of_bounds() {
         strm.avail_out = dest.len().try_into().unwrap();
 
         // Deflate first chunk.
-        let err = unsafe { deflate(strm, flush) };
+        let err = { deflate(strm, flush) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         // Change the parameters.
         let new_level = 0;
         let new_strategy = Z_DEFAULT_STRATEGY;
-        let err = unsafe { deflateParams(strm, new_level, new_strategy) };
+        let err = { deflateParams(strm, new_level, new_strategy) };
         match ReturnCode::from(err) {
             ReturnCode::Ok => {}
             ReturnCode::BufError => {
@@ -1954,7 +1967,7 @@ fn deflate_stored_window_out_of_bounds() {
                 strm.next_out = dest.as_mut_ptr();
                 strm.avail_out += add_space;
 
-                let err = unsafe { deflateParams(strm, new_level, new_strategy) };
+                let err = { deflateParams(strm, new_level, new_strategy) };
                 assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
             }
             err => panic!("fatal {err:?}"),
@@ -1966,7 +1979,7 @@ fn deflate_stored_window_out_of_bounds() {
             // Write the chunk.
             let avail = Ord::min(chunk, left);
             strm.avail_in = avail;
-            let err = unsafe { deflate(strm, flush) };
+            let err = { deflate(strm, flush) };
             match ReturnCode::from(err) {
                 ReturnCode::Ok => {
                     left -= avail;
@@ -1988,15 +2001,15 @@ fn deflate_stored_window_out_of_bounds() {
 
         assert_eq!(left, 0);
 
-        let _ = unsafe { deflateEnd(strm) };
+        let _ = { deflateEnd(strm) };
     });
 }
 
 #[test]
 fn test_crc32_z() {
-    assert_eq_rs_ng!({ crc32_z(0, core::ptr::null(), 0) });
-    assert_eq_rs_ng!({ crc32_z(1, core::ptr::null(), 0) });
-    assert_eq_rs_ng!({ crc32_z(2, core::ptr::null(), 32) });
+    assert_eq_rs_ng!(unsafe { crc32_z(0, core::ptr::null(), 0) });
+    assert_eq_rs_ng!(unsafe { crc32_z(1, core::ptr::null(), 0) });
+    assert_eq_rs_ng!(unsafe { crc32_z(2, core::ptr::null(), 32) });
 }
 
 #[test]
@@ -2006,20 +2019,28 @@ fn test_crc32_combine64() {
     let a = 0x98AB_CDEF;
     let b = 0x1234_5678;
 
-    assert_eq_rs_ng!({ crc32_combine64(a, b, 0 as z_off64_t) });
-    assert_eq_rs_ng!({ crc32_combine64(a, b, 32 as z_off64_t) });
-    assert_eq_rs_ng!({ crc32_combine64(a, b, i32::MAX as z_off64_t) });
+    assert_eq_rs_ng!(unsafe { crc32_combine64(a, b, 0 as z_off64_t) }, {
+        crc32_combine64(a, b, 0 as z_off64_t)
+    });
+    assert_eq_rs_ng!(unsafe { crc32_combine64(a, b, 32 as z_off64_t) }, {
+        crc32_combine64(a, b, 32 as z_off64_t)
+    });
+    assert_eq_rs_ng!(unsafe { crc32_combine64(a, b, i32::MAX as z_off64_t) }, {
+        crc32_combine64(a, b, i32::MAX as z_off64_t)
+    });
 
     if core::mem::size_of::<z_off64_t>() == 8 {
-        assert_eq_rs_ng!({ crc32_combine64(a, b, i64::MAX as z_off64_t) });
+        assert_eq_rs_ng!(unsafe { crc32_combine64(a, b, i64::MAX as z_off64_t) }, {
+            crc32_combine64(a, b, i64::MAX as z_off64_t)
+        });
     }
 }
 
 #[test]
 fn test_adler32_z() {
-    assert_eq_rs_ng!({ adler32_z(0, core::ptr::null(), 0) });
-    assert_eq_rs_ng!({ adler32_z(1, core::ptr::null(), 0) });
-    assert_eq_rs_ng!({ adler32_z(2, core::ptr::null(), 32) });
+    assert_eq_rs_ng!(unsafe { adler32_z(0, core::ptr::null(), 0) });
+    assert_eq_rs_ng!(unsafe { adler32_z(1, core::ptr::null(), 0) });
+    assert_eq_rs_ng!(unsafe { adler32_z(2, core::ptr::null(), 32) });
 }
 
 #[test]
@@ -2029,13 +2050,21 @@ fn test_adler32_combine64() {
     let a = 0x98AB_CDEF;
     let b = 0x1234_5678;
 
-    assert_eq_rs_ng!({ adler32_combine64(a, b, -1 as z_off64_t) });
-    assert_eq_rs_ng!({ adler32_combine64(a, b, 0 as z_off64_t) });
-    assert_eq_rs_ng!({ adler32_combine64(a, b, 32 as z_off64_t) });
-    assert_eq_rs_ng!({ adler32_combine64(a, b, i64::MAX as z_off64_t) });
+    assert_eq_rs_ng!(unsafe { adler32_combine64(a, b, -1 as z_off64_t) }, {
+        adler32_combine64(a, b, -1 as z_off64_t)
+    });
+    assert_eq_rs_ng!(unsafe { adler32_combine64(a, b, 0 as z_off64_t) }, {
+        adler32_combine64(a, b, 0 as z_off64_t)
+    });
+    assert_eq_rs_ng!(unsafe { adler32_combine64(a, b, 32 as z_off64_t) }, {
+        adler32_combine64(a, b, 32 as z_off64_t)
+    });
+    assert_eq_rs_ng!(unsafe { adler32_combine64(a, b, i64::MAX as z_off64_t) }, {
+        adler32_combine64(a, b, i64::MAX as z_off64_t)
+    });
 }
 
 #[test]
 fn test_get_crc_table() {
-    assert_eq_rs_ng!({ get_crc_table().read() });
+    assert_eq_rs_ng!(unsafe { get_crc_table().read() });
 }
