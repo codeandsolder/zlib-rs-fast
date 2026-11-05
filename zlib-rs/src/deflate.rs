@@ -3571,7 +3571,8 @@ fn compress_into<O: WritableBytes + ?Sized>(
 /// Returns the upper bound on the compressed size for an input of `source_len` bytes.
 ///
 /// When compression has this much space available, it will never fail because of insufficient
-/// output space.
+/// output space. Returns `usize::MAX` if the mathematical bound cannot be represented
+/// as `usize`; no finite output slice can satisfy that bound.
 ///
 /// # Example
 ///
@@ -3587,7 +3588,27 @@ fn compress_into<O: WritableBytes + ?Sized>(
 /// let (compressed, rc) = compress_slice(&mut buf, input, DeflateConfig::default());
 /// # }
 /// ```
+#[must_use]
 pub const fn compress_bound(source_len: usize) -> usize {
+    // div_ceil avoids the overflow in (source_len + 7) / 8; saturating additions
+    // avoid understating bounds that cannot fit in usize.
+    let quick_overhead = source_len.div_ceil(8);
+
+    source_len
+        .saturating_add(if source_len == 0 { 1 } else { 0 })
+        .saturating_add(if source_len < 9 { 1 } else { 0 })
+        .saturating_add(quick_overhead)
+        .saturating_add(DEFLATE_BLOCK_OVERHEAD)
+        .saturating_add(ZLIB_WRAPLEN)
+}
+
+/// zlib-ng-compatible C ABI bound, including its unsigned wrapping semantics.
+///
+/// C callers already observe the original zlib-ng integer behavior at extreme
+/// lengths; the Rust-facing `compress_bound` instead supplies a true saturating
+/// upper bound. This function intentionally stays separate from that safe API.
+#[must_use]
+pub const fn compress_bound_abi(source_len: usize) -> usize {
     compress_bound_help(source_len, ZLIB_WRAPLEN)
 }
 
@@ -4209,6 +4230,33 @@ mod test {
     use super::*;
 
     use core::{ffi::CStr, sync::atomic::AtomicUsize};
+
+    #[test]
+    fn compress_bound_never_wraps_below_its_input_length() {
+        // No allocation: these are mathematical length queries only.
+        let cases = [
+            0,
+            1,
+            8,
+            9,
+            1_024,
+            usize::MAX / 9,
+            usize::MAX / 2,
+            usize::MAX - 64,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
+        for n in cases {
+            let bound = compress_bound(n);
+            assert!(bound >= n, "bound wrapped for source length {n}");
+        }
+        assert_eq!(compress_bound(usize::MAX), usize::MAX);
+
+        // Existing zlib-sized requests keep exactly their historical bound.
+        for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
+            assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
 
     #[test]
     fn detect_data_type_basic() {

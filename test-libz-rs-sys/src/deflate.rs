@@ -802,6 +802,32 @@ fn test_compress_bound() {
 }
 
 #[test]
+#[cfg_attr(
+    target_endian = "big",
+    ignore = "architecture-specific deflate bounds diverge from zlib-ng"
+)]
+fn test_compress_bound_extreme_c_abi_matches_zlib_ng() {
+    let samples = [
+        0,
+        9,
+        c_ulong::from(u32::MAX - 6),
+        c_ulong::MAX / 9,
+        c_ulong::MAX - 64,
+        c_ulong::MAX,
+    ];
+    for len in samples {
+        // SAFETY: zlib-ng's compressBound takes a by-value integer and accesses no buffers.
+        assert_eq_rs_ng!(unsafe { compressBound(len) }, compressBound(len));
+        // The C ABI deliberately narrows by wrapping, not by saturating. On Windows x64,
+        // c_ulong is 32-bit even though compressBound_z takes a 64-bit usize.
+        assert_eq!(
+            libz_rs_sys::compressBound(len),
+            libz_rs_sys::compressBound_z(len as usize) as c_ulong,
+        );
+    }
+}
+
+#[test]
 fn test_compress_param() {
     let config = DeflateConfig::new(2);
 
