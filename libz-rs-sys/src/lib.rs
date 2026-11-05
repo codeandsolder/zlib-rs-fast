@@ -1160,9 +1160,16 @@ pub unsafe extern "C" fn inflateSetDictionary(
         return ReturnCode::StreamError as _;
     };
 
-    let dict = match dictLength {
-        0 => &[],
-        _ => unsafe { slice_from_raw_parts(dictionary, dictLength as usize) }.unwrap_or(&[]),
+    // A nonzero dictionary length requires a readable backing buffer. In
+    // particular, never silently reinterpret (NULL, nonzero) as an empty
+    // dictionary in raw mode, where that would otherwise return success.
+    let dict = if dictLength == 0 {
+        &[][..]
+    } else {
+        let Some(dict) = (unsafe { slice_from_raw_parts(dictionary, dictLength as usize) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        dict
     };
 
     zlib_rs::inflate::set_dictionary(stream, dict) as _

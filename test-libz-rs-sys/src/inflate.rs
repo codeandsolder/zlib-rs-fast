@@ -446,6 +446,74 @@ fn support() {
 }
 
 #[test]
+fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
+    use libz_rs_sys::*;
+
+    let mut raw = MaybeUninit::<z_stream>::zeroed();
+    // SAFETY: this is the correct ABI version and stream size; -15 enables raw DEFLATE.
+    assert_eq!(
+        unsafe {
+            inflateInit2_(
+                raw.as_mut_ptr(),
+                -15,
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        },
+        Z_OK,
+    );
+    // SAFETY: initialization succeeded.
+    let stream = unsafe { raw.assume_init_mut() };
+    let mut length_before = 0;
+    // SAFETY: the initialized stream and length output are valid; NULL dictionary means query.
+    assert_eq!(
+        unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &mut length_before) },
+        Z_OK,
+    );
+    assert_eq!(length_before, 0);
+    // SAFETY: NULL is a documented possible pointer, and the wrapper must reject
+    // a nonzero length before attempting to materialize or dereference any slice.
+    assert_eq!(
+        unsafe { inflateSetDictionary(stream, core::ptr::null(), 1) },
+        Z_STREAM_ERROR,
+    );
+    let mut length_after = 0;
+    // SAFETY: initialized stream and length output remain valid.
+    assert_eq!(
+        unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &mut length_after) },
+        Z_OK,
+    );
+    assert_eq!(length_after, length_before);
+    // SAFETY: zero-length input does not require a backing dictionary buffer.
+    assert_eq!(
+        unsafe { inflateSetDictionary(stream, core::ptr::null(), 0) },
+        Z_OK,
+    );
+    let valid = b"raw dictionary history";
+    // SAFETY: valid is readable and remains live for the duration of the call.
+    assert_eq!(
+        unsafe {
+            inflateSetDictionary(
+                stream,
+                valid.as_ptr(),
+                c_uint::try_from(valid.len()).unwrap_or(c_uint::MAX),
+            )
+        },
+        Z_OK,
+    );
+    let mut recovered = [0u8; 64];
+    // SAFETY: a valid output span is provided; recovered is sufficiently large.
+    assert_eq!(
+        unsafe { inflateGetDictionary(stream, recovered.as_mut_ptr(), &mut length_after) },
+        Z_OK,
+    );
+    assert_eq!(usize::try_from(length_after).ok(), Some(valid.len()));
+    assert_eq!(&recovered[..valid.len()], valid);
+    // SAFETY: end the initialized stream exactly once.
+    assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+}
+
+#[test]
 fn force_window_allocation() {
     inf(&[0x63, 0x00], "force window allocation", 0, -15, 1, Z_OK);
 }
