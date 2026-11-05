@@ -362,7 +362,8 @@ impl OutputCursor {
         debug_assert!(len <= self.avail_out as usize);
         self.next_out = self.next_out.wrapping_add(len);
         self.avail_out -= len as crate::c_api::uInt;
-        self.total_out += len as crate::c_api::z_size;
+        // The public zlib total_out is an unsigned C counter and wraps at its ABI width.
+        self.total_out = self.total_out.wrapping_add(len as crate::c_api::z_size);
     }
 }
 
@@ -4256,6 +4257,29 @@ mod test {
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
         }
+    }
+
+    #[test]
+    fn deflate_total_out_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let mut output = [0u8; 128];
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized deflate stream was not usable")?;
+        stream.total_out = crate::c_api::z_size::MAX - 1;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = 128; // Fixed-size output array.
+
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let written = output.len() - stream.avail_out as usize;
+        assert!(written >= 8);
+        assert_eq!(
+            stream.total_out,
+            (crate::c_api::z_size::MAX - 1).wrapping_add(written as crate::c_api::z_size)
+        );
+        assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]

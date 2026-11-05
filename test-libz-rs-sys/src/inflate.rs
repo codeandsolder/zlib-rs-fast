@@ -1368,6 +1368,69 @@ fn inflate_window_bits_0_is_15() {
 }
 
 #[test]
+fn inflate_total_in_counter_wraps_as_c_unsigned_long() {
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: initialize the zlib stream with the matching ABI struct size and version.
+        assert_eq!(
+            unsafe {
+                inflateInit_(
+                    raw.as_mut_ptr(),
+                    zlibVersion(),
+                    core::mem::size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+        );
+        // SAFETY: inflateInit_ succeeded and initialized the stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        let mut compressed = [0x78u8, 0x9c, 0x03, 0, 0, 0, 0, 1];
+        let mut out = [0u8; 1];
+        stream.total_in = c_ulong::MAX - 1;
+        stream.next_in = compressed.as_mut_ptr();
+        stream.avail_in = 8; // Fixed-size RFC1950 empty stream.
+        stream.next_out = out.as_mut_ptr();
+        stream.avail_out = 1; // Fixed-size scratch output.
+                              // SAFETY: all buffers remain allocated, and the stream is initialized.
+        assert_eq!(unsafe { inflate(stream, Z_FINISH) }, Z_STREAM_END);
+        let observed = (stream.total_in, stream.total_out, stream.avail_in);
+        // SAFETY: close a successfully initialized stream exactly once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+        observed
+    });
+}
+
+#[test]
+fn inflate_sync_counter_wraps_as_c_unsigned_long() {
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: initialize the zlib stream with the matching ABI struct size and version.
+        assert_eq!(
+            unsafe {
+                inflateInit_(
+                    raw.as_mut_ptr(),
+                    zlibVersion(),
+                    core::mem::size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+        );
+        // SAFETY: inflateInit_ succeeded and initialized the stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        let mut marker = [0u8, 0, 0xff, 0xff];
+        stream.total_in = c_ulong::MAX - 1;
+        stream.next_in = marker.as_mut_ptr();
+        stream.avail_in = 4; // Four-byte recovery marker.
+                             // SAFETY: the marker is a valid readable input buffer for the initialized stream.
+        assert_eq!(unsafe { inflateSync(stream) }, Z_OK);
+        let observed = (stream.total_in, stream.avail_in);
+        // SAFETY: close a successfully initialized stream exactly once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+        observed
+    });
+}
+
+#[test]
 fn uncompress_edge_cases() {
     let config = InflateConfig { window_bits: 15 };
 

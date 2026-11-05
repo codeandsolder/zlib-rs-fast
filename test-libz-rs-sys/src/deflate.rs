@@ -828,6 +828,42 @@ fn test_compress_bound_extreme_c_abi_matches_zlib_ng() {
 }
 
 #[test]
+fn deflate_total_out_counter_wraps_as_c_unsigned_long() {
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: initialize the zlib stream with the matching ABI struct size and version.
+        assert_eq!(
+            unsafe {
+                deflateInit_(
+                    raw.as_mut_ptr(),
+                    -1,
+                    zlibVersion(),
+                    core::mem::size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+        );
+        // SAFETY: deflateInit_ succeeded and initialized the stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        let mut out = [0u8; 128];
+        stream.total_out = c_ulong::MAX - 1;
+        stream.next_in = core::ptr::null_mut();
+        stream.avail_in = 0;
+        stream.next_out = out.as_mut_ptr();
+        stream.avail_out = 128; // Fixed-size output array.
+
+        // SAFETY: a successful initialized stream and writable output are valid for deflate.
+        assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
+        let written = out.len() - stream.avail_out as usize;
+        assert!(written >= 8);
+        let observed = (stream.total_out, stream.avail_out, out[..written].to_vec());
+        // SAFETY: close the initialized stream exactly once.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        observed
+    });
+}
+
+#[test]
 fn test_compress_param() {
     let config = DeflateConfig::new(2);
 

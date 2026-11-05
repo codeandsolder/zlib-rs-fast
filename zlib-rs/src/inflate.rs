@@ -2777,7 +2777,9 @@ fn inflate_bound_io(
     let next_in = (in_read != 0).then(|| bit_reader.next_input_ptr());
     let out_written = output.written_since_accounted();
 
-    stream.total_in += in_read as z_size;
+    // The public zlib counter is an unsigned C integer, which must wrap rather than panic
+    // when a caller has already consumed more than the ABI width can represent.
+    stream.total_in = stream.total_in.wrapping_add(in_read as z_size);
     state.total = state.total.wrapping_add(out_written);
     stream.total_out = state.total as _;
 
@@ -2888,7 +2890,8 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
         stream.next_in = unsafe { stream.next_in.add(len) };
     }
     stream.avail_in -= len as u32;
-    stream.total_in += len as z_size;
+    // inflateSync advances the same unsigned ABI counter as regular inflate.
+    stream.total_in = stream.total_in.wrapping_add(len as z_size);
 
     /* return no joy or set up to restart inflate() on a new block */
     if state.have != 4 {
@@ -3104,6 +3107,52 @@ mod tests {
             assert_eq!(decoded, plain);
             assert_eq!(consumed, compressed.len(), "trailing {trailing} bytes");
         }
+    }
+
+    #[test]
+    fn inflate_sync_total_in_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let mut marker = [0u8, 0, 0xff, 0xff];
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+        stream.next_in = marker.as_mut_ptr();
+        stream.avail_in = 4; // Four-byte stored-block sync marker.
+        stream.total_in = z_size::MAX - 1;
+
+        assert_eq!(sync(stream), ReturnCode::Ok);
+        assert_eq!(stream.total_in, 2);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_total_in_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        // An empty RFC1950 zlib stream is eight bytes long, and creates no output.
+        let mut input = [0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut output = [0u8; 1];
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+        stream.next_in = input.as_mut_ptr();
+        stream.avail_in = 8; // Eight-byte RFC1950 empty stream.
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = 1;
+        stream.total_in = z_size::MAX - 1;
+
+        // SAFETY: the input and output spans remain live and non-overlapping for this call.
+        assert_eq!(
+            unsafe { inflate(stream, InflateFlush::Finish) },
+            ReturnCode::StreamEnd
+        );
+        assert_eq!(stream.total_in, 6);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
     }
 
     #[test]
