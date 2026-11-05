@@ -255,7 +255,7 @@ pub(super) fn decode_back(
                 };
 
                 state.next = used;
-                state.len_table.codes = Codes::Codes;
+                state.len_table.codes = Codes::CodeLengths;
                 state.len_table.bits = root;
 
                 traceln!("inflate:       table sizes ok");
@@ -413,7 +413,7 @@ pub(super) fn decode_back(
 
                 let len_table = match state.len_table.codes {
                     Codes::Fixed => &crate::inflate::inffixed_tbl::LENFIX[..],
-                    Codes::Codes => &state.codes_codes,
+                    Codes::CodeLengths => &state.codes_codes,
                     Codes::Len => &state.len_codes,
                     Codes::Dist => &state.dist_codes,
                 };

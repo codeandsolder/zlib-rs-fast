@@ -242,7 +242,7 @@ impl Accumulator {
 
                 if !is_initial {
                     let xmm_initial = reg([init_crc, 0, 0, 0]);
-                    xmm_crc_part = unsafe { _mm_xor_si128(xmm_crc_part, xmm_initial) };
+                    xmm_crc_part = _mm_xor_si128(xmm_crc_part, xmm_initial);
                     init_crc = CRC32_INITIAL_VALUE;
                 }
 
@@ -253,7 +253,7 @@ impl Accumulator {
 
                     unsafe { self.fold_step::<1>() };
 
-                    self.fold[3] = unsafe { _mm_xor_si128(self.fold[3], xmm_t0) };
+                    self.fold[3] = _mm_xor_si128(self.fold[3], xmm_t0);
                     src = &src[16..];
                 }
 
