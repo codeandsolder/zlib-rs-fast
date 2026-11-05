@@ -100,17 +100,27 @@ impl Drop for GzCString {
 struct GzBuffer {
     ptr: NonNull<u8>,
     capacity: usize,
+    // Cached C ABI length, checked against the allocator's usize at creation.
+    // Neither field can be mutated after allocation.
     usable: usize,
+    usable_abi: c_uint,
 }
 
 impl GzBuffer {
     fn allocate(capacity: usize, usable: usize) -> Option<Self> {
-        assert!(usable <= capacity);
+        // Also guard private callers: never store lengths that can wrap when
+        // published through the C ABI, or deallocate a zero-sized allocation.
+        if capacity == 0 || usable > capacity {
+            return None;
+        }
+        c_uint::try_from(capacity).ok()?;
+        let usable_abi = c_uint::try_from(usable).ok()?;
         let ptr = ALLOCATOR.allocate_slice_raw::<u8>(capacity)?;
         Some(Self {
             ptr,
             capacity,
             usable,
+            usable_abi,
         })
     }
 
@@ -123,12 +133,12 @@ impl GzBuffer {
     }
 
     fn usable_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        // Safety: this buffer uniquely owns an allocation of at least `usable` bytes.
-        // `MaybeUninit<u8>` imposes no initialization requirement on those bytes.
+        // SAFETY: this buffer uniquely owns an allocation of at least its
+        // usable length. MaybeUninit<u8> allows uninitialized bytes.
         unsafe {
             core::slice::from_raw_parts_mut(
                 self.ptr.as_ptr().cast::<MaybeUninit<u8>>(),
-                self.usable,
+                self.usable(),
             )
         }
     }
@@ -314,20 +324,32 @@ impl GzState {
         Ok((exclusive, cloexec))
     }
 
-    // Get the number of bytes allocated for the `self.input` buffer.
-    fn in_capacity(&self) -> usize {
-        match self.mode {
-            GzMode::Write => self.want * 2,
-            _ => self.want,
-        }
+    // Every gzip allocation must fit both the Rust allocator and the
+    // z_stream avail_in/avail_out ABI counters, including the doubled buffer.
+    fn doubled_buffer_capacity(want: usize) -> Option<usize> {
+        let doubled = want.checked_mul(2)?;
+        c_uint::try_from(doubled).ok()?;
+        Some(doubled)
     }
 
-    // Get the number of bytes allocated for the `self.output` buffer.
-    fn out_capacity(&self) -> usize {
-        match self.mode {
-            GzMode::Read => self.want * 2,
-            _ => self.want,
-        }
+    // Get the number of bytes allocated for the input buffer.
+    fn in_capacity(&self) -> Option<usize> {
+        let doubled = Self::doubled_buffer_capacity(self.want)?;
+        Some(if self.mode == GzMode::Write {
+            doubled
+        } else {
+            self.want
+        })
+    }
+
+    // Get the number of bytes allocated for the output buffer.
+    fn out_capacity(&self) -> Option<usize> {
+        let doubled = Self::doubled_buffer_capacity(self.want)?;
+        Some(if self.mode == GzMode::Read {
+            doubled
+        } else {
+            self.want
+        })
     }
 
     fn input_ptr(&self) -> *mut u8 {
@@ -345,7 +367,7 @@ impl GzState {
     }
 
     fn allocate_input_buffer(&self) -> Option<GzBuffer> {
-        let capacity = self.in_capacity();
+        let capacity = self.in_capacity()?;
         let usable = match self.mode {
             GzMode::Write => self.want,
             _ => capacity,
@@ -354,7 +376,7 @@ impl GzState {
     }
 
     fn allocate_output_buffer(&self) -> Option<GzBuffer> {
-        let capacity = self.out_capacity();
+        let capacity = self.out_capacity()?;
         GzBuffer::allocate(capacity, capacity)
     }
 
@@ -364,6 +386,10 @@ impl GzState {
 
     fn out_size(&self) -> usize {
         self.output.as_ref().map_or(0, GzBuffer::usable)
+    }
+
+    fn out_avail(&self) -> c_uint {
+        self.output.as_ref().map_or(0, |buf| buf.usable_abi)
     }
 
     /// Return the initialized read-mode bytes exposed through the ABI `have`/`next` prefix.
@@ -1135,15 +1161,13 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
         return -1;
     }
 
-    // Check and set requested size.
-    let size = size as usize;
-    if size.checked_mul(2).is_none() {
-        // We must be able to double the requested size, because one of the two
-        // buffers (state.input in write mode, state.output in read mode) will be
-        // allocated as twice the requested size. Note: Because the C API specifies `size`
-        // is an unsigned int, but we use usize to represent the buffer sizes internally,
-        // this error condition is impossible to trigger in the common case where int
-        // is 32 bits and usize is 64 bits.
+    // Check the doubled buffer against both usize arithmetic and the C
+    // stream's uInt-sized avail_in/avail_out fields. On 64-bit machines,
+    // checking usize alone would accept sizes that later truncate in z_stream.
+    let Ok(size) = usize::try_from(size) else {
+        return -1;
+    };
+    if GzState::doubled_buffer_capacity(size).is_none() {
         return -1;
     }
 
@@ -2202,7 +2226,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
 
     // Initialize write buffer if compressing.
     if !state.direct {
-        state.stream.avail_out = state.out_size() as _;
+        state.stream.avail_out = state.out_avail();
         state.stream.next_out = state.output_ptr();
         state.next = state.stream.next_out;
     }
@@ -2283,7 +2307,7 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
                 }
             }
             if state.stream.avail_out == 0 {
-                state.stream.avail_out = state.out_size() as _;
+                state.stream.avail_out = state.out_avail();
                 state.stream.next_out = state.output_ptr();
             }
             state.next = state.stream.next_out;
@@ -3302,6 +3326,33 @@ mod tests {
         assert_eq!(state.in_size(), 64);
         assert_eq!(state.input.as_ref().unwrap().capacity, 128);
         assert_eq!(state.out_size(), 64);
+    }
+
+    #[test]
+    fn gzip_allocations_enforce_c_counter_geometry() {
+        assert!(GzBuffer::allocate(0, 0).is_none());
+        assert!(GzBuffer::allocate(8, 9).is_none());
+
+        let Ok(too_wide) = usize::try_from((c_uint::MAX / 2) + 1) else {
+            return;
+        };
+        let mut state = GzState::new();
+        state.want = too_wide;
+        for mode in [GzMode::Read, GzMode::Write] {
+            state.mode = mode;
+            assert!(state.in_capacity().is_none());
+            assert!(state.out_capacity().is_none());
+            assert!(state.allocate_input_buffer().is_none());
+            assert!(state.allocate_output_buffer().is_none());
+        }
+        // A representable request retains the mode-specific doubling.
+        state.want = 32;
+        state.mode = GzMode::Read;
+        assert_eq!(state.in_capacity(), Some(32));
+        assert_eq!(state.out_capacity(), Some(64));
+        state.mode = GzMode::Write;
+        assert_eq!(state.in_capacity(), Some(64));
+        assert_eq!(state.out_capacity(), Some(32));
     }
 
     #[test]

@@ -354,6 +354,29 @@ fn gzread_special_cases() {
 }
 
 #[test]
+fn gzbuffer_rejects_geometry_beyond_abi_counter_width() {
+    // No buffers are allocated until the first read, so exercise the
+    // extreme uInt sizes without requesting gigabytes of memory.
+    let outcomes = crate::assert_eq_rs_ng!(unsafe {
+        let path = CString::new(crate_path("src/test-data/issue-109.gz"))
+            .expect("fixture path contains no interior NUL");
+        let mode = c"r";
+        let handle = gzopen(path.as_ptr(), mode.as_ptr());
+        assert!(!handle.is_null());
+
+        let too_large = gzbuffer(handle, 0x8000_0000);
+        let max_uint = gzbuffer(handle, c_uint::MAX);
+        let max_doublable = gzbuffer(handle, 0x7fff_ffff);
+        // Reconfigure to a small buffer before closing; the large size is
+        // never allocated and is useful only to test boundary validation.
+        let small = gzbuffer(handle, 8);
+        let closed = gzclose(handle);
+        (too_large, max_uint, max_doublable, small, closed)
+    });
+    assert_eq!(outcomes, (-1, -1, 0, 0, Z_OK));
+}
+
+#[test]
 fn gzread_gzip() {
     const BUF_SIZE: usize = 128;
     const MAX_READ_SIZE: usize = 256;
