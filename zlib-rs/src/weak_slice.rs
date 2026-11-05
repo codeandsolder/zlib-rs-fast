@@ -11,14 +11,16 @@ pub struct WeakSliceMut<'a, T> {
     _marker: PhantomData<&'a mut [T]>,
 }
 
-impl<'a, T> WeakSliceMut<'a, T> {
+impl<T> WeakSliceMut<'_, T> {
     /// # Safety
     ///
-    /// The arguments must satisfy the requirements of [`core::slice::from_raw_parts_mut`]. The
-    /// difference versus a slice is that the slice requirements are only enforced when a slice is
-    /// needed, so in practice we mostly get the bounds checking and other convenient slice APIs,
-    /// without the exact correctness constraints of a rust core/std slice.
-    pub(crate) unsafe fn from_raw_parts_mut(ptr: *mut T, len: usize) -> Self {
+    /// The pointer must be non-null, properly aligned, and point into one live allocation
+    /// containing at least len initialized elements of T (even if len is zero, the pointer
+    /// must still be non-null and aligned). The allocation must remain alive for the handle
+    /// lifetime. The caller must prevent conflicting accesses whenever a shared or mutable
+    /// reference is materialized. Unlike a permanent Rust slice, this handle creates
+    /// references only during each borrow; it does not relax their aliasing requirements.
+    pub(crate) const unsafe fn from_raw_parts_mut(ptr: *mut T, len: usize) -> Self {
         Self {
             ptr,
             len,
@@ -26,38 +28,46 @@ impl<'a, T> WeakSliceMut<'a, T> {
         }
     }
 
-    pub(crate) fn into_raw_parts(self) -> (*mut T, usize) {
+    pub(crate) const fn into_raw_parts(self) -> (*mut T, usize) {
         (self.ptr, self.len)
     }
 
-    pub(crate) fn as_slice(&self) -> &[T] {
+    pub(crate) const fn as_slice(&self) -> &[T] {
         // Keep the materialized Rust reference tied to this borrow. Returning the backing
         // allocation lifetime here would allow a shared slice to outlive `&self` and overlap a
         // later mutable materialization from the same raw pointer.
+        // SAFETY: from_raw_parts_mut requires valid aligned storage covering len elements;
+        // the shared view is borrowed from self, excluding a concurrent mutable view.
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+    pub(crate) const fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: the unsafe constructor guarantees writable aligned storage covering len
+        // elements; exclusive access is enforced by the borrow of self.
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    pub(crate) fn as_ptr(&self) -> *const T {
+    pub(crate) const fn as_ptr(&self) -> *const T {
         self.ptr
     }
 
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "mutable pointer access requires exclusive borrowing of the backing slice handle"
+    )]
+    pub(crate) const fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub(crate) fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         let buf = &mut [];
         Self {
             ptr: buf.as_mut_ptr(),
@@ -73,27 +83,33 @@ pub struct WeakArrayMut<'a, T, const N: usize> {
     _marker: PhantomData<&'a mut [T; N]>,
 }
 
-impl<'a, T, const N: usize> WeakArrayMut<'a, T, N> {
+impl<T, const N: usize> WeakArrayMut<'_, T, N> {
     /// # Safety
     ///
-    /// The pointer must be [convertable to a reference](https://doc.rust-lang.org/std/ptr/index.html#pointer-to-reference-conversion).
-    pub(crate) unsafe fn from_ptr(ptr: *mut [T; N]) -> Self {
+    /// The pointer must be non-null, properly aligned, and valid for a live writable
+    /// array of N initialized elements for the handle lifetime. The caller must prevent
+    /// overlapping conflicting accesses whenever a reference is materialized.
+    pub(crate) const unsafe fn from_ptr(ptr: *mut [T; N]) -> Self {
         Self {
             ptr,
             _marker: PhantomData,
         }
     }
 
-    pub(crate) fn as_slice(&self) -> &[T] {
+    pub(crate) const fn as_slice(&self) -> &[T] {
         // As above, the reference must not outlive the borrow used to materialize it.
+        // SAFETY: from_ptr requires a live, aligned [T; N] allocation, and this shared
+        // materialization cannot outlive the borrow of the handle.
         unsafe { core::slice::from_raw_parts(self.ptr.cast(), N) }
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+    pub(crate) const fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: from_ptr requires valid writable [T; N] storage, and the mutable borrow
+        // of the handle excludes an overlapping materialization from this handle.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.cast(), N) }
     }
 
-    pub(crate) fn as_ptr(&self) -> *const [T; N] {
+    pub(crate) const fn as_ptr(&self) -> *const [T; N] {
         self.ptr
     }
 }
