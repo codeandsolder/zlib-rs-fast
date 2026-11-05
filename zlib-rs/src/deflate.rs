@@ -2167,11 +2167,25 @@ pub enum BlockType {
     DynamicTrees = 2,
 }
 
+/// Emit a single DEFLATE stored block using initialized bytes from the window.
+///
+/// # Panics
+///
+/// Panics if the input range is outside the initialized window, the stored payload is
+/// larger than the 16-bit DEFLATE length field, or the pending-output buffer is too small.
 pub fn zng_tr_stored_block(
     state: &mut State,
     window_range: core::ops::Range<usize>,
     is_last: bool,
 ) {
+    let input_block: &[u8] = &state.window.filled()[window_range];
+    let stored_len = input_block.len();
+    // Check before emitting a header; a stored block cannot represent more than 65535 bytes.
+    assert!(
+        u16::try_from(stored_len).is_ok(),
+        "DEFLATE stored block payload must fit in 16 bits"
+    );
+
     // send block type
     state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
 
@@ -2180,21 +2194,25 @@ pub fn zng_tr_stored_block(
 
     state.bit_writer.cmpr_bits_align();
 
-    let input_block: &[u8] = &state.window.filled()[window_range];
-    let stored_len = input_block.len() as u16;
-
-    state.bit_writer.pending.extend(&stored_len.to_le_bytes());
+    // The length and its complement are exactly 16-bit little-endian fields.
+    // Extract their low bytes after validating the range, without truncating
+    // the length used later for bit accounting.
     state
         .bit_writer
         .pending
-        .extend(&(!stored_len).to_le_bytes());
+        .extend(&stored_len.to_le_bytes()[..2]);
+    state
+        .bit_writer
+        .pending
+        .extend(&(!stored_len).to_le_bytes()[..2]);
 
     state.bit_writer.cmpr_bits_add(32);
     state.bit_writer.sent_bits_add(32);
     if stored_len > 0 {
         state.bit_writer.pending.extend(input_block);
-        state.bit_writer.cmpr_bits_add((stored_len << 3) as usize);
-        state.bit_writer.sent_bits_add((stored_len << 3) as usize);
+        let payload_bits = stored_len << 3;
+        state.bit_writer.cmpr_bits_add(payload_bits);
+        state.bit_writer.sent_bits_add(payload_bits);
     }
 }
 
@@ -4292,6 +4310,51 @@ mod test {
         // Existing zlib-sized requests keep exactly their historical bound.
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn stored_block_large_lengths_preserve_bytes_and_debug_bit_counts() {
+        for len in [8_191usize, 8_192, 16_384, 32_768, usize::from(u16::MAX)] {
+            let source: Vec<u8> = (0..len)
+                .map(|i| (i * 29 + i / 13).to_le_bytes()[0])
+                .collect();
+            // A maximum-sized stored block needs five bytes of header space beyond 64 KiB.
+            let mut stream = DeflateStream::new(DeflateConfig {
+                mem_level: 9,
+                ..DeflateConfig::new(0)
+            });
+            // SAFETY: source is an initialized, non-overlapping buffer and its bytes
+            // remain live while the stream copies the complete window prefix.
+            unsafe {
+                stream
+                    .state
+                    .window
+                    .copy_and_initialize(0..len, source.as_ptr());
+            }
+            zng_tr_stored_block(&mut stream.state, 0..len, true);
+
+            let pending = stream.state.bit_writer.pending.pending();
+            assert_eq!(pending.len(), len + 5);
+            assert_eq!(pending[0], 1);
+            assert_eq!(&pending[1..3], &len.to_le_bytes()[..2]);
+            assert_eq!(&pending[3..5], &(!len).to_le_bytes()[..2]);
+            assert_eq!(&pending[5..], source.as_slice());
+
+            #[cfg(feature = "ZLIB_DEBUG")]
+            {
+                assert_eq!(
+                    stream.state.bit_writer.compressed_len,
+                    32 + len * 8,
+                    "stored {len}-byte payload must count its full width"
+                );
+                assert_eq!(
+                    stream.state.bit_writer.bits_sent,
+                    40 + len * 8,
+                    "stored {len}-byte payload and header must count exactly"
+                );
+            }
+            assert!(end(&mut stream).is_ok());
         }
     }
 
