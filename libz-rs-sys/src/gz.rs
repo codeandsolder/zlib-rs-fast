@@ -390,6 +390,49 @@ impl GzState {
     fn out_avail(&self) -> c_uint {
         self.output.as_ref().map_or(0, |buf| buf.usable_abi)
     }
+    // The uncompressed gzip position is a signed 64-bit C offset. Check
+    // *before* publishing or consuming bytes, not after a buffer mutation.
+    fn checked_position_after(&self, bytes: usize) -> Option<i64> {
+        self.pos.checked_add(i64::try_from(bytes).ok()?)
+    }
+
+    fn position_room(&self) -> usize {
+        let available = i128::from(i64::MAX) - i128::from(self.pos);
+        usize::try_from(available).unwrap_or(usize::MAX)
+    }
+
+    fn fail_position_overflow(&mut self) {
+        gz_error(
+            self,
+            Some((
+                Z_STREAM_ERROR,
+                "uncompressed position exceeds signed 64-bit range",
+            )),
+        );
+    }
+
+    fn ensure_position_room(&mut self, bytes: usize) -> Result<(), ()> {
+        let pending = if self.seek { i128::from(self.skip) } else { 0 };
+        let Ok(bytes) = i128::try_from(bytes) else {
+            self.fail_position_overflow();
+            return Err(());
+        };
+        let target = i128::from(self.pos) + pending + bytes;
+        if i64::try_from(target).is_err() {
+            self.fail_position_overflow();
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn advance_position(&mut self, bytes: usize) -> Result<(), ()> {
+        let Some(pos) = self.checked_position_after(bytes) else {
+            self.fail_position_overflow();
+            return Err(());
+        };
+        self.pos = pos;
+        Ok(())
+    }
 
     /// Return the initialized read-mode bytes exposed through the ABI `have`/`next` prefix.
     fn buffered_output(&self) -> &[u8] {
@@ -1495,17 +1538,27 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
 
     let mut written = 0usize;
     while written < output.len() {
+        if state.have == 0 && state.eof && state.stream.avail_in == 0 {
+            state.past = true;
+            break;
+        }
         let remaining = output.len() - written;
-        let mut n = Ord::min(remaining, c_uint::MAX as usize);
+        // Even a valid writable caller buffer cannot advance a signed C
+        // stream position beyond i64::MAX. Return bytes already copied.
+        // The fatal error clears the exposed have count so the C gzgetc macro
+        // cannot advance the position without consulting the error state.
+        let room = state.position_room();
+        if room == 0 {
+            state.fail_position_overflow();
+            return written;
+        }
+        let mut n = remaining.min(c_uint::MAX as usize).min(room);
 
         if state.have != 0 {
             let available = state.buffered_output();
             n = Ord::min(n, available.len());
             output[written..written + n].write_copy_of_slice(&available[..n]);
             state.consume_buffered_output(n);
-        } else if state.eof && state.stream.avail_in == 0 {
-            state.past = true;
-            break;
         } else if state.how == How::Look || n < state.in_size() * 2 {
             if gz_fetch(state).is_err() {
                 return 0;
@@ -1532,8 +1585,10 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
             };
         }
 
+        if state.advance_position(n).is_err() {
+            return written;
+        }
         written += n;
-        state.pos += n as i64;
     }
 
     written
@@ -1569,9 +1624,18 @@ fn gz_skip(state: &mut GzState, mut len: i64) -> Result<(), ()> {
             } else {
                 state.have as usize
             };
+            // The byte-count is bounded by the current signed skip.
+            let Ok(take) = i64::try_from(n) else {
+                state.fail_position_overflow();
+                return Err(());
+            };
+            let Some(next) = state.pos.checked_add(take) else {
+                state.fail_position_overflow();
+                return Err(());
+            };
             state.consume_buffered_output(n);
-            state.pos += n as i64;
-            len -= n as i64;
+            state.pos = next;
+            len -= take;
         } else if state.eof && state.stream.avail_in == 0 {
             // Output buffer empty -- return if we're at the end of the input.
             break;
@@ -2064,6 +2128,12 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
         return 0;
     }
 
+    // Include a pending lazy seek: writing must not exceed the signed C
+    // offset range even after a successful virtual seek near i64::MAX.
+    if state.ensure_position_room(input.len()).is_err() {
+        return 0;
+    }
+
     if state.input.is_none() && gz_init(state).is_err() {
         return 0;
     }
@@ -2092,8 +2162,10 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
                     .usable_uninit_mut();
                 input.copy_to(&mut owned[have..have + Ord::min(capacity, input.len())])
             };
+            if state.advance_position(copy).is_err() {
+                return 0;
+            }
             state.stream.avail_in += copy as c_uint;
-            state.pos += copy as i64;
             if !input.is_empty() && gz_comp(state, Z_NO_FLUSH).is_err() {
                 return 0;
             }
@@ -2111,7 +2183,9 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
             let n = Ord::min(input.len(), c_uint::MAX as usize);
             state.stream.next_in = input.as_ptr();
             state.stream.avail_in = n as c_uint;
-            state.pos += n as i64;
+            if state.advance_position(n).is_err() {
+                break Err(());
+            }
             if gz_comp(state, Z_NO_FLUSH).is_err() {
                 break Err(());
             }
@@ -2140,6 +2214,10 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
 // - `Ok` on success.
 // - `Err` on error.
 fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
+    if state.ensure_position_room(len).is_err() {
+        return Err(());
+    }
+
     // Consume whatever is left in the input buffer.
     if state.stream.avail_in != 0 && gz_comp(state, Z_NO_FLUSH).is_err() {
         return Err(());
@@ -2157,7 +2235,7 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
         }
         state.stream.avail_in = n as _;
         state.stream.next_in = state.input_ptr();
-        state.pos += n as i64;
+        state.advance_position(n)?;
         if gz_comp(state, Z_NO_FLUSH).is_err() {
             return Err(());
         }
@@ -2510,6 +2588,9 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     if state.mode != GzMode::Write || state.err != Z_OK {
         return -1;
     }
+    if state.ensure_position_room(1).is_err() {
+        return -1;
+    }
 
     // Check for seek request.
     if state.seek {
@@ -2535,8 +2616,10 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
                 .expect("write input must remain allocated")
                 .usable_uninit_mut()[have]
                 .write(c as u8);
+            if state.advance_position(1).is_err() {
+                return -1;
+            }
             state.stream.avail_in += 1;
-            state.pos += 1;
             return c & 0xff;
         }
     }
@@ -2620,9 +2703,11 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
 
     // Try output buffer (no need to check for skip request).
     if state.have != 0 {
+        if state.advance_position(1).is_err() {
+            return -1;
+        }
         let ret = state.buffered_output()[0];
         state.consume_buffered_output(1);
-        state.pos += 1;
         return c_int::from(ret);
     }
 
@@ -2694,13 +2779,17 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
         }
     }
 
+    let Some(new_pos) = state.pos.checked_sub(1) else {
+        state.fail_position_overflow();
+        return -1;
+    };
     if state.push_back_buffered_byte(c as u8).is_err() {
         const MSG: &str = "out of room to push characters";
         gz_error(state, Some((Z_DATA_ERROR, MSG)));
         return -1;
     }
 
-    state.pos -= 1;
+    state.pos = new_pos;
     state.past = false;
     c
 }
@@ -2772,12 +2861,15 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
             let chunk = &available[..limit];
             let eol = chunk.iter().position(|&byte| byte == b'\n');
             let through_eol = eol.map_or(limit, |index| index + 1);
-            output[written..written + through_eol].write_copy_of_slice(&chunk[..through_eol]);
             (through_eol, eol.is_some())
         };
 
+        if state.advance_position(through_eol).is_err() {
+            return ptr::null_mut();
+        }
+        let available = state.buffered_output();
+        output[written..written + through_eol].write_copy_of_slice(&available[..through_eol]);
         state.consume_buffered_output(through_eol);
-        state.pos += through_eol as i64;
         written += through_eol;
 
         if saw_newline {
@@ -3149,9 +3241,11 @@ pub unsafe extern "C" fn gzvprintf(
         return 0;
     }
 
-    // Update buffer and position, compress first half if past that.
+    // Validate the signed logical position before publishing formatted data.
+    if state.advance_position(len as usize).is_err() {
+        return Z_STREAM_ERROR;
+    }
     state.stream.avail_in += len as u32;
-    state.pos += i64::from(len);
     if state.stream.avail_in as usize >= state.in_size() {
         let left = state.stream.avail_in - state.in_size() as u32;
         state.stream.avail_in = state.in_size() as u32;
@@ -3199,6 +3293,63 @@ mod tests {
     fn test_tell(state: &GzState) -> i64 {
         // SAFETY: gztell64 only observes this live initialized state.
         unsafe { gztell64(core::ptr::from_ref(state).cast_mut().cast()) }
+    }
+
+    fn test_putc(state: &mut GzState, byte: c_int) -> c_int {
+        // SAFETY: the state is live and exclusively borrowed during the call.
+        unsafe { gzputc(core::ptr::from_mut(state).cast(), byte) }
+    }
+
+    fn test_getc(state: &mut GzState) -> c_int {
+        // SAFETY: the state is live and exclusively borrowed during the call.
+        unsafe { gzgetc(core::ptr::from_mut(state).cast()) }
+    }
+
+    fn test_ungetc(state: &mut GzState, byte: c_int) -> c_int {
+        // SAFETY: the state is live and exclusively borrowed during the call.
+        unsafe { gzungetc(byte, core::ptr::from_mut(state).cast()) }
+    }
+
+    fn test_read(state: &mut GzState, output: &mut [u8]) -> c_int {
+        let Ok(len) = c_uint::try_from(output.len()) else {
+            return -1;
+        };
+        // SAFETY: output is a live, writable and disjoint caller span.
+        unsafe {
+            gzread(
+                core::ptr::from_mut(state).cast(),
+                output.as_mut_ptr().cast(),
+                len,
+            )
+        }
+    }
+
+    fn test_write(state: &mut GzState, input: &[u8]) -> c_int {
+        let Ok(len) = c_uint::try_from(input.len()) else {
+            return 0;
+        };
+        // SAFETY: input is a live, readable and disjoint caller span.
+        unsafe {
+            gzwrite(
+                core::ptr::from_mut(state).cast(),
+                input.as_ptr().cast(),
+                len,
+            )
+        }
+    }
+
+    fn test_gets(state: &mut GzState, output: &mut [u8]) -> *mut c_char {
+        let Ok(len) = c_int::try_from(output.len()) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: output is a live writable byte span for the call.
+        unsafe {
+            gzgets(
+                core::ptr::from_mut(state).cast(),
+                output.as_mut_ptr().cast(),
+                len,
+            )
+        }
     }
 
     // Generate a file path relative to the project's root
@@ -3353,6 +3504,117 @@ mod tests {
         assert_eq!(state.in_size(), 64);
         assert_eq!(state.input.as_ref().unwrap().capacity, 128);
         assert_eq!(state.out_size(), 64);
+    }
+
+    #[test]
+    fn gzip_single_byte_operations_reject_position_overflow_before_mutation() -> Result<(), ()> {
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        state.want = 8;
+        state.input = state.allocate_input_buffer();
+        assert!(state.input.is_some());
+        state.pos = i64::MAX;
+        assert_eq!(test_putc(&mut state, 42), -1);
+        assert_eq!(state.pos, i64::MAX);
+        assert_eq!(state.stream.avail_in, 0);
+
+        state.mode = GzMode::Read;
+        state.how = How::Gzip;
+        state.output = state.allocate_output_buffer();
+        state.output.as_mut().ok_or(())?.usable_uninit_mut()[0].write(67);
+        state.publish_buffered_output(0, 1);
+        gz_error(&mut state, None);
+        assert_eq!(test_getc(&mut state), -1);
+        assert_eq!(state.have, 0);
+        assert_eq!(state.pos, i64::MAX);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+
+        // Reenable the exposed byte and exercise the underflow path itself.
+        gz_error(&mut state, None);
+        state.publish_buffered_output(0, 1);
+        state.pos = i64::MIN;
+        assert_eq!(test_ungetc(&mut state, 68), -1);
+        assert_eq!(state.have, 0);
+        assert_eq!(state.pos, i64::MIN);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+
+        // Pushback from position zero to -1 remains valid.
+        state.pos = 0;
+        gz_error(&mut state, None);
+        state.publish_buffered_output(0, 1);
+        assert_eq!(test_ungetc(&mut state, 68), 68);
+        assert_eq!(state.pos, -1);
+        assert_eq!(test_getc(&mut state), 68);
+        assert_eq!(state.pos, 0);
+
+        // Return the representable prefix before reporting overflow.
+        state.pos = i64::MAX - 1;
+        let mut output = [0u8; 2];
+        assert_eq!(test_read(&mut state, &mut output), 1);
+        assert_eq!(output[0], 67);
+        assert_eq!(state.pos, i64::MAX);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_multi_byte_write_and_zero_fill_check_position_before_mutation() {
+        let mut writer = GzState::new();
+        writer.mode = GzMode::Write;
+        writer.pos = i64::MAX - 2;
+        assert_eq!(test_write(&mut writer, b"abc"), 0);
+        assert_eq!(writer.pos, i64::MAX - 2);
+        assert!(writer.input.is_none());
+        assert_eq!(writer.err, Z_STREAM_ERROR);
+
+        // A pending seek to i64::MAX must not trigger a massive zero-fill
+        // before rejecting a following write.
+        let mut pending = GzState::new();
+        pending.mode = GzMode::Write;
+        pending.pos = i64::MAX - 2;
+        pending.seek = true;
+        pending.skip = 2;
+        assert_eq!(test_write(&mut pending, b"a"), 0);
+        assert_eq!(pending.pos, i64::MAX - 2);
+        assert_eq!(pending.skip, 2);
+        assert!(pending.seek);
+        assert!(pending.input.is_none());
+
+        // Direct zero-fill also validates before initializing compressors.
+        let mut zeros = GzState::new();
+        zeros.mode = GzMode::Write;
+        zeros.pos = i64::MAX - 1;
+        assert_eq!(gz_zero(&mut zeros, 2), Err(()));
+        assert_eq!(zeros.pos, i64::MAX - 1);
+        assert!(zeros.input.is_none());
+    }
+
+    #[test]
+    fn gzip_terminal_reads_handle_signed_position_limits() -> Result<(), ()> {
+        // Reaching EOF at the maximum position must not raise a false error.
+        let mut empty = GzState::new();
+        empty.mode = GzMode::Read;
+        empty.how = How::Copy;
+        empty.pos = i64::MAX;
+        empty.eof = true;
+        assert_eq!(test_read(&mut empty, &mut [0u8; 1]), 0);
+        assert_eq!(empty.err, Z_OK);
+        assert!(empty.past);
+
+        // A line read cannot consume a buffered byte past i64::MAX.
+        let mut state = GzState::new();
+        state.mode = GzMode::Read;
+        state.how = How::Gzip;
+        state.want = 8;
+        state.pos = i64::MAX;
+        state.output = state.allocate_output_buffer();
+        state.output.as_mut().ok_or(())?.usable_uninit_mut()[0].write(b'A');
+        state.publish_buffered_output(0, 1);
+        assert!(test_gets(&mut state, &mut [0u8; 3]).is_null());
+        assert_eq!(state.have, 0);
+        assert_eq!(state.pos, i64::MAX);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+        Ok(())
     }
 
     #[test]
