@@ -106,14 +106,23 @@ struct GzBuffer {
 }
 
 impl GzBuffer {
+    // Every owned byte buffer is both a Rust allocation/slice and a zlib C
+    // availability span. On 32-bit targets, isize::MAX is the tighter bound.
+    fn checked_abi_len(len: usize) -> Option<c_uint> {
+        if len > isize::MAX.unsigned_abs() {
+            return None;
+        }
+        c_uint::try_from(len).ok()
+    }
+
     fn allocate(capacity: usize, usable: usize) -> Option<Self> {
         // Also guard private callers: never store lengths that can wrap when
-        // published through the C ABI, or deallocate a zero-sized allocation.
+        // published through the C ABI, or create an invalid Rust slice.
         if capacity == 0 || usable > capacity {
             return None;
         }
-        c_uint::try_from(capacity).ok()?;
-        let usable_abi = c_uint::try_from(usable).ok()?;
+        Self::checked_abi_len(capacity)?;
+        let usable_abi = Self::checked_abi_len(usable)?;
         let ptr = ALLOCATOR.allocate_slice_raw::<u8>(capacity)?;
         Some(Self {
             ptr,
@@ -328,7 +337,7 @@ impl GzState {
     // z_stream avail_in/avail_out ABI counters, including the doubled buffer.
     fn doubled_buffer_capacity(want: usize) -> Option<usize> {
         let doubled = want.checked_mul(2)?;
-        c_uint::try_from(doubled).ok()?;
+        GzBuffer::checked_abi_len(doubled)?;
         Some(doubled)
     }
 
@@ -3769,6 +3778,18 @@ mod tests {
     fn gzip_allocations_enforce_c_counter_geometry() {
         assert!(GzBuffer::allocate(0, 0).is_none());
         assert!(GzBuffer::allocate(8, 9).is_none());
+
+        // The shared constructor must reject an invalid Rust allocation
+        // extent even on 32-bit targets where it fits in an unsigned C int.
+        let beyond_rust = isize::MAX.unsigned_abs() + 1;
+        assert_eq!(GzBuffer::checked_abi_len(beyond_rust), None);
+        assert!(GzBuffer::allocate(beyond_rust, 1).is_none());
+        let biggest_legal = isize::MAX.unsigned_abs().min(c_uint::MAX as usize);
+        assert_eq!(
+            GzBuffer::checked_abi_len(biggest_legal),
+            c_uint::try_from(biggest_legal).ok()
+        );
+        assert!(GzState::doubled_buffer_capacity(isize::MAX.unsigned_abs() / 2 + 1).is_none());
 
         let Ok(too_wide) = usize::try_from((c_uint::MAX / 2) + 1) else {
             return;
