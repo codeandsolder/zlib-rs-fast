@@ -6,7 +6,7 @@
     feature(stdarch_loongarch)
 )]
 
-#[cfg(any(feature = "rust-allocator", feature = "c-allocator"))]
+#[cfg(any(test, feature = "rust-allocator", feature = "c-allocator"))]
 extern crate alloc;
 
 pub mod adler32;

@@ -29,7 +29,7 @@ mod gpu_match;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 mod near_optimal;
 mod pending;
 mod slide_hash;
@@ -3294,7 +3294,7 @@ pub fn drain_pending_output(state: &mut State<'_>, output: &mut OutputCursor) ->
 
 /// Drain all complete bytes currently produced by the complete-buffer near-optimal path while
 /// preserving any sub-byte DEFLATE prefix for the next block.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 fn drain_near_optimal_pending(
     state: &mut State<'_>,
     output: &mut [u8],
@@ -3313,7 +3313,7 @@ fn drain_near_optimal_pending(
     true
 }
 
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 fn emit_planned_near_optimal_block(
     state: &mut State<'_>,
     input: &[u8],
@@ -3361,7 +3361,7 @@ fn emit_planned_near_optimal_block(
 /// and reuses the production tree builder / stored-static-dynamic block chooser / bit writer.
 /// `optimization_passes` counts minimum-cost path searches per selected block; zero is retained only
 /// as a fixed-Huffman diagnostic baseline.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 pub fn compress_slice_near_optimal<'a>(
     output: &'a mut [u8],
     input: &[u8],
