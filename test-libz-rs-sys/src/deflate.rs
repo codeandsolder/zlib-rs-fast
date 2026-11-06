@@ -3701,7 +3701,7 @@ mod stable_api {
     #[test]
     #[should_panic = "StreamError"]
     fn invalid_config() {
-        zlib_rs::Deflate::new(9000, true, 15);
+        let _ = zlib_rs::Deflate::new(9000, true, 15);
     }
 
     fn with_window_bits(window_bits: i32) {

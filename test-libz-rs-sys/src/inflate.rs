@@ -2858,7 +2858,7 @@ mod stable_api {
     #[test]
     #[should_panic = "StreamError"]
     fn invalid_config() {
-        zlib_rs::Inflate::new(true, 123);
+        let _ = zlib_rs::Inflate::new(true, 123);
     }
 
     #[test]
