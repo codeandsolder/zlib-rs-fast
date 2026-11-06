@@ -139,12 +139,30 @@ impl GzBuffer {
     // Validate an ABI cursor using integer addresses, never offset_from on
     // potentially unrelated pointers. All returned slices are subsequently
     // derived from the allocation owner, retaining its pointer provenance.
-    fn checked_range(&self, cursor: *const u8, len: usize) -> Option<core::ops::Range<usize>> {
+    fn checked_range_within(
+        &self,
+        cursor: *const u8,
+        len: usize,
+        limit: usize,
+    ) -> Option<core::ops::Range<usize>> {
         let start = (cursor as usize).checked_sub(self.as_ptr() as usize)?;
-        if start > self.usable || len > self.usable - start {
+        if start > limit || len > limit - start {
             return None;
         }
         Some(start..start + len)
+    }
+
+    fn checked_range(&self, cursor: *const u8, len: usize) -> Option<core::ops::Range<usize>> {
+        self.checked_range_within(cursor, len, self.usable)
+    }
+
+    // Write input has additional owned capacity for formatted output.
+    fn checked_allocated_range(
+        &self,
+        cursor: *const u8,
+        len: usize,
+    ) -> Option<core::ops::Range<usize>> {
+        self.checked_range_within(cursor, len, self.capacity)
     }
 
     fn usable(&self) -> usize {
@@ -631,23 +649,34 @@ impl GzState {
     ///
     /// The large-write zero-copy path temporarily violates this invariant, but it does
     /// not call this helper while caller memory is bound to `next_in`.
-    fn owned_write_input_end(&self) -> usize {
-        debug_assert_eq!(self.mode, GzMode::Write);
-        let input = self
-            .input
-            .as_ref()
-            .expect("write input must be allocated before measuring it");
-        let base = input.as_ptr() as usize;
-        let next = self.stream.next_in as usize;
-        assert!(
-            next >= base,
-            "gzip write input pointer precedes owned input"
+    fn owned_write_input_end(&self) -> Option<usize> {
+        let input = self.input.as_ref()?;
+        input
+            .checked_allocated_range(self.stream.next_in, self.stream.avail_in as usize)
+            .map(|range| range.end)
+    }
+
+    // Validate both write output cursors and the deflate-owned suffix.
+    // Slices are derived from the owned allocation, never from ABI cursors.
+    fn pending_write_output(&self) -> Option<&[u8]> {
+        let output = self.output.as_ref()?;
+        let start = output.checked_range(self.next, 0)?.start;
+        let remaining =
+            output.checked_range(self.stream.next_out, self.stream.avail_out as usize)?;
+        if start > remaining.start || remaining.end != output.usable() {
+            return None;
+        }
+        // SAFETY: deflate initializes the prefix; both cursors were validated.
+        Some(unsafe {
+            core::slice::from_raw_parts(output.as_ptr().add(start), remaining.start - start)
+        })
+    }
+
+    fn invalid_write_cursor(&mut self) {
+        gz_error(
+            self,
+            Some((Z_STREAM_ERROR, "invalid gzip write buffer cursor")),
         );
-        let offset = next - base;
-        let avail = self.stream.avail_in as usize;
-        assert!(offset <= input.capacity);
-        assert!(avail <= input.capacity - offset);
-        offset + avail
     }
 }
 
@@ -2212,7 +2241,10 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
             if state.stream.avail_in == 0 {
                 state.stream.next_in = state.input_ptr();
             }
-            let have = state.owned_write_input_end();
+            let Some(have) = state.owned_write_input_end() else {
+                state.invalid_write_cursor();
+                return 0;
+            };
             let capacity = state.in_size().saturating_sub(have);
             let copy = {
                 let owned = state
@@ -2397,9 +2429,10 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
                 return Err(());
             }
         }
-        // Safety: the direct-write contract above established a readable span of
-        // exactly `avail_in` bytes starting at `next_in`.
-        state.stream.next_in = unsafe { state.stream.next_in.add(consumed) };
+        if consumed != 0 {
+            // SAFETY: a nonempty direct-write input span was validated above.
+            state.stream.next_in = unsafe { state.stream.next_in.add(consumed) };
+        }
         state.stream.avail_in = 0;
         return Ok(());
     }
@@ -2419,29 +2452,23 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
     // Run deflate on the provided input until it produces no more output.
     let mut ret = Z_OK;
     loop {
+        // Do not pass malformed owned output cursors to the deflater.
+        if state.pending_write_output().is_none() {
+            state.invalid_write_cursor();
+            return Err(());
+        }
         // Write out current buffer contents if full, or if flushing, but if
         // doing Z_FINISH then don't write until we get to Z_STREAM_END.
         if state.stream.avail_out == 0
             || (flush != Z_NO_FLUSH && (flush != Z_FINISH || ret == Z_STREAM_END))
         {
-            // Safety: Within this gz module, `state.stream.next` and `state.stream.next_out`
-            // always point within the same allocated object, `state.stream.output`.
-            // SAFETY: the two cursors belong to the same live owned
-            // compression output buffer, maintained by gz_comp.
-            let signed_have = unsafe { state.stream.next_out.offset_from(state.next) };
-            let Ok(have) = usize::try_from(signed_have) else {
-                const MSG: &str = "corrupt internal state in gz_comp";
-                gz_error(state, Some((Z_STREAM_ERROR, MSG)));
+            let Some(bytes) = state.pending_write_output() else {
+                state.invalid_write_cursor();
                 return Err(());
             };
-            if have != 0 {
-                // SAFETY: the pending prefix from next to next_out consists
-                // entirely of initialized compressed bytes in owned output.
-                let bytes = unsafe { core::slice::from_raw_parts(state.next, have) };
-                if write_all_to_fd(state.fd, bytes).is_err() {
-                    gz_error(state, Some((Z_ERRNO, "write error")));
-                    return Err(());
-                }
+            if !bytes.is_empty() && write_all_to_fd(state.fd, bytes).is_err() {
+                gz_error(state, Some((Z_ERRNO, "write error")));
+                return Err(());
             }
             if state.stream.avail_out == 0 {
                 state.stream.avail_out = state.out_avail();
@@ -2668,7 +2695,10 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
         // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
         // (This is an invariant maintained throughout this module, except for a specific
         // block within `gz_write` that does not call any function that might call `gzputc`.)
-        let have = state.owned_write_input_end();
+        let Some(have) = state.owned_write_input_end() else {
+            state.invalid_write_cursor();
+            return -1;
+        };
         if have < state.in_size() {
             state
                 .input
@@ -3302,7 +3332,20 @@ pub unsafe extern "C" fn gzvprintf(
 
     // The write input allocation is twice `in_size()` specifically for this function,
     // so at least one full `in_size()` span remains available after the current prefix.
-    let next = unsafe { (state.stream.next_in).add(state.stream.avail_in as usize) }.cast_mut();
+    let Some(have) = state.owned_write_input_end() else {
+        state.invalid_write_cursor();
+        return Z_STREAM_ERROR;
+    };
+    let Some(input) = state.input.as_ref() else {
+        state.invalid_write_cursor();
+        return Z_STREAM_ERROR;
+    };
+    if have > state.in_size() {
+        state.invalid_write_cursor();
+        return Z_STREAM_ERROR;
+    }
+    // SAFETY: there is one full input-sized block of reserved owned capacity.
+    let next = unsafe { input.as_ptr().add(have) };
 
     // NOTE: zlib-ng writes a NULL byte to the last position of the input buffer. It must do so
     // because in some cases it falls back to the `vsprintf` function, which contrary to
@@ -4036,6 +4079,64 @@ mod tests {
         // Safety: `gz_init` initialized the deflate stream above. Ending without
         // `Z_FINISH` reports `Z_DATA_ERROR`, but still releases the deflate state.
         assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_DATA_ERROR);
+    }
+
+    #[test]
+    fn invalid_owned_write_input_cursor_fails_without_panic() -> Result<(), ()> {
+        for after in [false, true] {
+            let mut state = GzState::new();
+            state.mode = GzMode::Write;
+            state.fd = -2;
+            assert_eq!(gz_init(&mut state), Ok(()));
+            let input = state.input.as_ref().ok_or(())?;
+            state.stream.next_in = if after {
+                input.as_ptr().wrapping_add(input.capacity + 1)
+            } else {
+                input.as_ptr().wrapping_sub(1)
+            };
+            state.stream.avail_in = 1;
+            assert_eq!(state.owned_write_input_end(), None);
+            let mut source = GzWriteInput::from_slice(b"a");
+            assert_eq!(gz_write(&mut state, &mut source), 0);
+            assert_eq!(state.err, Z_STREAM_ERROR);
+            // SAFETY: gz_init initialized the compression stream.
+            assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_OK);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_owned_write_output_cursors_fail_before_deflate() -> Result<(), ()> {
+        for wrong_next in [true, false] {
+            let mut state = GzState::new();
+            state.mode = GzMode::Write;
+            state.fd = -2;
+            assert_eq!(gz_init(&mut state), Ok(()));
+            let output = state.output.as_ref().ok_or(())?;
+            if wrong_next {
+                state.next = output.as_ptr().wrapping_sub(1);
+            } else {
+                state.stream.next_out = output.as_ptr().wrapping_add(output.usable() + 1);
+                state.stream.avail_out = 0;
+            }
+            assert!(state.pending_write_output().is_none());
+            assert_eq!(gz_comp(&mut state, Z_NO_FLUSH), Err(()));
+            assert_eq!(state.err, Z_STREAM_ERROR);
+            // SAFETY: gz_init initialized the compression stream.
+            assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_OK);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_direct_flush_never_arithmetics_on_null_input_cursor() {
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        state.direct = true;
+        state.fd = -2;
+        assert_eq!(gz_comp(&mut state, Z_NO_FLUSH), Ok(()));
+        assert!(state.stream.next_in.is_null());
+        assert_eq!(state.stream.avail_in, 0);
     }
 
     #[test]
