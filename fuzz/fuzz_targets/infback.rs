@@ -39,6 +39,24 @@ fn differential_inflate_back<const CHUNK: usize>(input: &[u8]) {
             );
         }
         (Err(_), Err(_)) => {}
+        (Ok(reference), Err(libz_rs_sys::Z_DATA_ERROR)) => {
+            // zlib-ng without INFLATE_STRICT can finish a stream by copying
+            // bytes from history that has never been initialized. Verify the
+            // input through the separate ordinary raw-DEFLATE inflate path
+            // before accepting this specific non-strict reference success.
+            // A valid stream rejected only by inflateBack remains a crash.
+            let mut ordinary_output = vec![0; reference.len().saturating_add(1)];
+            let (_, status) = zlib_rs::decompress_slice(
+                &mut ordinary_output,
+                input,
+                zlib_rs::InflateConfig { window_bits: -15 },
+            );
+            assert_eq!(
+                status,
+                zlib_rs::ReturnCode::DataError,
+                "inflateBack rejected an input not rejected by ordinary raw inflate; CHUNK={CHUNK}",
+            );
+        }
         (reference, ours) => {
             panic!(
                 "inflateBack success/failure mismatch for window_bits = {window_bits}, CHUNK = {CHUNK}: reference={reference:?}, ours={ours:?}",

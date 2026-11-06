@@ -102,6 +102,31 @@ fn invalid_back_history_is_rejected_without_reading_uninitialized_window() {
 }
 
 #[test]
+fn non_strict_reference_can_emit_uninitialized_back_history() {
+    // Minimized by hosted libFuzzer: the reference accepts a distance
+    // reaching before the first output byte and copies the 0xAA sentinel
+    // from its initial window. Rust must not treat it as valid DEFLATE.
+    const INPUT: &[u8] = &[0x22, 0x59, 0x01, 0x60, 0x00, 0x3D];
+
+    let reference = run_inflate_back_ng::<1>(INPUT, 15);
+    let ours = run_inflate_back_rs::<1>(INPUT, 15);
+    assert!(
+        matches!(&reference, Ok(bytes) if !bytes.is_empty() && bytes.iter().all(|&b| b == 0xAA))
+    );
+    assert_eq!(ours, Err(libz_rs_sys::Z_DATA_ERROR));
+
+    // A separate ordinary inflate entrypoint must also refuse this
+    // invalid back-reference before the harness tolerates C's success.
+    let mut output = vec![0; reference.as_ref().map_or(0, Vec::len) + 1];
+    let (_, status) = zlib_rs::decompress_slice(
+        &mut output,
+        INPUT,
+        zlib_rs::InflateConfig { window_bits: -15 },
+    );
+    assert_eq!(status, zlib_rs::ReturnCode::DataError);
+}
+
+#[test]
 fn blow_up_the_stack_1() {
     const INPUT: &[u8] = include_bytes!("test-data/blow_up_the_stack_1.gz");
     entry(INPUT);
