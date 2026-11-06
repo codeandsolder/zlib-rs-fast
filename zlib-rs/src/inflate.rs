@@ -930,6 +930,10 @@ impl<'a> InflateOutput<'a> {
         self.writer.extend(bytes)
     }
     #[inline]
+    fn fill_zero(&mut self, len: usize) {
+        self.writer.fill_zero(len);
+    }
+    #[inline]
     fn extend_from_window(&mut self, window: &Window<'_>, range: core::ops::Range<usize>) {
         self.writer.extend_from_window(window, range)
     }
@@ -1085,7 +1089,14 @@ fn copy_match_bytes(
             if sane {
                 return Err("invalid distance too far back\0");
             }
-            panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+            // Non-strict inflateUndermine is defined to synthesize zero
+            // bytes for the history that precedes the initialized window.
+            // The resumed Match state re-enters here with the remaining length.
+            let missing = from_end - window.have();
+            let copied = missing.min(*length).min(left);
+            output.fill_zero(copied);
+            *length -= copied;
+            return Ok(*length == 0);
         }
 
         let wnext = window.next();
@@ -2340,7 +2351,24 @@ fn inflate_fast_help_impl(
                                     break 'outer;
                                 }
 
-                                panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+                                // This cold branch follows the same initialized-history
+                                // reconstruction as the ordinary Match decoder. Fast inflate
+                                // reserves sufficient output for a whole DEFLATE match.
+                                let mut remaining = usize::from(len);
+                                while remaining != 0 {
+                                    if let Err(msg) = copy_match_bytes(
+                                        &state.window,
+                                        false,
+                                        usize::from(dist),
+                                        &mut remaining,
+                                        output,
+                                    ) {
+                                        bad = Some(msg);
+                                        state.mode = Mode::Bad;
+                                        break 'outer;
+                                    }
+                                }
+                                break 'dodist;
                             }
 
                             let mut op = dist as usize - written;
@@ -2963,7 +2991,7 @@ pub fn copy<'a>(
 }
 
 pub fn undermine(stream: &mut InflateStream, subvert: i32) -> ReturnCode {
-    stream.state.flags.update(Flags::SANE, (!subvert) != 0);
+    stream.state.flags.update(Flags::SANE, subvert == 0);
 
     ReturnCode::Ok
 }
@@ -3094,6 +3122,53 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_strict_missing_history_is_initialized_as_zero_without_panic() -> Result<(), &'static str>
+    {
+        let mut output_bytes = [0xa5u8; 32];
+        // SAFETY: the stack array is valid and uniquely writable for 32 bytes.
+        let mut output = unsafe { InflateOutput::new_uninit(output_bytes.as_mut_ptr(), 32) };
+        let window = Window::empty();
+        let mut remaining = 10;
+        assert_eq!(
+            copy_match_bytes(&window, true, 3, &mut remaining, &mut output),
+            Err("invalid distance too far back\0"),
+        );
+        assert_eq!(output.len(), 0);
+
+        while remaining != 0 {
+            copy_match_bytes(&window, false, 3, &mut remaining, &mut output)?;
+        }
+        assert_eq!(output.filled(), &[0; 10]);
+        assert_eq!(&output_bytes[10..], &[0xa5; 22]);
+        Ok(())
+    }
+
+    #[test]
+    fn non_strict_missing_history_rejoins_initialized_window_and_output() -> Result<(), &'static str>
+    {
+        let mut window_storage = [0xa5u8; 8];
+        let mut window = Window::from_initialized_slice(&mut window_storage);
+        let mut checksum = 1;
+        window.extend(
+            &[10, 11, 12, 13],
+            0,
+            false,
+            &mut checksum,
+            &mut Crc32Fold::new(),
+        );
+        let mut output_bytes = [0xa5u8; 16];
+        // SAFETY: the stack array is valid and uniquely writable for 16 bytes.
+        let mut output = unsafe { InflateOutput::new_uninit(output_bytes.as_mut_ptr(), 16) };
+        let mut remaining = 9;
+        while remaining != 0 {
+            copy_match_bytes(&window, false, 6, &mut remaining, &mut output)?;
+        }
+        assert_eq!(output.filled(), &[0, 0, 10, 11, 12, 13, 0, 0, 10]);
+        assert_eq!(&output_bytes[9..], &[0xa5; 7]);
+        Ok(())
+    }
 
     #[test]
     fn uncompress2_reports_bytes_consumed_including_with_trailing_input() {

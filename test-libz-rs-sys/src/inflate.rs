@@ -612,6 +612,101 @@ fn cover_wrap() {
 }
 
 #[test]
+fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
+) -> Result<(), &'static str> {
+    use libz_rs_sys::{inflate, inflateEnd, inflateInit2_, inflateUndermine};
+    // Final fixed-Huffman block: length-3 match at distance 1, then EOB.
+    // There are no preceding literals, so all three history bytes are missing.
+    // In normal mode
+    // it is Z_DATA_ERROR. inflateUndermine requests zlib's alternative:
+    // explicitly synthesize zero history instead of reading uninitialized
+    // window storage or panicking.
+    const MALFORMED: &[u8] = &[0x03, 0x02, 0x00];
+
+    for subvert in [1, 2, -1] {
+        let mut observed = Vec::new();
+        for &(output_chunk, trailing) in &[(1usize, 0usize), (512, 32)] {
+            let mut source = MALFORMED.to_vec();
+            source.extend(core::iter::repeat_n(0u8, trailing));
+            let mut stream = mem_setup();
+            assert_eq!(
+                unsafe { inflateInit2_(&mut stream, -15, VERSION, STREAM_SIZE) },
+                Z_OK,
+            );
+            assert_eq!(unsafe { inflateUndermine(&mut stream, subvert) }, Z_OK);
+            stream.next_in = source.as_mut_ptr();
+            stream.avail_in =
+                u32::try_from(source.len()).map_err(|_| "test input exceeds C width")?;
+
+            let mut result = Vec::new();
+            let mut done = false;
+            for _ in 0..256 {
+                let mut output = [0xa5u8; 512];
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out =
+                    u32::try_from(output_chunk).map_err(|_| "test output exceeds C width")?;
+                let before_in = stream.avail_in;
+                let code = unsafe { inflate(&mut stream, InflateFlush::NoFlush as i32) };
+                let written = output_chunk - stream.avail_out as usize;
+                result.extend_from_slice(&output[..written]);
+                if code == Z_STREAM_END {
+                    done = true;
+                    break;
+                }
+                assert_eq!(code, Z_OK, "unexpected result for chunk {output_chunk}");
+                assert!(
+                    written != 0 || stream.avail_in != before_in,
+                    "inflate must make progress for chunk {output_chunk}"
+                );
+            }
+            assert!(
+                done,
+                "invalid-history recovery must finish for {output_chunk}"
+            );
+            assert!(!result.is_empty());
+            assert!(
+                result.iter().all(|&b| b == 0),
+                "only synthesized zero history is allowed"
+            );
+            assert_eq!(unsafe { inflateEnd(&mut stream) }, Z_OK);
+            mem_done(&mut stream);
+            observed.push(result);
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "decoder paths must agree for {subvert}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn undermine_zero_restores_strict_history_validation() -> Result<(), &'static str> {
+    use libz_rs_sys::{inflate, inflateEnd, inflateInit2_, inflateUndermine};
+
+    let mut input = [0x03u8, 0x02, 0x00];
+    let mut output = [0xa5u8; 32];
+    let mut stream = mem_setup();
+    assert_eq!(
+        unsafe { inflateInit2_(&mut stream, -15, VERSION, STREAM_SIZE) },
+        Z_OK
+    );
+    assert_eq!(unsafe { inflateUndermine(&mut stream, 1) }, Z_OK);
+    assert_eq!(unsafe { inflateUndermine(&mut stream, 0) }, Z_OK);
+    stream.next_in = input.as_mut_ptr();
+    stream.avail_in = u32::try_from(input.len()).map_err(|_| "test input exceeds C width")?;
+    stream.next_out = output.as_mut_ptr();
+    stream.avail_out = u32::try_from(output.len()).map_err(|_| "test output exceeds C width")?;
+    assert_eq!(
+        unsafe { inflate(&mut stream, InflateFlush::NoFlush as i32) },
+        Z_DATA_ERROR,
+    );
+    assert_eq!(unsafe { inflateEnd(&mut stream) }, Z_OK);
+    mem_done(&mut stream);
+    Ok(())
+}
+
+#[test]
 fn inflate_mark_is_independent_of_unbound_io_buffers() {
     // inflateMark examines the initialized decode state. It does not require
     // the stream's caller-owned input/output buffers to remain attached between calls.

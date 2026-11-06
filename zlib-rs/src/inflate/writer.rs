@@ -76,6 +76,14 @@ impl<'a> Writer<'a> {
         self.filled += 1;
     }
 
+    /// Materialize missing history as initialized zero bytes, as requested by
+    /// inflateUndermine. Never expose the uninitialized contents of a window.
+    #[inline]
+    pub fn fill_zero(&mut self, len: usize) {
+        self.buf.as_mut_slice()[self.filled..][..len].fill(MaybeUninit::new(0));
+        self.filled += len;
+    }
+
     /// Appends data to the buffer
     #[inline(always)]
     pub fn extend(&mut self, buf: &[u8]) {
@@ -215,11 +223,11 @@ impl<'a> BackWriter<'a> {
         distance: usize,
         length: usize,
     ) -> Result<(), &'static str> {
-        if distance > self.writer.capacity() {
-            if sane {
-                return Err("invalid distance too far back\0");
-            }
-            panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+        if length == 0 {
+            return Ok(());
+        }
+        if sane && distance > self.writer.capacity() {
+            return Err("invalid distance too far back\0");
         }
 
         let written = self.writer.len();
@@ -229,7 +237,13 @@ impl<'a> BackWriter<'a> {
                 if sane {
                     return Err("invalid distance too far back\0");
                 }
-                panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+                // The callback's previous window has no initialized bytes
+                // this far back. Synthesize only the missing prefix, then
+                // resume the same match using the now-initialized output.
+                let missing = from_previous - self.previous_history;
+                let zeros = missing.min(length);
+                self.writer.fill_zero(zeros);
+                return self.copy_match(false, distance, length - zeros);
             }
 
             let copy = Ord::min(from_previous, length);
@@ -294,6 +308,33 @@ mod test {
             naive[M..][..length],
             "{offset_from_end} {length}"
         );
+    }
+
+    #[test]
+    fn callback_writer_non_strict_missing_history_zero_fills_only_unknown_prefix() {
+        let mut storage = [0xa5u8; 16];
+        let mut window = super::super::window::BackWindow::from_initialized_slice(&mut storage);
+        let mut writer = BackWriter::new(&mut window, 0);
+        assert_eq!(
+            writer.copy_match(true, 5, 11),
+            Err("invalid distance too far back\0")
+        );
+        assert_eq!(writer.len(), 0);
+        assert_eq!(writer.copy_match(false, 5, 11), Ok(()));
+        assert_eq!(writer.len(), 11);
+        assert_eq!(&storage[..11], &[0; 11]);
+        assert_eq!(&storage[11..], &[0xa5; 5]);
+    }
+
+    #[test]
+    fn callback_writer_uses_only_initialized_previous_history() {
+        let mut storage = [0, 1, 2, 3, 4, 5, 6, 7];
+        let mut window = super::super::window::BackWindow::from_initialized_slice(&mut storage);
+        window.mark_full_history();
+        let mut writer = BackWriter::new(&mut window, 0);
+        assert_eq!(writer.copy_match(false, 6, 8), Ok(()));
+        assert_eq!(writer.len(), 8);
+        assert_eq!(storage, [2, 3, 4, 5, 6, 7, 2, 3]);
     }
 
     #[test]
