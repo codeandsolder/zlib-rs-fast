@@ -724,6 +724,7 @@ fn inflate_mark_is_independent_of_unbound_io_buffers() {
             Z_OK
         );
         // SAFETY: inflateInit_ initialized the stream successfully.
+        // SAFETY: successful inflateInit2_ initialized every field in the C ABI stream.
         let stream = unsafe { raw.assume_init_mut() };
         // SAFETY: the initialized inflate state is live; inflateMark only observes it.
         let before = unsafe { inflateMark(stream) };
@@ -776,6 +777,7 @@ fn inflate_mark_reports_unfinished_stored_block_without_io_buffers() {
             Z_OK
         );
         // SAFETY: initialization succeeded.
+        // SAFETY: successful inflateInit2_ initialized every field in the C ABI stream.
         let stream = unsafe { raw.assume_init_mut() };
         let compressed_prefix = [0x78u8, 0x01, 0x01, 20, 0, 235, 255];
         let mut output = [0u8; 32];
@@ -1643,6 +1645,7 @@ fn inflate_total_in_counter_wraps_as_c_unsigned_long() {
             Z_OK,
         );
         // SAFETY: inflateInit_ succeeded and initialized the stream.
+        // SAFETY: successful inflateInit2_ initialized every field in the C ABI stream.
         let stream = unsafe { raw.assume_init_mut() };
         let mut compressed = [0x78u8, 0x9c, 0x03, 0, 0, 0, 0, 1];
         let mut out = [0u8; 1];
@@ -1676,6 +1679,7 @@ fn inflate_sync_counter_wraps_as_c_unsigned_long() {
             Z_OK,
         );
         // SAFETY: inflateInit_ succeeded and initialized the stream.
+        // SAFETY: successful inflateInit2_ initialized every field in the C ABI stream.
         let stream = unsafe { raw.assume_init_mut() };
         let mut marker = [0u8, 0, 0xff, 0xff];
         stream.total_in = c_ulong::MAX - 1;
@@ -1687,6 +1691,68 @@ fn inflate_sync_counter_wraps_as_c_unsigned_long() {
         // SAFETY: close a successfully initialized stream exactly once.
         assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
         observed
+    });
+}
+
+#[test]
+fn inflate_sync_preserves_output_total_after_recovery() {
+    assert_eq_rs_ng!({
+        // A non-final stored DEFLATE block yields "ABC", followed by a
+        // reserved block type (BTYPE=3) that requires recovery.
+        // The 00 00 ff ff marker precedes a final stored block "DEF".
+        let mut before_sync = [0x00u8, 0x03, 0x00, 0xfc, 0xff, b'A', b'B', b'C', 0x06];
+        let mut after_sync = [
+            0x00u8, 0x00, 0xff, 0xff, 0x01, 0x03, 0x00, 0xfc, 0xff, b'D', b'E', b'F',
+        ];
+        let mut output = [0xa5u8; 16];
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+
+        // SAFETY: the stream is writable and the version/size match this ABI.
+        let init_status = unsafe {
+            inflateInit2_(
+                raw.as_mut_ptr(),
+                -15,
+                zlibVersion(),
+                c_int::try_from(core::mem::size_of::<z_stream>()).unwrap_or(c_int::MAX),
+            )
+        };
+        assert_eq!(init_status, Z_OK);
+        // SAFETY: successful inflateInit2_ initialized every field in the C ABI stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        stream.next_in = before_sync.as_mut_ptr();
+        stream.avail_in = c_uint::try_from(before_sync.len()).unwrap_or(c_uint::MAX);
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = c_uint::try_from(output.len()).unwrap_or(c_uint::MAX);
+
+        // SAFETY: the provided input and output spans stay live and disjoint.
+        let first_status = unsafe { inflate(stream, Z_NO_FLUSH) };
+        assert_eq!(first_status, Z_DATA_ERROR);
+        assert_eq!(stream.total_out, 3);
+        assert_eq!(&output[..3], b"ABC");
+
+        stream.next_in = after_sync.as_mut_ptr();
+        stream.avail_in = c_uint::try_from(after_sync.len()).unwrap_or(c_uint::MAX);
+        // SAFETY: the recovery search sees the complete live input span.
+        let sync_status = unsafe { inflateSync(stream) };
+        assert_eq!(sync_status, Z_OK);
+        let total_at_sync = stream.total_out;
+
+        // SAFETY: the remaining DEFLATE span and output allocation stay valid.
+        let final_status = unsafe { inflate(stream, Z_FINISH) };
+        let total_after = stream.total_out;
+        let input_remaining = stream.avail_in;
+        // SAFETY: successfully initialized stream is freed once.
+        let end_status = unsafe { inflateEnd(stream) };
+        assert_eq!(end_status, Z_OK);
+        assert_eq!(&output[..6], b"ABCDEF");
+
+        (
+            sync_status,
+            total_at_sync,
+            final_status,
+            total_after,
+            input_remaining,
+        )
     });
 }
 

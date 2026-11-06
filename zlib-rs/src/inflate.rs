@@ -2927,6 +2927,9 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
     }
 
     let flags = state.gzip_flags;
+    // The next inflate call reconstructs total_out from this full-width count.
+    // reset() clears it, so preserve it alongside the public ABI counters.
+    let total = state.total;
     let total_in = stream.total_in;
     let total_out = stream.total_out;
 
@@ -2934,6 +2937,7 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
 
     stream.total_in = total_in;
     stream.total_out = total_out;
+    stream.state.total = total;
 
     stream.state.gzip_flags = flags;
     stream.state.mode = Mode::Type;
