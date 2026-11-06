@@ -77,6 +77,31 @@ fn inflate_copy_rejects_back_init_state() {
 }
 
 #[test]
+fn invalid_back_history_is_rejected_without_reading_uninitialized_window() {
+    // Minimized by hosted libFuzzer from an inflateBack one-byte callback.
+    // The input runs out before its incomplete DEFLATE stream can terminate.
+    const TRUNCATED: &[u8] = &[0x0a, 0x26, 0x0a, 0x26];
+    for chunk in [1usize, 512] {
+        let (reference, ours) = if chunk == 1 {
+            (
+                run_inflate_back_ng::<1>(TRUNCATED, 15),
+                run_inflate_back_rs::<1>(TRUNCATED, 15),
+            )
+        } else {
+            (
+                run_inflate_back_ng::<512>(TRUNCATED, 15),
+                run_inflate_back_rs::<512>(TRUNCATED, 15),
+            )
+        };
+        // zlib-ng's non-strict decoder can continue through an invalid
+        // distance and eventually report input exhaustion. The Rust decoder
+        // must instead refuse to read history never initialized by output.
+        assert_eq!(reference, Err(libz_ng_sys::Z_BUF_ERROR), "chunk={chunk}");
+        assert_eq!(ours, Err(libz_rs_sys::Z_DATA_ERROR), "chunk={chunk}");
+    }
+}
+
+#[test]
 fn blow_up_the_stack_1() {
     const INPUT: &[u8] = include_bytes!("test-data/blow_up_the_stack_1.gz");
     entry(INPUT);
