@@ -226,14 +226,44 @@ impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
         }
 
         let chunk_len = requests.len().div_ceil(workers);
+        // Keep ownership of each mutable result chunk in a recoverable slot.
+        // If thread creation is unsupported or the OS refuses another thread,
+        // run the affected and remaining jobs synchronously. Scoped threads
+        // must finish before these borrowed slices leave the scope.
+        let jobs = requests
+            .chunks(chunk_len)
+            .zip(results.chunks_mut(chunk_len))
+            .map(|job| std::sync::Mutex::new(Some(job)))
+            .collect::<std::vec::Vec<_>>();
         std::thread::scope(|scope| {
-            for (request_chunk, result_chunk) in requests
-                .chunks(chunk_len)
-                .zip(results.chunks_mut(chunk_len))
-            {
-                scope.spawn(move || {
-                    ScalarMatchSearchBackend.execute(request_chunk, result_chunk);
-                });
+            let mut can_spawn = true;
+            for job in &jobs {
+                if can_spawn {
+                    let result = std::thread::Builder::new().spawn_scoped(scope, move || {
+                        let Some((requests, results)) = job
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        else {
+                            return;
+                        };
+                        ScalarMatchSearchBackend.execute(requests, results);
+                    });
+                    if result.is_ok() {
+                        continue;
+                    }
+                    can_spawn = false;
+                }
+
+                // This job was never started, so its mutable results remain
+                // exclusively owned by the main scope. Preserve input order.
+                let pending = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((requests, results)) = pending {
+                    ScalarMatchSearchBackend.execute(requests, results);
+                }
             }
         });
     }
