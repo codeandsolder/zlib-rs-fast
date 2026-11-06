@@ -1,3 +1,4 @@
+pub mod chunked_inflate;
 #[cfg(test)]
 mod deflate;
 pub mod end_to_end;
