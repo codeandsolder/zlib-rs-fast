@@ -1224,6 +1224,61 @@ fn test_dict_deflate() {
 }
 
 #[test]
+fn deflate_prime_only_inserts_requested_bits() {
+    fn compress_after_prime(bits: i32, value: i32) -> Vec<u8> {
+        use libz_rs_sys::*;
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: supplied version and size match the C ABI stream.
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    raw.as_mut_ptr(),
+                    6,
+                    Z_DEFLATED,
+                    -15,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    zlibVersion(),
+                    c_int::try_from(core::mem::size_of::<z_stream>()).unwrap_or(c_int::MAX),
+                )
+            },
+            Z_OK
+        );
+        // SAFETY: successful initialization created a live stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        assert_eq!(unsafe { deflatePrime(stream, bits, value) }, Z_OK);
+        let mut output = [0u8; 128];
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = c_uint::try_from(output.len()).unwrap_or(c_uint::MAX);
+        // SAFETY: the output remains live and writable, with zero input available.
+        assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
+        let len = output.len() - stream.avail_out as usize;
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        output[..len].to_vec()
+    }
+
+    for (bits, high_value) in [
+        (0, -1),
+        (0, i32::MAX),
+        (1, -1),
+        (1, 0x7fff),
+        (3, -1),
+        (5, 0x7fff),
+        (7, i32::MIN),
+        (9, -1),
+        (15, 0x7fff_ffff),
+        (17, i32::MIN),
+        (31, -1),
+    ] {
+        let low_bits = high_value.cast_unsigned() & ((1u32 << bits) - 1);
+        let low_value = low_bits.cast_signed();
+        let full = compress_after_prime(bits, high_value);
+        let masked = compress_after_prime(bits, low_value);
+        assert_eq!(full, masked, "bits={bits}, high_value={high_value}");
+    }
+}
+
+#[test]
 fn deflate_prime_accepts_32_bits_like_zlib_ng() {
     assert_eq_rs_ng!(unsafe {
         let mut raw = MaybeUninit::<z_stream>::zeroed();

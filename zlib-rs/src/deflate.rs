@@ -960,8 +960,6 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
 }
 
 pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCode {
-    let mut value64 = value as u64;
-
     let state = &mut *stream.state;
 
     if bits < 0
@@ -979,6 +977,10 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
     if state.bit_writer.pending.remaining() < bytes_to_flush {
         return ReturnCode::BufError;
     }
+
+    // Only the requested low bits belong to the DEFLATE stream. Mask once
+    // before the reservoir can inherit high or sign-extended caller bits.
+    let mut value64 = u64::from(value.cast_unsigned()) & ((1u64 << bits) - 1);
 
     let mut put;
 
