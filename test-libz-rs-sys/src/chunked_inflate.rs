@@ -37,7 +37,7 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
 
     // The spare byte lets inflate consume an end marker/trailer after producing
     // exactly `data.len()` bytes, including the empty-stream case.
-    let mut decoded = vec![0xa5; data.len().checked_add(1).expect("output length fits")];
+    let mut decoded = vec![0xa5; data.len().saturating_add(1)];
     let input_chunk = input_chunk.max(1).min(c_uint::MAX as usize);
     let output_chunk = output_chunk.max(1).min(c_uint::MAX as usize);
 
@@ -48,7 +48,7 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
         if stream.avail_in == 0 && supplied < compressed.len() {
             let len = input_chunk.min(compressed.len() - supplied);
             stream.next_in = compressed[supplied..].as_ptr().cast_mut();
-            stream.avail_in = c_uint::try_from(len).expect("input transfer fits C ABI");
+            stream.avail_in = c_uint::try_from(len).unwrap_or(c_uint::MAX);
             supplied += len;
         }
 
@@ -57,7 +57,7 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
             assert_ne!(remaining, 0, "inflate produced more than expected");
             let len = output_chunk.min(remaining);
             stream.next_out = decoded[produced..].as_mut_ptr();
-            stream.avail_out = c_uint::try_from(len).expect("output transfer fits C ABI");
+            stream.avail_out = c_uint::try_from(len).unwrap_or(c_uint::MAX);
         }
 
         let before_in = stream.avail_in;
@@ -129,7 +129,7 @@ mod tests {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;
                 seed ^= seed << 5;
-                seed as u8
+                seed.to_le_bytes()[0]
             })
             .collect();
         for (input_chunk, output_chunk) in [(1, 1), (13, 7), (4_096, 255)] {
