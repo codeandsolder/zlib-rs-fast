@@ -12,71 +12,80 @@ fn end_to_end() {
 
 #[must_use]
 pub fn test(data: &[u8], config: DeflateConfig) -> bool {
-    if !(0..32).contains(&config.window_bits) {
-        // lower is raw, higher is gzip
-        return true;
-    }
-
-    // only proceed if this is a valid config
+    // Only proceed if this is a valid config.
     let mut stream = libz_rs_sys::z_stream::default();
-    let err = zlib_rs::deflate::init(&mut stream, config);
-    if err != ReturnCode::Ok {
+    if zlib_rs::deflate::init(&mut stream, config) != ReturnCode::Ok {
         return true;
     }
+    // SAFETY: `init` succeeded and the stream remains live until `deflateEnd`.
+    let output_bound = unsafe { libz_rs_sys::deflateBound_z(&raw mut stream, data.len()) };
+    // SAFETY: the initialized stream is being finalized exactly once.
     unsafe { libz_rs_sys::deflateEnd(&raw mut stream) };
 
-    const LENGTH: usize = 1 << 17;
+    let mut buffer_rs = vec![0; output_bound];
+    let (compressed_rs, code) = zlib_rs::deflate::compress_slice(&mut buffer_rs, data, config);
+    assert_eq!(ReturnCode::Ok, code);
 
-    // first, deflate the data using the standard zlib
-    let mut deflated_rs = [0; LENGTH];
-    let (deflated_rs, error) = zlib_rs::deflate::compress_slice(&mut deflated_rs, data, config);
+    let mut buffer_ng = vec![0; output_bound];
+    let (compressed_ng, code) = compress_slice_ng(&mut buffer_ng, data, config);
+    assert_eq!(ReturnCode::Ok, code);
 
-    let error = ReturnCode::from(error as i32);
-    assert_eq!(ReturnCode::Ok, error);
-
-    let mut deflated_ng = [0; LENGTH];
-    let (deflated_ng, error) = compress_slice_ng(&mut deflated_ng, data, config);
-
-    let error = ReturnCode::from(error as i32);
-    assert_eq!(ReturnCode::Ok, error);
-
-    assert_eq!(deflated_rs, deflated_ng);
-
-    let config = InflateConfig {
+    // Two encoders may produce different, equally valid DEFLATE representations.
+    // Cross-decode both outputs: every encoder/decoder combination must round-trip.
+    let inflate_config = InflateConfig {
         window_bits: match config.window_bits {
             8 => 9,
             n => n,
         },
     };
+    let mut buffer_ng = vec![0; data.len()];
+    let mut buffer_rs = vec![0; data.len()];
+    for (encoder, compressed) in [("zlib-rs", &*compressed_rs), ("zlib-ng", &*compressed_ng)] {
+        let (decoded, code) = uncompress_slice_ng(&mut buffer_ng, compressed, inflate_config);
+        assert_eq!(ReturnCode::Ok, code, "zlib-ng decoding {encoder}");
+        assert_eq!(decoded, data, "zlib-ng decoding {encoder}");
 
-    let mut dest_vec_ng = vec![0u8; data.len()];
-    let (output_ng, error) = uncompress_slice_ng(&mut dest_vec_ng, deflated_rs, config);
-
-    if error != ReturnCode::Ok || output_ng != data {
-        let path = std::env::temp_dir().join("deflate.txt");
-        std::fs::write(&path, data).unwrap();
-        let path = std::env::temp_dir().join("inflate.txt");
-        std::fs::write(&path, &*deflated_rs).unwrap();
-        eprintln!("saved deflated file to {path:?}");
+        let (decoded, code) =
+            zlib_rs::inflate::decompress_slice(&mut buffer_rs, compressed, inflate_config);
+        assert_eq!(ReturnCode::Ok, code, "zlib-rs decoding {encoder}");
+        assert_eq!(decoded, data, "zlib-rs decoding {encoder}");
     }
-
-    assert_eq!(ReturnCode::Ok, error);
-    assert_eq!(output_ng, data, "zlib-ng cannot decode these bytes!");
-
-    let mut dest_vec_rs = vec![0u8; data.len()];
-    let (output_rs, error) =
-        zlib_rs::inflate::decompress_slice(&mut dest_vec_rs, deflated_rs, config);
-
-    if error != ReturnCode::Ok || output_rs != data {
-        let path = std::env::temp_dir().join("deflate.txt");
-        std::fs::write(&path, data).unwrap();
-        let path = std::env::temp_dir().join("inflate.txt");
-        std::fs::write(&path, &*deflated_rs).unwrap();
-        eprintln!("saved deflated file to {path:?}");
-    }
-
-    assert_eq!(ReturnCode::Ok, error);
-    assert_eq!(output_rs, data);
-
     true
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "calls into C code")]
+fn different_valid_gzip_encodings_are_accepted() {
+    // Reproducer from the differential fuzz target: the two encoders choose
+    // distinct, valid DEFLATE representations of the same gzip payload.
+    const DATA: [u8; 51] = [
+        0xff, 0xfc, 0xd2, 0xda, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x8c, 0x06, 0x08, 0xff, 0x00,
+        0xff, 0x7f, 0xff, 0xff, 0xff, 0x74, 0x00, 0x00, 0x0e, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0xfd, 0xea, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let config = DeflateConfig {
+        level: 3,
+        window_bits: 31,
+        mem_level: 1,
+        ..DeflateConfig::default()
+    };
+    assert!(test(&DATA, config));
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "calls into C code")]
+fn raw_deflate_variants_are_cross_decoded() {
+    for window_bits in [-9, -15] {
+        let config = DeflateConfig {
+            level: 3,
+            window_bits,
+            mem_level: 1,
+            ..DeflateConfig::default()
+        };
+        assert!(test(
+            b"raw DEFLATE needs the same cross-decoder coverage",
+            config
+        ));
+    }
 }
