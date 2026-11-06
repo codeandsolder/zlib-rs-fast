@@ -511,8 +511,6 @@ jobs:
         working-directory: libz-rs-sys-cdylib
         run: |
           ls target/${{matrix.target}}/release
-          echo "----"
-          ls target/${{matrix.target}}/release/deps
           cc -o example example.c target/${{matrix.target}}/release/libz_rs.so -I../libz-rs-sys/include/
           ./example
           valgrind --track-origins=yes --error-exitcode=1 ./example
