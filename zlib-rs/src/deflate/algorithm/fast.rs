@@ -25,7 +25,7 @@ pub(super) struct FastProducer {
 }
 
 impl FastProducer {
-    pub(super) fn new(match_source: MatchSourceKind) -> Self {
+    pub(super) const fn new(match_source: MatchSourceKind) -> Self {
         Self {
             phase: FastPhase::Ready,
             match_source,
@@ -109,25 +109,22 @@ impl TokenProducer for FastProducer {
                         .try_into()
                         .expect("fast deflate probes four initialized bytes"),
                 );
+                // The low byte of this little-endian four-byte probe is exactly
+                // the literal at strstart; keep its byte identity explicit.
+                let literal = value.to_le_bytes()[0];
                 let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, value);
-                let distance = state.strstart as isize - hash_head as isize;
 
-                if (1..=state.max_dist() as isize).contains(&distance) && hash_head != 0 {
+                if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                     let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                     if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
                         let result = work.request(state).execute();
-                        self.phase = FastPhase::SearchReady {
-                            literal: value as u8,
-                            result,
-                        };
+                        self.phase = FastPhase::SearchReady { literal, result };
                         continue;
                     }
-                    self.phase = FastPhase::AwaitingSearch {
-                        literal: value as u8,
-                    };
+                    self.phase = FastPhase::AwaitingSearch { literal };
                     return ProduceStatus::MatchSearch(work);
                 }
-                value as u8
+                literal
             } else {
                 state.window.filled()[state.strstart]
             };

@@ -1874,6 +1874,21 @@ impl<'a> State<'a> {
         self.w_size - MIN_LOOKAHEAD
     }
 
+    /// Return the representable backward distance to an existing hash-chain position.
+    ///
+    /// Hash position zero may be used by the quick path as an actual history index;
+    /// other match producers separately reject it when treating zero as an empty sentinel.
+    /// Rejection is conservative: absent/out-of-range entries cannot yield invalid
+    /// or unrepresentable backreferences.
+    #[inline]
+    pub(crate) fn recent_hash_distance(&self, head: u16) -> Option<u16> {
+        let distance = self.strstart.checked_sub(usize::from(head))?;
+        if distance == 0 || distance > self.max_dist() {
+            return None;
+        }
+        u16::try_from(distance).ok()
+    }
+
     #[inline(always)]
     pub(crate) fn update_hash(&self, h: u32, val: u32) -> u32 {
         match self.hash_calc_variant {

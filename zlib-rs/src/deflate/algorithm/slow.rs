@@ -68,10 +68,9 @@ impl TokenProducer for SlowProducer {
                         } else {
                             0
                         };
-                        let distance = state.strstart as isize - hash_head as isize;
-                        if (1..=state.max_dist() as isize).contains(&distance)
+                        if hash_head != 0
+                            && state.recent_hash_distance(hash_head).is_some()
                             && state.prev_length < state.max_lazy_match
-                            && hash_head != 0
                         {
                             let kind = if self.use_longest_match_slow {
                                 MatchSearchKind::Slow

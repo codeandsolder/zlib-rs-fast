@@ -103,9 +103,8 @@ fn emit_next(state: &mut State<'_>) {
     if state.lookahead >= WANT_MIN_MATCH {
         let str_val = first_four_bytes(&state.window.filled()[state.strstart..]);
         let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, str_val);
-        let distance = state.strstart as isize - hash_head as isize;
 
-        if (1..=state.max_dist() as isize).contains(&distance) {
+        if let Some(distance) = state.recent_hash_distance(hash_head) {
             let match_start = &state.window.filled()[usize::from(hash_head)..];
             if str_val == first_four_bytes(match_start) {
                 let max_len = state.lookahead.min(STD_MAX_MATCH);
@@ -117,8 +116,6 @@ fn emit_next(state: &mut State<'_>) {
                     );
 
                 if match_len >= WANT_MIN_MATCH {
-                    let distance = u16::try_from(distance)
-                        .expect("DEFLATE window distances always fit in 16 bits");
                     state
                         .bit_writer
                         .emit_dist_static((match_len - STD_MIN_MATCH) as u8, distance);
@@ -131,7 +128,7 @@ fn emit_next(state: &mut State<'_>) {
 
         state
             .bit_writer
-            .emit_lit(StaticTreeDesc::L.static_tree, str_val as u8);
+            .emit_lit(StaticTreeDesc::L.static_tree, str_val.to_le_bytes()[0]);
     } else {
         let literal = state.window.filled()[state.strstart];
         state
@@ -159,5 +156,36 @@ mod tests {
     #[test]
     fn first_four_bytes_is_little_endian() {
         assert_eq!(first_four_bytes(&[1, 2, 3, 4, 5]), 0x0403_0201);
+    }
+
+    #[test]
+    fn hash_distance_checks_sentinels_underflow_and_window_boundary() {
+        use crate::deflate::{end, DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(1));
+        let state = &mut stream.state;
+        let limit = state.max_dist();
+        assert!(u16::try_from(limit).is_ok());
+
+        state.strstart = 42;
+        assert_eq!(state.recent_hash_distance(42), None); // zero distance
+        assert_eq!(state.recent_hash_distance(43), None); // future head
+        assert_eq!(state.recent_hash_distance(41), Some(1));
+        assert_eq!(state.recent_hash_distance(0), Some(42)); // quick path allows history index 0
+
+        state.strstart = limit + 1;
+        assert_eq!(state.recent_hash_distance(1), u16::try_from(limit).ok());
+        assert_eq!(state.recent_hash_distance(0), None);
+
+        // A caller that eventually supports larger windows must not truncate a
+        // valid usize distance into an incorrect u16 encoded backreference.
+        let original_w_size = state.w_size;
+        state.w_size = usize::from(u16::MAX) + crate::deflate::MIN_LOOKAHEAD + 1;
+        state.strstart = usize::from(u16::MAX) + 2;
+        assert_eq!(state.recent_hash_distance(1), None);
+
+        state.w_size = original_w_size;
+        state.strstart = 0;
+        assert!(end(&mut stream).is_ok());
     }
 }
