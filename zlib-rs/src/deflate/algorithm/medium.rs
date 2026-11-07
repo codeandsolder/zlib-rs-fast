@@ -439,30 +439,40 @@ fn fizzle_matches(window: &[u8], max_dist: usize, current: &mut Match, next: &mu
         return;
     }
 
-    if current.match_length > 1 + next.match_start {
+    // A possible leftward shift must remain inside both history positions.
+    // Keep this in unsigned address space; signed intermediates could wrap
+    // before being cast back into a window index.
+    let shift = usize::from(current.match_length - 1);
+    let Some(match_start) = usize::from(next.match_start).checked_sub(shift) else {
         return;
-    }
-
-    if current.match_length > 1 + next.strstart {
+    };
+    let Some(origin_start) = usize::from(next.strstart).checked_sub(shift) else {
         return;
-    }
-
-    let m = &window[(-(current.match_length as isize) + 1 + next.match_start as isize) as usize..];
-    let orig = &window[(-(current.match_length as isize) + 1 + next.strstart as isize) as usize..];
+    };
+    let (Some(&match_byte), Some(&origin_byte)) =
+        (window.get(match_start), window.get(origin_start))
+    else {
+        return;
+    };
 
     /* quick exit check.. if this fails then don't bother with anything else */
-    if m[0] != orig[0] {
+    if match_byte != origin_byte {
         return;
     }
 
     /* step one: try to move the "next" match to the left as much as possible */
-    let limit = next.strstart.saturating_sub(max_dist as u16);
+    let limit = next
+        .strstart
+        .saturating_sub(u16::try_from(max_dist).unwrap_or(u16::MAX));
 
     let mut c = *current;
     let mut n = *next;
-
-    let m = &window[..n.match_start as usize];
-    let orig = &window[..n.strstart as usize];
+    let (Some(m), Some(orig)) = (
+        window.get(..usize::from(n.match_start)),
+        window.get(..usize::from(n.strstart)),
+    ) else {
+        return;
+    };
 
     let mut m = m.iter().rev();
     let mut orig = orig.iter().rev();
@@ -498,5 +508,52 @@ fn fizzle_matches(window: &[u8], max_dist: usize, current: &mut Match, next: &mu
         n.orgstart += 1;
         *current = c;
         *next = n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fizzle_uses_valid_history_indices_and_preserves_match_distance() {
+        let history = [b'a'; 32];
+        let current = Match {
+            match_start: 4,
+            match_length: 4,
+            strstart: 10,
+            orgstart: 10,
+        };
+        let next = Match {
+            match_start: 8,
+            match_length: 6,
+            strstart: 14,
+            orgstart: 14,
+        };
+
+        let mut left = current;
+        let mut right = next;
+        fizzle_matches(&history, 64, &mut left, &mut right);
+        assert!(left.match_length < current.match_length);
+        assert!(right.match_length > next.match_length);
+        assert_eq!(
+            right.strstart - right.match_start,
+            next.strstart - next.match_start
+        );
+
+        let mut malformed_next = next;
+        malformed_next.match_start = u16::MAX;
+        malformed_next.strstart = u16::MAX;
+        let mut unchanged_current = current;
+        fizzle_matches(&history, 64, &mut unchanged_current, &mut malformed_next);
+        assert_eq!(unchanged_current, current);
+        assert_eq!(malformed_next.match_start, u16::MAX);
+
+        let mut underflow_next = next;
+        underflow_next.match_start = 1;
+        let mut unchanged_current = current;
+        fizzle_matches(&history, 64, &mut unchanged_current, &mut underflow_next);
+        assert_eq!(unchanged_current, current);
+        assert_eq!(underflow_next.match_start, 1);
     }
 }
