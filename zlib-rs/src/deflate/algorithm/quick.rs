@@ -101,12 +101,12 @@ fn pending_needs_drain(state: &State<'_>) -> bool {
 
 fn emit_next(state: &mut State<'_>) {
     if state.lookahead >= WANT_MIN_MATCH {
-        let str_val = first_four_bytes(&state.window.filled()[state.strstart..]);
+        let str_val = StandardHashCalc::first_four_bytes(&state.window.filled()[state.strstart..]);
         let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, str_val);
 
         if let Some(distance) = state.recent_hash_distance(hash_head) {
             let match_start = &state.window.filled()[usize::from(hash_head)..];
-            if str_val == first_four_bytes(match_start) {
+            if str_val == StandardHashCalc::first_four_bytes(match_start) {
                 let max_len = state.lookahead.min(STD_MAX_MATCH);
                 let match_len = WANT_MIN_MATCH
                     + crate::deflate::match_compare::common_prefix_len(
@@ -140,22 +140,16 @@ fn emit_next(state: &mut State<'_>) {
     state.lookahead -= 1;
 }
 
-#[inline]
-fn first_four_bytes(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(
-        bytes[..4]
-            .try_into()
-            .expect("quick deflate only probes four initialized bytes"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn first_four_bytes_is_little_endian() {
-        assert_eq!(first_four_bytes(&[1, 2, 3, 4, 5]), 0x0403_0201);
+        assert_eq!(
+            StandardHashCalc::first_four_bytes(&[1, 2, 3, 4, 5]),
+            0x0403_0201
+        );
     }
 
     #[test]

@@ -36,10 +36,20 @@ impl StandardHashCalc {
         Self::hash_calc(h, val) & Self::HASH_CALC_MASK
     }
 
+    /// Read a four-byte hash probe from initialized window bytes.
+    ///
+    /// Every caller has already established at least four bytes of lookahead.
+    /// Array chunks express that precondition directly without an additional
+    /// fallible slice-to-array conversion on the match-search hot path.
+    #[inline]
+    pub(crate) fn first_four_bytes(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes.as_chunks::<4>().0[0])
+    }
+
     #[inline]
     pub fn quick_insert_string(state: &mut State, string: usize) -> u16 {
         let slice = &state.window.filled()[string + Self::HASH_CALC_OFFSET..];
-        let val = u32::from_le_bytes(slice[..4].try_into().unwrap());
+        let val = Self::first_four_bytes(slice);
 
         Self::quick_insert_value(state, string, val)
     }
@@ -69,7 +79,7 @@ impl StandardHashCalc {
         for (i, w) in slice.windows(4).enumerate() {
             let idx = string as u16 + i as u16;
 
-            let val = u32::from_le_bytes(w.try_into().unwrap());
+            let val = Self::first_four_bytes(w);
 
             let hm = Self::update_hash(0, val) as usize;
 

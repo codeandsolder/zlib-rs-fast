@@ -39,7 +39,7 @@ impl TokenProducer for FastProducer {
             if let FastPhase::SearchReady { literal, result } = self.phase {
                 self.phase = FastPhase::Ready;
                 state.match_start = result.start;
-                let mut match_len = result.length;
+                let mut match_len = usize::from(result.length);
 
                 if match_len >= WANT_MIN_MATCH {
                     let block_ready = state.tally_dist(
@@ -104,11 +104,8 @@ impl TokenProducer for FastProducer {
                     return ProduceStatus::MatchSearch(MatchSearchWork::external());
                 }
 
-                let value = u32::from_le_bytes(
-                    state.window.filled()[state.strstart..state.strstart + 4]
-                        .try_into()
-                        .expect("fast deflate probes four initialized bytes"),
-                );
+                let value =
+                    StandardHashCalc::first_four_bytes(&state.window.filled()[state.strstart..]);
                 // The low byte of this little-endian four-byte probe is exactly
                 // the literal at strstart; keep its byte identity explicit.
                 let literal = value.to_le_bytes()[0];
