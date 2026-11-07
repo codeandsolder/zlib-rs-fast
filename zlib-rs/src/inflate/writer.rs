@@ -129,12 +129,19 @@ impl<'a> Writer<'a> {
         // double the initialized prefix. This expresses that recurrence directly without
         // architecture dispatch or copying past the logical end of the match.
         if length > offset_from_end {
-            buf.copy_within(start..current, current);
-            let mut initialized = offset_from_end;
-            while initialized < length {
-                let copy_len = initialized.min(length - initialized);
-                buf.copy_within(current..current + copy_len, current + initialized);
-                initialized += copy_len;
+            if offset_from_end == 1 {
+                // A distance-one match repeats a single initialized byte.
+                // Filling the span avoids up to eight overlapping memmoves.
+                let repeated = buf[start];
+                buf[current..end].fill(repeated);
+            } else {
+                buf.copy_within(start..current, current);
+                let mut initialized = offset_from_end;
+                while initialized < length {
+                    let copy_len = initialized.min(length - initialized);
+                    buf.copy_within(current..current + copy_len, current + initialized);
+                    initialized += copy_len;
+                }
             }
         } else {
             buf.copy_within(start..start + length, current);
