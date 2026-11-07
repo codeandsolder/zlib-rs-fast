@@ -9,7 +9,9 @@
 // We are assuming little-endianness so we process the input
 // LSB-first. We need to use the "reversed" value from e.g
 // https://en.wikipedia.org/wiki/Cyclic_redundancy_check#Polynomial_representations.
-pub const CRC32_LSB_POLY: usize = 0xedb8_8320usize;
+// CRC polynomial arithmetic is intrinsically 32-bit, even when a braid
+// processes 64-bit machine words. Keep word width only for indexing/input.
+pub const CRC32_LSB_POLY: u32 = 0xedb8_8320;
 
 const W: usize = core::mem::size_of::<usize>();
 
@@ -19,9 +21,9 @@ const _: () = assert!(W >= core::mem::size_of::<u32>());
 
 // Pre-computed tables for the CRC32 algorithm.
 // CRC32_BYTE_TABLE corresponds to MulByXPowD from the paper.
-static CRC32_BYTE_TABLE: [[u32; 256]; 1] = build_crc32_table::<256, 1, 1>();
+static CRC32_BYTE_TABLE: [[u32; 256]; 1] = build_crc32_table::<1, 1>();
 // CRC32_WORD_TABLE is MulWordByXpowD.
-static CRC32_WORD_TABLE: [[u32; 256]; W] = build_crc32_table::<256, W, 1>();
+static CRC32_WORD_TABLE: [[u32; 256]; W] = build_crc32_table::<W, 1>();
 
 // FIXME: make const fn when msrv allows.
 pub fn get_crc_table() -> &'static [u32; 256] {
@@ -33,7 +35,7 @@ pub fn get_crc_table() -> &'static [u32; 256] {
 struct Crc32BraidTable<const N: usize>;
 
 impl<const N: usize> Crc32BraidTable<N> {
-    const TABLE: [[u32; 256]; W] = build_crc32_table::<256, W, N>();
+    const TABLE: [[u32; 256]; W] = build_crc32_table::<W, N>();
 }
 
 // Build the CRC32 tables using a more efficient and simpler approach
@@ -41,13 +43,17 @@ impl<const N: usize> Crc32BraidTable<N> {
 // multiplication and exponentiation, respectively) from the paper,
 // but with identical results. This function is const, so it should be
 // fully evaluated at compile time.
-const fn build_crc32_table<const A: usize, const W: usize, const N: usize>() -> [[u32; A]; W] {
-    let mut arr = [[0u32; A]; W];
+const fn build_crc32_table<const W: usize, const N: usize>() -> [[u32; 256]; W] {
+    let mut arr = [[0u32; 256]; W];
     let mut i = 0;
     while i < W {
-        let mut j = 0;
-        while j < A {
-            let mut c = j;
+        // CRC-32 is applied to each possible byte. Use a u32 seed for the
+        // polynomial and a usize index for the table instead of converting
+        // word-sized arithmetic back to u32 after every table entry.
+        let mut byte = 0u32;
+        let mut index = 0usize;
+        while index < 256 {
+            let mut c = byte;
             let mut k = 0;
             while k < 8 * (W * N - i) {
                 if c & 1 != 0 {
@@ -57,8 +63,9 @@ const fn build_crc32_table<const A: usize, const W: usize, const N: usize>() -> 
                 }
                 k += 1;
             }
-            arr[i][j] = c as u32;
-            j += 1;
+            arr[i][index] = c;
+            byte += 1;
+            index += 1;
         }
         i += 1;
     }
@@ -147,7 +154,8 @@ mod test {
     }
 
     fn crc32_words(data: &[u8], start: u32) -> u32 {
-        // Get a word-aligned sub-slice of the input data
+        // SAFETY: usize has no invalid bit patterns, and align_to returns
+        // properly aligned, disjoint subslices within the live input bytes.
         let (prefix, words, suffix) = unsafe { data.align_to::<usize>() };
         let crc = !start;
         let crc = crc32_naive_inner(prefix, crc);
@@ -175,7 +183,10 @@ mod test {
     fn crc32_naive_inner_endianness_and_alignment() {
         assert_eq!(crc32_naive_inner(&[0, 1], 0), 1_996_959_894);
 
-        let v: Vec<_> = (0..1024).map(|i| i as u8).collect();
+        // Cycle through all possible byte values without lossy integer casts.
+        let v: Vec<_> = core::iter::successors(Some(0u8), |byte| Some(byte.wrapping_add(1)))
+            .take(1024)
+            .collect();
         let start = 0;
 
         // test alignment

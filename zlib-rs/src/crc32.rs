@@ -16,6 +16,7 @@ mod vpclmulqdq;
 
 pub use combine::{crc32_combine, crc32_combine_gen, crc32_combine_op};
 
+#[must_use]
 pub fn crc32(start: u32, buf: &[u8]) -> u32 {
     /* For lens < 64, crc32_braid method is faster. The CRC32 instruction for
      * these short lengths might also prove to be effective */
@@ -32,6 +33,7 @@ fn crc32_braid(start: u32, buf: &[u8]) -> u32 {
     braid::crc32_braid::<5>(start, buf)
 }
 
+#[must_use]
 pub fn get_crc_table() -> &'static [u32; 256] {
     braid::get_crc_table()
 }
@@ -65,9 +67,11 @@ impl Default for Crc32Fold {
     }
 }
 impl Crc32Fold {
+    #[must_use]
     pub fn new() -> Self {
         Self::new_with_initial(CRC32_INITIAL_VALUE)
     }
+    #[must_use]
     pub fn new_with_initial(initial: u32) -> Self {
         #[cfg(target_arch = "x86_64")]
         let backend = if crate::cpu_features::is_enabled_pclmulqdq() {
@@ -108,11 +112,9 @@ impl Crc32Fold {
                     // SAFETY: selected only after runtime PCLMULQDQ/SSE4.1 detection.
                     unsafe { accumulator.fold(src, initial) };
                 }
-                return;
             }
             Crc32Backend::Scalar(value) => {
                 *value = braid::crc32_braid::<5>(*value, src);
-                return;
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -129,29 +131,28 @@ impl Crc32Fold {
             Crc32Backend::Scalar(value) => *value = braid::crc32_braid::<5>(*value, src),
         }
     }
+    #[must_use]
     pub fn finish(self) -> u32 {
         #[cfg(target_arch = "x86_64")]
-        return match self.backend {
+        let result = match self.backend {
             Crc32Backend::Pclmul {
                 accumulator,
                 pending_initial,
-            } => match pending_initial {
-                Some(initial) => initial,
-                None => {
-                    // SAFETY: selected only after runtime PCLMULQDQ/SSE4.1 detection.
-                    unsafe { accumulator.finish() }
-                }
-            },
+            } => pending_initial.unwrap_or_else(|| {
+                // SAFETY: selected only after runtime PCLMULQDQ/SSE4.1 detection.
+                unsafe { accumulator.finish() }
+            }),
             Crc32Backend::Scalar(value) => value,
         };
         #[cfg(not(target_arch = "x86_64"))]
-        match self.backend {
+        let result = match self.backend {
             #[cfg(target_arch = "aarch64")]
             Crc32Backend::ArmCrc(value) => value,
             #[cfg(target_arch = "loongarch64")]
             Crc32Backend::LoongArchCrc(value) => value,
             Crc32Backend::Scalar(value) => value,
-        }
+        };
+        result
     }
 }
 
@@ -164,8 +165,10 @@ mod test {
     const INPUT: [u8; 1024] = {
         let mut array = [0; 1024];
         let mut i = 0;
+        let mut byte = 0u8;
         while i < array.len() {
-            array[i] = i as u8;
+            array[i] = byte;
+            byte = byte.wrapping_add(1);
             i += 1;
         }
 

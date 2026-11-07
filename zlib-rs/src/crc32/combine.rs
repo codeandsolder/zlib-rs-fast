@@ -74,7 +74,7 @@ pub const fn multmodp(a: u32, mut b: u32) -> u32 {
         }
         m >>= 1;
         b = if (b & 1) != 0 {
-            (b >> 1) ^ CRC32_LSB_POLY as u32
+            (b >> 1) ^ CRC32_LSB_POLY
         } else {
             b >> 1
         };
