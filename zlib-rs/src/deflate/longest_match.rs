@@ -31,8 +31,25 @@ pub enum MatchSearchKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchSearchResult {
-    pub(crate) length: usize,
+    /// Length in the DEFLATE domain (0..=258), not the width of the host pointer.
+    pub(crate) length: u16,
     pub(crate) start: Pos,
+}
+
+impl MatchSearchResult {
+    /// Encode a backend result into the format's bounded match-length domain.
+    ///
+    /// A search backend may use host-width indexes or wider device counters,
+    /// but an individual DEFLATE match can cover at most 258 bytes. Truncating
+    /// the *search* to that prefix is valid; truncating its integer bits is not.
+    #[inline]
+    pub(crate) fn new(length: usize, start: Pos) -> Self {
+        const _: () = assert!(STD_MAX_MATCH <= u16::MAX as usize);
+        let bounded = length.min(STD_MAX_MATCH);
+        // Conversion cannot fail because STD_MAX_MATCH is at most u16::MAX.
+        let length = u16::try_from(bounded).unwrap_or(u16::MAX);
+        Self { length, start }
+    }
 }
 
 /// Owned scheduler token for one longest-match computation.
@@ -310,10 +327,7 @@ fn longest_match_help<const SLOW: bool>(
     // A previous lazy match can be longer than the input remaining at end of
     // stream. There is then no candidate that can improve it.
     if best_len >= params.lookahead {
-        return MatchSearchResult {
-            length: params.lookahead,
-            start: match_start,
-        };
+        return MatchSearchResult::new(params.lookahead, match_start);
     }
 
     let mut chain_remaining = params.max_chain_length;
@@ -379,18 +393,12 @@ fn longest_match_help<const SLOW: bool>(
             match_start = candidate_start as Pos;
 
             if len >= params.lookahead {
-                return MatchSearchResult {
-                    length: params.lookahead,
-                    start: match_start,
-                };
+                return MatchSearchResult::new(params.lookahead, match_start);
             }
 
             best_len = len;
             if best_len >= usize::from(params.nice_match) {
-                return MatchSearchResult {
-                    length: best_len,
-                    start: match_start,
-                };
+                return MatchSearchResult::new(best_len, match_start);
             }
 
             if SLOW && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
@@ -424,10 +432,7 @@ fn longest_match_help<const SLOW: bool>(
         cursor = next;
     }
 
-    MatchSearchResult {
-        length: best_len,
-        start: match_start,
-    }
+    MatchSearchResult::new(best_len, match_start)
 }
 
 fn initial_slow_cursor(
@@ -593,15 +598,26 @@ fn break_matching(
     best_len: usize,
     match_start: Pos,
 ) -> MatchSearchResult {
-    MatchSearchResult {
-        length: best_len.min(params.lookahead),
-        start: match_start,
-    }
+    MatchSearchResult::new(best_len.min(params.lookahead), match_start)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_result_length_uses_deflate_domain_even_for_wide_backend_counters() {
+        for length in [0, 1, 3, STD_MAX_MATCH] {
+            let result = MatchSearchResult::new(length, 19);
+            assert_eq!(usize::from(result.length), length);
+            assert_eq!(result.start, 19);
+        }
+        for length in [STD_MAX_MATCH + 1, usize::from(u16::MAX), usize::MAX] {
+            let result = MatchSearchResult::new(length, 19);
+            assert_eq!(usize::from(result.length), STD_MAX_MATCH);
+            assert_eq!(result.start, 19);
+        }
+    }
 
     #[test]
     fn requests_are_worker_safe_and_batchable() {

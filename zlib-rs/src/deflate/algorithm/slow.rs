@@ -41,7 +41,7 @@ impl TokenProducer for SlowProducer {
                 SlowPhase::SearchReady(result) => {
                     self.phase = SlowPhase::Ready;
                     state.match_start = result.start;
-                    let mut length = result.length;
+                    let mut length = usize::from(result.length);
                     if length <= 5 && state.strategy == Strategy::Filtered {
                         length = STD_MIN_MATCH - 1;
                     }

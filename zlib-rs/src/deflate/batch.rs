@@ -612,10 +612,7 @@ impl<'a> BatchRuntime<'a> {
             usize::from(state.prev_length)
         }
         .min(state.lookahead);
-        let incumbent = MatchSearchResult {
-            length: incumbent_length,
-            start: state.match_start,
-        };
+        let incumbent = MatchSearchResult::new(incumbent_length, state.match_start);
 
         let Some(candidate) = table.get(absolute_position) else {
             return incumbent;
@@ -642,10 +639,7 @@ impl<'a> BatchRuntime<'a> {
             return incumbent;
         };
 
-        MatchSearchResult {
-            length: candidate_length,
-            start: local_start,
-        }
+        MatchSearchResult::new(candidate_length, local_start)
     }
 
     fn complete_match_search(&mut self, result: MatchSearchResult) {
