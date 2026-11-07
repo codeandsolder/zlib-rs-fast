@@ -397,16 +397,14 @@ pub(super) fn decode_back(
                     let input_len = input.available();
                     let mut bit_reader =
                         BitReader::from_buffer(input.bit_buffer(), input.as_slice());
-                    let mut writer = BackWriter::new(&mut window, output.len());
-                    inflate_fast_back(state, &mut bit_reader, &mut writer);
+                    output.with_writer(&mut window, |writer| {
+                        inflate_fast_back(state, &mut bit_reader, writer);
+                    });
 
                     let remaining = bit_reader.bytes_remaining();
                     let bits = bit_reader.into_buffer();
                     input.advance(input_len - remaining);
                     input.set_bit_buffer(bits);
-                    let filled = writer.len();
-                    drop(writer);
-                    output.set_len(filled, &window);
 
                     continue 'inf_leave;
                 }
@@ -572,18 +570,19 @@ pub(super) fn decode_back(
                         ret = code;
                         break 'inf_leave;
                     }
-                    let mut writer = BackWriter::new(&mut window, output.len());
-                    let copy = Ord::min(state.length, writer.remaining());
-                    if let Err(msg) =
-                        writer.copy_match(state.flags.contains(Flags::SANE), state.offset, copy)
-                    {
-                        state.mode = Mode::Bad;
-                        state.bad(msg);
-                        continue 'inf_leave;
-                    }
-                    let filled = writer.len();
-                    drop(writer);
-                    output.set_len(filled, &window);
+                    let copy = match output.copy_match(
+                        &mut window,
+                        state.flags.contains(Flags::SANE),
+                        state.offset,
+                        state.length,
+                    ) {
+                        Ok(count) => count,
+                        Err(msg) => {
+                            state.mode = Mode::Bad;
+                            state.bad(msg);
+                            continue 'inf_leave;
+                        }
+                    };
                     state.length -= copy;
                     if state.length == 0 {
                         break;
