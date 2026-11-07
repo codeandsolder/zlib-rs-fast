@@ -5,12 +5,11 @@ use core::marker::PhantomData;
 use crate::allocate::Allocator;
 use crate::c_api::internal_state;
 use crate::inflate::bitreader::BitReader;
-use crate::inflate::inftrees::{inflate_table, CodeType, InflateTable};
 use crate::inflate::{
     back_io::{BackInput, BackOutput},
-    BackWindow, Codes, Flags, InflateAllocOffsets, InflateConfig, InflateStateKind, InflateStream,
-    Mode, State, Table, Window, INFLATE_FAST_MIN_HAVE, INFLATE_FAST_MIN_LEFT, INFLATE_STRICT,
-    MAX_BITS, MAX_DIST_EXTRA_BITS,
+    BackWindow, CodeLengthRepeat, Codes, Flags, InflateAllocOffsets, InflateConfig,
+    InflateStateKind, InflateStream, Mode, State, Table, Window, INFLATE_FAST_MIN_HAVE,
+    INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS, MAX_DIST_EXTRA_BITS,
 };
 use crate::traceln;
 use crate::{c_api::z_stream, inflate::writer::BackWriter, ReturnCode};
@@ -222,44 +221,22 @@ pub(super) fn decode_back(
                 traceln!("inflate:       table sizes ok");
                 state.have = 0;
 
-                // permutation of code lengths ;
-                const ORDER: [u8; 19] = [
-                    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-                ];
-
                 while state.have < state.ncode {
                     if let Err(code) = input.need_bits(3) {
                         ret = code;
                         break 'inf_leave;
                     }
-                    state.lens[usize::from(ORDER[state.have])] = input.bits(3) as u16;
-                    state.have += 1;
+                    state.append_code_length_alphabet(input.bits(3) as u16);
                     input.drop_bits(3);
                 }
 
-                while state.have < 19 {
-                    state.lens[usize::from(ORDER[state.have])] = 0;
-                    state.have += 1;
+                if let Err(msg) = state.finish_code_length_alphabet() {
+                    state.mode = Mode::Bad;
+                    state.bad(msg);
+                    continue;
                 }
 
-                let InflateTable::Success { root, used } = inflate_table(
-                    CodeType::Codes,
-                    &state.lens[..19],
-                    &mut state.codes_codes,
-                    7,
-                    &mut state.work,
-                ) else {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid code lengths set\0");
-                    continue;
-                };
-
-                state.next = used;
-                state.len_table.codes = Codes::CodeLengths;
-                state.len_table.bits = root;
-
                 traceln!("inflate:       table sizes ok");
-                state.have = 0;
 
                 while state.have < state.nlen + state.ndist {
                     let here = loop {
@@ -283,110 +260,35 @@ pub(super) fn decode_back(
                             state.lens[state.have] = here.val;
                             state.have += 1;
                         }
-                        16 => {
-                            if let Err(code) = input.need_bits(usize::from(here_bits) + 2) {
+                        symbol => {
+                            let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
+                                state.mode = Mode::Bad;
+                                state.bad("invalid bit length repeat\0");
+                                continue 'inf_leave;
+                            };
+                            if let Err(code) = input
+                                .need_bits(usize::from(here_bits) + usize::from(repeat.extra_bits))
+                            {
                                 ret = code;
                                 break 'inf_leave;
                             }
                             input.drop_bits(here_bits);
-                            if state.have == 0 {
+                            let extra = input.bits(usize::from(repeat.extra_bits));
+                            input.drop_bits(repeat.extra_bits);
+                            if let Err(msg) = state.append_code_length_repeat(repeat, extra) {
                                 state.mode = Mode::Bad;
-                                state.bad("invalid bit length repeat\0");
+                                state.bad(msg);
                                 continue 'inf_leave;
                             }
-
-                            let len = state.lens[state.have - 1];
-                            let copy = 3 + input.bits(2) as usize;
-                            input.drop_bits(2);
-
-                            if state.have + copy > state.nlen + state.ndist {
-                                state.mode = Mode::Bad;
-                                state.bad("invalid bit length repeat\0");
-                                continue 'inf_leave;
-                            }
-
-                            state.lens[state.have..][..copy].fill(len);
-                            state.have += copy;
-                        }
-                        17 => {
-                            if let Err(code) = input.need_bits(usize::from(here_bits) + 3) {
-                                ret = code;
-                                break 'inf_leave;
-                            }
-                            input.drop_bits(here_bits);
-                            let copy = 3 + input.bits(3) as usize;
-                            input.drop_bits(3);
-
-                            if state.have + copy > state.nlen + state.ndist {
-                                state.mode = Mode::Bad;
-                                state.bad("invalid bit length repeat\0");
-                                continue 'inf_leave;
-                            }
-
-                            state.lens[state.have..][..copy].fill(0);
-                            state.have += copy;
-                        }
-                        18.. => {
-                            if let Err(code) = input.need_bits(usize::from(here_bits) + 7) {
-                                ret = code;
-                                break 'inf_leave;
-                            }
-                            input.drop_bits(here_bits);
-                            let copy = 11 + input.bits(7) as usize;
-                            input.drop_bits(7);
-
-                            if state.have + copy > state.nlen + state.ndist {
-                                state.mode = Mode::Bad;
-                                state.bad("invalid bit length repeat\0");
-                                continue 'inf_leave;
-                            }
-
-                            state.lens[state.have..][..copy].fill(0);
-                            state.have += copy;
                         }
                     }
                 }
 
-                // check for end-of-block code (better have one)
-                if state.lens[256] == 0 {
+                if let Err(msg) = state.finish_dynamic_trees() {
                     state.mode = Mode::Bad;
-                    state.bad("invalid code -- missing end-of-block\0");
+                    state.bad(msg);
                     continue 'inf_leave;
                 }
-
-                // build code tables
-
-                let InflateTable::Success { root, used } = inflate_table(
-                    CodeType::Lens,
-                    &state.lens[..state.nlen],
-                    &mut state.len_codes,
-                    10,
-                    &mut state.work,
-                ) else {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid literal/lengths set\0");
-                    continue 'inf_leave;
-                };
-
-                state.len_table.codes = Codes::Len;
-                state.len_table.bits = root;
-                state.next = used;
-
-                let InflateTable::Success { root, used } = inflate_table(
-                    CodeType::Dists,
-                    &state.lens[state.nlen..][..state.ndist],
-                    &mut state.dist_codes,
-                    9,
-                    &mut state.work,
-                ) else {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid distances set\0");
-                    continue 'inf_leave;
-                };
-
-                state.dist_table.bits = root;
-                state.dist_table.codes = Codes::Dist;
-                state.next += used;
 
                 state.mode = Mode::Len;
             }

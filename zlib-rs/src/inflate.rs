@@ -35,6 +35,45 @@ use self::{
 
 const INFLATE_STRICT: bool = false;
 
+// RFC 1951 §3.2.7: the transmitted code-length alphabet uses this permutation.
+// Both ordinary and callback inflate must use the same layout.
+const CODE_LENGTH_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// Run-length instructions in the dynamic code-length alphabet (RFC 1951).
+/// Extra bits are still read by the owning input cursor, so an incomplete
+/// input chunk never partly mutates the decoder's code-length sequence.
+#[derive(Clone, Copy)]
+struct CodeLengthRepeat {
+    extra_bits: u8,
+    base_count: usize,
+    previous: bool,
+}
+
+impl CodeLengthRepeat {
+    const fn from_symbol(symbol: u16) -> Option<Self> {
+        match symbol {
+            16 => Some(Self {
+                extra_bits: 2,
+                base_count: 3,
+                previous: true,
+            }),
+            17 => Some(Self {
+                extra_bits: 3,
+                base_count: 3,
+                previous: false,
+            }),
+            18 => Some(Self {
+                extra_bits: 7,
+                base_count: 11,
+                previous: false,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Initialize callback-driven inflate directly from caller-owned scratch storage.
 ///
 /// This is the raw boundary used by `libz-rs-sys::inflateBackInit_`: the caller window is allowed
@@ -841,6 +880,101 @@ impl<'a> State<'a> {
             allocation_start,
             total_allocation_size,
         }
+    }
+
+    /// Record one transmitted code-length-alphabet entry in RFC 1951 order.
+    fn append_code_length_alphabet(&mut self, length: u16) {
+        self.lens[CODE_LENGTH_ORDER[self.have]] = length;
+        self.have += 1;
+    }
+
+    /// Append a decoded repeat instruction only if the complete run is valid.
+    /// No partially initialized code lengths become visible on failure.
+    fn append_code_length_repeat(
+        &mut self,
+        repeat: CodeLengthRepeat,
+        extra_value: u64,
+    ) -> Result<(), &'static str> {
+        const BAD_REPEAT: &str = "invalid bit length repeat\0";
+        let remaining = (self.nlen + self.ndist)
+            .checked_sub(self.have)
+            .ok_or(BAD_REPEAT)?;
+        let extra = usize::try_from(extra_value).map_err(|_| BAD_REPEAT)?;
+        let count = repeat.base_count.checked_add(extra).ok_or(BAD_REPEAT)?;
+        if count > remaining {
+            return Err(BAD_REPEAT);
+        }
+        let value = if repeat.previous {
+            if self.have == 0 {
+                return Err(BAD_REPEAT);
+            }
+            self.lens[self.have - 1]
+        } else {
+            0
+        };
+        self.lens[self.have..self.have + count].fill(value);
+        self.have += count;
+        Ok(())
+    }
+
+    /// Complete the code-length alphabet and construct its canonical table.
+    /// Both inflate front-ends use the same validation and table metadata.
+    fn finish_code_length_alphabet(&mut self) -> Result<(), &'static str> {
+        while self.have < CODE_LENGTH_ORDER.len() {
+            self.append_code_length_alphabet(0);
+        }
+
+        let InflateTable::Success { root, used } = inflate_table(
+            CodeType::Codes,
+            &self.lens[..CODE_LENGTH_ORDER.len()],
+            &mut self.codes_codes,
+            7,
+            &mut self.work,
+        ) else {
+            return Err("invalid code lengths set\0");
+        };
+
+        self.next = used;
+        self.len_table.codes = Codes::CodeLengths;
+        self.len_table.bits = root;
+        self.have = 0;
+        Ok(())
+    }
+
+    /// Build the dynamic literal/length and distance tables after both length
+    /// alphabets are decoded. The ordinary and callback decoders share the
+    /// exact same validation, code-table sizes and error strings.
+    fn finish_dynamic_trees(&mut self) -> Result<(), &'static str> {
+        if self.lens[256] == 0 {
+            return Err("invalid code -- missing end-of-block\0");
+        }
+
+        let InflateTable::Success { root, used } = inflate_table(
+            CodeType::Lens,
+            &self.lens[..self.nlen],
+            &mut self.len_codes,
+            10,
+            &mut self.work,
+        ) else {
+            return Err("invalid literal/lengths set\0");
+        };
+        self.len_table.codes = Codes::Len;
+        self.len_table.bits = root;
+        self.next = used;
+
+        let InflateTable::Success { root, used } = inflate_table(
+            CodeType::Dists,
+            &self.lens[self.nlen..][..self.ndist],
+            &mut self.dist_codes,
+            9,
+            &mut self.work,
+        ) else {
+            return Err("invalid distances set\0");
+        };
+        self.dist_table.codes = Codes::Dist;
+        self.dist_table.bits = root;
+        self.next += used;
+        Ok(())
     }
 
     fn len_table_ref(&self) -> &[Code] {
@@ -1924,40 +2058,16 @@ impl State<'_> {
                         break 'blk Mode::LenLens;
                     }
                     Mode::LenLens => {
-                        // permutation of code lengths ;
-                        const ORDER: [u8; 19] = [
-                            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-                        ];
-
                         while self.have < self.ncode {
                             need_bits_for_mode(bit_reader, 3, mode)?;
-                            self.lens[usize::from(ORDER[self.have])] = bit_reader.bits(3) as u16;
-                            self.have += 1;
+                            self.append_code_length_alphabet(bit_reader.bits(3) as u16);
                             bit_reader.drop_bits(3);
                         }
 
-                        while self.have < 19 {
-                            self.lens[usize::from(ORDER[self.have])] = 0;
-                            self.have += 1;
-                        }
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Codes,
-                            &self.lens[..19],
-                            &mut self.codes_codes,
-                            7,
-                            &mut self.work,
-                        ) else {
+                        if let Err(msg) = self.finish_code_length_alphabet() {
                             mode = Mode::Bad;
-                            break 'label self.bad("invalid code lengths set\0");
-                        };
-
-                        self.next = used;
-                        self.len_table.codes = Codes::CodeLengths;
-                        self.len_table.bits = root;
-
-                        self.have = 0;
-
+                            break 'label self.bad(msg);
+                        }
                         break 'blk Mode::CodeLens;
                     }
                     Mode::CodeLens => {
@@ -1980,106 +2090,32 @@ impl State<'_> {
                                     self.lens[self.have] = here.val;
                                     self.have += 1;
                                 }
-                                16 => {
+                                symbol => {
+                                    let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
+                                        mode = Mode::Bad;
+                                        break 'label self.bad("invalid bit length repeat\0");
+                                    };
                                     need_bits_for_mode(
                                         bit_reader,
-                                        usize::from(here_bits) + 2,
+                                        usize::from(here_bits) + usize::from(repeat.extra_bits),
                                         mode,
                                     )?;
                                     bit_reader.drop_bits(here_bits);
-                                    if self.have == 0 {
+                                    let extra = bit_reader.bits(usize::from(repeat.extra_bits));
+                                    bit_reader.drop_bits(repeat.extra_bits);
+                                    if let Err(msg) = self.append_code_length_repeat(repeat, extra)
+                                    {
                                         mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
+                                        break 'label self.bad(msg);
                                     }
-
-                                    let len = self.lens[self.have - 1];
-                                    let copy = 3 + bit_reader.bits(2) as usize;
-                                    bit_reader.drop_bits(2);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(len);
-                                    self.have += copy;
-                                }
-                                17 => {
-                                    need_bits_for_mode(
-                                        bit_reader,
-                                        usize::from(here_bits) + 3,
-                                        mode,
-                                    )?;
-                                    bit_reader.drop_bits(here_bits);
-                                    let copy = 3 + bit_reader.bits(3) as usize;
-                                    bit_reader.drop_bits(3);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(0);
-                                    self.have += copy;
-                                }
-                                18.. => {
-                                    need_bits_for_mode(
-                                        bit_reader,
-                                        usize::from(here_bits) + 7,
-                                        mode,
-                                    )?;
-                                    bit_reader.drop_bits(here_bits);
-                                    let copy = 11 + bit_reader.bits(7) as usize;
-                                    bit_reader.drop_bits(7);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(0);
-                                    self.have += copy;
                                 }
                             }
                         }
 
-                        // check for end-of-block code (better have one)
-                        if self.lens[256] == 0 {
+                        if let Err(msg) = self.finish_dynamic_trees() {
                             mode = Mode::Bad;
-                            break 'label self.bad("invalid code -- missing end-of-block\0");
+                            break 'label self.bad(msg);
                         }
-
-                        // build code tables
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Lens,
-                            &self.lens[..self.nlen],
-                            &mut self.len_codes,
-                            10,
-                            &mut self.work,
-                        ) else {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid literal/lengths set\0");
-                        };
-
-                        self.len_table.codes = Codes::Len;
-                        self.len_table.bits = root;
-                        self.next = used;
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Dists,
-                            &self.lens[self.nlen..][..self.ndist],
-                            &mut self.dist_codes,
-                            9,
-                            &mut self.work,
-                        ) else {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid distances set\0");
-                        };
-
-                        self.dist_table.bits = root;
-                        self.dist_table.codes = Codes::Dist;
-                        self.next += used;
 
                         mode = Mode::Len_;
 
@@ -3096,6 +3132,54 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_code_length_runs_validate_without_partial_writes() -> Result<(), &'static str> {
+        let mut state = State::new(InflateStateKind::Regular);
+        state.nlen = 257;
+        state.ndist = 1;
+        state.lens[0] = 7;
+        state.have = 1;
+
+        let previous = CodeLengthRepeat::from_symbol(16).ok_or("missing previous repeat")?;
+        let short_zero = CodeLengthRepeat::from_symbol(17).ok_or("missing short zero repeat")?;
+        let long_zero = CodeLengthRepeat::from_symbol(18).ok_or("missing long zero repeat")?;
+
+        state.append_code_length_repeat(previous, 0)?;
+        assert_eq!(&state.lens[..4], &[7, 7, 7, 7]);
+        state.append_code_length_repeat(previous, 3)?;
+        assert_eq!(&state.lens[4..10], &[7; 6]);
+
+        state.append_code_length_repeat(short_zero, 7)?;
+        assert_eq!(&state.lens[10..20], &[0; 10]);
+        state.append_code_length_repeat(long_zero, 127)?;
+        assert_eq!(&state.lens[20..158], &[0; 138]);
+        assert_eq!(state.have, 158);
+
+        // Both long and short repeats reject a run crossing the alphabet
+        // boundary without changing the preceding decoded prefix or cursor.
+        state.have = 257;
+        state.lens[257] = 0xa5;
+        assert_eq!(
+            state.append_code_length_repeat(short_zero, 0),
+            Err("invalid bit length repeat\0")
+        );
+        assert_eq!(
+            state.append_code_length_repeat(long_zero, 0),
+            Err("invalid bit length repeat\0")
+        );
+        assert_eq!(state.have, 257);
+        assert_eq!(state.lens[257], 0xa5);
+
+        state.have = 0;
+        assert_eq!(
+            state.append_code_length_repeat(previous, 0),
+            Err("invalid bit length repeat\0")
+        );
+        assert_eq!(state.have, 0);
+        assert!(CodeLengthRepeat::from_symbol(19).is_none());
+        Ok(())
+    }
 
     #[test]
     fn gzip_header_fields_clip_storage_but_consume_all_fragments() {
