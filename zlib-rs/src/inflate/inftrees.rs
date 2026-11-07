@@ -2,6 +2,7 @@
 
 use crate::{Code, ENOUGH_DISTS, ENOUGH_LENS};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodeType {
     Codes,
     Lens,
@@ -46,13 +47,30 @@ pub fn inflate_table(
     bits: usize,
     work: &mut [u16],
 ) -> InflateTable {
+    // The DEFLATE format bounds each alphabet. Enforce that contract once,
+    // before counting lengths in u16 and storing symbol indices in u16 scratch.
+    let max_symbols = match codetype {
+        CodeType::Codes => 19,
+        CodeType::Lens => 288, // includes the two fixed-tree-only symbols
+        CodeType::Dists => 32,
+    };
+    if lens.len() > max_symbols {
+        return InflateTable::InvalidCode;
+    }
+    if work.len() < lens.len() {
+        return InflateTable::EnoughIsNotEnough;
+    }
+
     // number of codes of each length
     let mut count = [0u16; MAX_BITS + 1];
 
     let (mut min, mut max) = (MAX_BITS, 0);
     for &len in lens {
+        if usize::from(len) > MAX_BITS {
+            return InflateTable::InvalidCode;
+        }
         if len > 0 {
-            count[len as usize] += 1;
+            count[usize::from(len)] += 1;
             max = Ord::max(max, usize::from(len));
             min = Ord::min(min, usize::from(len));
         }
@@ -66,6 +84,9 @@ pub fn inflate_table(
             val: 0,
         };
 
+        if table.len() < 2 {
+            return InflateTable::EnoughIsNotEnough;
+        }
         table[0] = code;
         table[1] = code;
 
@@ -100,9 +121,12 @@ pub fn inflate_table(
     /* sort symbols by length, by symbol order within each length */
     for (sym, len) in lens.iter().copied().enumerate() {
         if len != 0 {
-            let offset = offs[len as usize];
-            offs[len as usize] += 1;
-            work[offset as usize] = sym as u16;
+            let offset = &mut offs[usize::from(len)];
+            let Ok(symbol) = u16::try_from(sym) else {
+                return InflateTable::InvalidCode;
+            };
+            work[usize::from(*offset)] = symbol;
+            *offset += 1;
         }
     }
 
@@ -122,6 +146,9 @@ pub fn inflate_table(
     if matches!(codetype, CodeType::Dists) && used > ENOUGH_DISTS {
         return InflateTable::EnoughIsNotEnough;
     }
+    if used > table.len() {
+        return InflateTable::EnoughIsNotEnough;
+    }
 
     let mut huff = 0; // starting code
     let mut reversed_huff = 0u32; // starting code, reversed
@@ -135,22 +162,27 @@ pub fn inflate_table(
 
     // process all codes and make table entries
     'outer: loop {
+        // The format guarantees a byte-sized bit count, so do not narrow
+        // an invalid length when constructing a decode entry.
+        let Ok(code_bits) = u8::try_from(len - drop_) else {
+            return InflateTable::InvalidCode;
+        };
         // create table entry
         let here = if work[sym] >= match_ {
             Code {
-                bits: (len - drop_) as u8,
-                op: extra[(work[sym] - match_) as usize],
-                val: base[(work[sym] - match_) as usize],
+                bits: code_bits,
+                op: extra[usize::from(work[sym] - match_)],
+                val: base[usize::from(work[sym] - match_)],
             }
         } else if work[sym] + 1 < match_ {
             Code {
-                bits: (len - drop_) as u8,
+                bits: code_bits,
                 op: 0,
                 val: work[sym],
             }
         } else {
             Code {
-                bits: (len - drop_) as u8,
+                bits: code_bits,
                 op: 0b0110_0000,
                 val: 0,
             }
@@ -172,7 +204,10 @@ pub fn inflate_table(
 
         // backwards increment the len-bit code huff
         reversed_huff = reversed_huff.wrapping_add(0x8000_0000u32 >> (len - 1));
-        huff = reversed_huff.reverse_bits() as usize;
+        let Ok(reversed) = usize::try_from(reversed_huff.reverse_bits()) else {
+            return InflateTable::InvalidCode;
+        };
+        huff = reversed;
 
         // go to next symbol, update count, len
         sym += 1;
@@ -181,7 +216,7 @@ pub fn inflate_table(
             if len == max {
                 break 'outer;
             }
-            len = lens[work[sym] as usize] as usize;
+            len = usize::from(lens[usize::from(work[sym])]);
         }
 
         // create new sub-table if needed
@@ -198,7 +233,7 @@ pub fn inflate_table(
             curr = len - drop_;
             let mut left = 1 << curr;
             while curr + drop_ < max {
-                left -= count[curr + drop_] as i32;
+                left -= i32::from(count[curr + drop_]);
                 if left <= 0 {
                     break;
                 }
@@ -216,14 +251,18 @@ pub fn inflate_table(
             if matches!(codetype, CodeType::Dists) && used > ENOUGH_DISTS {
                 return InflateTable::EnoughIsNotEnough;
             }
+            if used > table.len() {
+                return InflateTable::EnoughIsNotEnough;
+            }
 
             /* point entry in root table to sub-table */
             low = huff & mask;
-            table[low] = Code {
-                op: curr as u8,
-                bits: root as u8,
-                val: next as u16,
+            let (Ok(op), Ok(bits), Ok(val)) =
+                (u8::try_from(curr), u8::try_from(root), u16::try_from(next))
+            else {
+                return InflateTable::EnoughIsNotEnough;
             };
+            table[low] = Code { op, bits, val };
         }
     }
 
@@ -231,9 +270,12 @@ pub fn inflate_table(
     at most one remaining entry, since if the code is incomplete, the
     maximum code length that was allowed to get this far is one bit) */
     if huff != 0 {
+        let Ok(bits) = u8::try_from(len - drop_) else {
+            return InflateTable::InvalidCode;
+        };
         let here = Code {
             op: 64,
-            bits: (len - drop_) as u8,
+            bits,
             val: 0,
         };
 
@@ -249,6 +291,59 @@ mod test {
     use super::*;
 
     #[test]
+    fn rejects_invalid_alphabets_without_indexing_outside_scratch() {
+        for (kind, allowed) in [
+            (CodeType::Codes, 19usize),
+            (CodeType::Lens, 288),
+            (CodeType::Dists, 32),
+        ] {
+            let mut table = [Code::default(); crate::ENOUGH_LENS];
+            let mut work = [0u16; 288];
+            let mut oversize = vec![0u16; allowed + 1];
+            assert_eq!(
+                inflate_table(kind, &oversize, &mut table, 7, &mut work),
+                InflateTable::InvalidCode
+            );
+            oversize.truncate(allowed);
+            if !oversize.is_empty() {
+                oversize[0] = 16;
+                assert_eq!(
+                    inflate_table(kind, &oversize, &mut table, 7, &mut work),
+                    InflateTable::InvalidCode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_insufficient_scratch_and_table_capacity() {
+        let mut table = [Code::default(); 8];
+        let mut short_work = [0u16; 1];
+        let zero_codes = [0u16; 2];
+        assert_eq!(
+            inflate_table(CodeType::Codes, &zero_codes, &mut table, 7, &mut short_work),
+            InflateTable::EnoughIsNotEnough
+        );
+
+        let mut work = [0u16; 2];
+        assert_eq!(
+            inflate_table(CodeType::Codes, &zero_codes, &mut table[..1], 7, &mut work),
+            InflateTable::EnoughIsNotEnough
+        );
+        // Both a valid one-bit root and its corresponding two table entries
+        // must fit, even if the caller supplies an empty or short output.
+        let one_bit = [1u16, 1];
+        assert_eq!(
+            inflate_table(CodeType::Codes, &one_bit, &mut table[..1], 1, &mut work),
+            InflateTable::EnoughIsNotEnough
+        );
+        assert_eq!(
+            inflate_table(CodeType::Codes, &one_bit, &mut table[..2], 1, &mut work),
+            InflateTable::Success { root: 1, used: 2 }
+        );
+    }
+
+    #[test]
     fn not_enough_errors() {
         // we need to call inflate_table() directly in order to manifest
         // not-enough errors, since zlib insures that enough is always enough
@@ -256,8 +351,7 @@ mod test {
         let table = [Code::default(); crate::ENOUGH_DISTS];
 
         let mut work = [0; 16];
-        let mut lens: [_; 16] = core::array::from_fn(|i| (i + 1) as u16);
-        lens[15] = 15;
+        let lens: [u16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15];
 
         let mut next = table;
         let bits = 15;
