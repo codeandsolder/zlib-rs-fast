@@ -1,15 +1,18 @@
 use super::braid::CRC32_LSB_POLY;
 
+#[must_use]
 pub const fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     crc32_combine_op(crc1, crc2, crc32_combine_gen(len2))
 }
 
-#[inline(always)]
+#[must_use]
+#[inline]
 pub const fn crc32_combine_gen(len2: u64) -> u32 {
     x2nmodp(len2, 3)
 }
 
-#[inline(always)]
+#[must_use]
+#[inline]
 pub const fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
     multmodp(op, crc1) ^ crc2
 }
@@ -50,8 +53,15 @@ const X2N_TABLE: [u32; 32] = [
 ];
 
 // Return a(x) multiplied by b(x) modulo p(x), where p(x) is the CRC polynomial,
-// reflected. For speed, this requires that a not be zero.
+// reflected. The normal nonzero path exits immediately after the last set bit.
 pub const fn multmodp(a: u32, mut b: u32) -> u32 {
+    // A zero polynomial has no contribution. Without this guard the bit scan
+    // shifts its mask down to zero and loops forever, even through the public
+    // crc32_combine_op() entry point when its operator argument is zero.
+    if a == 0 {
+        return 0;
+    }
+
     let mut m = 1 << 31;
     let mut p = 0;
 
@@ -96,14 +106,14 @@ mod test {
 
     #[test]
     fn test_crc32_combine() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
-
-        fn test(data: Vec<u8>) -> bool {
+        // QuickCheck owns the generated Vec. The capture-free property uses
+        // only borrowed views, without a separate pass-by-value function.
+        let property: fn(Vec<u8>) -> bool = |data| {
             let Some(buf_len) = data.first().copied() else {
                 return true;
             };
 
-            let buf_size = Ord::max(buf_len, 1) as usize;
+            let buf_size = usize::from(Ord::max(buf_len, 1));
 
             let crc0 = 0;
             let mut crc1 = crc0;
@@ -138,6 +148,15 @@ mod test {
             assert_eq!(combine1, combine2);
 
             true
+        };
+        ::quickcheck::quickcheck(property);
+    }
+
+    #[test]
+    fn zero_multiplication_operator_is_the_additive_identity() {
+        for crc in [0, 1, 0xdead_beef, u32::MAX] {
+            assert_eq!(multmodp(0, crc), 0);
+            assert_eq!(crc32_combine_op(crc, 0x1234_5678, 0), 0x1234_5678);
         }
     }
 }
