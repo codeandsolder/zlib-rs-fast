@@ -48,7 +48,7 @@ impl MediumProducer {
 
     fn apply_current_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
         state.match_start = result.start;
-        self.current_match.match_length = result.length as u16;
+        self.current_match.match_length = result.length;
         self.current_match.match_start = result.start;
         if usize::from(self.current_match.match_length) < WANT_MIN_MATCH
             || self.current_match.match_start >= self.current_match.strstart
@@ -59,7 +59,7 @@ impl MediumProducer {
 
     fn apply_future_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
         state.match_start = result.start;
-        self.next_match.match_length = result.length as u16;
+        self.next_match.match_length = result.length;
         self.next_match.match_start = result.start;
 
         if self.next_match.match_start >= self.next_match.strstart {
@@ -107,13 +107,12 @@ impl MediumProducer {
                 current_match.strstart = state.strstart as u16;
                 current_match.orgstart = current_match.strstart;
 
-                let dist = state.strstart as i64 - i64::from(hash_head);
-                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                     let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
                         .request(state)
                         .execute();
                     state.match_start = result.start;
-                    current_match.match_length = result.length as u16;
+                    current_match.match_length = result.length;
                     current_match.match_start = result.start;
                     if usize::from(current_match.match_length) < WANT_MIN_MATCH
                         || current_match.match_start >= current_match.strstart
@@ -144,13 +143,12 @@ impl MediumProducer {
                 next_match.strstart = state.strstart as u16;
                 next_match.orgstart = next_match.strstart;
 
-                let dist = state.strstart as i64 - i64::from(hash_head);
-                if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                     let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
                         .request(state)
                         .execute();
                     state.match_start = result.start;
-                    next_match.match_length = result.length as u16;
+                    next_match.match_length = result.length;
                     next_match.match_start = result.start;
                     if next_match.match_start >= next_match.strstart
                         || usize::from(next_match.match_length) < WANT_MIN_MATCH
@@ -228,8 +226,7 @@ impl TokenProducer for MediumProducer {
                         } else {
                             0
                         };
-                        let dist = state.strstart as i64 - hash_head as i64;
-                        if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                        if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                             let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                             if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
                                 let result = work.request(state).execute();
@@ -277,8 +274,7 @@ impl TokenProducer for MediumProducer {
 
                         let hash_head =
                             StandardHashCalc::quick_insert_string(state, state.strstart);
-                        let dist = state.strstart as i64 - hash_head as i64;
-                        if (1..=state.max_dist() as i64).contains(&dist) && hash_head != 0 {
+                        if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                             let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                             if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
                                 let result = work.request(state).execute();
