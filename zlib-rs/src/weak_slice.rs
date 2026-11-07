@@ -12,6 +12,16 @@ pub struct WeakSliceMut<'a, T> {
 }
 
 impl<T> WeakSliceMut<'_, T> {
+    /// Retain a mutable slice's exclusive lifetime without permanently
+    /// materializing a Rust reference to its backing allocation.
+    pub(crate) const fn from_mut_slice(slice: &mut [T]) -> WeakSliceMut<'_, T> {
+        WeakSliceMut {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+            _marker: PhantomData,
+        }
+    }
+
     /// # Safety
     ///
     /// The pointer must be non-null, properly aligned, and point into one live allocation

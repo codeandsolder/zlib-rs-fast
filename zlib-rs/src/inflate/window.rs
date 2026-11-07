@@ -299,6 +299,11 @@ impl<'a> BackWindow<'a> {
     pub(crate) const fn as_mut_ptr(&mut self) -> *mut MaybeUninit<u8> {
         self.buf.as_mut_ptr()
     }
+
+    /// Borrow storage without asserting that its unwritten tail is initialized.
+    pub(crate) const fn as_uninit_slice(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.buf.as_mut_slice()
+    }
 }
 
 #[cfg(all(test, feature = "rust-allocator"))]
