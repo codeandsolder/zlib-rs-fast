@@ -49,6 +49,24 @@ impl BitBuffer {
         self.bits_used += bits;
     }
 
+    /// Return the number of bytes contributed to the reservoir by an
+    /// eight-byte lookahead. When 56..=63 bits are already buffered,
+    /// this is a speculative peek that consumes no new input bytes.
+    ///
+    /// A refill may *inspect* eight bytes, but only the whole bytes actually
+    /// incorporated into the reservoir advance the input cursor.
+    #[inline]
+    fn refill_from_word(&mut self, lookahead: u64) -> usize {
+        let previous_bits = self.bits_used;
+        debug_assert!(previous_bits < 64);
+        let loaded_bytes = usize::from(7 - (previous_bits >> 3));
+        // The high byte of the lookahead may be speculative. It becomes
+        // valid only after the next refill, and return_unused_bytes masks it.
+        self.bit_buffer |= lookahead << previous_bits;
+        self.bits_used = 0b111_000 | (previous_bits & 0b111);
+        loaded_bytes
+    }
+
     #[inline(always)]
     pub fn start_sync_search(&mut self) -> ([u8; 4], usize) {
         assert!(
@@ -178,15 +196,16 @@ impl<'input> BitReader<'input> {
             self.bytes_remaining() >= 8,
             "bit-reader refill requires eight input bytes"
         );
-        let bytes: [u8; 8] = self.as_slice()[..8]
-            .try_into()
-            .expect("refill length was checked above");
-        let read = u64::from_le_bytes(bytes);
-        self.bits.bit_buffer |= read << self.bits.bits_used;
-        let increment = (63 ^ self.bits.bits_used) >> 3;
-        self.position += usize::from(increment);
-        self.loaded_input_bytes += usize::from(increment);
-        self.bits.bits_used |= 56;
+        // Fixed-size indexing below is safe because we checked that eight bytes
+        // are available. A stack array makes the endian conversion explicit
+        // without an additional fallible conversion or unchecked pointer read.
+        let bytes = self.as_slice();
+        let lookahead = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let loaded_bytes = self.bits.refill_from_word(lookahead);
+        self.position += loaded_bytes;
+        self.loaded_input_bytes += loaded_bytes;
     }
 
     #[inline(always)]
@@ -226,11 +245,8 @@ impl std::io::Read for BitReader<'_> {
         assert_eq!(self.bits.bits_used, 0, "bit buffer not cleared before read");
         let count = Ord::min(buf.len(), self.bytes_remaining());
         buf[..count].copy_from_slice(&self.as_slice()[..count]);
-        self.position += count;
-        if count != 0 {
-            // Read consumes directly from the input slice, not through the bit reservoir.
-            self.loaded_input_bytes = 0;
-        }
+        // Direct reads have the same rewind boundary as any other direct skip.
+        self.advance(count);
         Ok(count)
     }
 }
@@ -358,6 +374,51 @@ mod tests {
         reader.return_unused_bytes();
         assert_eq!(reader.into_buffer(), max_prime);
         assert_eq!(reader.bytes_remaining(), 16);
+    }
+
+    #[test]
+    fn refill_rewind_retains_only_valid_bits_for_every_alignment() {
+        let input = [0x31, 0x82, 0x73, 0x14, 0xf5, 0xa6, 0x47, 0x98, 0x39];
+        let input_word = u64::from_le_bytes([
+            input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
+        ]);
+        for initial_bits in 0..=63 {
+            let mut bits = BitBuffer::default();
+            bits.prime(initial_bits, u64::from(u32::MAX));
+            let original = (u64::from(u32::MAX) & ((1_u64 << initial_bits) - 1))
+                | (input_word << initial_bits);
+            let loaded_bytes = usize::from(7 - (initial_bits >> 3));
+            for consumed in 0..=32u8 {
+                let mut reader = BitReader::from_buffer(bits, &input);
+                reader.refill();
+                assert_eq!(reader.bytes_remaining(), input.len() - loaded_bytes);
+                assert_eq!(reader.bits_in_buffer(), 0b111_000 | (initial_bits & 0b111));
+                assert_eq!(reader.hold(), original);
+
+                reader.drop_bits(consumed);
+                let remaining = usize::from(reader.bits_in_buffer());
+                let refundable = (remaining / 8).min(loaded_bytes);
+                let retained_bits = remaining - refundable * 8;
+                // The fast decoder exits only after it can persist at most
+                // 32 leftover bits. Larger states are valid *during* refill.
+                if retained_bits > 32 {
+                    continue;
+                }
+                reader.return_unused_bytes();
+
+                let retained_mask = (1_u64 << retained_bits) - 1;
+                assert_eq!(usize::from(reader.bits_in_buffer()), retained_bits);
+                assert_eq!(reader.hold(), (original >> consumed) & retained_mask);
+                assert_eq!(
+                    reader.bytes_remaining(),
+                    input.len() - loaded_bytes + refundable
+                );
+                if consumed == 0 {
+                    assert_eq!(reader.into_buffer(), bits);
+                    assert_eq!(reader.as_slice(), &input);
+                }
+            }
+        }
     }
 
     #[test]
