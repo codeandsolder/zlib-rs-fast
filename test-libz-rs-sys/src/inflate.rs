@@ -188,6 +188,110 @@ fn mem_done(stream: &mut libz_rs_sys::z_stream) {
     stream.zfree = None;
 }
 
+/// Stateful callback fixture for the actual C ABI, exercising both the
+/// single-span fast path and repeated short callback-fed input chunks.
+struct BackRoundTrip {
+    input: Vec<u8>,
+    next: usize,
+    chunk_size: usize,
+    output: Vec<u8>,
+    output_calls: usize,
+}
+
+unsafe extern "C" fn read_back_round_trip(
+    descriptor: *mut c_void,
+    next: *mut *const c_uchar,
+) -> c_uint {
+    // SAFETY: descriptor is a uniquely borrowed BackRoundTrip fixture during
+    // each synchronous inflateBack callback.
+    let context = unsafe { &mut *descriptor.cast::<BackRoundTrip>() };
+    let count = context.chunk_size.min(context.input.len() - context.next);
+    if count == 0 {
+        // SAFETY: next is a valid output pointer supplied by inflateBack.
+        unsafe { *next = core::ptr::null() };
+        return 0;
+    }
+    // SAFETY: count is bounded by the remaining input bytes, whose Vec
+    // remains unchanged for the duration of this inflateBack invocation.
+    unsafe { *next = context.input.as_ptr().add(context.next) };
+    context.next += count;
+    count as c_uint
+}
+
+unsafe extern "C" fn write_back_round_trip(
+    descriptor: *mut c_void,
+    bytes: *mut c_uchar,
+    count: c_uint,
+) -> c_int {
+    // SAFETY: descriptor points to the live fixture; the output pointer covers
+    // exactly count initialized bytes until this synchronous callback returns.
+    let context = unsafe { &mut *descriptor.cast::<BackRoundTrip>() };
+    let bytes = unsafe { core::slice::from_raw_parts(bytes, count as usize) };
+    context.output.extend_from_slice(bytes);
+    context.output_calls += 1;
+    0
+}
+
+#[test]
+fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
+    use libz_rs_sys::*;
+
+    // Repeated medium-range patterns generate both dynamic Huffman symbols
+    // and back-references, including those spanning callback output windows.
+    let seed: Vec<u8> = (0..2048usize)
+        .map(|i| (i.wrapping_mul(73) ^ (i >> 3) ^ (i >> 8)) as u8)
+        .collect();
+    let original: Vec<u8> = (0..100_123usize)
+        .map(|i| seed[(i + i / 8192) % seed.len()])
+        .collect();
+    let mut compressed_storage = vec![0; zlib_rs::deflate::compress_bound(original.len())];
+    let (compressed, code) = compress_slice(
+        &mut compressed_storage,
+        &original,
+        DeflateConfig {
+            window_bits: -15,
+            ..DeflateConfig::default()
+        },
+    );
+    assert_eq!(code, ReturnCode::Ok);
+    let compressed = compressed.to_vec();
+
+    for chunk_size in [7, 31, 4096, usize::MAX] {
+        let mut fixture = BackRoundTrip {
+            input: compressed.clone(),
+            next: 0,
+            chunk_size,
+            output: Vec::with_capacity(original.len()),
+            output_calls: 0,
+        };
+        let mut stream = mem_setup();
+        let mut window = vec![0xa5; 32768];
+        assert_eq!(
+            unsafe { inflateBackInit_(&mut stream, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE) },
+            Z_OK
+        );
+        let count = chunk_size.min(fixture.input.len());
+        stream.next_in = fixture.input.as_mut_ptr();
+        stream.avail_in = count as c_uint;
+        fixture.next = count;
+        let descriptor = (&raw mut fixture).cast::<c_void>();
+        let result = unsafe {
+            inflateBack(
+                &mut stream,
+                Some(read_back_round_trip),
+                descriptor,
+                Some(write_back_round_trip),
+                descriptor,
+            )
+        };
+        assert_eq!(result, Z_STREAM_END, "input chunk {chunk_size}");
+        assert_eq!(fixture.output, original, "input chunk {chunk_size}");
+        assert_eq!(fixture.output_calls, 4, "input chunk {chunk_size}");
+        assert_eq!(unsafe { inflateBackEnd(&mut stream) }, Z_OK);
+        mem_done(&mut stream);
+    }
+}
+
 #[test]
 fn inflate_back_init_allocates_state_only() {
     use libz_rs_sys::*;

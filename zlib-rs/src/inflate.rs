@@ -1279,7 +1279,7 @@ impl State<'_> {
         let avail_out = output.remaining();
 
         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
-            inflate_fast_help(self, reader, output);
+            inflate_fast_help_impl::<true, _>(self, reader, output);
             match self.mode {
                 Mode::Len => {}
                 _ => return ControlFlow::Continue(()),
@@ -1324,7 +1324,7 @@ impl State<'_> {
                         // rechecks output space, so keep the complete fast-path reserve available.
                         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
                             self.mode = mode;
-                            inflate_fast_help(self, &mut bit_reader, output);
+                            inflate_fast_help_impl::<true, _>(self, &mut bit_reader, output);
                             return LenDecodeOutcome::continue_with(self.mode, bit_reader);
                         }
 
@@ -2210,25 +2210,142 @@ impl State<'_> {
     }
 }
 
+/// Compile-time output policy for the shared DEFLATE fast decoder.
+///
+/// Ordinary inflate may consult circular history, while inflateBack uses the
+/// caller's previous full output window. Generic dispatch specializes the hot loop.
+trait FastDecodeOutput {
+    fn push(&mut self, byte: u8);
+    fn remaining(&self) -> usize;
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        distance: usize,
+        length: usize,
+    ) -> Result<(), &'static str>;
+}
+
+impl FastDecodeOutput for InflateOutput<'_> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        self.writer.push(byte);
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.writer.remaining()
+    }
+
+    #[inline]
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        dist: usize,
+        mut len: usize,
+    ) -> Result<(), &'static str> {
+        let window_size = state.window.size();
+        // max distance in output
+        let written = self.len();
+
+        if dist > written {
+            // Copy from the circular history window
+            if (dist - written) > state.window.have() {
+                if state.flags.contains(Flags::SANE) {
+                    return Err("invalid distance too far back\0");
+                }
+
+                // This cold branch follows the same initialized-history
+                // reconstruction as the ordinary Match decoder. Fast inflate
+                // reserves sufficient output for a whole DEFLATE match.
+                let mut remaining = len;
+                while remaining != 0 {
+                    copy_match_bytes(&state.window, false, dist, &mut remaining, self)?;
+                }
+                return Ok(());
+            }
+
+            let mut op = dist - written;
+            let mut from;
+
+            let window_next = state.window.next();
+
+            if window_next == 0 {
+                // This case is hit when the window has just wrapped around
+                // by logic in `Window::extend`. It is special-cased because
+                // apparently this is quite common.
+                //
+                // the match is at the end of the window, even though the next
+                // position has now wrapped around.
+                from = window_size - op;
+            } else if window_next >= op {
+                // the standard case: a contiguous copy from the window, no wrapping
+                from = window_next - op;
+            } else {
+                // This case is hit when the window has recently wrapped around
+                // by logic in `Window::extend`.
+                //
+                // The match is (partially) at the end of the window
+                op -= window_next;
+                from = window_size - op;
+
+                if op < len {
+                    // This case is hit when part of the match is at the end of the
+                    // window, and part of it has wrapped around to the start. Copy
+                    // the end section here, the start section will be copied below.
+                    len -= op;
+                    self.extend_from_window(&state.window, from..from + op);
+                    from = 0;
+                    op = window_next;
+                }
+            }
+
+            let copy = Ord::min(op, len);
+            self.extend_from_window(&state.window, from..from + copy);
+
+            if op < len {
+                // here we need some bytes from the output itself
+                self.copy_match(dist, len - op);
+            }
+        } else {
+            self.copy_match(dist, len);
+        }
+        Ok(())
+    }
+}
+
+impl FastDecodeOutput for writer::BackWriter<'_> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        writer::BackWriter::push(self, byte);
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        writer::BackWriter::remaining(self)
+    }
+
+    #[inline]
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        distance: usize,
+        length: usize,
+    ) -> Result<(), &'static str> {
+        self.copy_match(state.flags.contains(Flags::SANE), distance, length)
+    }
+}
+
 /// Fast literal/length/distance decoder.
 ///
 /// Callers enter only when at least `INFLATE_FAST_MIN_HAVE` bytes and
 /// `INFLATE_FAST_MIN_LEFT` output bytes are available. The helper retains those fast-path
 /// invariants with assertions in the checked reader/output primitives rather than an unsafe
 /// caller contract.
-fn inflate_fast_help(
-    state: &mut State,
-    bit_reader: &mut BitReader<'_>,
-    output: &mut InflateOutput<'_>,
-) {
-    inflate_fast_help_impl(state, bit_reader, output);
-}
-
 #[inline(always)]
-fn inflate_fast_help_impl(
+fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
     state: &mut State,
     bit_reader: &mut BitReader<'_>,
-    output: &mut InflateOutput<'_>,
+    output: &mut O,
 ) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
@@ -2238,8 +2355,6 @@ fn inflate_fast_help_impl(
     // IDEA: use const generics for the bits here?
     let lmask = (1u64 << state.len_table.bits) - 1;
     let dmask = (1u64 << state.dist_table.bits) - 1;
-
-    let window_size = state.window.size();
 
     let mut bad = None;
 
@@ -2308,7 +2423,7 @@ fn inflate_fast_help_impl(
                 output.push(here.val as u8);
             } else if op & 16 != 0 {
                 let op = op & MAX_BITS;
-                let mut len = here.val + bit_reader.bits(op as usize) as u16;
+                let len = here.val + bit_reader.bits(op as usize) as u16;
                 bit_reader.drop_bits(op);
 
                 here = dcode[(bit_reader.hold() & dmask) as usize];
@@ -2342,82 +2457,12 @@ fn inflate_fast_help_impl(
 
                         bit_reader.drop_bits(op);
 
-                        // max distance in output
-                        let written = output.len();
-
-                        if dist as usize > written {
-                            // copy fropm the window
-                            if (dist as usize - written) > state.window.have() {
-                                if state.flags.contains(Flags::SANE) {
-                                    bad = Some("invalid distance too far back\0");
-                                    state.mode = Mode::Bad;
-                                    break 'outer;
-                                }
-
-                                // This cold branch follows the same initialized-history
-                                // reconstruction as the ordinary Match decoder. Fast inflate
-                                // reserves sufficient output for a whole DEFLATE match.
-                                let mut remaining = usize::from(len);
-                                while remaining != 0 {
-                                    if let Err(msg) = copy_match_bytes(
-                                        &state.window,
-                                        false,
-                                        usize::from(dist),
-                                        &mut remaining,
-                                        output,
-                                    ) {
-                                        bad = Some(msg);
-                                        state.mode = Mode::Bad;
-                                        break 'outer;
-                                    }
-                                }
-                                break 'dodist;
-                            }
-
-                            let mut op = dist as usize - written;
-                            let mut from;
-
-                            let window_next = state.window.next();
-
-                            if window_next == 0 {
-                                // This case is hit when the window has just wrapped around
-                                // by logic in `Window::extend`. It is special-cased because
-                                // apparently this is quite common.
-                                //
-                                // the match is at the end of the window, even though the next
-                                // position has now wrapped around.
-                                from = window_size - op;
-                            } else if window_next >= op {
-                                // the standard case: a contiguous copy from the window, no wrapping
-                                from = window_next - op;
-                            } else {
-                                // This case is hit when the window has recently wrapped around
-                                // by logic in `Window::extend`.
-                                //
-                                // The match is (partially) at the end of the window
-                                op -= window_next;
-                                from = window_size - op;
-
-                                if op < len as usize {
-                                    // This case is hit when part of the match is at the end of the
-                                    // window, and part of it has wrapped around to the start. Copy
-                                    // the end section here, the start section will be copied below.
-                                    len -= op as u16;
-                                    output.extend_from_window(&state.window, from..from + op);
-                                    from = 0;
-                                    op = window_next;
-                                }
-                            }
-
-                            let copy = Ord::min(op, len as usize);
-                            output.extend_from_window(&state.window, from..from + copy);
-
-                            if op < len as usize {
-                                // here we need some bytes from the output itself
-                                output.copy_match(dist as usize, len as usize - op);
-                            }
-                        } else {
-                            output.copy_match(dist as usize, len as usize)
+                        if let Err(msg) =
+                            output.copy_back_reference(state, usize::from(dist), usize::from(len))
+                        {
+                            bad = Some(msg);
+                            state.mode = Mode::Bad;
+                            break 'outer;
                         }
                     } else if (op & 64) == 0 {
                         // 2nd level distance code
@@ -2449,7 +2494,14 @@ fn inflate_fast_help_impl(
         }
 
         // For normal `inflate`, include the bits in the bit_reader buffer in the count of available bytes.
-        let remaining = bit_reader.bytes_remaining_including_buffer();
+        // Ordinary inflate considers retained bytes in the bit reservoir for
+        // its fast-loop threshold, while the callback decoder counts only the
+        // unread callback span. Specialize that input policy at compile time.
+        let remaining = if COUNT_BUFFERED_INPUT {
+            bit_reader.bytes_remaining_including_buffer()
+        } else {
+            bit_reader.bytes_remaining()
+        };
         if remaining >= INFLATE_FAST_MIN_HAVE && output.remaining() >= INFLATE_FAST_MIN_LEFT {
             continue;
         }

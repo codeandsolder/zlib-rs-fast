@@ -9,7 +9,7 @@ use crate::inflate::{
     back_io::{BackInput, BackOutput},
     BackWindow, CodeLengthRepeat, Codes, Flags, InflateAllocOffsets, InflateConfig,
     InflateStateKind, InflateStream, Mode, State, Table, Window, INFLATE_FAST_MIN_HAVE,
-    INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS, MAX_DIST_EXTRA_BITS,
+    INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS,
 };
 use crate::traceln;
 use crate::{c_api::z_stream, inflate::writer::BackWriter, ReturnCode};
@@ -300,7 +300,7 @@ pub(super) fn decode_back(
                     let mut bit_reader =
                         BitReader::from_buffer(input.bit_buffer(), input.as_slice());
                     output.with_writer(&mut window, |writer| {
-                        inflate_fast_back(state, &mut bit_reader, writer);
+                        super::inflate_fast_help_impl::<false, _>(state, &mut bit_reader, writer);
                     });
 
                     let remaining = bit_reader.bytes_remaining();
@@ -543,178 +543,6 @@ pub(super) fn decode_back(
     state.back_window = window;
 
     ret
-}
-
-#[inline(always)]
-fn inflate_fast_back(
-    state: &mut State,
-    bit_reader: &mut BitReader<'_>,
-    writer: &mut BackWriter<'_>,
-) {
-    debug_assert!(bit_reader.bytes_remaining() >= 15);
-
-    let lcode = state.len_table_ref();
-    let dcode = state.dist_table_ref();
-
-    // IDEA: use const generics for the bits here?
-    let lmask = (1u64 << state.len_table.bits) - 1;
-    let dmask = (1u64 << state.dist_table.bits) - 1;
-
-    let mut bad = None;
-
-    if bit_reader.bits_in_buffer() < 10 {
-        debug_assert!(bit_reader.bytes_remaining() >= 15);
-        // The fast-path entry invariant guarantees at least eight bytes remain for `refill`.
-        bit_reader.refill();
-    }
-    // We had at least 15 bytes in the slice, plus whatever was in the buffer. After filling the
-    // buffer from the slice, we now have at least 8 bytes remaining in the slice, plus a full buffer.
-    debug_assert!(
-        bit_reader.bytes_remaining() >= 8 && bit_reader.bytes_remaining_including_buffer() >= 15
-    );
-
-    'outer: loop {
-        // This condition is ensured above for the first iteration of the `outer` loop. For
-        // subsequent iterations, the loop continuation condition is
-        // `bit_reader.bytes_remaining_including_buffer() > 15`. And because the buffer
-        // contributes at most 7 bytes to the result of bit_reader.bytes_remaining_including_buffer(),
-        // that means that the slice contains at least 8 bytes.
-        debug_assert!(
-            bit_reader.bytes_remaining() >= 8
-                && bit_reader.bytes_remaining_including_buffer() >= 15
-        );
-
-        let mut here = {
-            let bits = bit_reader.bits_in_buffer();
-            let hold = bit_reader.hold();
-
-            // Safety: As described in the comments for the debug_assert at the start of
-            // the `outer` loop, it is guaranteed that `bit_reader.bytes_remaining() >= 8` here,
-            // which satisfies `refill`'s eight-byte requirement. And, because the total
-            // number of bytes in `bit_reader`'s buffer plus its slice is at least 15, and
-            // `refill` moves at most 7 bytes from the slice to the buffer, the slice will still
-            // contain at least 8 bytes after this `refill` call.
-            bit_reader.refill();
-            // After the refill, there will be at least 8 bytes left in the bit_reader's slice.
-            debug_assert!(bit_reader.bytes_remaining() >= 8);
-
-            // in most cases, the read can be interleaved with the logic
-            // based on benchmarks this matters in practice. wild.
-            if bits as usize >= state.len_table.bits {
-                lcode[(hold & lmask) as usize]
-            } else {
-                lcode[(bit_reader.hold() & lmask) as usize]
-            }
-        };
-
-        if here.op == 0 {
-            writer.push(here.val as u8);
-            bit_reader.drop_bits(here.bits);
-            here = lcode[(bit_reader.hold() & lmask) as usize];
-
-            if here.op == 0 {
-                writer.push(here.val as u8);
-                bit_reader.drop_bits(here.bits);
-                here = lcode[(bit_reader.hold() & lmask) as usize];
-            }
-        }
-
-        'dolen: loop {
-            bit_reader.drop_bits(here.bits);
-            let op = here.op;
-
-            if op == 0 {
-                writer.push(here.val as u8);
-            } else if op & 16 != 0 {
-                let op = op & MAX_BITS;
-                let len = here.val + bit_reader.bits(op as usize) as u16;
-                bit_reader.drop_bits(op);
-
-                here = dcode[(bit_reader.hold() & dmask) as usize];
-
-                // we have two fast-path loads: 10+10 + 15+5 = 40,
-                // but we may need to refill here in the worst case
-                if bit_reader.bits_in_buffer() < MAX_BITS + MAX_DIST_EXTRA_BITS {
-                    debug_assert!(bit_reader.bytes_remaining() >= 8);
-                    // Safety: On the first iteration of the `dolen` loop, we can rely on the
-                    // invariant documented for the previous `refill` call above: after that
-                    // operation, `bit_reader.bytes_remining >= 8`, which satisfies the safety
-                    // requirement for this call. For subsequent iterations, this invariant
-                    // remains true because nothing else within the `dolen` loop consumes data
-                    // from the slice.
-                    bit_reader.refill();
-                }
-
-                'dodist: loop {
-                    bit_reader.drop_bits(here.bits);
-                    let op = here.op;
-
-                    if op & 16 != 0 {
-                        let op = op & MAX_BITS;
-                        let dist = here.val + bit_reader.bits(op as usize) as u16;
-
-                        if INFLATE_STRICT && dist as usize > state.dmax {
-                            bad = Some("invalid distance too far back\0");
-                            state.mode = Mode::Bad;
-                            break 'outer;
-                        }
-
-                        bit_reader.drop_bits(op);
-
-                        if let Err(msg) = writer.copy_match(
-                            state.flags.contains(Flags::SANE),
-                            dist as usize,
-                            len as usize,
-                        ) {
-                            bad = Some(msg);
-                            state.mode = Mode::Bad;
-                            break 'outer;
-                        }
-                    } else if (op & 64) == 0 {
-                        // 2nd level distance code
-                        here = dcode[(here.val + bit_reader.bits(op as usize) as u16) as usize];
-                        continue 'dodist;
-                    } else {
-                        bad = Some("invalid distance code\0");
-                        state.mode = Mode::Bad;
-                        break 'outer;
-                    }
-
-                    break 'dodist;
-                }
-            } else if (op & 64) == 0 {
-                // 2nd level length code
-                here = lcode[(here.val + bit_reader.bits(op as usize) as u16) as usize];
-                continue 'dolen;
-            } else if op & 32 != 0 {
-                // end of block
-                state.mode = Mode::Type;
-                break 'outer;
-            } else {
-                bad = Some("invalid literal/length code\0");
-                state.mode = Mode::Bad;
-                break 'outer;
-            }
-
-            break 'dolen;
-        }
-
-        // For normal `inflate`, include the bits in the bit_reader buffer in the count of available bytes.
-        let remaining = bit_reader.bytes_remaining();
-        if remaining >= INFLATE_FAST_MIN_HAVE && writer.remaining() >= INFLATE_FAST_MIN_LEFT {
-            continue;
-        }
-
-        break 'outer;
-    }
-
-    // return unused bytes (on entry, bits < 8, so in won't go too far back)
-    bit_reader.return_unused_bytes();
-
-    if let Some(error_message) = bad {
-        debug_assert!(matches!(state.mode, Mode::Bad));
-        state.bad(error_message);
-    }
 }
 
 #[cfg(test)]
