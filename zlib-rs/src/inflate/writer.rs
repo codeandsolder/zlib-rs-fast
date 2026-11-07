@@ -135,16 +135,24 @@ impl<'a> Writer<'a> {
                 let repeated = buf[start];
                 buf[current..end].fill(repeated);
             } else {
-                buf.copy_within(start..current, current);
+                // The initial source precedes the destination. Explicit
+                // disjoint borrows permit memcpy rather than memmove.
+                let (previous, output) = buf.split_at_mut(current);
+                output[..offset_from_end].copy_from_slice(&previous[start..current]);
                 let mut initialized = offset_from_end;
                 while initialized < length {
                     let copy_len = initialized.min(length - initialized);
-                    buf.copy_within(current..current + copy_len, current + initialized);
+                    // Each prefix-doubling step reads exclusively from the
+                    // already written prefix and writes beyond its end.
+                    let (prefix, tail) = buf.split_at_mut(current + initialized);
+                    tail[..copy_len].copy_from_slice(&prefix[current..current + copy_len]);
                     initialized += copy_len;
                 }
             }
         } else {
-            buf.copy_within(start..start + length, current);
+            // Non-overlapping matches are disjoint by definition.
+            let (previous, output) = buf.split_at_mut(current);
+            output[..length].copy_from_slice(&previous[start..start + length]);
         }
         // Commit the initialized extent only after every copy succeeds.
         self.filled = end;
@@ -420,6 +428,39 @@ mod test {
         for offset_from_end in 1..=M {
             for length in 0..=258 {
                 test_copy_match(offset_from_end, length);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_match_initializes_uninitialized_output_tail() {
+        // Copy the same references into genuinely uninitialized backing
+        // storage, not merely a buffer pre-filled with known sentinel bytes.
+        // Only the decoded prefix may ever be materialized as typed bytes.
+        let prefix: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for distance in [1, 2, 3, 4, 8, 16, 32, 64] {
+            for length in [0, 1, distance - 1, distance, distance + 1, 258] {
+                let mut storage = [MaybeUninit::uninit(); 64 + 258];
+                for (slot, &byte) in storage.iter_mut().zip(prefix.iter()) {
+                    slot.write(byte);
+                }
+                let mut writer = Writer {
+                    buf: WeakSliceMut::from_mut_slice(&mut storage),
+                    filled: prefix.len(),
+                };
+
+                let mut expected = prefix.to_vec();
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - distance]);
+                }
+
+                writer.copy_match(distance, length);
+                assert_eq!(writer.len(), expected.len());
+                assert_eq!(
+                    writer.filled(),
+                    expected,
+                    "distance {distance}, length {length}"
+                );
             }
         }
     }
