@@ -523,6 +523,12 @@ pub enum InflateStateKind {
 /// `inflateCopy()` shallow-copies the destination exactly like zlib. Each parser operation creates
 /// only the short mutable access it needs, and all nested extra/name/comment pointer writes are
 /// confined here.
+#[derive(Clone, Copy)]
+enum GzipStringField {
+    Name,
+    Comment,
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct GzipHeaderOutput(NonNull<gz_header>);
@@ -585,71 +591,69 @@ impl GzipHeaderOutput {
         });
     }
 
+    /// Copy into a caller-owned gzip metadata field without crossing its capacity.
+    ///
+    /// The nested buffer contracts are established by the unsafe get_header
+    /// boundary, while this helper confines raw writes to one checked operation.
+    fn write_bounded(ptr: *mut u8, capacity: usize, offset: usize, bytes: &[u8]) -> usize {
+        if ptr.is_null() || offset >= capacity {
+            return 0;
+        }
+        let count = bytes.len().min(capacity - offset);
+        if count != 0 {
+            // SAFETY: get_header requires this nested destination to be writable for
+            // capacity bytes, disjoint from the caller input. The offset and count
+            // bound this copy to that allocation.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), count) };
+        }
+        count
+    }
+
     fn write_extra(&mut self, remaining_before: usize, bytes: &[u8]) {
         self.with_header_mut(|head| {
-            if head.extra.is_null() {
-                return;
-            }
-
             let written = (head.extra_len as usize)
                 .checked_sub(remaining_before)
                 .expect("extra-field progress stays within declared length");
-            let capacity = head.extra_max as usize;
-            let count = Ord::min(bytes.len(), capacity.saturating_sub(written));
-            if count == 0 {
-                return;
-            }
-            let offset = Ord::min(written, capacity);
-
-            // SAFETY: `get_header` requires `extra` to be writable for `extra_max` bytes. `offset`
-            // and `count` are bounded to that capacity and `bytes` is readable for `count` bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.extra.add(offset), count)
-            };
+            Self::write_bounded(head.extra, head.extra_max as usize, written, bytes);
         });
     }
 
-    fn write_name(&mut self, offset: usize, bytes: &[u8]) -> usize {
+    fn write_string(&mut self, field: GzipStringField, offset: usize, bytes: &[u8]) -> usize {
         self.with_header_mut(|head| {
-            if head.name.is_null() {
-                return 0;
-            }
-
-            let remaining = (head.name_max as usize)
-                .checked_sub(offset)
-                .expect("name output offset stays within capacity");
-            let count = Ord::min(bytes.len(), remaining);
-            if count != 0 {
-                // SAFETY: `get_header` requires `name` writable for `name_max` bytes, and the
-                // checked offset plus bounded count stays within that allocation.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.name.add(offset), count)
-                };
-            }
-            count
+            let (ptr, capacity) = match field {
+                GzipStringField::Name => (head.name, head.name_max as usize),
+                GzipStringField::Comment => (head.comment, head.comm_max as usize),
+            };
+            Self::write_bounded(ptr, capacity, offset, bytes)
         })
     }
+}
 
-    fn write_comment(&mut self, offset: usize, bytes: &[u8]) -> usize {
-        self.with_header_mut(|head| {
-            if head.comment.is_null() {
-                return 0;
-            }
+/// Consume a gzip NUL-terminated metadata field across any number of caller
+/// input fragments. The stored count reflects only bytes that fit the destination,
+/// while the input cursor and optional header CRC always account for the entire field.
+fn consume_gzip_header_string(
+    reader: &mut BitReader<'_>,
+    header: Option<GzipHeaderOutput>,
+    field: GzipStringField,
+    stored: &mut usize,
+    checksum: &mut u32,
+    update_crc: bool,
+) -> bool {
+    let available = reader.as_slice();
+    let terminator = available.iter().position(|&byte| byte == 0);
+    let count = terminator.map_or(available.len(), |position| position + 1);
+    let bytes = &available[..count];
 
-            let remaining = (head.comm_max as usize)
-                .checked_sub(offset)
-                .expect("comment output offset stays within capacity");
-            let count = Ord::min(bytes.len(), remaining);
-            if count != 0 {
-                // SAFETY: `get_header` requires `comment` writable for `comm_max` bytes, and the
-                // checked offset plus bounded count stays within that allocation.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.comment.add(offset), count)
-                };
-            }
-            count
-        })
+    if let Some(mut header) = header {
+        *stored += header.write_string(field, *stored, bytes);
     }
+    if update_crc {
+        *checksum = crc32(*checksum, bytes);
+    }
+    reader.advance(count);
+
+    terminator.is_some()
 }
 
 #[repr(C, align(64))]
@@ -1579,34 +1583,14 @@ impl State<'_> {
                     }
                     Mode::Name => {
                         if (self.gzip_flags & 0x0800) != 0 {
-                            if bit_reader.bytes_remaining() == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-
-                            // the name string will always be null-terminated, but might be longer than we have
-                            // space for in the header struct. Nonetheless, we read the whole thing.
-                            let slice = bit_reader.as_slice();
-                            let null_terminator_index = slice.iter().position(|c| *c == 0);
-
-                            // we include the null terminator if it exists
-                            let name_slice = match null_terminator_index {
-                                Some(i) => &slice[..=i],
-                                None => slice,
-                            };
-
-                            // if the header has space, store as much as possible in there
-                            if let Some(mut head) = self.head {
-                                self.length += head.write_name(self.length, name_slice);
-                            }
-
-                            if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                self.checksum = crc32(self.checksum, name_slice);
-                            }
-
-                            let reached_end = name_slice.last() == Some(&0);
-                            bit_reader.advance(name_slice.len());
-
-                            if !reached_end && bit_reader.bytes_remaining() == 0 {
+                            if !consume_gzip_header_string(
+                                bit_reader,
+                                self.head,
+                                GzipStringField::Name,
+                                &mut self.length,
+                                &mut self.checksum,
+                                (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0,
+                            ) {
                                 break 'label ReturnCode::Ok;
                             }
                         } else if let Some(mut head) = self.head {
@@ -1614,39 +1598,18 @@ impl State<'_> {
                         }
 
                         self.length = 0;
-
                         break 'blk Mode::Comment;
                     }
                     Mode::Comment => {
-                        if (self.gzip_flags & 0x01000) != 0 {
-                            if bit_reader.bytes_remaining() == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-
-                            // the comment string will always be null-terminated, but might be longer than we have
-                            // space for in the header struct. Nonetheless, we read the whole thing.
-                            let slice = bit_reader.as_slice();
-                            let null_terminator_index = slice.iter().position(|c| *c == 0);
-
-                            // we include the null terminator if it exists
-                            let comment_slice = match null_terminator_index {
-                                Some(i) => &slice[..=i],
-                                None => slice,
-                            };
-
-                            // if the header has space, store as much as possible in there
-                            if let Some(mut head) = self.head {
-                                self.length += head.write_comment(self.length, comment_slice);
-                            }
-
-                            if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                self.checksum = crc32(self.checksum, comment_slice);
-                            }
-
-                            let reached_end = comment_slice.last() == Some(&0);
-                            bit_reader.advance(comment_slice.len());
-
-                            if !reached_end && bit_reader.bytes_remaining() == 0 {
+                        if (self.gzip_flags & 0x1000) != 0 {
+                            if !consume_gzip_header_string(
+                                bit_reader,
+                                self.head,
+                                GzipStringField::Comment,
+                                &mut self.length,
+                                &mut self.checksum,
+                                (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0,
+                            ) {
                                 break 'label ReturnCode::Ok;
                             }
                         } else if let Some(mut head) = self.head {
@@ -3104,6 +3067,8 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
 ///     - If `head.extra` is not NULL, it must be writable for at least `head.extra_max` bytes
 ///     - if `head.name` is not NULL, it must be writable for at least `head.name_max` bytes
 ///     - if `head.comment` is not NULL, it must be writable for at least `head.comm_max` bytes
+/// * The nested output buffers must not overlap the compressed input span of any inflate call
+///   that writes into them: metadata copies use non-overlapping memory semantics.
 pub unsafe fn get_header(
     stream: &mut InflateStream<'_>,
     head: Option<&mut gz_header>,
@@ -3131,6 +3096,90 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_header_fields_clip_storage_but_consume_all_fragments() {
+        let mut extra = [0xa5_u8; 6];
+        let mut name = [0xa5_u8; 5];
+        let mut comment = [0xa5_u8; 6];
+        let mut header = gz_header {
+            extra: extra.as_mut_ptr(),
+            extra_len: 8,
+            extra_max: 4,
+            name: name.as_mut_ptr(),
+            name_max: 3,
+            comment: comment.as_mut_ptr(),
+            comm_max: 4,
+            ..gz_header::default()
+        };
+
+        // SAFETY: every nested pointer refers to its independent, uniquely
+        // writable stack buffer, with capacities no larger than those buffers.
+        let mut destination = unsafe { GzipHeaderOutput::new(&mut header) };
+        destination.write_extra(8, b"abc");
+        destination.write_extra(5, b"defgh");
+        assert_eq!(extra, *b"abcd\xa5\xa5");
+        assert_eq!(header.extra_len, 8);
+
+        let mut checksum = crate::CRC32_INITIAL_VALUE;
+        let mut stored = 0;
+        let mut first = BitReader::from_buffer(BitBuffer::default(), b"abc");
+        assert!(!consume_gzip_header_string(
+            &mut first,
+            Some(destination),
+            GzipStringField::Name,
+            &mut stored,
+            &mut checksum,
+            true,
+        ));
+        assert!(first.as_slice().is_empty());
+        assert_eq!(stored, 3);
+
+        let mut second = BitReader::from_buffer(BitBuffer::default(), b"def\0trailing");
+        assert!(consume_gzip_header_string(
+            &mut second,
+            Some(destination),
+            GzipStringField::Name,
+            &mut stored,
+            &mut checksum,
+            true,
+        ));
+        assert_eq!(second.as_slice(), b"trailing");
+        assert_eq!(stored, 3);
+        assert_eq!(name, *b"abc\xa5\xa5");
+        assert_eq!(checksum, crc32(crate::CRC32_INITIAL_VALUE, b"abcdef\0"));
+
+        stored = 0;
+        let mut third = BitReader::from_buffer(BitBuffer::default(), b"you\0unused");
+        assert!(consume_gzip_header_string(
+            &mut third,
+            Some(destination),
+            GzipStringField::Comment,
+            &mut stored,
+            &mut checksum,
+            false,
+        ));
+        assert_eq!(third.as_slice(), b"unused");
+        assert_eq!(stored, 4);
+        assert_eq!(comment, *b"you\0\xa5\xa5");
+        assert_eq!(checksum, crc32(crate::CRC32_INITIAL_VALUE, b"abcdef\0"));
+
+        // The same bounded write must handle a missing destination without
+        // touching memory or losing the input cursor's progress.
+        destination.clear_comment();
+        let mut missing = BitReader::from_buffer(BitBuffer::default(), b"skip\0rest");
+        stored = 0;
+        assert!(consume_gzip_header_string(
+            &mut missing,
+            Some(destination),
+            GzipStringField::Comment,
+            &mut stored,
+            &mut checksum,
+            false,
+        ));
+        assert_eq!(stored, 0);
+        assert_eq!(missing.as_slice(), b"rest");
+    }
 
     #[test]
     fn non_strict_missing_history_is_initialized_as_zero_without_panic() -> Result<(), &'static str>
