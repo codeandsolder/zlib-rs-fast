@@ -18,12 +18,12 @@ impl<'a> Writer<'a> {
     ///
     /// The arguments must satisfy the requirements of [`core::slice::from_raw_parts_mut`].
     #[inline]
-    pub unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Writer<'a> {
+    pub const unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
         // SAFETY: The preconditions for WeakSliceMut::from_raw_parts_mut are the same
         // as for core::slice::from_raw_parts_mut, and the caller is responsible for
         // ensuring the latter.
-        let buf = unsafe { WeakSliceMut::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, len) };
-        Writer { buf, filled: 0 }
+        let buf = unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) };
+        Self { buf, filled: 0 }
     }
 
     /// Reborrow a window with a prefix already produced by the decoder.
@@ -44,19 +44,19 @@ impl<'a> Writer<'a> {
 
     /// Pointer to where the next byte will be written
     #[inline]
-    pub fn next_out(&mut self) -> *mut MaybeUninit<u8> {
+    pub const fn next_out(&mut self) -> *mut MaybeUninit<u8> {
         self.buf.as_mut_ptr().wrapping_add(self.filled).cast()
     }
 
     /// Returns the total capacity of the buffer.
     #[inline]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.buf.len()
     }
 
     /// Returns the length of the filled part of the buffer
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.filled
     }
 
@@ -71,12 +71,12 @@ impl<'a> Writer<'a> {
 
     /// Returns the number of bytes at the end of the slice that have not yet been filled.
     #[inline]
-    pub fn remaining(&self) -> usize {
+    pub const fn remaining(&self) -> usize {
         self.capacity() - self.filled
     }
 
     #[inline]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         self.filled == self.buf.len()
     }
 
@@ -122,7 +122,6 @@ impl<'a> Writer<'a> {
         let end = current + length;
 
         let buf = self.buf.as_mut_slice();
-        self.filled = end;
 
         // DEFLATE matches may overlap their output. `copy_within` has memmove semantics,
         // which is not enough for a match longer than its distance: newly written bytes
@@ -130,9 +129,8 @@ impl<'a> Writer<'a> {
         // double the initialized prefix. This expresses that recurrence directly without
         // architecture dispatch or copying past the logical end of the match.
         if length > offset_from_end {
-            let seed_len = length.min(offset_from_end);
-            buf.copy_within(start..start + seed_len, current);
-            let mut initialized = seed_len;
+            buf.copy_within(start..current, current);
+            let mut initialized = offset_from_end;
             while initialized < length {
                 let copy_len = initialized.min(length - initialized);
                 buf.copy_within(current..current + copy_len, current + initialized);
@@ -141,6 +139,8 @@ impl<'a> Writer<'a> {
         } else {
             buf.copy_within(start..start + length, current);
         }
+        // Commit the initialized extent only after every copy succeeds.
+        self.filled = end;
     }
 
     /// Copy initialized bytes from another position in this same backing allocation.
@@ -195,12 +195,12 @@ impl<'a> BackWriter<'a> {
     }
 
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.writer.len()
     }
 
     #[inline]
-    pub(crate) fn remaining(&self) -> usize {
+    pub(crate) const fn remaining(&self) -> usize {
         self.writer.remaining()
     }
 
@@ -300,29 +300,33 @@ mod test {
     const N: usize = 512;
     const M: usize = 128;
 
-    fn test_array() -> [MaybeUninit<u8>; N] {
-        core::array::from_fn(|i| MaybeUninit::new(if i < M { i as u8 } else { 0xAAu8 }))
+    fn test_array() -> [u8; N] {
+        core::array::from_fn(|i| {
+            if i < M {
+                u8::try_from(i).unwrap_or(0xaa)
+            } else {
+                0xaa
+            }
+        })
     }
 
     fn test_copy_match(offset_from_end: usize, length: usize) {
-        let mut buf = test_array();
+        let mut buf = test_array().map(MaybeUninit::new);
         let mut writer = Writer {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) },
+            buf: WeakSliceMut::from_mut_slice(&mut buf),
             filled: M,
         };
         writer.copy_match(offset_from_end, length);
-        assert_eq!(writer.filled, M + length);
+        assert_eq!(writer.len(), M + length);
 
-        let mut naive = test_array();
+        let mut expected = test_array();
         for i in 0..length {
-            naive[M + i] = naive[M - offset_from_end + i];
+            expected[M + i] = expected[M - offset_from_end + i];
         }
 
-        let buf = unsafe { core::mem::transmute::<[MaybeUninit<u8>; N], [u8; N]>(buf) };
-        let naive = unsafe { core::mem::transmute::<[MaybeUninit<u8>; N], [u8; N]>(naive) };
         assert_eq!(
-            buf[M..][..length],
-            naive[M..][..length],
+            &writer.filled()[M..],
+            &expected[M..M + length],
             "{offset_from_end} {length}"
         );
     }
@@ -408,7 +412,7 @@ mod test {
     fn copy_match() {
         for offset_from_end in 1..=M {
             for length in 0..=258 {
-                test_copy_match(offset_from_end, length)
+                test_copy_match(offset_from_end, length);
             }
         }
     }
@@ -417,12 +421,12 @@ mod test {
     fn copy_match_at_exact_buffer_end() {
         let mut buf = [1, 2, 3, 0xAA, 0xAA].map(MaybeUninit::new);
         let mut writer = Writer {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) },
+            buf: WeakSliceMut::from_mut_slice(&mut buf),
             filled: 3,
         };
 
         writer.copy_match(3, 2);
 
-        assert_eq!(buf.map(|e| unsafe { e.assume_init() }), [1, 2, 3, 1, 2]);
+        assert_eq!(writer.filled(), &[1, 2, 3, 1, 2]);
     }
 }

@@ -133,22 +133,21 @@ impl Window<'_> {
         checksum: &mut u32,
         crc_fold: &mut Crc32Fold,
     ) {
+        // Checksum every incoming byte, even when only its trailing window
+        // survives as history. The checksum is independent of the ring split.
+        if update_checksum {
+            if flags != 0 {
+                crc_fold.fold(slice);
+            } else {
+                *checksum = adler32(*checksum, slice);
+            }
+        }
+
         let len = slice.len();
         let wsize = self.size();
 
         if len >= wsize {
-            let pos = len - wsize;
-            let (non_window_slice, window_slice) = slice.split_at(pos);
-
-            if update_checksum {
-                if flags != 0 {
-                    crc_fold.fold(non_window_slice);
-                    crc_fold.fold(window_slice);
-                } else {
-                    *checksum = adler32(*checksum, non_window_slice);
-                    *checksum = adler32(*checksum, window_slice);
-                }
-            }
+            let window_slice = &slice[len - wsize..];
             self.buf.as_mut_slice()[..wsize].write_copy_of_slice(window_slice);
             self.next = 0;
             self.have = wsize;
@@ -158,13 +157,6 @@ impl Window<'_> {
         let end_len = Ord::min(wsize - self.next, len);
         let (end_part, start_part) = slice.split_at(end_len);
 
-        if update_checksum {
-            if flags != 0 {
-                crc_fold.fold(end_part);
-            } else {
-                *checksum = adler32(*checksum, end_part);
-            }
-        }
         self.buf.as_mut_slice()[self.next..][..end_part.len()].write_copy_of_slice(end_part);
 
         if start_part.is_empty() {
@@ -176,13 +168,6 @@ impl Window<'_> {
                 self.have += end_len;
             }
         } else {
-            if update_checksum {
-                if flags != 0 {
-                    crc_fold.fold(start_part);
-                } else {
-                    *checksum = adler32(*checksum, start_part);
-                }
-            }
             self.buf.as_mut_slice()[..start_part.len()].write_copy_of_slice(start_part);
             self.next = start_part.len();
             self.have = wsize;
@@ -447,6 +432,35 @@ mod test {
 
         free_window(window);
         Ok(())
+    }
+
+    #[test]
+    fn crc_tracks_original_input_across_wrap_and_replacement() {
+        let mut storage = [0u8; 8];
+        let mut window = Window::from_initialized_slice(&mut storage);
+        let mut checksum = 0;
+        let mut crc = Crc32Fold::new();
+
+        window.extend(&[10, 11, 12], 1, true, &mut checksum, &mut crc);
+        window.extend(&[13, 14, 15, 16, 17, 18], 1, true, &mut checksum, &mut crc);
+        assert_eq!(window.next(), 1);
+        assert_eq!(window.have(), 8);
+        let (tail, head) = window.dictionary_segments();
+        assert_eq!(tail, &[11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(head, &[18]);
+
+        window.extend(
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+            1,
+            true,
+            &mut checksum,
+            &mut crc,
+        );
+        assert_eq!(window.as_slice(), &[25, 26, 27, 28, 29, 30, 31, 32]);
+        assert_eq!(window.next(), 0);
+
+        let expected = crc32fast::hash(&(10u8..=32).collect::<Vec<_>>());
+        assert_eq!(crc.finish(), expected);
     }
 
     #[test]
