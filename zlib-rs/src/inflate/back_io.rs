@@ -198,15 +198,6 @@ impl BackOutput {
     }
 
     #[inline(always)]
-    pub(super) fn set_len(&mut self, filled: usize, window: &BackWindow<'_>) {
-        assert!(
-            filled <= window.buffer_size(),
-            "inflateBack output stays in-bounds"
-        );
-        self.filled = filled;
-    }
-
-    #[inline(always)]
     pub(super) fn remaining(&self, window: &BackWindow<'_>) -> usize {
         window.buffer_size() - self.filled
     }
@@ -220,56 +211,97 @@ impl BackOutput {
         }
     }
 
+    /// Give the decoder one exclusive, initialized-prefix-aware writer view,
+    /// then commit its new length before the window can be borrowed again.
+    #[inline]
+    pub(super) fn with_writer<R>(
+        &mut self,
+        window: &mut BackWindow<'_>,
+        operation: impl FnOnce(&mut BackWriter<'_>) -> R,
+    ) -> R {
+        let mut writer = BackWriter::new(window, self.filled);
+        let result = operation(&mut writer);
+        self.filled = writer.len();
+        result
+    }
+
+    /// Copy at most the current window's remaining capacity. The calling
+    /// decoder handles continuation after a full-window callback.
+    pub(super) fn copy_match(
+        &mut self,
+        window: &mut BackWindow<'_>,
+        sane: bool,
+        distance: usize,
+        length: usize,
+    ) -> Result<usize, &'static str> {
+        self.with_writer(window, |writer| {
+            let count = length.min(writer.remaining());
+            writer.copy_match(sane, distance, count)?;
+            Ok(count)
+        })
+    }
+
     #[inline(always)]
     pub(super) fn push(&mut self, window: &mut BackWindow<'_>, byte: u8) {
-        let mut writer = BackWriter::new(window, self.filled);
-        assert!(
-            writer.remaining() != 0,
-            "inflateBack output has room for literal"
-        );
-        writer.push(byte);
-        self.filled = writer.len();
+        self.with_writer(window, |writer| {
+            assert_ne!(
+                writer.remaining(),
+                0,
+                "inflateBack output has room for literal"
+            );
+            writer.push(byte);
+        });
     }
 
     #[inline(always)]
     pub(super) fn extend(&mut self, window: &mut BackWindow<'_>, bytes: &[u8]) {
-        let mut writer = BackWriter::new(window, self.filled);
-        assert!(
-            bytes.len() <= writer.remaining(),
-            "inflateBack output copy fits"
-        );
-        writer.extend(bytes);
-        self.filled = writer.len();
+        self.with_writer(window, |writer| {
+            assert!(
+                bytes.len() <= writer.remaining(),
+                "inflateBack output copy fits"
+            );
+            writer.extend(bytes);
+        });
     }
 
-    /// Flush a full output window to the zlib callback and reset the cursor for reuse.
+    /// Expose only the initialized output prefix to the caller callback.
+    /// Both full-window and final-partial-window deliveries use this boundary.
+    #[inline]
+    fn deliver(&mut self, window: &mut BackWindow<'_>) -> Result<(), ReturnCode> {
+        debug_assert!(self.filled > 0 && self.filled <= window.buffer_size());
+        // The window size was validated at inflateBackInit to be at most 32768.
+        let count = self.filled as u32;
+        // SAFETY: BackOutput::new established the callback contract. Every
+        // byte in 0..filled was initialized by BackWriter, and the callback
+        // may read that prefix but may not invalidate the window storage.
+        let result = unsafe {
+            (self.callback)(
+                self.descriptor,
+                window.as_uninit_slice().as_mut_ptr().cast::<u8>(),
+                count,
+            )
+        };
+        if result != 0 {
+            return Err(ReturnCode::BufError);
+        }
+        Ok(())
+    }
+
+    /// Flush a full output window and reset the prefix for the next chunk.
     #[inline(always)]
     pub(super) fn flush_if_full(&mut self, window: &mut BackWindow<'_>) -> Result<(), ReturnCode> {
         if self.filled != window.buffer_size() {
             return Ok(());
         }
 
-        // The whole window is initialized before it is exposed to the callback or later history
-        // reads.
+        // Only a completely initialized window becomes previous history.
         window.mark_full_history();
-        // SAFETY: `BackOutput::new` established the callback contract, and `filled == capacity`
-        // proves the complete window is initialized for this callback.
-        if unsafe {
-            (self.callback)(
-                self.descriptor,
-                window.as_mut_ptr().cast::<u8>(),
-                self.filled as u32,
-            )
-        } != 0
-        {
-            return Err(ReturnCode::BufError);
-        }
+        self.deliver(window)?;
         self.filled = 0;
         Ok(())
     }
 
-    /// Deliver any final partial window. This intentionally does not mark a full-history window:
-    /// no later decode step consumes history after `inflateBack` starts returning.
+    /// Deliver a final partial prefix, without marking incomplete history.
     #[inline(always)]
     pub(super) fn flush_remaining(
         &mut self,
@@ -278,19 +310,67 @@ impl BackOutput {
         if self.filled == 0 {
             return Ok(());
         }
+        self.deliver(window)
+    }
+}
 
-        // SAFETY: `BackOutput::new` established the callback contract and `filled` tracks exactly
-        // the initialized prefix of the caller-owned window.
-        if unsafe {
-            (self.callback)(
-                self.descriptor,
-                window.as_mut_ptr().cast::<u8>(),
-                self.filled as u32,
-            )
-        } != 0
-        {
-            return Err(ReturnCode::BufError);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CallbackData {
+        chunks: Vec<Vec<u8>>,
+        reject: bool,
+    }
+
+    unsafe extern "C" fn record_output(descriptor: *mut c_void, bytes: *mut u8, len: u32) -> i32 {
+        // SAFETY: test passes the exclusive address of CallbackData as descriptor.
+        let data = unsafe { &mut *descriptor.cast::<CallbackData>() };
+        if data.reject {
+            return 1;
         }
-        Ok(())
+
+        // SAFETY: BackOutput delivers only the initialized prefix of its borrowed
+        // scratch window. The callback copies it before that window is reused.
+        let prefix = unsafe { core::slice::from_raw_parts(bytes, len as usize) };
+        data.chunks.push(prefix.to_vec());
+        0
+    }
+
+    #[test]
+    fn callback_output_commits_history_and_delivers_only_initialized_prefixes() {
+        let mut storage = [0xa5; 8];
+        let mut window = BackWindow::from_initialized_slice(&mut storage);
+        let mut data = CallbackData {
+            chunks: Vec::new(),
+            reject: false,
+        };
+        // SAFETY: the descriptor refers to live, uniquely borrowed test state,
+        // and record_output only reads initialized output bytes before returning.
+        let mut output =
+            unsafe { BackOutput::new(record_output, (&raw mut data).cast::<c_void>()) };
+
+        output.extend(&mut window, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(output.len(), 8);
+        assert_eq!(output.flush_if_full(&mut window), Ok(()));
+        assert_eq!(output.len(), 0);
+        assert_eq!(output.history_available(&window), 8);
+        assert_eq!(data.chunks, vec![vec![1, 2, 3, 4, 5, 6, 7, 8]]);
+
+        assert_eq!(output.copy_match(&mut window, true, 8, 5), Ok(5));
+        assert_eq!(output.len(), 5);
+        assert_eq!(output.flush_if_full(&mut window), Ok(()));
+        assert_eq!(data.chunks.len(), 1);
+        assert_eq!(output.flush_remaining(&mut window), Ok(()));
+        assert_eq!(data.chunks[1], [1, 2, 3, 4, 5]);
+        data.reject = true;
+        assert_eq!(
+            output.flush_remaining(&mut window),
+            Err(ReturnCode::BufError)
+        );
+        assert_eq!(output.len(), 5);
+        assert_eq!(data.chunks.len(), 2);
+        // No part of the unwritten tail is overwritten by the partial match.
+        assert_eq!(&storage[5..], &[6, 7, 8]);
     }
 }

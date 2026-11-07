@@ -2,17 +2,19 @@
 
 mod simd;
 
+#[must_use]
 pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
     simd::adler32(start_checksum, data)
 }
 
+#[must_use]
 pub fn adler32_combine(adler1: u32, adler2: u32, len2: u64) -> u32 {
     const BASE: u64 = self::BASE as u64;
 
     let rem = len2 % BASE;
 
-    let adler1 = adler1 as u64;
-    let adler2 = adler2 as u64;
+    let adler1 = u64::from(adler1);
+    let adler2 = u64::from(adler2);
 
     /* the derivation of this formula is left as an exercise for the reader */
     let mut sum1 = adler1 & 0xffff;
@@ -34,7 +36,11 @@ pub fn adler32_combine(adler1: u32, adler2: u32, len2: u64) -> u32 {
         sum2 -= BASE;
     }
 
-    (sum1 | (sum2 << 16)) as u32
+    // Both limbs have been reduced modulo BASE (< 2^16), so the packed
+    // result always fits the Adler-32 return type.
+    let packed = sum1 | (sum2 << 16);
+    u32::try_from(packed)
+        .unwrap_or_else(|_| unreachable!("two reduced Adler-32 limbs exceed 32 bits"))
 }
 
 // inefficient but correct, useful for testing
@@ -46,7 +52,7 @@ fn naive_adler32(start_checksum: u32, data: &[u8]) -> u32 {
     let mut b = (start_checksum >> 16) & 0xFFFF;
 
     for &byte in data {
-        a = (a + byte as u32) % MOD_ADLER;
+        a = (a + u32::from(byte)) % MOD_ADLER;
         b = (b + a) % MOD_ADLER;
     }
 
@@ -90,7 +96,7 @@ mod test {
 
         for &len in LENGTHS {
             let data: Vec<_> = (0..len)
-                .map(|index| (index.wrapping_mul(131).wrapping_add(17) & 0xff) as u8)
+                .map(|index| index.wrapping_mul(131).wrapping_add(17).to_le_bytes()[0])
                 .collect();
 
             for start in [0, 1, 42, u32::MAX] {
@@ -105,9 +111,7 @@ mod test {
 
     #[test]
     fn test_adler32_combine() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
-
-        fn test(data: Vec<u8>) -> bool {
+        fn test(data: &[u8]) -> bool {
             let Some(buf_len) = data.first().copied() else {
                 return true;
             };
@@ -115,13 +119,11 @@ mod test {
             let buf_size = Ord::max(buf_len, 1) as usize;
 
             let mut adler1 = 1;
-            let mut adler2 = 1;
-
             for chunk in data.chunks(buf_size) {
                 adler1 = adler32(adler1, chunk);
             }
 
-            adler2 = adler32(adler2, &data);
+            let adler2 = adler32(1, data);
 
             assert_eq!(adler1, adler2);
 
@@ -130,6 +132,28 @@ mod test {
             assert_eq!(combine1, combine2);
 
             true
+        }
+
+        let property: fn(Vec<u8>) -> bool = |data| test(&data);
+        ::quickcheck::quickcheck(property);
+    }
+
+    #[test]
+    fn largest_nmax_block_never_overflows_simd_adler() {
+        for len in [
+            NMAX as usize - 1,
+            NMAX as usize,
+            NMAX as usize + 1,
+            2 * NMAX as usize,
+        ] {
+            let data = vec![u8::MAX; len];
+            for initial in [1, u32::MAX, 0xffff_0001] {
+                assert_eq!(
+                    adler32(initial, &data),
+                    naive_adler32(initial, &data),
+                    "worst-case SIMD sum: len={len}, initial={initial:#x}"
+                );
+            }
         }
     }
 }

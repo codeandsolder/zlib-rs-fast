@@ -10,7 +10,7 @@ fn edge_cases() {
 
     assert_eq!(
         assert_eq_rs_ng! {
-            {
+            unsafe {
                 let mut stream = MaybeUninit::uninit();
                 inflateBackInit_(
                     stream.as_mut_ptr(),
@@ -26,7 +26,7 @@ fn edge_cases() {
 
     assert_eq!(
         assert_eq_rs_ng! {
-            {
+            unsafe {
                 let mut stream = MaybeUninit::uninit();
                 inflateBackInit_(
                     stream.as_mut_ptr(),
@@ -44,7 +44,7 @@ fn edge_cases() {
 #[test]
 fn inflate_copy_rejects_back_init_state() {
     for force_non_null_output in [false, true] {
-        let result = assert_eq_rs_ng!({
+        let result = assert_eq_rs_ng!(unsafe {
             let mut source = MaybeUninit::<z_stream>::zeroed();
             let mut copy = MaybeUninit::<z_stream>::zeroed();
             let mut window = vec![0xAA; 1 << 15];
@@ -74,6 +74,56 @@ fn inflate_copy_rejects_back_init_state() {
 
         assert_eq!(result, libz_ng_sys::Z_STREAM_ERROR);
     }
+}
+
+#[test]
+fn invalid_back_history_is_rejected_without_reading_uninitialized_window() {
+    // Minimized by hosted libFuzzer from an inflateBack one-byte callback.
+    // The input runs out before its incomplete DEFLATE stream can terminate.
+    const TRUNCATED: &[u8] = &[0x0a, 0x26, 0x0a, 0x26];
+    for chunk in [1usize, 512] {
+        let (reference, ours) = if chunk == 1 {
+            (
+                run_inflate_back_ng::<1>(TRUNCATED, 15),
+                run_inflate_back_rs::<1>(TRUNCATED, 15),
+            )
+        } else {
+            (
+                run_inflate_back_ng::<512>(TRUNCATED, 15),
+                run_inflate_back_rs::<512>(TRUNCATED, 15),
+            )
+        };
+        // zlib-ng's non-strict decoder can continue through an invalid
+        // distance and eventually report input exhaustion. The Rust decoder
+        // must instead refuse to read history never initialized by output.
+        assert_eq!(reference, Err(libz_ng_sys::Z_BUF_ERROR), "chunk={chunk}");
+        assert_eq!(ours, Err(libz_rs_sys::Z_DATA_ERROR), "chunk={chunk}");
+    }
+}
+
+#[test]
+fn non_strict_reference_can_emit_uninitialized_back_history() {
+    // Minimized by hosted libFuzzer: the reference accepts a distance
+    // reaching before the first output byte and copies the 0xAA sentinel
+    // from its initial window. Rust must not treat it as valid DEFLATE.
+    const INPUT: &[u8] = &[0x22, 0x59, 0x01, 0x60, 0x00, 0x3D];
+
+    let reference = run_inflate_back_ng::<1>(INPUT, 15);
+    let ours = run_inflate_back_rs::<1>(INPUT, 15);
+    assert!(
+        matches!(&reference, Ok(bytes) if !bytes.is_empty() && bytes.iter().all(|&b| b == 0xAA))
+    );
+    assert_eq!(ours, Err(libz_rs_sys::Z_DATA_ERROR));
+
+    // A separate ordinary inflate entrypoint must also refuse this
+    // invalid back-reference before the harness tolerates C's success.
+    let mut output = vec![0; reference.as_ref().map_or(0, Vec::len) + 1];
+    let (_, status) = zlib_rs::decompress_slice(
+        &mut output,
+        INPUT,
+        zlib_rs::InflateConfig { window_bits: -15 },
+    );
+    assert_eq!(status, zlib_rs::ReturnCode::DataError);
 }
 
 #[test]

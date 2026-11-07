@@ -1,8 +1,14 @@
 #![cfg_attr(feature = "gzprintf", feature(c_variadic))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
+#![expect(
+    non_camel_case_types,
+    reason = "the public C ABI uses established zlib type names"
+)]
+#![expect(
+    non_snake_case,
+    reason = "the public C ABI uses established zlib function names"
+)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc = include_str!("../README.md")]
 
@@ -48,7 +54,6 @@ use zlib_rs::{
 
 pub use zlib_rs::c_api::*;
 
-#[allow(non_camel_case_types)]
 pub type size_t = usize;
 
 #[cfg(feature = "custom-prefix")]
@@ -527,26 +532,47 @@ pub unsafe extern "C" fn uncompress2_z(
 ) -> c_int {
     // stock zlib will just dereference a NULL pointer: that's UB.
     // Hence us returning an error value is compatible
+    // SAFETY: the FFI contract requires a non-null destLen to be uniquely writable.
     let Some(destLen) = (unsafe { destLen.as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
+    // SAFETY: the caller provides a live writable source-length output.
     let Some(sourceLen) = (unsafe { sourceLen.as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
-    let Some(output) = (unsafe { slice_from_raw_parts_uninit_mut(dest, *destLen) }) else {
-        return ReturnCode::StreamError as _;
+    // Zero-capacity output does not require caller backing storage. The inflate
+    // core already uses its own scratch byte to distinguish an empty stream
+    // from one that would produce output.
+    let output = if *destLen == 0 {
+        &mut [][..]
+    } else {
+        // SAFETY: the contract guarantees a writable, disjoint destination
+        // span of this nonzero length whenever the pointer is non-null.
+        let Some(output) = (unsafe { slice_from_raw_parts_uninit_mut(dest, *destLen) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        output
     };
 
-    let Some(input) = (unsafe { slice_from_raw_parts(source, *sourceLen) }) else {
-        return ReturnCode::StreamError as _;
+    // A NULL source with zero length is an empty input span. Nonzero
+    // lengths still require a readable caller-owned buffer.
+    let input = if *sourceLen == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the contract guarantees a readable input span of this
+        // nonzero length whenever the pointer is non-null.
+        let Some(input) = (unsafe { slice_from_raw_parts(source, *sourceLen) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        input
     };
 
     let config = InflateConfig::default();
     let (consumed, output, err) = zlib_rs::inflate::uncompress2(output, input, config);
 
-    *sourceLen -= consumed as usize;
+    *sourceLen = consumed;
     *destLen = output.len();
 
     err as c_int
@@ -1155,9 +1181,16 @@ pub unsafe extern "C" fn inflateSetDictionary(
         return ReturnCode::StreamError as _;
     };
 
-    let dict = match dictLength {
-        0 => &[],
-        _ => unsafe { slice_from_raw_parts(dictionary, dictLength as usize) }.unwrap_or(&[]),
+    // A nonzero dictionary length requires a readable backing buffer. In
+    // particular, never silently reinterpret (NULL, nonzero) as an empty
+    // dictionary in raw mode, where that would otherwise return success.
+    let dict = if dictLength == 0 {
+        &[][..]
+    } else {
+        let Some(dict) = (unsafe { slice_from_raw_parts(dictionary, dictLength as usize) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        dict
     };
 
     zlib_rs::inflate::set_dictionary(stream, dict) as _
@@ -1443,7 +1476,7 @@ pub unsafe extern "C" fn compress_z(
 ///
 ///`sourceLen` is the byte length of the source buffer.
 /// Upon entry, `destLen` is the total size of the destination buffer,
-/// which must be at least the value returned by [`compressBound`]`(sourceLen)`.
+/// which must be at least the value returned by `compressBound(sourceLen)`.
 /// Upon exit, `destLen` is the actual size of the compressed data.
 ///
 /// A call to [`compress`] is equivalent to [`compress2`] with a level parameter of [`Z_DEFAULT_COMPRESSION`].
@@ -1529,16 +1562,27 @@ pub unsafe extern "C" fn compress2_z(
 ) -> c_int {
     // stock zlib will just dereference a NULL pointer: that's UB.
     // Hence us returning an error value is compatible
+    // SAFETY: the FFI contract requires a non-null destLen to be writable.
     let Some(destLen) = (unsafe { destLen.as_mut() }) else {
         return ReturnCode::StreamError as _;
     };
 
+    // SAFETY: the caller owns a writable, disjoint output span of
+    // this length when dest is non-null.
     let Some(output) = (unsafe { slice_from_raw_parts_uninit_mut(dest, *destLen) }) else {
         return ReturnCode::StreamError as _;
     };
 
-    let Some(input) = (unsafe { slice_from_raw_parts(source, sourceLen) }) else {
-        return ReturnCode::StreamError as _;
+    // An empty source has no backing buffer requirement. A positive length
+    // still requires a non-null readable pointer.
+    let input = if sourceLen == 0 {
+        &[][..]
+    } else {
+        // SAFETY: non-null source is guaranteed readable for sourceLen bytes.
+        let Some(input) = (unsafe { slice_from_raw_parts(source, sourceLen) }) else {
+            return ReturnCode::StreamError as _;
+        };
+        input
     };
 
     let config = DeflateConfig::new(level);
@@ -1554,7 +1598,7 @@ pub unsafe extern "C" fn compress2_z(
 /// The level parameter has the same meaning as in [`deflateInit_`].
 /// `sourceLen` is the byte length of the source buffer.
 /// Upon entry, `destLen` is the total size of the destination buffer,
-/// which must be at least the value returned by [`compressBound`]`(sourceLen)`.
+/// which must be at least the value returned by `compressBound(sourceLen)`.
 /// Upon exit, `destLen` is the actual size of the compressed data.
 ///
 /// # Returns
@@ -1603,7 +1647,7 @@ pub unsafe extern "C" fn compress2(
 /// Can be used before a [`compress`] or [`compress2`] call to allocate the destination buffer.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(compressBound_z))]
 pub extern "C" fn compressBound_z(sourceLen: usize) -> usize {
-    zlib_rs::deflate::compress_bound(sourceLen)
+    zlib_rs::deflate::compress_bound_abi(sourceLen)
 }
 
 /// Returns an upper bound on the compressed size after [`compress`] or [`compress2`] on `sourceLen` bytes.
@@ -1611,7 +1655,7 @@ pub extern "C" fn compressBound_z(sourceLen: usize) -> usize {
 /// Can be used before a [`compress`] or [`compress2`] call to allocate the destination buffer.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(compressBound))]
 pub extern "C" fn compressBound(sourceLen: c_ulong) -> c_ulong {
-    zlib_rs::deflate::compress_bound(sourceLen as usize) as c_ulong
+    zlib_rs::deflate::compress_bound_abi(sourceLen as usize) as c_ulong
 }
 
 /// Deallocates all dynamically allocated data structures for this stream.

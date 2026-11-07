@@ -24,15 +24,32 @@ impl SearchCursor {
 
 /// Which chain-walking heuristic to use for one immutable match search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchSearchKind {
+pub enum MatchSearchKind {
     Standard,
     Slow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchSearchResult {
-    pub(crate) length: usize,
+pub struct MatchSearchResult {
+    /// Length in the DEFLATE domain (0..=258), not the width of the host pointer.
+    pub(crate) length: u16,
     pub(crate) start: Pos,
+}
+
+impl MatchSearchResult {
+    /// Encode a backend result into the format's bounded match-length domain.
+    ///
+    /// A search backend may use host-width indexes or wider device counters,
+    /// but an individual DEFLATE match can cover at most 258 bytes. Truncating
+    /// the *search* to that prefix is valid; truncating its integer bits is not.
+    #[inline]
+    pub(crate) fn new(length: usize, start: Pos) -> Self {
+        const _: () = assert!(STD_MAX_MATCH <= u16::MAX as usize);
+        let bounded = length.min(STD_MAX_MATCH);
+        // Conversion cannot fail because STD_MAX_MATCH is at most u16::MAX.
+        let length = u16::try_from(bounded).unwrap_or(u16::MAX);
+        Self { length, start }
+    }
 }
 
 /// Owned scheduler token for one longest-match computation.
@@ -40,7 +57,7 @@ pub(crate) struct MatchSearchResult {
 /// It carries no stream borrow. The scheduler may queue this token while the producer is paused,
 /// then materialize an immutable request from that stream's State when the search is dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchSearchWork {
+pub enum MatchSearchWork {
     HashChain {
         cur_match: Pos,
         kind: MatchSearchKind,
@@ -76,7 +93,7 @@ impl MatchSearchWork {
 /// expensive search a detachable unit for future scoped CPU batches or device submission.
 /// Borrowed immutable storage shared by one or more match-search descriptions.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MatchSearchResources<'a> {
+pub struct MatchSearchResources<'a> {
     initialized: &'a [u8],
     prev: &'a [Pos],
     head: &'a [Pos],
@@ -87,7 +104,7 @@ pub(crate) struct MatchSearchResources<'a> {
 /// Keep these in their native host types for now. A future device backend can define a checked
 /// packed representation at its own boundary instead of silently narrowing compressor indexes here.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MatchSearchParams {
+pub struct MatchSearchParams {
     cur_match: Pos,
     strstart: usize,
     lookahead: usize,
@@ -104,7 +121,7 @@ pub(crate) struct MatchSearchParams {
 }
 
 #[derive(Debug)]
-pub(crate) struct MatchSearchRequest<'a> {
+pub struct MatchSearchRequest<'a> {
     resources: MatchSearchResources<'a>,
     params: MatchSearchParams,
 }
@@ -186,7 +203,7 @@ fn execute_slow(
 /// Backends may parallelize or offload execution, but must preserve request/result indexing and may
 /// not mutate compressor state. Request lifetimes bound any borrowed window/hash snapshot to the
 /// dispatch scope.
-pub(crate) trait MatchSearchBackend {
+pub trait MatchSearchBackend {
     fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]);
 }
 
@@ -226,20 +243,50 @@ impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
         }
 
         let chunk_len = requests.len().div_ceil(workers);
+        // Keep ownership of each mutable result chunk in a recoverable slot.
+        // If thread creation is unsupported or the OS refuses another thread,
+        // run the affected and remaining jobs synchronously. Scoped threads
+        // must finish before these borrowed slices leave the scope.
+        let jobs = requests
+            .chunks(chunk_len)
+            .zip(results.chunks_mut(chunk_len))
+            .map(|job| std::sync::Mutex::new(Some(job)))
+            .collect::<std::vec::Vec<_>>();
         std::thread::scope(|scope| {
-            for (request_chunk, result_chunk) in requests
-                .chunks(chunk_len)
-                .zip(results.chunks_mut(chunk_len))
-            {
-                scope.spawn(move || {
-                    ScalarMatchSearchBackend.execute(request_chunk, result_chunk);
-                });
+            let mut can_spawn = true;
+            for job in &jobs {
+                if can_spawn {
+                    let result = std::thread::Builder::new().spawn_scoped(scope, move || {
+                        let Some((requests, results)) = job
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        else {
+                            return;
+                        };
+                        ScalarMatchSearchBackend.execute(requests, results);
+                    });
+                    if result.is_ok() {
+                        continue;
+                    }
+                    can_spawn = false;
+                }
+
+                // This job was never started, so its mutable results remain
+                // exclusively owned by the main scope. Preserve input order.
+                let pending = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((requests, results)) = pending {
+                    ScalarMatchSearchBackend.execute(requests, results);
+                }
             }
         });
     }
 }
 
-pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
+pub fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
     backend: &B,
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
@@ -256,7 +303,7 @@ pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?S
 ///
 /// The default remains allocation-free and synchronous. Backend choice is deliberately outside the
 /// token producers so later CPU/device executors do not contaminate compression semantics.
-pub(crate) fn execute_match_search_batch(
+pub fn execute_match_search_batch(
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
 ) {
@@ -280,10 +327,7 @@ fn longest_match_help<const SLOW: bool>(
     // A previous lazy match can be longer than the input remaining at end of
     // stream. There is then no candidate that can improve it.
     if best_len >= params.lookahead {
-        return MatchSearchResult {
-            length: params.lookahead,
-            start: match_start,
-        };
+        return MatchSearchResult::new(params.lookahead, match_start);
     }
 
     let mut chain_remaining = params.max_chain_length;
@@ -349,18 +393,12 @@ fn longest_match_help<const SLOW: bool>(
             match_start = candidate_start as Pos;
 
             if len >= params.lookahead {
-                return MatchSearchResult {
-                    length: params.lookahead,
-                    start: match_start,
-                };
+                return MatchSearchResult::new(params.lookahead, match_start);
             }
 
             best_len = len;
             if best_len >= usize::from(params.nice_match) {
-                return MatchSearchResult {
-                    length: best_len,
-                    start: match_start,
-                };
+                return MatchSearchResult::new(best_len, match_start);
             }
 
             if SLOW && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
@@ -394,10 +432,7 @@ fn longest_match_help<const SLOW: bool>(
         cursor = next;
     }
 
-    MatchSearchResult {
-        length: best_len,
-        start: match_start,
-    }
+    MatchSearchResult::new(best_len, match_start)
 }
 
 fn initial_slow_cursor(
@@ -563,15 +598,26 @@ fn break_matching(
     best_len: usize,
     match_start: Pos,
 ) -> MatchSearchResult {
-    MatchSearchResult {
-        length: best_len.min(params.lookahead),
-        start: match_start,
-    }
+    MatchSearchResult::new(best_len.min(params.lookahead), match_start)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_result_length_uses_deflate_domain_even_for_wide_backend_counters() {
+        for length in [0, 1, 3, STD_MAX_MATCH] {
+            let result = MatchSearchResult::new(length, 19);
+            assert_eq!(usize::from(result.length), length);
+            assert_eq!(result.start, 19);
+        }
+        for length in [STD_MAX_MATCH + 1, usize::from(u16::MAX), usize::MAX] {
+            let result = MatchSearchResult::new(length, 19);
+            assert_eq!(usize::from(result.length), STD_MAX_MATCH);
+            assert_eq!(result.start, 19);
+        }
+    }
 
     #[test]
     fn requests_are_worker_safe_and_batchable() {

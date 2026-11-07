@@ -4,22 +4,25 @@ const LANES: usize = 16;
 type HashPositions = Simd<u16, LANES>;
 
 pub fn slide_hash(state: &mut crate::deflate::State) {
-    let window_size = state.w_size as u16;
+    // Hash entries are u16. A window larger than their entire range would
+    // saturate every entry to zero; wrapping the size would instead retain
+    // stale chain links.
+    let window_size = u16::try_from(state.w_size).unwrap_or(u16::MAX);
     slide_hash_chain(state.head.as_mut_slice(), window_size);
     slide_hash_chain(state.prev.as_mut_slice(), window_size);
 }
 
 fn slide_hash_chain(table: &mut [u16], window_size: u16) {
     let offset = HashPositions::splat(window_size);
-    let mut chunks = table.chunks_exact_mut(LANES);
+    let (chunks, tail) = table.as_chunks_mut::<LANES>();
 
-    for chunk in &mut chunks {
-        HashPositions::from_slice(chunk)
+    for chunk in chunks {
+        HashPositions::from_array(*chunk)
             .saturating_sub(offset)
             .copy_to_slice(chunk);
     }
 
-    for position in chunks.into_remainder() {
+    for position in tail {
         *position = position.saturating_sub(window_size);
     }
 }

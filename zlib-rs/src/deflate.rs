@@ -29,7 +29,7 @@ mod gpu_match;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 mod near_optimal;
 mod pending;
 mod slide_hash;
@@ -50,7 +50,7 @@ pub use batch::{
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 
-pub(crate) type Pos = u16;
+pub type Pos = u16;
 
 // SAFETY: This struct must have the same layout as [`z_stream`], so that casts and transmutations
 // between the two can work without UB.
@@ -98,33 +98,41 @@ const _: () = {
 };
 
 #[derive(Clone, Copy)]
-pub(crate) struct InputCursor {
+pub struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
+    // Only bytes consumed during this Compressor invocation can be reread from behind next_in.
+    // A prior invocation's buffer may already have been freed by the caller.
+    initial_capacity: crate::c_api::uInt,
 }
 
 impl InputCursor {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             next_in: stream.next_in,
             avail_in: stream.avail_in,
             total_in: stream.total_in,
+            initial_capacity: stream.avail_in,
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.next_in = self.next_in;
         stream.avail_in = self.avail_in;
         stream.total_in = self.total_in;
     }
 
-    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Self {
-        Self {
-            next_in: bytes.as_ptr() as *mut u8,
-            avail_in: bytes.len() as crate::c_api::uInt,
+    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Option<Self> {
+        // The caller supplies the retained dictionary tail (at most 32 KiB). Keep this
+        // conversion fallible so a future general slice caller cannot silently truncate it.
+        let avail_in = crate::c_api::uInt::try_from(bytes.len()).ok()?;
+        Some(Self {
+            next_in: bytes.as_ptr().cast_mut(),
+            avail_in,
             total_in,
-        }
+            initial_capacity: avail_in,
+        })
     }
 
     /// Copy live caller input into initialized window storage and consume it.
@@ -154,6 +162,11 @@ impl InputCursor {
         copied
     }
 
+    /// Bytes advanced through this cursor since it was bound to the current caller input.
+    const fn consumed_here(&self) -> usize {
+        (self.initial_capacity - self.avail_in) as usize
+    }
+
     /// Copy bytes immediately preceding the current input cursor into the LZ history window.
     ///
     /// # Safety
@@ -165,6 +178,12 @@ impl InputCursor {
         bytes_back: usize,
     ) {
         assert!(destination.len() <= bytes_back);
+        // C callers can replace or free their previous input between deflate calls.
+        // Stored-mode history recovery must never traverse back into that old buffer.
+        assert!(
+            bytes_back <= self.consumed_here(),
+            "stored history must originate from input consumed in this call"
+        );
         let source = self.next_in.wrapping_sub(bytes_back);
         // SAFETY: required by this method's caller; `Window` validates the destination range.
         unsafe { window.copy_and_initialize(destination, source) };
@@ -173,7 +192,9 @@ impl InputCursor {
     fn consume(&mut self, len: usize) {
         debug_assert!(len <= self.avail_in as usize);
         self.next_in = self.next_in.wrapping_add(len);
-        self.avail_in -= len as crate::c_api::uInt;
+        let len = crate::c_api::uInt::try_from(len)
+            .expect("input consumption is bounded by the caller's uInt availability");
+        self.avail_in -= len;
         self.total_in = self.total_in.wrapping_add(len as crate::c_api::z_size);
     }
 }
@@ -185,7 +206,7 @@ impl InputCursor {
 /// Keeping that ABI-visible value explicit prevents input cursors from silently carrying stream
 /// state unrelated to byte traversal.
 #[derive(Clone, Copy)]
-pub(crate) struct StreamChecksum(crate::c_api::z_checksum);
+pub struct StreamChecksum(crate::c_api::z_checksum);
 
 impl StreamChecksum {
     fn from_stream(stream: &DeflateStream<'_>) -> Self {
@@ -298,14 +319,14 @@ impl<'a> GzipHeaderRef<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct OutputCursor {
+pub struct OutputCursor {
     next_out: *mut crate::c_api::Bytef,
     pub(crate) avail_out: crate::c_api::uInt,
     pub(crate) total_out: crate::c_api::z_size,
 }
 
 impl OutputCursor {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             next_out: stream.next_out,
             avail_out: stream.avail_out,
@@ -313,7 +334,7 @@ impl OutputCursor {
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.next_out = self.next_out;
         stream.avail_out = self.avail_out;
         stream.total_out = self.total_out;
@@ -361,8 +382,11 @@ impl OutputCursor {
     fn advance(&mut self, len: usize) {
         debug_assert!(len <= self.avail_out as usize);
         self.next_out = self.next_out.wrapping_add(len);
-        self.avail_out -= len as crate::c_api::uInt;
-        self.total_out += len as crate::c_api::z_size;
+        let len = crate::c_api::uInt::try_from(len)
+            .expect("output emission is bounded by the caller's uInt availability");
+        self.avail_out -= len;
+        // The public zlib total_out is an unsigned C counter and wraps at its ABI width.
+        self.total_out = self.total_out.wrapping_add(len as crate::c_api::z_size);
     }
 }
 
@@ -371,7 +395,7 @@ impl OutputCursor {
 /// `DeflateStream` is constrained by the public zlib ABI. Algorithms operate on this
 /// Rust-owned view instead: compression state is borrowed separately from independent input and
 /// output cursors, which are committed back to the ABI shell when the algorithm returns.
-pub(crate) struct Compressor<'a, 'state> {
+pub struct Compressor<'a, 'state> {
     pub(crate) state: &'a mut State<'state>,
     pub(crate) input: InputCursor,
     pub(crate) output: OutputCursor,
@@ -599,7 +623,7 @@ impl<'a> DeflateStream<'a> {
 }
 
 /// number of elements in hash table
-pub(crate) const HASH_SIZE: usize = 65536;
+pub const HASH_SIZE: usize = 65536;
 /// log2(HASH_SIZE)
 const HASH_BITS: usize = 16;
 
@@ -886,31 +910,31 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     }
 
     let state = &mut *stream.state;
-    // avoid computing Adler-32 in read_buf
-    state.wrap = 0;
-
-    // if dictionary would fill window, just replace the history
-    if dictionary.len() >= state.w_size {
-        if wrap == 0 {
-            // clear the hash table
-            state.head.as_mut_slice().fill(0);
-
-            state.strstart = 0;
-            state.block_start = 0;
-            state.insert = 0;
-            state.window.clear();
-        } else {
-            /* already empty otherwise */
-        }
-
-        // use the tail
+    let replace_history = dictionary.len() >= state.w_size;
+    if replace_history {
         dictionary = &dictionary[dictionary.len() - state.w_size..];
     }
 
-    // Feed the dictionary through the ordinary window-refill core without impersonating caller
-    // input in the public z_stream. zlib counts retained dictionary bytes in total_in, but next_in
-    // and avail_in remain exactly the caller's values across deflateSetDictionary.
-    let mut dictionary_input = InputCursor::from_slice(dictionary, stream.total_in);
+    // A general input cursor cannot represent more than uInt::MAX bytes in a single call.
+    // This retained dictionary tail is bounded by the window, but validate before mutating
+    // the compressor state so even an invalid future caller gets a clean error.
+    let Some(mut dictionary_input) = InputCursor::from_slice(dictionary, stream.total_in) else {
+        return ReturnCode::StreamError;
+    };
+
+    if replace_history && wrap == 0 {
+        state.head.as_mut_slice().fill(0);
+        state.strstart = 0;
+        state.block_start = 0;
+        state.insert = 0;
+        state.window.clear();
+    }
+
+    // Adler-32 above covered the complete dictionary before retaining only its window tail.
+    // Feed that tail through the ordinary window-refill core without impersonating
+    // caller input in the public z_stream. Retained bytes count in total_in; the caller's
+    // next_in and avail_in remain unchanged across deflateSetDictionary.
+    state.wrap = 0;
     fill_window_core(state, &mut dictionary_input, &mut checksum);
 
     while state.lookahead >= STD_MIN_MATCH {
@@ -936,8 +960,6 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
 }
 
 pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCode {
-    let mut value64 = value as u64;
-
     let state = &mut *stream.state;
 
     if bits < 0
@@ -955,6 +977,10 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
     if state.bit_writer.pending.remaining() < bytes_to_flush {
         return ReturnCode::BufError;
     }
+
+    // Only the requested low bits belong to the DEFLATE stream. Mask once
+    // before the reservoir can inherit high or sign-extended caller bits.
+    let mut value64 = u64::from(value.cast_unsigned()) & ((1u64 << bits) - 1);
 
     let mut put;
 
@@ -1088,8 +1114,10 @@ fn lm_init(state: &mut State) {
     // zlib uses CLEAR_HASH here
     state.head.as_mut_slice().fill(0);
 
-    // Set the default configuration parameters:
+    // Hashes are a property of the live history representation, not a tunable
+    // search budget. Choose the representation only while the history is empty.
     lm_set_level(state, state.level);
+    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
 
     state.strstart = 0;
     state.block_start = 0;
@@ -1110,7 +1138,9 @@ fn lm_set_level(state: &mut State, level: i8) {
     state.nice_match = config.nice_length;
     state.max_chain_length = config.max_chain;
 
-    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
+    // Do not change the hash representation here. deflateParams() may update the
+    // level while a nonempty head/prev table still describes earlier input.
+    // Reinterpreting those buckets with a different hash algorithm breaks searches.
     state.level = level;
 }
 
@@ -1121,21 +1151,28 @@ pub fn tune(
     nice_length: usize,
     max_chain: usize,
 ) -> ReturnCode {
-    stream.state.good_match = good_length as u16;
+    // These are comparison thresholds and maximum chain-search budgets, not bitfields:
+    // - no DEFLATE match length exceeds 258;
+    // - no window search has more than 32,768 distinct candidate positions.
+    // A larger tuning parameter therefore has the same effect as u16::MAX; wrapping
+    // it to zero would instead disable matching or change compression decisions.
+    let bound = |value| u16::try_from(value).unwrap_or(u16::MAX);
+    stream.state.good_match = bound(good_length);
     stream.state.medium_next_match = MatchCandidate::EMPTY;
     // zlib exposes one tuning knob for both historical uses of max_lazy. Keep the
     // public contract while representing the two internal concepts independently.
-    stream.state.max_insert_length = max_lazy as u16;
-    stream.state.max_lazy_match = max_lazy as u16;
-    stream.state.nice_match = nice_length as u16;
-    stream.state.max_chain_length = max_chain as u16;
+    let lazy = bound(max_lazy);
+    stream.state.max_insert_length = lazy;
+    stream.state.max_lazy_match = lazy;
+    stream.state.nice_match = bound(nice_length);
+    stream.state.max_chain_length = bound(max_chain);
 
     ReturnCode::Ok
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Value {
+pub struct Value {
     a: u16,
     b: u16,
 }
@@ -1183,16 +1220,16 @@ impl Value {
 }
 
 /// number of length codes, not counting the special END_BLOCK code
-pub(crate) const LENGTH_CODES: usize = 29;
+pub const LENGTH_CODES: usize = 29;
 
 /// number of literal bytes 0..255
 const LITERALS: usize = 256;
 
 /// number of Literal or Length codes, including the END_BLOCK code
-pub(crate) const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
+pub const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
 
 /// number of distance codes
-pub(crate) const D_CODES: usize = 30;
+pub const D_CODES: usize = 30;
 
 /// number of codes used to transfer the bit lengths
 const BL_CODES: usize = 19;
@@ -1206,7 +1243,7 @@ const MAX_BITS: usize = 15;
 /// Bit length codes must not exceed MAX_BL_BITS bits
 const MAX_BL_BITS: usize = 7;
 
-pub(crate) const DIST_CODE_LEN: usize = 512;
+pub const DIST_CODE_LEN: usize = 512;
 
 struct BitWriter<'a> {
     pub(crate) pending: Pending<'a>, // output still pending
@@ -1559,7 +1596,7 @@ impl<'a> BitWriter<'a> {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidate {
+pub struct MatchCandidate {
     pub(crate) match_start: u16,
     pub(crate) match_length: u16,
     pub(crate) strstart: u16,
@@ -1576,7 +1613,7 @@ impl MatchCandidate {
 }
 
 #[repr(C, align(64))]
-pub(crate) struct State<'a> {
+pub struct State<'a> {
     status: Status,
 
     last_flush: i8, /* value of flush param for previous deflate call */
@@ -1837,6 +1874,21 @@ impl<'a> State<'a> {
         self.w_size - MIN_LOOKAHEAD
     }
 
+    /// Return the representable backward distance to an existing hash-chain position.
+    ///
+    /// Hash position zero may be used by the quick path as an actual history index;
+    /// other match producers separately reject it when treating zero as an empty sentinel.
+    /// Rejection is conservative: absent/out-of-range entries cannot yield invalid
+    /// or unrepresentable backreferences.
+    #[inline]
+    pub(crate) fn recent_hash_distance(&self, head: u16) -> Option<u16> {
+        let distance = self.strstart.checked_sub(usize::from(head))?;
+        if distance == 0 || distance > self.max_dist() {
+            return None;
+        }
+        u16::try_from(distance).ok()
+    }
+
     #[inline(always)]
     pub(crate) fn update_hash(&self, h: u32, val: u32) -> u32 {
         match self.hash_calc_variant {
@@ -1938,7 +1990,7 @@ impl<'a> State<'a> {
     fn detect_data_type(dyn_tree: &[Value]) -> DataType {
         // set bits 0..6, 14..25, and 28..31
         // 0xf3ffc07f = binary 11110011111111111100000001111111
-        const NON_TEXT: u64 = 0xf3ffc07f;
+        const NON_TEXT: u64 = 0xf3ff_c07f;
         let mut mask = NON_TEXT;
 
         /* Check for non-textual bytes. */
@@ -2085,7 +2137,7 @@ const fn rank_flush(f: i8) -> i8 {
 }
 
 #[derive(Debug)]
-pub(crate) enum BlockState {
+pub enum BlockState {
     /// block not completed, need more input or more output
     NeedMore = 0,
     /// block flush performed
@@ -2097,7 +2149,7 @@ pub(crate) enum BlockState {
 }
 
 // Maximum stored block length in deflate format (not including header).
-pub(crate) const MAX_STORED: usize = 65535; // so u16::max
+pub const MAX_STORED: usize = 65535; // so u16::max
 
 fn read_buf_window_core(
     state: &mut State<'_>,
@@ -2126,17 +2178,31 @@ fn read_buf_window_core(
     len
 }
 
-pub(crate) enum BlockType {
+pub enum BlockType {
     StoredBlock = 0,
     StaticTrees = 1,
     DynamicTrees = 2,
 }
 
-pub(crate) fn zng_tr_stored_block(
+/// Emit a single DEFLATE stored block using initialized bytes from the window.
+///
+/// # Panics
+///
+/// Panics if the input range is outside the initialized window, the stored payload is
+/// larger than the 16-bit DEFLATE length field, or the pending-output buffer is too small.
+pub fn zng_tr_stored_block(
     state: &mut State,
     window_range: core::ops::Range<usize>,
     is_last: bool,
 ) {
+    let input_block: &[u8] = &state.window.filled()[window_range];
+    let stored_len = input_block.len();
+    // Check before emitting a header; a stored block cannot represent more than 65535 bytes.
+    assert!(
+        u16::try_from(stored_len).is_ok(),
+        "DEFLATE stored block payload must fit in 16 bits"
+    );
+
     // send block type
     state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
 
@@ -2145,36 +2211,40 @@ pub(crate) fn zng_tr_stored_block(
 
     state.bit_writer.cmpr_bits_align();
 
-    let input_block: &[u8] = &state.window.filled()[window_range];
-    let stored_len = input_block.len() as u16;
-
-    state.bit_writer.pending.extend(&stored_len.to_le_bytes());
+    // The length and its complement are exactly 16-bit little-endian fields.
+    // Extract their low bytes after validating the range, without truncating
+    // the length used later for bit accounting.
     state
         .bit_writer
         .pending
-        .extend(&(!stored_len).to_le_bytes());
+        .extend(&stored_len.to_le_bytes()[..2]);
+    state
+        .bit_writer
+        .pending
+        .extend(&(!stored_len).to_le_bytes()[..2]);
 
     state.bit_writer.cmpr_bits_add(32);
     state.bit_writer.sent_bits_add(32);
     if stored_len > 0 {
         state.bit_writer.pending.extend(input_block);
-        state.bit_writer.cmpr_bits_add((stored_len << 3) as usize);
-        state.bit_writer.sent_bits_add((stored_len << 3) as usize);
+        let payload_bits = stored_len << 3;
+        state.bit_writer.cmpr_bits_add(payload_bits);
+        state.bit_writer.sent_bits_add(payload_bits);
     }
 }
 
 /// The minimum match length mandated by the deflate standard
-pub(crate) const STD_MIN_MATCH: usize = 3;
+pub const STD_MIN_MATCH: usize = 3;
 /// The maximum match length mandated by the deflate standard
-pub(crate) const STD_MAX_MATCH: usize = 258;
+pub const STD_MAX_MATCH: usize = 258;
 
 /// The minimum wanted match length, affects deflate_quick, deflate_fast, deflate_medium and deflate_slow
-pub(crate) const WANT_MIN_MATCH: usize = 4;
+pub const WANT_MIN_MATCH: usize = 4;
 
-pub(crate) const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
+pub const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
 
 #[inline]
-pub(crate) fn fill_window_core(
+pub fn fill_window_core(
     state: &mut State<'_>,
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
@@ -2183,7 +2253,7 @@ pub(crate) fn fill_window_core(
 }
 
 #[inline]
-pub(crate) fn fill_window_core_with_hash_maintenance(
+pub fn fill_window_core_with_hash_maintenance(
     state: &mut State<'_>,
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
@@ -2249,9 +2319,11 @@ pub(crate) fn fill_window_core_with_hash_maintenance(
         // Initialize the hash value now that we have some input:
         if maintain_hash_chain && state.lookahead + state.insert >= STD_MIN_MATCH {
             let string = state.strstart - state.insert;
-            if state.max_chain_length > 1024 {
-                let v0 = state.window.filled()[string] as u32;
-                let v1 = state.window.filled()[string + 1] as u32;
+            // The rolling seed must match the hash representation used to index
+            // the live head/prev tables, not the current (possibly tuned) chain budget.
+            if matches!(state.hash_calc_variant, HashCalcVariant::Roll) {
+                let v0 = u32::from(state.window.filled()[string]);
+                let v1 = u32::from(state.window.filled()[string + 1]);
                 state.ins_h = state.update_hash(v0, v1);
             } else if string >= 1 {
                 state.quick_insert_string(string + 2 - STD_MIN_MATCH);
@@ -2280,7 +2352,7 @@ pub(crate) fn fill_window_core_with_hash_maintenance(
     );
 }
 
-pub(crate) struct StaticTreeDesc {
+pub struct StaticTreeDesc {
     /// static tree or NULL
     pub(crate) static_tree: &'static [Value],
     /// extra bits for each code or NULL
@@ -2348,7 +2420,7 @@ impl StaticTreeDesc {
 }
 
 #[derive(Clone)]
-pub(crate) struct TreeDesc<const N: usize> {
+pub struct TreeDesc<const N: usize> {
     dyn_tree: [Value; N],
     max_code: usize,
     stat_desc: &'static StaticTreeDesc,
@@ -2528,7 +2600,7 @@ fn gen_bitlen<const N: usize>(
 }
 
 /// Checks that symbol is a printing character (excluding space)
-#[allow(unused)]
+#[cfg(feature = "ZLIB_DEBUG")]
 fn isgraph(c: u8) -> bool {
     (c > 0x20) && (c <= 0x7E)
 }
@@ -2818,8 +2890,7 @@ fn zng_tr_flush_block(
         static_lenb = stored_len as usize + 5;
     }
 
-    #[allow(clippy::unnecessary_unwrap)]
-    if stored_len as usize + 4 <= opt_lenb && window_offset.is_some() {
+    if let Some(window_offset) = window_offset.filter(|_| stored_len as usize + 4 <= opt_lenb) {
         /* 4: two words for the lengths
          * The test buf != NULL is only necessary if LIT_BUFSIZE > WSIZE.
          * Otherwise we can't have processed more than WSIZE input bytes since
@@ -2827,7 +2898,6 @@ fn zng_tr_flush_block(
          * successful. If LIT_BUFSIZE <= WSIZE, it is never too late to
          * transform a block into a stored block.
          */
-        let window_offset = window_offset.unwrap();
         let range = window_offset..window_offset + stored_len as usize;
         zng_tr_stored_block(state, range, last);
     } else if static_lenb == opt_lenb {
@@ -3212,7 +3282,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DrainOutcome {
+pub enum DrainOutcome {
     Ready,
     OutputFull,
 }
@@ -3221,10 +3291,7 @@ pub(crate) enum DrainOutcome {
 ///
 /// `OutputFull` deliberately mirrors zlib's streaming boundary: callers return once the supplied
 /// output buffer reaches zero, even when that write happened to consume the final pending byte.
-pub(crate) fn drain_pending_output(
-    state: &mut State<'_>,
-    output: &mut OutputCursor,
-) -> DrainOutcome {
+pub fn drain_pending_output(state: &mut State<'_>, output: &mut OutputCursor) -> DrainOutcome {
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();
@@ -3244,7 +3311,7 @@ pub(crate) fn drain_pending_output(
 
 /// Drain all complete bytes currently produced by the complete-buffer near-optimal path while
 /// preserving any sub-byte DEFLATE prefix for the next block.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 fn drain_near_optimal_pending(
     state: &mut State<'_>,
     output: &mut [u8],
@@ -3263,7 +3330,7 @@ fn drain_near_optimal_pending(
     true
 }
 
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 fn emit_planned_near_optimal_block(
     state: &mut State<'_>,
     input: &[u8],
@@ -3311,7 +3378,7 @@ fn emit_planned_near_optimal_block(
 /// and reuses the production tree builder / stored-static-dynamic block chooser / bit writer.
 /// `optimization_passes` counts minimum-cost path searches per selected block; zero is retained only
 /// as a fixed-Huffman diagnostic baseline.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 pub fn compress_slice_near_optimal<'a>(
     output: &'a mut [u8],
     input: &[u8],
@@ -3527,18 +3594,18 @@ fn compress_into<O: WritableBytes + ?Sized>(
         return (0, err);
     }
 
-    let max = core::ffi::c_uint::MAX as usize;
     let mut left = output_len;
     let mut source_len = input.len();
 
     let return_code = loop {
         if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, max) as _;
+            stream.avail_out = core::ffi::c_uint::try_from(left).unwrap_or(core::ffi::c_uint::MAX);
             left -= stream.avail_out as usize;
         }
 
         if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(source_len, max) as _;
+            stream.avail_in =
+                core::ffi::c_uint::try_from(source_len).unwrap_or(core::ffi::c_uint::MAX);
             source_len -= stream.avail_in as usize;
         }
 
@@ -3561,11 +3628,9 @@ fn compress_into<O: WritableBytes + ?Sized>(
         }
     };
 
-    let produced = stream.total_out as usize;
-    assert!(
-        produced <= output_len,
-        "deflate reported output beyond caller storage"
-    );
+    // The public zlib total_out counter may wrap on 64-bit Windows (32-bit c_ulong).
+    // Recover the exact Rust-slice length from caller output budgets instead.
+    let produced = crate::output_buffer::written_from_budget(output_len, left, stream.avail_out);
 
     // may DataError if insufficient output space
     if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {
@@ -3578,7 +3643,8 @@ fn compress_into<O: WritableBytes + ?Sized>(
 /// Returns the upper bound on the compressed size for an input of `source_len` bytes.
 ///
 /// When compression has this much space available, it will never fail because of insufficient
-/// output space.
+/// output space. Returns `usize::MAX` if the mathematical bound cannot be represented
+/// as `usize`; no finite output slice can satisfy that bound.
 ///
 /// # Example
 ///
@@ -3594,7 +3660,27 @@ fn compress_into<O: WritableBytes + ?Sized>(
 /// let (compressed, rc) = compress_slice(&mut buf, input, DeflateConfig::default());
 /// # }
 /// ```
+#[must_use]
 pub const fn compress_bound(source_len: usize) -> usize {
+    // div_ceil avoids the overflow in (source_len + 7) / 8; saturating additions
+    // avoid understating bounds that cannot fit in usize.
+    let quick_overhead = source_len.div_ceil(8);
+
+    source_len
+        .saturating_add(if source_len == 0 { 1 } else { 0 })
+        .saturating_add(if source_len < 9 { 1 } else { 0 })
+        .saturating_add(quick_overhead)
+        .saturating_add(DEFLATE_BLOCK_OVERHEAD)
+        .saturating_add(ZLIB_WRAPLEN)
+}
+
+/// zlib-ng-compatible C ABI bound, including its unsigned wrapping semantics.
+///
+/// C callers already observe the original zlib-ng integer behavior at extreme
+/// lengths; the Rust-facing `compress_bound` instead supplies a true saturating
+/// upper bound. This function intentionally stays separate from that safe API.
+#[must_use]
+pub const fn compress_bound_abi(source_len: usize) -> usize {
     compress_bound_help(source_len, ZLIB_WRAPLEN)
 }
 
@@ -4099,7 +4185,8 @@ impl DeflateAllocOffsets {
         let pending = unsafe { Pending::from_raw_parts(pending_ptr, self.lit_bufsize * LIT_BUFS) };
 
         let sym_buf_ptr = unsafe { base.add(self.sym_buf_pos) };
-        let sym_buf = unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize) };
+        let sym_buf =
+            unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize * (LIT_BUFS - 1)) };
 
         DeflateAllocBuffers {
             state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
@@ -4216,6 +4303,203 @@ mod test {
     use super::*;
 
     use core::{ffi::CStr, sync::atomic::AtomicUsize};
+
+    #[test]
+    fn compress_bound_never_wraps_below_its_input_length() {
+        // No allocation: these are mathematical length queries only.
+        let cases = [
+            0,
+            1,
+            8,
+            9,
+            1_024,
+            usize::MAX / 9,
+            usize::MAX / 2,
+            usize::MAX - 64,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
+        for n in cases {
+            let bound = compress_bound(n);
+            assert!(bound >= n, "bound wrapped for source length {n}");
+        }
+        assert_eq!(compress_bound(usize::MAX), usize::MAX);
+
+        // Existing zlib-sized requests keep exactly their historical bound.
+        for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
+            assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn stored_block_large_lengths_preserve_bytes_and_debug_bit_counts() {
+        for len in [8_191usize, 8_192, 16_384, 32_768, usize::from(u16::MAX)] {
+            let source: Vec<u8> = (0..len)
+                .map(|i| (i * 29 + i / 13).to_le_bytes()[0])
+                .collect();
+            // A maximum-sized stored block needs five bytes of header space beyond 64 KiB.
+            let mut stream = DeflateStream::new(DeflateConfig {
+                mem_level: 9,
+                ..DeflateConfig::new(0)
+            });
+            // SAFETY: source is an initialized, non-overlapping buffer and its bytes
+            // remain live while the stream copies the complete window prefix.
+            unsafe {
+                stream
+                    .state
+                    .window
+                    .copy_and_initialize(0..len, source.as_ptr());
+            }
+            zng_tr_stored_block(&mut stream.state, 0..len, true);
+
+            let pending = stream.state.bit_writer.pending.pending();
+            assert_eq!(pending.len(), len + 5);
+            assert_eq!(pending[0], 1);
+            assert_eq!(&pending[1..3], &len.to_le_bytes()[..2]);
+            assert_eq!(&pending[3..5], &(!len).to_le_bytes()[..2]);
+            assert_eq!(&pending[5..], source.as_slice());
+
+            #[cfg(feature = "ZLIB_DEBUG")]
+            {
+                assert_eq!(
+                    stream.state.bit_writer.compressed_len,
+                    32 + len * 8,
+                    "stored {len}-byte payload must count its full width"
+                );
+                assert_eq!(
+                    stream.state.bit_writer.bits_sent,
+                    40 + len * 8,
+                    "stored {len}-byte payload and header must count exactly"
+                );
+            }
+            assert!(end(&mut stream).is_ok());
+        }
+    }
+
+    #[test]
+    fn window_refill_seeds_hash_by_history_representation_not_tuned_chain(
+    ) -> Result<(), &'static str> {
+        let source = b"ABCDABCD0123456789".repeat(32);
+        let rolling_seed = RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]));
+
+        for (level, chain, expected_seed) in [
+            (7, 4_096, 0),
+            (7, 128, 0),
+            (9, 128, rolling_seed),
+            (9, 4_096, rolling_seed),
+        ] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
+            let mut input = InputCursor::from_slice(&source, stream.total_in)
+                .ok_or("test source length must fit zlib uInt")?;
+            let mut checksum = StreamChecksum::from_stream(&stream);
+            fill_window_core(&mut stream.state, &mut input, &mut checksum);
+            assert_eq!(input.avail_in, 0, "the refill should consume all the input");
+            assert_eq!(
+                stream.state.ins_h, expected_seed,
+                "level {level}, tuned chain {chain}, hash mode {:?}",
+                stream.state.hash_calc_variant
+            );
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn level_changes_preserve_live_hash_table_representation() {
+        let dictionary: Vec<u8> = (0..4_096usize)
+            .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
+            .collect();
+
+        for (old_level, new_level, expected_roll) in [(7, 9, false), (9, 7, true), (6, 9, false)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(old_level));
+            assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
+            assert!(stream.state.strstart > 0);
+            assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
+            assert_eq!(
+                params(&mut stream, new_level, Strategy::Default),
+                ReturnCode::Ok
+            );
+
+            assert_eq!(
+                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
+                expected_roll,
+                "level change {old_level} to {new_level} reinterpreted existing hash history",
+            );
+            assert!(end(&mut stream).is_ok());
+        }
+    }
+
+    #[test]
+    fn tune_wide_parameters_do_not_wrap_to_zero() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::new(9)), ReturnCode::Ok);
+        // SAFETY: init succeeded and its state is live, uniquely borrowed by this test.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("deflate state missing after init")?;
+
+        // All four tunables are upper bounds or comparison thresholds. A positive
+        // value beyond u16 range must not become zero after narrowing.
+        assert_eq!(tune(stream, 65_536, 65_536, 65_536, 65_536), ReturnCode::Ok);
+        assert_eq!(stream.state.good_match, u16::MAX);
+        assert_eq!(stream.state.max_lazy_match, u16::MAX);
+        assert_eq!(stream.state.max_insert_length, u16::MAX);
+        assert_eq!(stream.state.nice_match, u16::MAX);
+        assert_eq!(stream.state.max_chain_length, u16::MAX);
+
+        // A negative C i32 forwarded by the C wrapper becomes a large usize.
+        // It must remain a high threshold rather than wrapping into a short one.
+        assert_eq!(
+            tune(stream, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+            ReturnCode::Ok
+        );
+        assert_eq!(stream.state.max_chain_length, u16::MAX);
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn input_cursor_history_is_scoped_to_current_call() -> Result<(), &'static str> {
+        let source = b"two separate caller buffers";
+        let mut first = InputCursor::from_slice(&source[..8], crate::c_api::z_size::MAX - 1)
+            .ok_or("the eight-byte input must fit in zlib uInt")?;
+        assert_eq!(first.consumed_here(), 0);
+        first.consume(5);
+        assert_eq!(first.consumed_here(), 5);
+        assert_eq!(first.avail_in, 3);
+        assert_eq!(first.total_in, 3);
+
+        // Changing the caller input buffer resets the readable history budget, even
+        // though total_in carries the wrapped counter from the previous invocation.
+        let next = InputCursor::from_slice(&source[8..], first.total_in)
+            .ok_or("the second input must fit in zlib uInt")?;
+        assert_eq!(next.consumed_here(), 0);
+        assert_eq!(next.total_in, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn deflate_total_out_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let mut output = [0u8; 128];
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized deflate stream was not usable")?;
+        stream.total_out = crate::c_api::z_size::MAX - 1;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = 128; // Fixed-size output array.
+
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let written = output.len() - stream.avail_out as usize;
+        assert!(written >= 8);
+        assert_eq!(
+            stream.total_out,
+            (crate::c_api::z_size::MAX - 1).wrapping_add(written as crate::c_api::z_size)
+        );
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn detect_data_type_basic() {

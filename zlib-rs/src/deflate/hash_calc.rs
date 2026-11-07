@@ -29,17 +29,27 @@ impl StandardHashCalc {
 
     fn hash_calc(_: u32, val: u32) -> u32 {
         const HASH_SLIDE: u32 = 16;
-        val.wrapping_mul(2654435761) >> HASH_SLIDE
+        val.wrapping_mul(2_654_435_761) >> HASH_SLIDE
     }
 
     pub fn update_hash(h: u32, val: u32) -> u32 {
         Self::hash_calc(h, val) & Self::HASH_CALC_MASK
     }
 
+    /// Read a four-byte hash probe from initialized window bytes.
+    ///
+    /// Every caller has already established at least four bytes of lookahead.
+    /// Array chunks express that precondition directly without an additional
+    /// fallible slice-to-array conversion on the match-search hot path.
+    #[inline]
+    pub(crate) fn first_four_bytes(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes.as_chunks::<4>().0[0])
+    }
+
     #[inline]
     pub fn quick_insert_string(state: &mut State, string: usize) -> u16 {
         let slice = &state.window.filled()[string + Self::HASH_CALC_OFFSET..];
-        let val = u32::from_le_bytes(slice[..4].try_into().unwrap());
+        let val = Self::first_four_bytes(slice);
 
         Self::quick_insert_value(state, string, val)
     }
@@ -69,7 +79,7 @@ impl StandardHashCalc {
         for (i, w) in slice.windows(4).enumerate() {
             let idx = string as u16 + i as u16;
 
-            let val = u32::from_le_bytes(w.try_into().unwrap());
+            let val = Self::first_four_bytes(w);
 
             let hm = Self::update_hash(0, val) as usize;
 
@@ -143,25 +153,25 @@ mod tests {
     #[test]
     fn roll_hash_calc() {
         assert_eq!(RollHashCalc::hash_calc(2565, 93), 82173);
-        assert_eq!(RollHashCalc::hash_calc(16637, 10), 532394);
-        assert_eq!(RollHashCalc::hash_calc(8106, 100), 259364);
-        assert_eq!(RollHashCalc::hash_calc(29988, 101), 959717);
-        assert_eq!(RollHashCalc::hash_calc(9445, 98), 302274);
-        assert_eq!(RollHashCalc::hash_calc(7362, 117), 235573);
-        assert_eq!(RollHashCalc::hash_calc(6197, 103), 198343);
+        assert_eq!(RollHashCalc::hash_calc(16637, 10), 532_394);
+        assert_eq!(RollHashCalc::hash_calc(8106, 100), 259_364);
+        assert_eq!(RollHashCalc::hash_calc(29988, 101), 959_717);
+        assert_eq!(RollHashCalc::hash_calc(9445, 98), 302_274);
+        assert_eq!(RollHashCalc::hash_calc(7362, 117), 235_573);
+        assert_eq!(RollHashCalc::hash_calc(6197, 103), 198_343);
         assert_eq!(RollHashCalc::hash_calc(1735, 32), 55488);
-        assert_eq!(RollHashCalc::hash_calc(22720, 61), 727101);
-        assert_eq!(RollHashCalc::hash_calc(6205, 32), 198528);
-        assert_eq!(RollHashCalc::hash_calc(3826, 117), 122421);
-        assert_eq!(RollHashCalc::hash_calc(24117, 101), 771781);
+        assert_eq!(RollHashCalc::hash_calc(22720, 61), 727_101);
+        assert_eq!(RollHashCalc::hash_calc(6205, 32), 198_528);
+        assert_eq!(RollHashCalc::hash_calc(3826, 117), 122_421);
+        assert_eq!(RollHashCalc::hash_calc(24117, 101), 771_781);
     }
 
     #[test]
     fn standard_hash_calc() {
-        assert_eq!(StandardHashCalc::hash_calc(0, 807411760), 65468);
-        assert_eq!(StandardHashCalc::hash_calc(0, 540024864), 42837);
-        assert_eq!(StandardHashCalc::hash_calc(0, 538980384), 33760);
-        assert_eq!(StandardHashCalc::hash_calc(0, 775430176), 8925);
-        assert_eq!(StandardHashCalc::hash_calc(0, 941629472), 42053);
+        assert_eq!(StandardHashCalc::hash_calc(0, 807_411_760), 65468);
+        assert_eq!(StandardHashCalc::hash_calc(0, 540_024_864), 42837);
+        assert_eq!(StandardHashCalc::hash_calc(0, 538_980_384), 33760);
+        assert_eq!(StandardHashCalc::hash_calc(0, 775_430_176), 8925);
+        assert_eq!(StandardHashCalc::hash_calc(0, 941_629_472), 42053);
     }
 }

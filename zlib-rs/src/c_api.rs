@@ -1,5 +1,7 @@
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
+#![expect(
+    non_camel_case_types,
+    reason = "C-facing zlib ABI type spellings must be preserved"
+)]
 
 use core::ffi::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
 
@@ -123,8 +125,8 @@ impl z_stream {
 }
 
 // // zlib stores Adler-32 and CRC-32 checksums in unsigned long; zlib-ng uses uint32_t.
-pub(crate) type z_size = c_ulong;
-pub(crate) type z_checksum = c_ulong;
+pub type z_size = c_ulong;
+pub type z_checksum = c_ulong;
 
 // opaque to the user
 pub enum internal_state {}
@@ -238,16 +240,13 @@ impl gz_header {
     //  12 - QDOS
     //  13 - Acorn RISCOS
     // 255 - unknown
-    #[allow(clippy::if_same_then_else)]
     pub const OS_CODE: u8 = {
         if cfg!(windows) {
             10
         } else if cfg!(target_os = "macos") {
             19
-        } else if cfg!(unix) {
-            3
         } else {
-            3 // assume unix
+            3 // assume Unix, matching zlib defaults
         }
     };
 

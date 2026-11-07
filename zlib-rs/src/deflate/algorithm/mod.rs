@@ -789,7 +789,7 @@ pub(super) fn drive_standard(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Algorithm {
+pub enum Algorithm {
     Stored,
     Quick,
     Fast,
@@ -840,7 +840,7 @@ pub(super) fn run(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> Block
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LevelConfig {
+pub struct LevelConfig {
     pub good_length: u16,
     pub max_lazy: u16,
     pub nice_length: u16,
@@ -879,11 +879,11 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
 ];
 
-pub(crate) fn level_config(level: i8) -> LevelConfig {
+pub fn level_config(level: i8) -> LevelConfig {
     LEVEL_CONFIGS[level as usize]
 }
 
-pub(crate) fn change_requires_block_boundary(
+pub fn change_requires_block_boundary(
     current_level: i8,
     current_strategy: Strategy,
     next_level: i8,
