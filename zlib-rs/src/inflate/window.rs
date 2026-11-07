@@ -15,7 +15,7 @@ pub struct Window<'a> {
     next: usize, // write head
 }
 
-impl<'a> Window<'a> {
+impl Window<'_> {
     #[must_use]
     pub const fn into_raw_parts(self) -> (*mut u8, usize) {
         let (ptr, len) = self.buf.into_raw_parts();
@@ -37,10 +37,10 @@ impl<'a> Window<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) const fn from_initialized_slice(storage: &'a mut [u8]) -> Self {
+    pub(crate) const fn from_initialized_slice<'a>(storage: &'a mut [u8]) -> Window<'a> {
         // SAFETY: a mutable byte slice is fully initialized, writable, and uniquely borrowed for
         // the returned window lifetime.
-        unsafe { Self::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
+        unsafe { Window::<'a>::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
     }
 
     #[must_use]
@@ -191,12 +191,15 @@ impl<'a> Window<'a> {
 
     #[cfg(test)]
     #[must_use]
-    pub fn new_in(alloc: &crate::inflate::Allocator<'a>, window_bits: usize) -> Option<Self> {
+    pub fn new_in<'a>(
+        alloc: &crate::inflate::Allocator<'a>,
+        window_bits: usize,
+    ) -> Option<Window<'a>> {
         let len = 1 << window_bits;
         let ptr = alloc.allocate_slice_raw::<u8>(len)?;
 
         // SAFETY: the allocator returned a unique writable allocation of exactly len bytes.
-        Some(unsafe { Self::from_raw_parts(ptr.as_ptr(), len) })
+        Some(unsafe { Window::<'a>::from_raw_parts(ptr.as_ptr(), len) })
     }
 
     /// Clone only proven-initialized history into independent raw storage.
