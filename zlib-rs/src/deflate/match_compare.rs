@@ -1,6 +1,8 @@
 use core::simd::{cmp::SimdPartialEq, Simd};
 
+// Keep the comparison mask derived from lane width, rather than assuming 32 lanes.
 const LANES: usize = 32;
+const ALL_LANES_MASK: u64 = u64::MAX >> (64 - LANES);
 type Bytes = Simd<u8, LANES>;
 
 /// Length of the common prefix of two equally-sized byte slices.
@@ -15,53 +17,49 @@ pub fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
         "common-prefix inputs must have equal lengths"
     );
 
-    let vector_len = left.len() / LANES * LANES;
-    if let Some(mismatch) = first_mismatch_chunks(&left[..vector_len], &right[..vector_len]) {
+    let (left_chunks, left_tail) = left.as_chunks::<LANES>();
+    let (right_chunks, right_tail) = right.as_chunks::<LANES>();
+    if let Some(mismatch) = first_mismatch_chunks(left_chunks, right_chunks) {
         return mismatch;
     }
 
-    vector_len
-        + left[vector_len..]
+    left_chunks.len() * LANES
+        + left_tail
             .iter()
-            .zip(&right[vector_len..])
+            .zip(right_tail)
             .position(|(left, right)| left != right)
-            .unwrap_or(left.len() - vector_len)
+            .unwrap_or(left_tail.len())
 }
 
 /// Length of the prefix made entirely from `byte`.
 #[inline]
 pub fn repeated_prefix_len(byte: u8, src: &[u8]) -> usize {
     let repeated = Bytes::splat(byte);
-    let vector_len = src.len() / LANES * LANES;
+    let (chunks, tail) = src.as_chunks::<LANES>();
 
-    for (chunk_index, chunk) in src[..vector_len].chunks_exact(LANES).enumerate() {
-        let equal = Bytes::from_slice(chunk).simd_eq(repeated).to_bitmask();
-        if equal != u32::MAX as u64 {
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let equal = Bytes::from_array(*chunk).simd_eq(repeated).to_bitmask();
+        if equal != ALL_LANES_MASK {
             return chunk_index * LANES + equal.trailing_ones() as usize;
         }
     }
 
-    vector_len
-        + src[vector_len..]
+    chunks.len() * LANES
+        + tail
             .iter()
             .position(|value| *value != byte)
-            .unwrap_or(src.len() - vector_len)
+            .unwrap_or(tail.len())
 }
 
 #[inline]
-fn first_mismatch_chunks(left: &[u8], right: &[u8]) -> Option<usize> {
+fn first_mismatch_chunks(left: &[[u8; LANES]], right: &[[u8; LANES]]) -> Option<usize> {
     debug_assert_eq!(left.len(), right.len());
-    debug_assert_eq!(left.len() % LANES, 0);
 
-    for (chunk_index, (left, right)) in left
-        .chunks_exact(LANES)
-        .zip(right.chunks_exact(LANES))
-        .enumerate()
-    {
-        let equal = Bytes::from_slice(left)
-            .simd_eq(Bytes::from_slice(right))
+    for (chunk_index, (left, right)) in left.iter().zip(right).enumerate() {
+        let equal = Bytes::from_array(*left)
+            .simd_eq(Bytes::from_array(*right))
             .to_bitmask();
-        if equal != u32::MAX as u64 {
+        if equal != ALL_LANES_MASK {
             return Some(chunk_index * LANES + equal.trailing_ones() as usize);
         }
     }
