@@ -4170,7 +4170,8 @@ impl DeflateAllocOffsets {
         let pending = unsafe { Pending::from_raw_parts(pending_ptr, self.lit_bufsize * LIT_BUFS) };
 
         let sym_buf_ptr = unsafe { base.add(self.sym_buf_pos) };
-        let sym_buf = unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize) };
+        let sym_buf =
+            unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize * (LIT_BUFS - 1)) };
 
         DeflateAllocBuffers {
             state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
