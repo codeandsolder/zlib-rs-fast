@@ -1804,12 +1804,16 @@ impl State<'_> {
                         break 'blk Mode::Type;
                     }
                     Mode::Check => {
-                        if !cfg!(feature = "__internal-fuzz-disable-checksum") && self.wrap != 0 {
+                        if self.wrap != 0 {
                             need_bits_for_mode(bit_reader, 32, mode)?;
+                            let verify_checksum = self.wrap & 4 != 0
+                                && !cfg!(feature = "__internal-fuzz-disable-checksum");
+                            // Disabling checksum verification must not skip the
+                            // trailer or the final output-length accounting.
 
-                            self.total += output.len();
+                            self.total = self.total.wrapping_add(output.len());
 
-                            if self.wrap & 4 != 0 {
+                            if verify_checksum {
                                 if self.gzip_flags != 0 {
                                     self.crc_fold.fold(output.filled());
                                     self.checksum = self.crc_fold.finish();
@@ -1826,7 +1830,7 @@ impl State<'_> {
 
                             output.mark_accounted();
 
-                            if self.wrap & 4 != 0 && given_checksum != self.checksum {
+                            if verify_checksum && given_checksum != self.checksum {
                                 mode = Mode::Bad;
                                 break 'label self.bad("incorrect data check\0");
                             }
@@ -2829,7 +2833,8 @@ fn inflate_bound_io(
             && valid_mode(state.mode)
             && (not_done(state.mode) || !matches!(flush, InflateFlush::Finish)));
 
-    let update_checksum = state.wrap & 4 != 0;
+    let update_checksum =
+        state.wrap & 4 != 0 && !cfg!(feature = "__internal-fuzz-disable-checksum");
 
     if must_update_window {
         state.window.extend(
