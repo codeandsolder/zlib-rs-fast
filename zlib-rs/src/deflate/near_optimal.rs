@@ -2460,28 +2460,62 @@ struct BoundaryCandidate {
     shift: BoundaryShift,
 }
 
-fn consider_shift_candidate(
-    candidates: &mut Vec<BoundaryCandidate>,
-    delta: i64,
-    shift: BoundaryShift,
-) {
-    if delta >= 0 {
-        return;
-    }
+/// Small, sorted shortlist with one overflow slot to reproduce the existing
+/// sort-then-truncate tie behavior exactly. No allocation is needed while
+/// scanning boundary shifts, including when the fifth candidate is considered.
+#[derive(Clone, Debug)]
+struct BoundaryShortlist {
+    entries: [BoundaryCandidate; EXACT_BOUNDARY_CANDIDATES + 1],
+    len: usize,
+}
 
-    if let Some(existing) = candidates
-        .iter_mut()
-        .find(|candidate| candidate.shift.is_near(shift))
-    {
-        if delta < existing.delta {
-            *existing = BoundaryCandidate { delta, shift };
+impl Default for BoundaryShortlist {
+    fn default() -> Self {
+        Self {
+            entries: [BoundaryCandidate {
+                delta: 0,
+                shift: BoundaryShift::Right(0),
+            }; EXACT_BOUNDARY_CANDIDATES + 1],
+            len: 0,
         }
-    } else {
-        candidates.push(BoundaryCandidate { delta, shift });
+    }
+}
+
+impl BoundaryShortlist {
+    fn as_slice(&self) -> &[BoundaryCandidate] {
+        &self.entries[..self.len]
     }
 
-    candidates.sort_unstable_by_key(|candidate| candidate.delta);
-    candidates.truncate(EXACT_BOUNDARY_CANDIDATES);
+    fn consider(&mut self, delta: i64, shift: BoundaryShift) {
+        if delta >= 0 {
+            return;
+        }
+
+        if let Some(index) = self
+            .as_slice()
+            .iter()
+            .position(|candidate| candidate.shift.is_near(shift))
+        {
+            if delta >= self.entries[index].delta {
+                // The shortlist is already sorted, so no sorting is needed
+                // when the existing nearby representative is still better.
+                return;
+            }
+            self.entries[index] = BoundaryCandidate { delta, shift };
+        } else {
+            if self.len == EXACT_BOUNDARY_CANDIDATES && delta > self.entries[self.len - 1].delta {
+                // Strictly worse than the weakest finalist. Equality must
+                // still go through the old five-item unstable sort because
+                // truncation could retain either tied representative.
+                return;
+            }
+            self.entries[self.len] = BoundaryCandidate { delta, shift };
+            self.len += 1;
+        }
+
+        self.entries[..self.len].sort_unstable_by_key(|candidate| candidate.delta);
+        self.len = self.len.min(EXACT_BOUNDARY_CANDIDATES);
+    }
 }
 
 fn fixed_cost_shift_candidates(
@@ -2489,9 +2523,9 @@ fn fixed_cost_shift_candidates(
     right: &PlannedBlock,
     left_costs: &TokenCosts,
     right_costs: &TokenCosts,
-) -> Vec<BoundaryCandidate> {
+) -> BoundaryShortlist {
     debug_assert_eq!(left.range.end, right.range.start);
-    let mut candidates = Vec::with_capacity(EXACT_BOUNDARY_CANDIDATES);
+    let mut candidates = BoundaryShortlist::default();
 
     // Positive shift: move a prefix of the right block into the left block.
     let mut moved = 0usize;
@@ -2506,7 +2540,7 @@ fn fixed_cost_shift_candidates(
             break;
         }
         delta += i64::from(left_costs.token_cost(token)) - i64::from(right_costs.token_cost(token));
-        consider_shift_candidate(&mut candidates, delta, BoundaryShift::Right(moved));
+        candidates.consider(delta, BoundaryShift::Right(moved));
     }
 
     // Negative shift: move a suffix of the left block into the right block.
@@ -2522,10 +2556,9 @@ fn fixed_cost_shift_candidates(
             break;
         }
         delta += i64::from(right_costs.token_cost(token)) - i64::from(left_costs.token_cost(token));
-        consider_shift_candidate(&mut candidates, delta, BoundaryShift::Left(moved));
+        candidates.consider(delta, BoundaryShift::Left(moved));
     }
 
-    candidates.sort_unstable_by_key(|candidate| candidate.delta);
     candidates
 }
 
@@ -2600,6 +2633,53 @@ fn shortlisted_shift_histograms(
         "every shortlisted shift must end at a token boundary"
     );
     snapshots
+}
+
+/// Exact-score the frozen-cost shortlist against the best unchanged/merged
+/// partition. Returning only strict improvements preserves the original tie
+/// preference and keeps partition application separate from candidate scoring.
+fn best_exact_boundary_shift(
+    state: &mut super::State<'_>,
+    left: &PlannedBlock,
+    right: &PlannedBlock,
+    left_histogram: &TokenHistogram,
+    right_histogram: &TokenHistogram,
+    candidates: &[BoundaryCandidate],
+    mut best_total_bits: usize,
+) -> Option<(BoundaryShift, usize)> {
+    let snapshots =
+        shortlisted_shift_histograms(left, right, left_histogram, right_histogram, candidates);
+    let mut best_shift = None;
+    for (candidate, snapshot) in candidates.iter().copied().zip(snapshots) {
+        // All nominees end at token boundaries, verified before scoring.
+        let Some((shifted_left, shifted_right)) = snapshot else {
+            continue;
+        };
+        let Some((new_left_len, new_right_len)) =
+            candidate.shift.lengths(left.input_len(), right.input_len())
+        else {
+            continue;
+        };
+        let Some(boundary) = candidate.shift.boundary(left.range.end) else {
+            continue;
+        };
+        let Some(new_left_score) =
+            compressed_histogram_score(state, &shifted_left, new_left_len, None)
+        else {
+            continue;
+        };
+        let Some(new_right_score) =
+            compressed_histogram_score(state, &shifted_right, new_right_len, None)
+        else {
+            continue;
+        };
+        let total_bits = new_left_score.bits + new_right_score.bits;
+        if total_bits < best_total_bits {
+            best_total_bits = total_bits;
+            best_shift = Some((candidate.shift, boundary));
+        }
+    }
+    best_shift
 }
 
 /// Apply a chosen shift directly to the owned token vectors. Partition scoring
@@ -2678,7 +2758,6 @@ pub fn optimize_token_partition(
     };
 
     let mut best_total_bits = left_score.bits + right_score.bits;
-    let mut best_shift = None;
     let mut merge_is_best = false;
 
     let merged_len = left.input_len() + right.input_len();
@@ -2695,52 +2774,28 @@ pub fn optimize_token_partition(
     }
 
     let candidates = fixed_cost_shift_candidates(left, right, &left_costs, &right_costs);
-    let snapshots =
-        shortlisted_shift_histograms(left, right, &left_histogram, &right_histogram, &candidates);
-    for (candidate, snapshot) in candidates.into_iter().zip(snapshots) {
-        // All nominees are produced at exact token boundaries, verified by
-        // shortlisted_shift_histograms before any exact rescoring starts.
-        let Some((shifted_left, shifted_right)) = snapshot else {
-            continue;
-        };
-        let Some((new_left_len, new_right_len)) =
-            candidate.shift.lengths(left.input_len(), right.input_len())
-        else {
-            continue;
-        };
-        let Some(boundary) = candidate.shift.boundary(left.range.end) else {
-            continue;
-        };
-        let Some(new_left_score) =
-            compressed_histogram_score(state, &shifted_left, new_left_len, None)
-        else {
-            continue;
-        };
-        let Some(new_right_score) =
-            compressed_histogram_score(state, &shifted_right, new_right_len, None)
-        else {
-            continue;
-        };
-        let total_bits = new_left_score.bits + new_right_score.bits;
-        if total_bits < best_total_bits {
-            best_total_bits = total_bits;
-            best_shift = Some((candidate.shift, boundary));
-            merge_is_best = false;
-        }
-    }
+    let best_shift = best_exact_boundary_shift(
+        state,
+        left,
+        right,
+        &left_histogram,
+        &right_histogram,
+        candidates.as_slice(),
+        best_total_bits,
+    );
 
-    let outcome = if merge_is_best {
+    let outcome = if let Some((shift, boundary)) = best_shift {
+        shift_tokens(left, right, shift);
+        left.range.end = boundary;
+        right.range.start = boundary;
+        BoundaryOptimization::Shifted
+    } else if merge_is_best {
         let mut tokens = core::mem::take(&mut left.tokens);
         tokens.append(&mut right.tokens);
         BoundaryOptimization::Merged(PlannedBlock {
             range: left.range.start..right.range.end,
             tokens,
         })
-    } else if let Some((shift, boundary)) = best_shift {
-        shift_tokens(left, right, shift);
-        left.range.end = boundary;
-        right.range.start = boundary;
-        BoundaryOptimization::Shifted
     } else {
         BoundaryOptimization::Unchanged
     };
@@ -2888,6 +2943,54 @@ mod boundary_tests {
     }
 
     #[test]
+    fn fixed_capacity_shortlist_preserves_sort_and_tie_semantics() {
+        // Exact oracle: the previous allocation-backed candidate admission,
+        // unstable sort and truncation, including ties at the fourth slot.
+        fn reference_consider(
+            candidates: &mut Vec<BoundaryCandidate>,
+            delta: i64,
+            shift: BoundaryShift,
+        ) {
+            if delta >= 0 {
+                return;
+            }
+            if let Some(existing) = candidates
+                .iter_mut()
+                .find(|candidate| candidate.shift.is_near(shift))
+            {
+                if delta < existing.delta {
+                    *existing = BoundaryCandidate { delta, shift };
+                }
+            } else {
+                candidates.push(BoundaryCandidate { delta, shift });
+            }
+            candidates.sort_unstable_by_key(|candidate| candidate.delta);
+            candidates.truncate(EXACT_BOUNDARY_CANDIDATES);
+        }
+
+        let mut previous = Vec::new();
+        let mut shortlist = BoundaryShortlist::default();
+        let mut rng = 0x5b25_a65d_f197_20b3u64;
+        for iteration in 0..20_000 {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let delta = i64::try_from((rng >> 9) % 117).unwrap_or_default() - 90;
+            let distance = usize::try_from((rng >> 18) % 4_096).unwrap_or_default() + 1;
+            let shift = if (rng >> 49) & 1 == 0 {
+                BoundaryShift::Left(distance)
+            } else {
+                BoundaryShift::Right(distance)
+            };
+            reference_consider(&mut previous, delta, shift);
+            shortlist.consider(delta, shift);
+            assert_eq!(
+                shortlist.as_slice(),
+                previous.as_slice(),
+                "iteration={iteration}, delta={delta}, shift={shift:?}"
+            );
+        }
+    }
+
+    #[test]
     fn boundary_shift_supports_full_usize_positions_and_checks_lengths() {
         let boundary = (isize::MAX as usize) + 16;
         assert_eq!(
@@ -3022,11 +3125,16 @@ mod boundary_tests {
         let left_histogram = TokenHistogram::from_tokens(&left.tokens);
         let right_histogram = TokenHistogram::from_tokens(&right.tokens);
         let shifts = fixed_cost_shift_candidates(&left, &right, &left_costs, &right_costs);
-        let snapshots =
-            shortlisted_shift_histograms(&left, &right, &left_histogram, &right_histogram, &shifts);
+        let snapshots = shortlisted_shift_histograms(
+            &left,
+            &right,
+            &left_histogram,
+            &right_histogram,
+            shifts.as_slice(),
+        );
         let snapshot = &snapshots[0];
-        assert_eq!(shifts[0].shift, BoundaryShift::Left(500));
-        shift_tokens(&mut left, &mut right, shifts[0].shift);
+        assert_eq!(shifts.as_slice()[0].shift, BoundaryShift::Left(500));
+        shift_tokens(&mut left, &mut right, shifts.as_slice()[0].shift);
         let new_left = &left.tokens;
         let new_right = &right.tokens;
         assert_eq!(new_left.len(), 5_500);
@@ -3067,11 +3175,16 @@ mod boundary_tests {
         let left_histogram = TokenHistogram::from_tokens(&left.tokens);
         let right_histogram = TokenHistogram::from_tokens(&right.tokens);
         let shifts = fixed_cost_shift_candidates(&left, &right, &left_costs, &right_costs);
-        let snapshots =
-            shortlisted_shift_histograms(&left, &right, &left_histogram, &right_histogram, &shifts);
+        let snapshots = shortlisted_shift_histograms(
+            &left,
+            &right,
+            &left_histogram,
+            &right_histogram,
+            shifts.as_slice(),
+        );
         let snapshot = &snapshots[0];
-        assert_eq!(shifts[0].shift, BoundaryShift::Right(500));
-        let shift = shifts[0].shift;
+        assert_eq!(shifts.as_slice()[0].shift, BoundaryShift::Right(500));
+        let shift = shifts.as_slice()[0].shift;
         shift_tokens(&mut left, &mut right, shift);
         let shifted_left = &left.tokens;
         let shifted_right = &right.tokens;
