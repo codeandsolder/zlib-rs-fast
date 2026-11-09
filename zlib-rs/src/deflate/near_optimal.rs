@@ -25,6 +25,35 @@ impl MatchCandidate {
         length: 0,
         distance: 0,
     };
+
+    /// Update the best match for one distance-code bucket. Both discovery
+    /// strategies deliver byte positions as usize; only this boundary converts
+    /// their bounded DEFLATE length/distance into the compact token encoding.
+    #[inline]
+    fn consider(&mut self, length: usize, distance: usize) {
+        if length < STD_MIN_MATCH {
+            return;
+        }
+        assert!(
+            length <= STD_MAX_MATCH,
+            "match exceeds DEFLATE length limit"
+        );
+        assert!(
+            (1..=1usize << crate::MAX_WBITS).contains(&distance),
+            "match exceeds DEFLATE distance limit"
+        );
+        if length > usize::from(self.length)
+            || (length == usize::from(self.length) && distance < usize::from(self.distance))
+        {
+            let Ok(length) = u16::try_from(length) else {
+                unreachable!("bounded DEFLATE length always fits u16");
+            };
+            let Ok(distance) = u16::try_from(distance) else {
+                unreachable!("bounded DEFLATE distance always fits u16");
+            };
+            *self = Self { length, distance };
+        }
+    }
 }
 
 /// Sparse whole-input candidate table in CSR form.
@@ -266,6 +295,19 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
             }
 
             let mut best = MatchCandidate::NONE;
+            // Both suffix-rank probes and direct scans use exactly the same
+            // comparison, distance-bucket tie-breaking and token conversion.
+            let mut consider_position = |candidate_position: usize| {
+                debug_assert!(candidate_position < position);
+                let distance = position - candidate_position;
+                debug_assert!((min_distance..=max_distance).contains(&distance));
+                let length = match_compare::common_prefix_len(
+                    &input[position..position + available],
+                    &input[candidate_position..candidate_position + available],
+                );
+                best.consider(length, distance);
+            };
+
             if let Some(active) = &mut active[code] {
                 if available < STD_MIN_MATCH {
                     continue;
@@ -279,48 +321,15 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
                 }
 
                 let (predecessor, successor) = active.neighbors(rank);
-                let mut consider_rank = |candidate_rank: usize| {
-                    let candidate_position = suffixes.position_at(candidate_rank);
-                    let distance = position - candidate_position;
-                    debug_assert!((min_distance..=max_distance).contains(&distance));
-                    let length = match_compare::common_prefix_len(
-                        &input[position..position + available],
-                        &input[candidate_position..candidate_position + available],
-                    );
-                    if length >= STD_MIN_MATCH
-                        && (length > usize::from(best.length)
-                            || (length == usize::from(best.length)
-                                && distance < usize::from(best.distance)))
-                    {
-                        best = MatchCandidate {
-                            length: length as u16,
-                            distance: distance as u16,
-                        };
-                    }
-                };
                 if let Some(candidate_rank) = predecessor {
-                    consider_rank(candidate_rank);
+                    consider_position(suffixes.position_at(candidate_rank));
                 }
                 if let Some(candidate_rank) = successor {
-                    consider_rank(candidate_rank);
+                    consider_position(suffixes.position_at(candidate_rank));
                 }
             } else if available >= STD_MIN_MATCH {
                 for distance in min_distance..=max_distance.min(position) {
-                    let candidate_position = position - distance;
-                    let length = match_compare::common_prefix_len(
-                        &input[position..position + available],
-                        &input[candidate_position..candidate_position + available],
-                    );
-                    if length >= STD_MIN_MATCH
-                        && (length > usize::from(best.length)
-                            || (length == usize::from(best.length)
-                                && distance < usize::from(best.distance)))
-                    {
-                        best = MatchCandidate {
-                            length: length as u16,
-                            distance: distance as u16,
-                        };
-                    }
+                    consider_position(position - distance);
                 }
             }
 
@@ -1272,6 +1281,54 @@ mod tests {
         // Reject that input at the candidate boundary, not when the token
         // eventually reaches the Huffman writer.
         let _ = build_match_candidates(b"aaaaaaa", (1usize << crate::MAX_WBITS) + 1);
+    }
+
+    #[test]
+    fn compact_match_candidate_selects_longest_then_nearest() {
+        let mut best = MatchCandidate::NONE;
+        best.consider(STD_MIN_MATCH - 1, 1);
+        assert_eq!(best, MatchCandidate::NONE);
+
+        best.consider(STD_MIN_MATCH, 2);
+        assert_eq!(
+            best,
+            MatchCandidate {
+                length: 3,
+                distance: 2
+            }
+        );
+        best.consider(STD_MIN_MATCH, 32_768);
+        assert_eq!(best.distance, 2, "equal-length matches prefer the nearest");
+        best.consider(STD_MIN_MATCH, 1);
+        assert_eq!(best.distance, 1);
+        best.consider(STD_MAX_MATCH, 32_768);
+        assert_eq!(
+            best,
+            MatchCandidate {
+                length: 258,
+                distance: 32_768,
+            }
+        );
+        best.consider(STD_MAX_MATCH - 1, 1);
+        assert_eq!(
+            best.distance, 32_768,
+            "a shorter match must not replace a longer one"
+        );
+        assert_eq!(core::mem::size_of::<MatchCandidate>(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "match exceeds DEFLATE length limit")]
+    fn compact_match_candidate_rejects_overlength() {
+        let mut candidate = MatchCandidate::NONE;
+        candidate.consider(STD_MAX_MATCH + 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "match exceeds DEFLATE distance limit")]
+    fn compact_match_candidate_rejects_out_of_window_distance() {
+        let mut candidate = MatchCandidate::NONE;
+        candidate.consider(STD_MIN_MATCH, (1usize << crate::MAX_WBITS) + 1);
     }
 
     #[test]
