@@ -229,6 +229,7 @@ impl TokenCosts {
             + u32::from(StaticTreeDesc::EXTRA_DBITS[code]) * u32::from(COST_SCALE)
     }
 
+    #[cfg(test)]
     fn match_cost(&self, length: usize, distance: usize) -> u32 {
         debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length));
         debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&distance));
@@ -239,6 +240,7 @@ impl TokenCosts {
     }
 
     /// One token fits u32; whole-parse dynamic-programming totals use u64.
+    #[cfg(test)]
     fn token_cost(&self, token: ParseToken) -> u32 {
         match token {
             ParseToken::Literal(byte) => self.literal_cost(byte),

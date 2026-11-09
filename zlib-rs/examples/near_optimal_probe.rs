@@ -7,13 +7,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let path = args
         .next()
-        .ok_or("usage: near_optimal_probe FILE [BYTES] [PASSES]")?;
+        .ok_or("usage: near_optimal_probe FILE [BYTES] [PASSES] [ENCODED_OUT]")?;
     let requested = args.next().map(|value| value.parse()).transpose()?;
     let passes: usize = args
         .next()
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or(10);
+    // Optional output enables independent decoding and byte-for-byte
+    // verification of real-world input samples outside this process.
+    let encoded_path = args.next();
 
     let bytes = fs::read(Path::new(&path))?;
     let limit = requested.unwrap_or(bytes.len()).min(bytes.len());
@@ -28,6 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (optimal, optimal_code) = compress_slice_near_optimal(&mut optimal_buf, input, passes);
     let elapsed = start.elapsed();
     assert_eq!(optimal_code, ReturnCode::Ok);
+    if let Some(path) = encoded_path {
+        fs::write(path, &*optimal)?;
+    }
 
     println!("input_bytes={}", input.len());
     println!("stock_l9_bytes={}", stock.len());
