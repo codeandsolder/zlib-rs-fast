@@ -2,21 +2,56 @@
 
 use crate::{
     deflate::{
-        drain_pending_output, emit_stored_block_header, zng_tr_stored_block, BlockState,
-        Compressor, MAX_STORED,
+        drain_pending_output, emit_stored_block_header, unflushed_block_span, zng_tr_stored_block,
+        BlockState, Compressor, State, MAX_STORED,
     },
     DeflateFlush,
 };
+
+/// Stored output may reference only bytes still resident in the window.
+///
+/// A negative DEFLATE block origin is valid for an already-compressed block,
+/// but stored-mode copying must never reinterpret it as an unsigned offset.
+fn resident_origin(state: &State<'_>) -> usize {
+    let (origin, _) = unflushed_block_span(state.strstart, state.block_start);
+    let Some(origin) = origin else {
+        unreachable!("stored block start must be present in the sliding window");
+    };
+    origin
+}
+
+/// Convert only at the State boundary, after validating the next resident
+/// offset against the current initialized position.
+fn set_resident_origin(state: &mut State<'_>, next: usize) {
+    assert!(
+        next <= state.strstart,
+        "stored block origin moved beyond the window cursor"
+    );
+    let Ok(next) = isize::try_from(next) else {
+        unreachable!("stored block origin exceeds signed index range");
+    };
+    state.block_start = next;
+}
+
+fn advance_resident_origin(state: &mut State<'_>, count: usize) {
+    let Some(next) = resident_origin(state).checked_add(count) else {
+        unreachable!("stored block origin arithmetic overflow");
+    };
+    set_resident_origin(state, next);
+}
+
+/// Number of output bytes needed for a stored-block header, accounting for
+/// buffered prefix bits, the three-bit block marker, byte alignment and LEN/NLEN.
+fn stored_header_size(bits_valid: u8) -> usize {
+    assert!(bits_valid <= 64, "invalid bit reservoir occupancy");
+    (usize::from(bits_valid) + 42) / 8
+}
 
 pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     // Stored-mode output must be backed by bytes still in the sliding window.
     // The compressed-level transition path flushes before switching modes;
     // negative block_start is only meaningful for already-flushed history.
-    assert!(
-        stream.state.block_start >= 0
-            && stream.state.block_start.unsigned_abs() <= stream.state.strstart,
-        "stored block start must be present in the sliding window"
-    );
+    let _ = resident_origin(stream.state);
     // Smallest worthy block size when not flushing or finishing. By default
     // this is 32K. This can be as small as 507 bytes for memLevel == 1. For
     // large input and output buffers, the stored block size will be larger.
@@ -38,14 +73,14 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         let mut len = MAX_STORED;
 
         // number of header bytes
-        have = usize::from((stream.state.bit_writer.bits_valid + 42) / 8);
+        have = stored_header_size(stream.state.bit_writer.bits_valid);
 
         // we need room for at least the header
         if (stream.output.avail_out as usize) < have {
             break;
         }
 
-        let left = stream.state.strstart - stream.state.block_start.unsigned_abs();
+        let left = stream.state.strstart - resident_origin(stream.state);
         // avail_in is a C uInt. On a 32-bit target its maximum can be
         // usize::MAX, so adding buffered bytes must not wrap the total.
         let available = left.saturating_add(stream.input.avail_in as usize);
@@ -88,9 +123,9 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
 
         if left > 0 {
             let left = left.min(len);
-            let start = stream.state.block_start as usize;
+            let start = resident_origin(stream.state);
             stream.copy_window_to_output(start..start + left);
-            stream.state.block_start += left as isize;
+            advance_resident_origin(stream.state, left);
             len -= left;
         }
 
@@ -136,7 +171,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
             state.strstart += used;
             state.insert += used.min(state.w_size - state.insert);
         }
-        stream.state.block_start = stream.state.strstart as isize;
+        set_resident_origin(stream.state, stream.state.strstart);
     }
 
     // If the last block was written to next_out, then done.
@@ -149,20 +184,20 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     if flush != DeflateFlush::NoFlush
         && flush != DeflateFlush::Finish
         && stream.input.avail_in == 0
-        && stream.state.strstart == stream.state.block_start.unsigned_abs()
+        && stream.state.strstart == resident_origin(stream.state)
     {
         return BlockState::BlockDone;
     }
 
     // Fill the window with any remaining input
     let mut have = stream.state.window_size - stream.state.strstart;
-    if stream.input.avail_in as usize > have
-        && stream.state.block_start.unsigned_abs() >= stream.state.w_size
+    if stream.input.avail_in as usize > have && resident_origin(stream.state) >= stream.state.w_size
     {
         // slide the window down
         let state = &mut stream.state;
-        state.block_start -= state.w_size as isize;
+        let next_origin = resident_origin(state) - state.w_size;
         state.strstart -= state.w_size;
+        set_resident_origin(state, next_origin);
 
         // Preserve only the logically initialized upper-half history.
         state.window.slide_down(state.w_size);
@@ -192,12 +227,12 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
 
     // number of header bytes
     let state = &mut stream.state;
-    let have = ((state.bit_writer.bits_valid + 42) >> 3) as usize;
+    let have = stored_header_size(state.bit_writer.bits_valid);
 
     // maximum stored block length that will fit in pending:
     let have = Ord::min(state.bit_writer.pending.capacity() - have, MAX_STORED);
     let min_block = Ord::min(have, state.w_size);
-    let left = state.strstart - state.block_start.unsigned_abs();
+    let left = state.strstart - resident_origin(state);
 
     if left >= min_block
         || ((left > 0 || flush == DeflateFlush::Finish)
@@ -208,10 +243,10 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         let len = left.min(have);
         last = flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == left;
 
-        let start = state.block_start.unsigned_abs();
+        let start = resident_origin(state);
         zng_tr_stored_block(state, start..start + len, last);
 
-        state.block_start += len as isize;
+        advance_resident_origin(state, len);
         let _ = drain_pending_output(stream.state, &mut stream.output);
     }
 

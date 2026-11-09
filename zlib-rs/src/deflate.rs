@@ -4968,6 +4968,97 @@ mod test {
     }
 
     #[test]
+    fn stored_streaming_fragmentation_preserves_bytes_across_window_slides() {
+        let input: Vec<u8> = (0usize..190_001)
+            .map(|index| ((index * 37) ^ (index / 29)).to_le_bytes()[0])
+            .collect();
+
+        for window_bits in [-crate::MAX_WBITS, crate::MAX_WBITS, 16 + crate::MAX_WBITS] {
+            for mem_level in [1, 8] {
+                let config = DeflateConfig {
+                    window_bits,
+                    mem_level,
+                    ..DeflateConfig::new(0)
+                };
+                for chunk_size in [7, 509, 32_768] {
+                    let compressed = compress_with_output_chunks(&input, config, chunk_size);
+                    let mut restored = vec![0u8; input.len()];
+                    let (decoded, status) = crate::decompress_slice(
+                        &mut restored,
+                        &compressed,
+                        InflateConfig { window_bits },
+                    );
+                    assert_eq!(
+                        status, ReturnCode::Ok,
+                        "stored roundtrip status for window_bits={window_bits}, mem_level={mem_level}, out_chunk={chunk_size}"
+                    );
+                    assert_eq!(
+                        decoded, input,
+                        "stored roundtrip mismatch for window_bits={window_bits}, mem_level={mem_level}, out_chunk={chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stored_and_compressed_level_transitions_preserve_long_history() -> Result<(), &'static str> {
+        let before: Vec<u8> = (0usize..160_000)
+            .map(|index| ((index * 17) ^ (index / 43)).to_le_bytes()[0])
+            .collect();
+        let after = b"level-transition-stored-and-huffman/".repeat(3_000);
+        for (old_level, new_level) in [(0, 6), (6, 0)] {
+            let mut raw = z_stream::default();
+            let config = DeflateConfig {
+                mem_level: 1,
+                ..DeflateConfig::new(old_level)
+            };
+            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            // SAFETY: init created the uniquely owned live compression state.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                .ok_or("initialized compression stream missing its state")?;
+            let mut output = vec![0u8; compress_bound(before.len() + after.len()) + 1024];
+            stream.next_in = before.as_ptr().cast_mut();
+            stream.avail_in = before.len().try_into().map_err(|_| "input too long")?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output.len().try_into().map_err(|_| "output too long")?;
+
+            while stream.avail_in > 0 {
+                assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+                assert_ne!(stream.avail_out, 0);
+            }
+            assert_eq!(params(stream, new_level, Strategy::Default), ReturnCode::Ok);
+            assert_eq!(i32::from(stream.state.level), new_level);
+
+            stream.next_in = after.as_ptr().cast_mut();
+            stream.avail_in = after.len().try_into().map_err(|_| "tail too long")?;
+            loop {
+                match deflate(stream, DeflateFlush::Finish) {
+                    ReturnCode::Ok => assert_ne!(stream.avail_out, 0),
+                    ReturnCode::StreamEnd => break,
+                    other => panic!("stored-level transition {old_level}->{new_level}: {other:?}"),
+                }
+            }
+            let written =
+                usize::try_from(stream.total_out).map_err(|_| "output size exceeds usize")?;
+            assert_eq!(stream.avail_in, 0);
+            assert!(end(stream).is_ok());
+
+            let mut original = before.clone();
+            original.extend_from_slice(&after);
+            let mut restored = vec![0u8; original.len()];
+            let (decoded, code) = crate::decompress_slice(
+                &mut restored,
+                &output[..written],
+                InflateConfig::default(),
+            );
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(decoded, original, "level {old_level}->{new_level}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn stored_mode_never_reads_a_slid_out_block_start() {
         let mut stream = DeflateStream::new(DeflateConfig::new(0));
         stream.state.block_start = -1;
