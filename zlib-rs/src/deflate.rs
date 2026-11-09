@@ -840,6 +840,34 @@ fn init_with_lit_bufsize(
     reset(stream)
 }
 
+/// Return the bytes accumulated since the start of the current DEFLATE block.
+///
+/// A nonnegative origin identifies resident bytes in the sliding window.
+/// When a slide moves that origin out of the window, it becomes negative:
+/// its absolute value is the missing prefix length. The accumulated length
+/// still includes that prefix, but no stored-block source range exists.
+///
+/// # Panics
+///
+/// Panics if the block start lies beyond the current position or the combined
+/// distance cannot be represented in the host address-size integer.
+const fn unflushed_block_span(strstart: usize, block_start: isize) -> (Option<usize>, usize) {
+    let origin = block_start.unsigned_abs();
+    if block_start < 0 {
+        assert!(
+            origin <= usize::MAX - strstart,
+            "unflushed block length exceeds host integer range"
+        );
+        (None, strstart + origin)
+    } else {
+        assert!(
+            origin <= strstart,
+            "block start is after the current position"
+        );
+        (Some(origin), strstart - origin)
+    }
+}
+
 pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> ReturnCode {
     let level = if level == crate::c_api::Z_DEFAULT_COMPRESSION {
         6
@@ -851,7 +879,11 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         return ReturnCode::StreamError;
     }
 
-    let level = level as i8;
+    // The public ABI level is signed and validated above; preserve its
+    // representability explicitly before storing it in the compact state.
+    let Ok(level) = i8::try_from(level) else {
+        unreachable!("validated compression level does not fit i8");
+    };
 
     let state = &mut *stream.state;
 
@@ -867,7 +899,8 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         let state = &mut *stream.state;
 
         if stream.avail_in != 0
-            || ((state.strstart as isize - state.block_start) + state.lookahead as isize) != 0
+            || unflushed_block_span(state.strstart, state.block_start).1 != 0
+            || state.lookahead != 0
         {
             return ReturnCode::BufError;
         }
@@ -2298,7 +2331,10 @@ pub fn fill_window_core_with_hash_maintenance(
             }
 
             state.strstart -= wsize; /* we now have strstart >= MAX_DIST */
-            state.block_start = state.block_start.wrapping_sub_unsigned(wsize);
+            let Some(slid_origin) = state.block_start.checked_sub_unsigned(wsize) else {
+                unreachable!("window slide exceeds signed block-origin range");
+            };
+            state.block_start = slid_origin;
             state.insert = Ord::min(state.insert, state.strstart);
 
             if maintain_hash_chain {
@@ -2947,14 +2983,18 @@ fn zng_tr_flush_block(
 }
 
 fn encode_block_core(state: &mut State<'_>, is_last: bool) {
-    zng_tr_flush_block(
-        state,
-        (state.block_start >= 0).then_some(state.block_start as usize),
-        (state.strstart as isize - state.block_start) as u32,
-        is_last,
-    );
+    let (window_offset, unflushed_len) = unflushed_block_span(state.strstart, state.block_start);
+    // This count describes the current not-yet-encoded token block, not a
+    // lifetime total; token-buffer capacity bounds it well below u32::MAX.
+    let Ok(stored_len) = u32::try_from(unflushed_len) else {
+        unreachable!("unflushed DEFLATE block exceeds u32 length");
+    };
+    zng_tr_flush_block(state, window_offset, stored_len, is_last);
 
-    state.block_start = state.strstart as isize;
+    let Ok(next_origin) = isize::try_from(state.strstart) else {
+        unreachable!("current window position exceeds signed block-origin range");
+    };
+    state.block_start = next_origin;
 }
 
 fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
@@ -4347,6 +4387,133 @@ mod test {
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
         }
+    }
+
+    #[test]
+    fn unflushed_block_span_tracks_slid_out_prefixes() {
+        let window = 1usize << crate::MAX_WBITS;
+        let slid_origin = -(1isize << crate::MAX_WBITS);
+        assert_eq!(unflushed_block_span(100, 10), (Some(10), 90));
+        assert_eq!(unflushed_block_span(100, 100), (Some(100), 0));
+        assert_eq!(unflushed_block_span(100, -1), (None, 101));
+        assert_eq!(
+            unflushed_block_span(window, slid_origin),
+            (None, window * 2)
+        );
+        assert_eq!(
+            unflushed_block_span(window + 4, slid_origin),
+            (None, window * 2 + 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "block start is after the current position")]
+    fn unflushed_block_span_rejects_future_origin() {
+        let _ = unflushed_block_span(10, 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "unflushed block length exceeds host integer range")]
+    fn unflushed_block_span_rejects_overflow() {
+        let _ = unflushed_block_span(usize::MAX, isize::MIN);
+    }
+
+    #[test]
+    fn compressed_block_survives_multiple_window_slides_before_flush() -> Result<(), &'static str> {
+        // Compressible input produces few tokens but crosses several window
+        // slides before the DEFLATE block is emitted. Its origin must remain
+        // outside the current window and its length must not narrow or wrap.
+        let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
+        for level in [1, 6, 9] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            let mut output = vec![0u8; compress_bound(source.len()) + 64];
+            stream.next_in = source.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(source.len())
+                .map_err(|_| "test input exceeds ABI length")?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| "test output exceeds ABI length")?;
+
+            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+            assert_eq!(stream.avail_in, 0);
+            assert!(
+                stream.state.block_start < 0,
+                "level {level} did not leave a block spanning a window slide"
+            );
+            let (window_offset, block_len) =
+                unflushed_block_span(stream.state.strstart, stream.state.block_start);
+            assert_eq!(window_offset, None);
+            assert!(block_len > stream.state.w_size);
+            assert!(block_len <= source.len());
+
+            assert_eq!(
+                deflate(&mut stream, DeflateFlush::Finish),
+                ReturnCode::StreamEnd
+            );
+            let written = usize::try_from(stream.total_out)
+                .map_err(|_| "test output count exceeds host usize")?;
+            assert!(end(&mut stream).is_ok());
+            let mut decoded = vec![0u8; source.len()];
+            let (restored, code) = crate::decompress_slice(
+                &mut decoded,
+                &output[..written],
+                crate::InflateConfig::default(),
+            );
+            assert_eq!(code, ReturnCode::Ok, "level {level} did not decode");
+            assert_eq!(restored, source, "level {level} round-trip mismatch");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn level_change_flushes_block_with_origin_outside_window() -> Result<(), &'static str> {
+        let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
+        for (initial_level, next_level) in [(1, 6), (6, 9), (9, 1)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level));
+            let mut output = vec![0u8; compress_bound(source.len()) + 256];
+            stream.next_in = source.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(source.len())
+                .map_err(|_| "test input exceeds ABI length")?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| "test output exceeds ABI length")?;
+
+            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+            assert_eq!(stream.avail_in, 0);
+            assert!(stream.state.block_start < 0);
+            assert!(
+                unflushed_block_span(stream.state.strstart, stream.state.block_start).1
+                    > stream.state.w_size
+            );
+
+            assert_eq!(
+                params(&mut stream, next_level, Strategy::Default),
+                ReturnCode::Ok,
+                "level transition {initial_level} -> {next_level} failed"
+            );
+            assert_eq!(i32::from(stream.state.level), next_level);
+            assert!(stream.state.block_start >= 0);
+            assert_eq!(
+                stream.state.block_start.unsigned_abs(),
+                stream.state.strstart
+            );
+            assert_eq!(
+                deflate(&mut stream, DeflateFlush::Finish),
+                ReturnCode::StreamEnd
+            );
+            let written =
+                usize::try_from(stream.total_out).map_err(|_| "test output exceeds host usize")?;
+            assert!(end(&mut stream).is_ok());
+            let mut decoded = vec![0u8; source.len()];
+            let (restored, status) = crate::decompress_slice(
+                &mut decoded,
+                &output[..written],
+                crate::InflateConfig::default(),
+            );
+            assert_eq!(status, ReturnCode::Ok);
+            assert_eq!(restored, source);
+        }
+        Ok(())
     }
 
     #[test]
