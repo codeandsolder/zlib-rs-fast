@@ -243,13 +243,8 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
         max_distance <= 1usize << crate::MAX_WBITS,
         "candidate history exceeds the DEFLATE window"
     );
-    // Suffix ranks and positions are stored as u32. Candidate entry offsets
-    // are not: their count can grow by up to D_CODES per input byte.
-    assert!(
-        u32::try_from(input.len()).is_ok(),
-        "input exceeds the suffix-rank index range"
-    );
-
+    // SuffixRanks checks that its compact u32 backing can address the input.
+    // Candidate entry offsets remain usize because there may be D_CODES entries per byte.
     let suffixes = SuffixRanks::new(input);
     let ranges = distance_code_ranges(max_distance);
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
@@ -262,7 +257,7 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
     offsets.push(0);
 
     for position in 0..input.len() {
-        let rank = suffixes.rank[position] as usize;
+        let rank = suffixes.rank_of(position);
         let available = STD_MAX_MATCH.min(input.len() - position);
 
         for (code, &(min_distance, max_distance)) in ranges.iter().enumerate() {
@@ -278,14 +273,14 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
                 let Some(add) = position.checked_sub(min_distance) else {
                     continue;
                 };
-                active.insert(suffixes.rank[add] as usize);
+                active.insert(suffixes.rank_of(add));
                 if let Some(remove) = position.checked_sub(max_distance + 1) {
-                    active.remove(suffixes.rank[remove] as usize);
+                    active.remove(suffixes.rank_of(remove));
                 }
 
                 let (predecessor, successor) = active.neighbors(rank);
                 let mut consider_rank = |candidate_rank: usize| {
-                    let candidate_position = suffixes.sa[candidate_rank] as usize;
+                    let candidate_position = suffixes.position_at(candidate_rank);
                     let distance = position - candidate_position;
                     debug_assert!((min_distance..=max_distance).contains(&distance));
                     let length = match_compare::common_prefix_len(
@@ -512,12 +507,36 @@ fn distance_code_ranges(max_distance: usize) -> [(usize, usize); D_CODES] {
     })
 }
 
+/// Convert an already-bounded suffix-array index to the platform slice index.
+///
+/// All values passed here index the input, its suffix permutation, or the
+/// associated counting-sort tables. Their backing arrays have already been
+/// allocated at a representable usize length, so even on a narrow-pointer
+/// target the index is bounded by a real allocation rather than arbitrary u32.
+#[inline]
+const fn suffix_index(value: u32) -> usize {
+    value as usize
+}
+
+/// A suffix permutation and its inverse. Both arrays remain packed u32; all
+/// consumers operate on ordinary slice indices through rank_of/position_at.
+/// This is the only boundary converting the compact rank/position storage.
 struct SuffixRanks {
     sa: Vec<u32>,
     rank: Vec<u32>,
 }
 
 impl SuffixRanks {
+    #[inline]
+    fn rank_of(&self, position: usize) -> usize {
+        suffix_index(self.rank[position])
+    }
+
+    #[inline]
+    fn position_at(&self, suffix_rank: usize) -> usize {
+        suffix_index(self.sa[suffix_rank])
+    }
+
     fn new(input: &[u8]) -> Self {
         if input.is_empty() {
             return Self {
@@ -525,9 +544,10 @@ impl SuffixRanks {
                 rank: Vec::new(),
             };
         }
-        assert!(input.len() <= u32::MAX as usize);
+        let length = u32::try_from(input.len())
+            .unwrap_or_else(|_| panic!("input exceeds the suffix-rank index range"));
 
-        let mut sa = (0..input.len() as u32).collect::<Vec<_>>();
+        let mut sa = (0..length).collect::<Vec<_>>();
         let mut scratch = vec![0u32; input.len()];
         let mut rank = input
             .iter()
@@ -542,25 +562,29 @@ impl SuffixRanks {
             // Prefix-doubling ranks are dense integers after the first round. Sort the pair
             // (rank[pos], rank[pos + span]) with two stable counting passes instead of doing a
             // comparison sort of all suffixes at every doubling step.
-            counting_sort_suffixes_by_second(&sa, &mut scratch, &rank, span, max_rank, &mut counts);
-            counting_sort_suffixes_by_first(&scratch, &mut sa, &rank, max_rank, &mut counts);
+            counting_sort_suffixes(&sa, &mut scratch, max_rank, &mut counts, |position| {
+                suffix_second_rank(&rank, position, span)
+            });
+            counting_sort_suffixes(&scratch, &mut sa, max_rank, &mut counts, |position| {
+                rank[suffix_index(position)]
+            });
 
             let mut class = 1u32;
-            next_rank[sa[0] as usize] = class;
+            next_rank[suffix_index(sa[0])] = class;
             for pair in sa.windows(2) {
                 let left = pair[0];
                 let right = pair[1];
-                if rank[left as usize] != rank[right as usize]
+                if rank[suffix_index(left)] != rank[suffix_index(right)]
                     || suffix_second_rank(&rank, left, span)
                         != suffix_second_rank(&rank, right, span)
                 {
                     class += 1;
                 }
-                next_rank[right as usize] = class;
+                next_rank[suffix_index(right)] = class;
             }
 
             core::mem::swap(&mut rank, &mut next_rank);
-            if class as usize == input.len() {
+            if class == length {
                 break;
             }
             max_rank = class;
@@ -571,51 +595,35 @@ impl SuffixRanks {
 
         // The doubling ranks are 1-based equivalence classes. The parser wants direct indices into
         // `sa`, so materialize the exact inverse suffix-array permutation once.
-        for (suffix_rank, &position) in sa.iter().enumerate() {
-            rank[position as usize] = suffix_rank as u32;
+        for (suffix_rank, &position) in (0..length).zip(&sa) {
+            rank[suffix_index(position)] = suffix_rank;
         }
 
         Self { sa, rank }
     }
 }
 
-fn counting_sort_suffixes_by_second(
+/// Stable counting sort over compact suffix positions using a caller-selected
+/// rank key. Both radix passes must use identical offset/prefix accounting;
+/// the only difference is which half of the suffix-rank pair provides the key.
+fn counting_sort_suffixes(
     source: &[u32],
     target: &mut [u32],
-    rank: &[u32],
-    span: usize,
     max_rank: u32,
     counts: &mut [u32],
+    key_of: impl Fn(u32) -> u32,
 ) {
-    let counts = &mut counts[..=max_rank as usize];
+    debug_assert_eq!(source.len(), target.len());
+    let counts = &mut counts[..=suffix_index(max_rank)];
     counts.fill(0);
     for &position in source {
-        counts[suffix_second_rank(rank, position, span) as usize] += 1;
-    }
-    counts_to_offsets(counts);
-    for &position in source {
-        let key = suffix_second_rank(rank, position, span) as usize;
-        target[counts[key] as usize] = position;
+        let key = suffix_index(key_of(position));
         counts[key] += 1;
     }
-}
-
-fn counting_sort_suffixes_by_first(
-    source: &[u32],
-    target: &mut [u32],
-    rank: &[u32],
-    max_rank: u32,
-    counts: &mut [u32],
-) {
-    let counts = &mut counts[..=max_rank as usize];
-    counts.fill(0);
-    for &position in source {
-        counts[rank[position as usize] as usize] += 1;
-    }
     counts_to_offsets(counts);
     for &position in source {
-        let key = rank[position as usize] as usize;
-        target[counts[key] as usize] = position;
+        let key = suffix_index(key_of(position));
+        target[suffix_index(counts[key])] = position;
         counts[key] += 1;
     }
 }
@@ -631,7 +639,7 @@ fn counts_to_offsets(counts: &mut [u32]) {
 
 #[inline]
 fn suffix_second_rank(rank: &[u32], position: u32, span: usize) -> u32 {
-    let position = position as usize;
+    let position = suffix_index(position);
     if position < rank.len().saturating_sub(span) {
         rank[position + span]
     } else {
@@ -1126,11 +1134,65 @@ mod tests {
         }
 
         let suffixes = SuffixRanks::new(&input);
-        for (rank, &position) in suffixes.sa.iter().enumerate() {
-            assert_eq!(suffixes.rank[position as usize], rank as u32);
+        for rank in 0..input.len() {
+            let position = suffixes.position_at(rank);
+            assert_eq!(suffixes.rank_of(position), rank);
         }
         for pair in suffixes.sa.windows(2) {
-            assert!(input[pair[0] as usize..] < input[pair[1] as usize..]);
+            assert!(input[suffix_index(pair[0])..] < input[suffix_index(pair[1])..]);
+        }
+    }
+
+    #[test]
+    fn suffix_counting_sort_preserves_order_with_equal_keys() {
+        let source = [5u32, 2, 4, 1, 3, 0];
+        let keys = [1u32, 2, 0, 2, 1, 0];
+        let mut target = [0u32; 6];
+        let mut counts = [0u32; 3];
+        counting_sort_suffixes(&source, &mut target, 2, &mut counts, |position| {
+            keys[suffix_index(position)]
+        });
+        // The suffix index is the payload. Equal-key order must be stable for
+        // the two-pass LSD radix sort to preserve the lexicographic tie break.
+        assert_eq!(target, [5, 2, 4, 0, 1, 3]);
+        assert_eq!(counts, [2, 4, 6]);
+    }
+
+    #[test]
+    fn suffix_ranks_invert_repetitive_and_boundary_length_inputs() {
+        for length in [
+            0usize, 1, 2, 3, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1_023, 1_024, 1_025, 4_095,
+            4_096, 4_097,
+        ] {
+            for pattern in 0..3 {
+                let input: Vec<u8> = (0..length)
+                    .map(|position| match pattern {
+                        0 => b'a',
+                        1 => b'a' + u8::try_from(position % 3).unwrap_or_default(),
+                        _ => u8::try_from((position * 73 + position / 7) % 251).unwrap_or_default(),
+                    })
+                    .collect();
+
+                let suffixes = SuffixRanks::new(&input);
+                assert_eq!(suffixes.sa.len(), length);
+                assert_eq!(suffixes.rank.len(), length);
+                for rank in 0..length {
+                    let position = suffixes.position_at(rank);
+                    assert!(position < length);
+                    assert_eq!(
+                        suffixes.rank_of(position),
+                        rank,
+                        "length={length} pattern={pattern} rank={rank}"
+                    );
+                }
+                for rank in 1..length {
+                    assert!(
+                        input[suffixes.position_at(rank - 1)..]
+                            < input[suffixes.position_at(rank)..],
+                        "suffix order: length={length} pattern={pattern} rank={rank}"
+                    );
+                }
+            }
         }
     }
 
