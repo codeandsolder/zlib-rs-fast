@@ -2168,7 +2168,7 @@ pub const MAX_STORED: usize = 65535; // so u16::max
 /// stored-block emission. Validate the complete field before either caller
 /// modifies its output: a stored block can hold at most 65,535 bytes.
 #[inline]
-pub(crate) fn stored_block_length_fields(length: usize) -> [u8; 4] {
+fn stored_block_length_fields(length: usize) -> [u8; 4] {
     assert!(
         length <= MAX_STORED,
         "DEFLATE stored block payload must fit in 16 bits"
@@ -2211,6 +2211,21 @@ pub enum BlockType {
     DynamicTrees = 2,
 }
 
+/// Emit the header for a stored block whose payload will be written separately.
+///
+/// Validates the 16-bit LEN/NLEN field before altering the pending bits.
+/// Both the direct-output and pending-output implementations use this same path.
+#[inline]
+fn emit_stored_block_header(state: &mut State, stored_len: usize, is_last: bool) {
+    let length_fields = stored_block_length_fields(stored_len);
+    state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
+    state.bit_writer.emit_align();
+    state.bit_writer.cmpr_bits_align();
+    state.bit_writer.pending.extend(&length_fields);
+    state.bit_writer.cmpr_bits_add(32);
+    state.bit_writer.sent_bits_add(32);
+}
+
 /// Emit a single DEFLATE stored block using initialized bytes from the window.
 ///
 /// # Panics
@@ -2222,24 +2237,14 @@ pub fn zng_tr_stored_block(
     window_range: core::ops::Range<usize>,
     is_last: bool,
 ) {
-    let input_block: &[u8] = &state.window.filled()[window_range];
-    let stored_len = input_block.len();
-    let length_fields = stored_block_length_fields(stored_len);
-
-    // send block type
-    state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
-
-    // align on byte boundary
-    state.bit_writer.emit_align();
-
-    state.bit_writer.cmpr_bits_align();
-
-    state.bit_writer.pending.extend(&length_fields);
-
-    state.bit_writer.cmpr_bits_add(32);
-    state.bit_writer.sent_bits_add(32);
+    // Validate both the window range and format width before emitting the header.
+    let stored_len = state.window.filled()[window_range.clone()].len();
+    emit_stored_block_header(state, stored_len, is_last);
     if stored_len > 0 {
-        state.bit_writer.pending.extend(input_block);
+        state
+            .bit_writer
+            .pending
+            .extend(&state.window.filled()[window_range]);
         let payload_bits = stored_len << 3;
         state.bit_writer.cmpr_bits_add(payload_bits);
         state.bit_writer.sent_bits_add(payload_bits);
@@ -4341,6 +4346,23 @@ mod test {
         // Existing zlib-sized requests keep exactly their historical bound.
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn stored_header_emits_real_length_without_payload_or_rewrite() {
+        for len in [0usize, 1, 255, 256, 32_768, MAX_STORED] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(0));
+            emit_stored_block_header(&mut stream.state, len, true);
+            let fields = stored_block_length_fields(len);
+            let pending = stream.state.bit_writer.pending.pending();
+            assert_eq!(pending, &[&[1u8][..], &fields[..]].concat());
+            #[cfg(feature = "ZLIB_DEBUG")]
+            {
+                assert_eq!(stream.state.bit_writer.compressed_len, 32);
+                assert_eq!(stream.state.bit_writer.bits_sent, 40);
+            }
+            assert!(end(&mut stream).is_ok());
         }
     }
 

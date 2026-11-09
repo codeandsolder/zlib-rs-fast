@@ -2,7 +2,7 @@
 
 use crate::{
     deflate::{
-        drain_pending_output, stored_block_length_fields, zng_tr_stored_block, BlockState,
+        drain_pending_output, emit_stored_block_header, zng_tr_stored_block, BlockState,
         Compressor, MAX_STORED,
     },
     DeflateFlush,
@@ -71,15 +71,10 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
             break;
         }
 
-        // Make a dummy stored block in pending to get the header bytes,
-        // including any pending bits. This also updates the debugging counts.
+        // Emit the actual stored header directly, preserving pending bits
+        // and debug accounting without constructing and rewriting a dummy block.
         last = flush == DeflateFlush::Finish && len == available;
-        let length_fields = stored_block_length_fields(len);
-        zng_tr_stored_block(stream.state, 0..0, last);
-
-        /* Replace the lengths in the dummy stored block with len. */
-        stream.state.bit_writer.pending.truncate_tail(4);
-        stream.state.bit_writer.pending.extend(&length_fields);
+        emit_stored_block_header(stream.state, len, last);
 
         // Write the stored block header bytes.
         let _ = drain_pending_output(stream.state, &mut stream.output);
