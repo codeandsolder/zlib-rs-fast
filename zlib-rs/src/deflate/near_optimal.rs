@@ -1168,6 +1168,34 @@ mod tests {
     }
 
     #[test]
+    fn iteration_history_checks_full_tokens_across_best_and_worse_paths() {
+        let best = vec![ParseToken::Literal(b'a'), ParseToken::Literal(b'b')];
+        let worse = vec![ParseToken::Literal(b'a'), ParseToken::Literal(b'c')];
+        let improvement = vec![ParseToken::Literal(b'z')];
+
+        let mut history = PreviousParse::None;
+        assert!(!history.converged(Some(&best), &best));
+
+        history = PreviousParse::Best;
+        assert!(history.converged(Some(&best), &best));
+        assert!(!history.converged(Some(&best), &worse));
+
+        history = PreviousParse::Other(worse);
+        assert!(history.converged(
+            Some(&best),
+            &[ParseToken::Literal(b'a'), ParseToken::Literal(b'c')]
+        ));
+        assert!(!history.converged(Some(&best), &best));
+        assert!(!history.converged(Some(&best), &improvement));
+
+        // A later better path becomes the previous path by reference to the
+        // selected result, without maintaining a separate copy of its tokens.
+        history = PreviousParse::Best;
+        assert!(history.converged(Some(&improvement), &improvement));
+        assert!(!history.converged(Some(&best), &improvement));
+    }
+
+    #[test]
     fn suffix_ranks_preserve_lexicographic_order() {
         let mut state = 0x243f_6a88_85a3_08d3u64;
         let mut input = vec![0u8; 32 * 1024];
@@ -1842,6 +1870,28 @@ pub struct PlannedBlockSource {
     candidates: MatchCandidates,
 }
 
+/// The last optimization iteration is either the selected best path or an
+/// independently owned worse path. Refer to the best path when the two coincide
+/// instead of duplicating its potentially large token vector just to detect
+/// convergence on the next pass.
+#[derive(Default)]
+enum PreviousParse {
+    #[default]
+    None,
+    Best,
+    Other(Vec<ParseToken>),
+}
+
+impl PreviousParse {
+    fn converged(&self, best: Option<&[ParseToken]>, next: &[ParseToken]) -> bool {
+        match self {
+            Self::None => false,
+            Self::Best => best.is_some_and(|best| best == next),
+            Self::Other(previous) => previous == next,
+        }
+    }
+}
+
 impl PlannedBlockSource {
     pub(crate) fn into_parts(self) -> (PlannedBlock, ParseModel) {
         (self.block, self.model)
@@ -1879,23 +1929,26 @@ impl PlannedBlockSource {
         let mut costs = previous_model
             .map(|previous| blend_previous_model(&default_costs, observations, previous))
             .unwrap_or(default_costs);
-        let mut current_tokens = None;
-        let mut best_tokens = None;
+        let mut previous = PreviousParse::None;
+        let mut best_tokens: Option<Vec<ParseToken>> = None;
 
         for _ in 0..optimization_passes {
             let reparsed = parse_range(context, &self.candidates, local_range.clone(), &costs);
             if reparsed.tokens.len() > MAX_BLOCK_TOKENS {
                 break;
             }
+            let converged = previous.converged(best_tokens.as_deref(), &reparsed.tokens);
             let (next_costs, reparsed_score) = costs_and_block_score(state, &reparsed.tokens);
             if reparsed_score.bits < best_score.bits {
                 best_score = reparsed_score;
-                best_tokens = Some(reparsed.tokens.clone());
+                best_tokens = Some(reparsed.tokens);
+                previous = PreviousParse::Best;
+            } else {
+                previous = PreviousParse::Other(reparsed.tokens);
             }
-            if current_tokens.as_ref() == Some(&reparsed.tokens) {
+            if converged {
                 break;
             }
-            current_tokens = Some(reparsed.tokens);
             costs = next_costs;
         }
 
@@ -2128,27 +2181,27 @@ pub fn optimized_parse_range(
     let mut costs = previous_model
         .map(|previous| blend_previous_model(&default_costs, initial_observations, previous))
         .unwrap_or(default_costs);
-    let mut previous_parse: Option<ParseResult> = None;
-    let mut best = None;
+    let mut previous = PreviousParse::None;
+    let mut best: Option<ParseResult> = None;
     let mut best_costs = None;
     let mut best_score = usize::MAX;
 
     for _ in 0..optimization_passes {
         let next = parse_range(input, candidates, block.clone(), &costs);
+        let converged =
+            previous.converged(best.as_ref().map(|p| p.tokens.as_slice()), &next.tokens);
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
         if next_score.bits < best_score {
             best_score = next_score.bits;
             best_costs = Some(next_costs.clone());
-            best = Some(next.clone());
+            best = Some(next);
+            previous = PreviousParse::Best;
+        } else {
+            previous = PreviousParse::Other(next.tokens);
         }
-        if previous_parse
-            .as_ref()
-            .is_some_and(|previous| previous.tokens == next.tokens)
-        {
+        if converged {
             break;
         }
-        // Retain the previous parse rather than cloning its token Vec every pass.
-        previous_parse = Some(next);
         costs = next_costs;
     }
 
@@ -2796,15 +2849,19 @@ mod encoded_tests {
         let input = super::tests::two_distribution_input()[..8_000].to_vec();
         assert_eq!(choose_block_ranges(&input, 32_506), [0..input.len()]);
 
-        let mut one_buffer = vec![0u8; compress_bound(input.len())];
-        let (one, one_code) = super::super::compress_slice_near_optimal(&mut one_buffer, &input, 1);
-        assert_eq!(one_code, ReturnCode::Ok);
-        let one_len = one.len();
-
-        let mut two_buffer = vec![0u8; compress_bound(input.len())];
-        let (two, two_code) = super::super::compress_slice_near_optimal(&mut two_buffer, &input, 2);
-        assert_eq!(two_code, ReturnCode::Ok);
-        assert!(two.len() <= one_len, "{} > {one_len}", two.len());
+        let mut previous_len = usize::MAX;
+        for passes in 1..=4 {
+            let mut buffer = vec![0u8; compress_bound(input.len())];
+            let (encoded, code) =
+                super::super::compress_slice_near_optimal(&mut buffer, &input, passes);
+            assert_eq!(code, ReturnCode::Ok);
+            assert!(
+                encoded.len() <= previous_len,
+                "pass count {passes}: {} > {previous_len}",
+                encoded.len(),
+            );
+            previous_len = encoded.len();
+        }
     }
 
     #[test]
@@ -2831,6 +2888,7 @@ mod encoded_tests {
         );
 
         assert_round_trip(&input, 1);
+        assert_round_trip(&input, 3);
     }
 
     #[test]
