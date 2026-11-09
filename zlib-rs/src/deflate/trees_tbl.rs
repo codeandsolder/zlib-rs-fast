@@ -77,13 +77,11 @@ pub const STATIC_LTREE_ENCODINGS: [Value; 256] = {
 
     let mut lc = 0;
     while lc < table.len() {
-        let (code, len) = super::encode_len(&STATIC_LTREE, lc as u8);
+        let bits = super::encode_len(&STATIC_LTREE, lc as u8);
 
-        // assert that there is no precision loss
-        assert!(code as u16 as u64 == code);
-        assert!(len as u16 as usize == len);
-
-        table[lc] = Value::new(code as u16, len as u16);
+        // These precomputed static length encodings fit the compact Value table.
+        assert!(bits.value <= u16::MAX as u64);
+        table[lc] = Value::new(bits.value as u16, bits.len as u16);
 
         lc += 1;
     }

@@ -1296,48 +1296,82 @@ struct BitWriter<'a> {
     bits_sent: usize,
 }
 
+/// A bounded, least-significant-bit-first DEFLATE code or combined match.
+///
+/// The representation maintains the width beside the bits it describes,
+/// instead of narrowing unbounded bit counts at the eventual writer call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedBits {
+    value: u64,
+    len: u8,
+}
+
+impl PackedBits {
+    const fn new(value: u64, len: u8) -> Self {
+        // Only internal Huffman tables and checked extra-bit widths construct
+        // these sequences. Validate their contract in debug builds without
+        // adding per-match branches to release compression.
+        debug_assert!(len <= 64, "packed DEFLATE sequence exceeds reservoir width");
+        debug_assert!(
+            len == 64 || value >> len == 0,
+            "packed DEFLATE sequence contains bits beyond its width"
+        );
+        Self { value, len }
+    }
+
+    const fn code(symbol: Value) -> Self {
+        // A Huffman code is at most 15 bits. The representation's
+        // broader byte width is only an internal bitstream count.
+        debug_assert!(symbol.len() <= 15);
+        Self::new(symbol.code() as u64, symbol.len() as u8)
+    }
+
+    const fn append(&mut self, suffix: Self) {
+        debug_assert!(
+            suffix.len <= 64 && self.len <= 64 - suffix.len,
+            "packed DEFLATE sequence exceeds reservoir width"
+        );
+        // Wrapping shift makes appending a zero-width suffix to a full-width
+        // value an ordinary no-op, with no branch in the match hot path.
+        self.value |= suffix.value.wrapping_shl(self.len as u32);
+        self.len += suffix.len;
+    }
+}
+
 #[inline]
-const fn encode_len(ltree: &[Value], lc: u8) -> (u64, usize) {
+const fn encode_len(ltree: &[Value], lc: u8) -> PackedBits {
     let mut lc = lc as usize;
 
     /* Send the length code, len is the match length - STD_MIN_MATCH */
     let code = self::trees_tbl::LENGTH_CODE[lc] as usize;
     let c = code + LITERALS + 1;
     assert!(c < L_CODES, "bad l_code");
-    // send_code_trace(s, c);
 
-    let lnode = ltree[c];
-    let mut match_bits: u64 = lnode.code() as u64;
-    let mut match_bits_len = lnode.len() as usize;
-    let extra = StaticTreeDesc::EXTRA_LBITS[code] as usize;
+    let mut encoded = PackedBits::code(ltree[c]);
+    let extra = StaticTreeDesc::EXTRA_LBITS[code];
     if extra != 0 {
         lc -= self::trees_tbl::BASE_LENGTH[code] as usize;
-        match_bits |= (lc as u64) << match_bits_len;
-        match_bits_len += extra;
+        encoded.append(PackedBits::new(lc as u64, extra));
     }
 
-    (match_bits, match_bits_len)
+    encoded
 }
 
 #[inline]
-const fn encode_dist(dtree: &[Value], mut dist: u16) -> (u64, usize) {
-    dist -= 1; /* dist is now the match distance - 1 */
+const fn encode_dist(dtree: &[Value], dist: u16) -> PackedBits {
+    assert!(dist != 0, "DEFLATE match distance must be nonzero");
+    let mut dist = dist - 1;
     let code = State::d_code(dist as usize) as usize;
     assert!(code < D_CODES, "bad d_code");
-    // send_code_trace(s, code);
 
-    /* Send the distance code */
-    let dnode = dtree[code];
-    let mut match_bits = dnode.code() as u64;
-    let mut match_bits_len = dnode.len() as usize;
-    let extra = StaticTreeDesc::EXTRA_DBITS[code] as usize;
+    let mut encoded = PackedBits::code(dtree[code]);
+    let extra = StaticTreeDesc::EXTRA_DBITS[code];
     if extra != 0 {
         dist -= self::trees_tbl::BASE_DIST[code];
-        match_bits |= (dist as u64) << match_bits_len;
-        match_bits_len += extra;
+        encoded.append(PackedBits::new(dist as u64, extra));
     }
 
-    (match_bits, match_bits_len)
+    encoded
 }
 
 impl<'a> BitWriter<'a> {
@@ -1396,50 +1430,46 @@ impl<'a> BitWriter<'a> {
         self.bit_buffer = 0;
         self.bits_valid = 0;
 
+        #[cfg(feature = "ZLIB_DEBUG")]
         self.sent_bits_align();
     }
 
-    fn send_bits_trace(&self, _value: u64, _len: u8) {
-        trace!(" l {:>2} v {:>4x} ", _len, _value);
+    // These counters do not exist in release builds. Keep their updates
+    // feature-gated rather than exposing release-build no-op methods.
+    #[cfg(feature = "ZLIB_DEBUG")]
+    fn cmpr_bits_add(&mut self, len: usize) {
+        self.compressed_len += len;
     }
 
-    fn cmpr_bits_add(&mut self, _len: usize) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.compressed_len += _len;
-        }
-    }
-
+    #[cfg(feature = "ZLIB_DEBUG")]
     fn cmpr_bits_align(&mut self) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.compressed_len = self.compressed_len.next_multiple_of(8);
-        }
+        self.compressed_len = self.compressed_len.next_multiple_of(8);
     }
 
-    fn sent_bits_add(&mut self, _len: usize) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.bits_sent += _len;
-        }
+    #[cfg(feature = "ZLIB_DEBUG")]
+    fn sent_bits_add(&mut self, len: usize) {
+        self.bits_sent += len;
     }
 
+    #[cfg(feature = "ZLIB_DEBUG")]
     fn sent_bits_align(&mut self) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.bits_sent = self.bits_sent.next_multiple_of(8);
-        }
+        self.bits_sent = self.bits_sent.next_multiple_of(8);
     }
 
-    #[inline(always)]
+    #[inline]
     fn send_bits(&mut self, val: u64, len: u8) {
         debug_assert!(len <= 64);
         debug_assert!(self.bits_valid <= 64);
+        debug_assert!(
+            len == 64 || val >> len == 0,
+            "bit values must fit their width"
+        );
 
         let total_bits = len + self.bits_valid;
 
-        self.send_bits_trace(val, len);
-        self.sent_bits_add(len as usize);
+        trace!(" l {:>2} v {:>4x} ", len, val);
+        #[cfg(feature = "ZLIB_DEBUG")]
+        self.sent_bits_add(usize::from(len));
 
         if total_bits < Self::BIT_BUF_SIZE {
             self.bit_buffer |= val << self.bits_valid;
@@ -1453,18 +1483,17 @@ impl<'a> BitWriter<'a> {
         if self.bits_valid == Self::BIT_BUF_SIZE {
             self.pending.extend(&self.bit_buffer.to_le_bytes());
             self.bit_buffer = val;
-            self.bits_valid = total_bits - Self::BIT_BUF_SIZE;
         } else {
             self.bit_buffer |= val << self.bits_valid;
             self.pending.extend(&self.bit_buffer.to_le_bytes());
             self.bit_buffer = val >> (Self::BIT_BUF_SIZE - self.bits_valid);
-            self.bits_valid = total_bits - Self::BIT_BUF_SIZE;
         }
+        self.bits_valid = total_bits - Self::BIT_BUF_SIZE;
     }
 
     fn send_code(&mut self, code: usize, tree: &[Value]) {
-        let node = tree[code];
-        self.send_bits(node.code() as u64, node.len() as u8)
+        let bits = PackedBits::code(tree[code]);
+        self.send_bits(bits.value, bits.len);
     }
 
     /// Send one empty static block to give enough lookahead for inflate.
@@ -1521,32 +1550,17 @@ impl<'a> BitWriter<'a> {
         lc: u8,
         dist: u16,
     ) -> usize {
-        let (mut match_bits, mut match_bits_len) = encode_len(ltree, lc);
-
-        let (dist_match_bits, dist_match_bits_len) = encode_dist(dtree, dist);
-
-        match_bits |= dist_match_bits << match_bits_len;
-        match_bits_len += dist_match_bits_len;
-
-        self.send_bits(match_bits, match_bits_len as u8);
-
-        match_bits_len
+        let mut bits = encode_len(ltree, lc);
+        bits.append(encode_dist(dtree, dist));
+        self.send_bits(bits.value, bits.len);
+        usize::from(bits.len)
     }
 
     pub(crate) fn emit_dist_static(&mut self, lc: u8, dist: u16) -> usize {
-        let precomputed_len = trees_tbl::STATIC_LTREE_ENCODINGS[lc as usize];
-        let mut match_bits = precomputed_len.code() as u64;
-        let mut match_bits_len = precomputed_len.len() as usize;
-
-        let dtree = self::trees_tbl::STATIC_DTREE.as_slice();
-        let (dist_match_bits, dist_match_bits_len) = encode_dist(dtree, dist);
-
-        match_bits |= dist_match_bits << match_bits_len;
-        match_bits_len += dist_match_bits_len;
-
-        self.send_bits(match_bits, match_bits_len as u8);
-
-        match_bits_len
+        let mut bits = PackedBits::code(trees_tbl::STATIC_LTREE_ENCODINGS[usize::from(lc)]);
+        bits.append(encode_dist(&trees_tbl::STATIC_DTREE, dist));
+        self.send_bits(bits.value, bits.len);
+        usize::from(bits.len)
     }
 
     fn compress_block_help(&mut self, sym_buf: &SymBuf, ltree: &[Value], dtree: &[Value]) {
@@ -2211,9 +2225,12 @@ fn emit_stored_block_header(state: &mut State, stored_len: usize, is_last: bool)
     let length_fields = stored_block_length_fields(stored_len);
     state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
     state.bit_writer.emit_align();
+    #[cfg(feature = "ZLIB_DEBUG")]
     state.bit_writer.cmpr_bits_align();
     state.bit_writer.pending.extend(&length_fields);
+    #[cfg(feature = "ZLIB_DEBUG")]
     state.bit_writer.cmpr_bits_add(32);
+    #[cfg(feature = "ZLIB_DEBUG")]
     state.bit_writer.sent_bits_add(32);
 }
 
@@ -2236,9 +2253,12 @@ pub fn zng_tr_stored_block(
             .bit_writer
             .pending
             .extend(&state.window.filled()[window_range]);
-        let payload_bits = stored_len << 3;
-        state.bit_writer.cmpr_bits_add(payload_bits);
-        state.bit_writer.sent_bits_add(payload_bits);
+        #[cfg(feature = "ZLIB_DEBUG")]
+        {
+            let payload_bits = stored_len << 3;
+            state.bit_writer.cmpr_bits_add(payload_bits);
+            state.bit_writer.sent_bits_add(payload_bits);
+        }
     }
 }
 
@@ -4598,6 +4618,78 @@ mod test {
             }
             assert!(end(&mut stream).is_ok());
         }
+    }
+
+    #[test]
+    fn packed_match_bits_preserve_every_static_length_and_distance_boundary() {
+        for length in 0..=u8::MAX {
+            let length_bits = encode_len(&trees_tbl::STATIC_LTREE, length);
+            let precalculated = trees_tbl::STATIC_LTREE_ENCODINGS[usize::from(length)];
+            assert_eq!(u64::from(precalculated.code()), length_bits.value);
+            assert_eq!(
+                u8::try_from(precalculated.len()).ok(),
+                Some(length_bits.len)
+            );
+
+            // Exhaust every valid distance; no width is narrowed after
+            // concatenation. The complete match always fits the 64-bit writer.
+            for distance in 1..=32768u16 {
+                let distance_bits = encode_dist(&trees_tbl::STATIC_DTREE, distance);
+                let mut combined = length_bits;
+                combined.append(distance_bits);
+                assert!(combined.len <= 64);
+                if combined.len != 64 {
+                    assert_eq!(combined.value >> combined.len, 0);
+                }
+                assert_eq!(
+                    combined.value & ((1u64 << length_bits.len) - 1),
+                    length_bits.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bit_writer_matches_independent_lsb_first_stream_across_reservoir_boundaries() {
+        let mut stream = DeflateStream::new(DeflateConfig::new(6));
+        let writer = &mut stream.state.bit_writer;
+        let mut expected_bits = Vec::new();
+        for len in [0u8, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 1, 64, 8, 0, 7, 63] {
+            let value = if len == 0 { 0 } else { u64::MAX >> (64 - len) };
+            let packed = PackedBits::new(value, len);
+            writer.send_bits(packed.value, packed.len);
+            for bit in 0..len {
+                expected_bits.push(((value >> bit) & 1) != 0);
+            }
+        }
+        writer.emit_align();
+        let mut expected = vec![0u8; expected_bits.len().div_ceil(8)];
+        for (index, bit) in expected_bits.iter().copied().enumerate() {
+            if bit {
+                expected[index / 8] |= 1 << (index % 8);
+            }
+        }
+        assert_eq!(writer.pending.pending(), expected);
+        assert_eq!(writer.bits_valid, 0);
+        assert_eq!(writer.bit_buffer, 0);
+        let last_bits = expected_bits.len() % 8;
+        assert_eq!(
+            usize::from(writer.bits_used),
+            if last_bits == 0 { 8 } else { last_bits }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "packed DEFLATE sequence contains bits beyond its width")]
+    fn packed_bits_reject_unaccounted_high_bits() {
+        let _ = PackedBits::new(0b100, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "packed DEFLATE sequence exceeds reservoir width")]
+    fn packed_bits_reject_overwide_concatenation() {
+        let mut bits = PackedBits::new(u64::MAX, 64);
+        bits.append(PackedBits::new(1, 1));
     }
 
     #[test]
