@@ -3548,7 +3548,7 @@ pub fn compress_slice_near_optimal<'a>(
             if !ok {
                 break;
             }
-            let previous_model = current.as_ref().map(|(_, model)| *model);
+            let previous_model = current.as_ref().map(|(_, model)| model);
             let mut next = near_optimal::parse_planned_block_source(
                 state,
                 input,
@@ -3578,7 +3578,7 @@ pub fn compress_slice_near_optimal<'a>(
                         state,
                         input,
                         optimization_passes,
-                        Some(*current_model),
+                        Some(current_model),
                     );
                 }
                 near_optimal::BoundaryOptimization::Unchanged => {}

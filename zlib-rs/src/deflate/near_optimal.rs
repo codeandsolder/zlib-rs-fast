@@ -111,14 +111,14 @@ impl BlockObservations {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenCosts {
     literal: [u16; 256],
     length: [u16; LENGTH_CODES],
     distance: [u16; D_CODES],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseModel {
     costs: TokenCosts,
     observations: BlockObservations,
@@ -150,23 +150,24 @@ impl TokenCosts {
         }
     }
 
-    fn literal_cost(self, byte: u8) -> u64 {
-        u64::from(self.literal[byte as usize])
+    fn literal_cost(&self, byte: u8) -> u32 {
+        u32::from(self.literal[usize::from(byte)])
     }
 
-    fn match_cost(self, length: usize, distance: usize) -> u64 {
+    fn match_cost(&self, length: usize, distance: usize) -> u32 {
         debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length));
         debug_assert!(distance > 0);
 
         let length_code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
         let distance_code = State::d_code(distance - 1) as usize;
-        u64::from(self.length[length_code])
-            + u64::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u64::from(COST_SCALE)
-            + u64::from(self.distance[distance_code])
-            + u64::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u64::from(COST_SCALE)
+        u32::from(self.length[length_code])
+            + u32::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u32::from(COST_SCALE)
+            + u32::from(self.distance[distance_code])
+            + u32::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u32::from(COST_SCALE)
     }
 
-    fn token_cost(self, token: ParseToken) -> u64 {
+    /// One token fits u32; whole-parse dynamic-programming totals use u64.
+    fn token_cost(&self, token: ParseToken) -> u32 {
         match token {
             ParseToken::Literal(byte) => self.literal_cost(byte),
             ParseToken::Match { length, distance } => {
@@ -894,7 +895,7 @@ fn split_hash3(input: &[u8], position: usize) -> usize {
 /// to matches before `block.start`, which is exactly what multi-block DEFLATE needs. The dynamic
 /// program itself is local to the selected block and never crosses its end.
 #[cfg(test)]
-pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: TokenCosts) -> ParseResult {
+pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: &TokenCosts) -> ParseResult {
     parse_range(input, candidates, 0..input.len(), costs)
 }
 
@@ -902,7 +903,7 @@ pub fn parse_range(
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
-    costs: TokenCosts,
+    costs: &TokenCosts,
 ) -> ParseResult {
     assert_eq!(candidates.len_for_parse(), input.len());
     assert!(block.start <= block.end && block.end <= input.len());
@@ -952,7 +953,7 @@ pub fn parse_range(
             &mut best_cost,
             &mut steps,
             local_position + 1,
-            prefix_cost + costs.literal_cost(input[position]),
+            prefix_cost + u64::from(costs.literal_cost(input[position])),
             ParseToken::Literal(input[position]),
         );
 
@@ -1309,13 +1310,13 @@ mod tests {
         output
     }
 
-    fn brute_cost(input: &[u8], costs: TokenCosts, max_distance: usize) -> u64 {
+    fn brute_cost(input: &[u8], costs: &TokenCosts, max_distance: usize) -> u64 {
         const INF: u64 = u64::MAX / 4;
         let mut best = vec![INF; input.len() + 1];
         best[0] = 0;
         for position in 0..input.len() {
-            best[position + 1] =
-                best[position + 1].min(best[position] + costs.literal_cost(input[position]));
+            best[position + 1] = best[position + 1]
+                .min(best[position] + u64::from(costs.literal_cost(input[position])));
             let max_len = STD_MAX_MATCH.min(input.len() - position);
             for candidate in position.saturating_sub(max_distance)..position {
                 let matched = common_prefix(
@@ -1325,7 +1326,7 @@ mod tests {
                 for length in STD_MIN_MATCH..=matched {
                     let distance = position - candidate;
                     best[position + length] = best[position + length]
-                        .min(best[position] + costs.match_cost(length, distance));
+                        .min(best[position] + u64::from(costs.match_cost(length, distance)));
                 }
             }
         }
@@ -1466,7 +1467,7 @@ mod tests {
         let mut input = history.clone();
         input.extend_from_slice(&history);
         let table = build_match_candidates(&input, 32_506);
-        let parsed = parse_range(&input, &table, 6_000..12_000, TokenCosts::fixed());
+        let parsed = parse_range(&input, &table, 6_000..12_000, &TokenCosts::fixed());
         assert!(matches!(
             parsed.tokens.first(),
             Some(ParseToken::Match { length, distance })
@@ -1490,8 +1491,8 @@ mod tests {
         let input = b"abcabcabcxabcaabcabcabc---abcabc";
         let table = build_match_candidates(input, 32);
         let fixed = TokenCosts::fixed();
-        let parsed = parse_block(input, &table, fixed);
-        assert_eq!(parsed.cost_x16, brute_cost(input, fixed, 32));
+        let parsed = parse_block(input, &table, &fixed);
+        assert_eq!(parsed.cost_x16, brute_cost(input, &fixed, 32));
         assert_eq!(expand(&parsed.tokens), input);
     }
 
@@ -1509,8 +1510,8 @@ mod tests {
             *cost = (3 + (byte % 11) as u16) * COST_SCALE;
         }
 
-        let parsed = parse_block(input, &table, costs);
-        assert_eq!(parsed.cost_x16, brute_cost(input, costs, 32));
+        let parsed = parse_block(input, &table, &costs);
+        assert_eq!(parsed.cost_x16, brute_cost(input, &costs, 32));
         assert_eq!(expand(&parsed.tokens), input);
     }
 }
@@ -1668,7 +1669,7 @@ impl PlannedBlockSource {
         state: &mut super::State<'_>,
         input: &[u8],
         optimization_passes: usize,
-        previous_model: Option<ParseModel>,
+        previous_model: Option<&ParseModel>,
     ) -> bool {
         if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
             self.refresh_model(state);
@@ -1686,13 +1687,13 @@ impl PlannedBlockSource {
         let (default_costs, observations) =
             initial_statistical_costs(context, &self.candidates, local_range.clone());
         let mut costs = previous_model
-            .map(|previous| blend_previous_model(default_costs, observations, previous))
+            .map(|previous| blend_previous_model(&default_costs, observations, previous))
             .unwrap_or(default_costs);
         let mut current_tokens = None;
         let mut best_tokens = None;
 
         for _ in 0..optimization_passes {
-            let reparsed = parse_range(context, &self.candidates, local_range.clone(), costs);
+            let reparsed = parse_range(context, &self.candidates, local_range.clone(), &costs);
             if reparsed.tokens.len() > MAX_BLOCK_TOKENS {
                 break;
             }
@@ -1850,12 +1851,12 @@ fn blend_cost(previous: u16, default: u16, change_amount: u8) -> u16 {
 }
 
 fn blend_previous_model(
-    default: TokenCosts,
+    default: &TokenCosts,
     current: BlockObservations,
-    previous: ParseModel,
+    previous: &ParseModel,
 ) -> TokenCosts {
     if current.total == 0 || previous.observations.total == 0 {
-        return default;
+        return default.clone();
     }
 
     let mut total_delta = 0u64;
@@ -1868,7 +1869,7 @@ fn blend_previous_model(
     }
     let cutoff = u64::from(previous.observations.total) * u64::from(current.total) * 200 / 512;
     if total_delta > 3 * cutoff {
-        return default;
+        return default.clone();
     }
     let change_amount = if 4 * total_delta > 9 * cutoff {
         3
@@ -1880,7 +1881,7 @@ fn blend_previous_model(
         0
     };
 
-    let mut blended = default;
+    let mut blended = default.clone();
     for index in 0..blended.literal.len() {
         blended.literal[index] = blend_cost(
             previous.costs.literal[index],
@@ -1920,10 +1921,10 @@ pub fn optimized_parse_range(
     candidates: &MatchCandidates,
     block: Range<usize>,
     optimization_passes: usize,
-    previous_model: Option<ParseModel>,
+    previous_model: Option<&ParseModel>,
 ) -> (ParseResult, ParseModel) {
     if optimization_passes == 0 {
-        let parsed = parse_range(input, candidates, block, TokenCosts::fixed());
+        let parsed = parse_range(input, candidates, block, &TokenCosts::fixed());
         let (costs, _) = costs_and_block_score(state, &parsed.tokens);
         let model = ParseModel {
             costs,
@@ -1935,25 +1936,29 @@ pub fn optimized_parse_range(
     let (default_costs, initial_observations) =
         initial_statistical_costs(input, candidates, block.clone());
     let mut costs = previous_model
-        .map(|previous| blend_previous_model(default_costs, initial_observations, previous))
+        .map(|previous| blend_previous_model(&default_costs, initial_observations, previous))
         .unwrap_or(default_costs);
-    let mut previous_tokens = None;
+    let mut previous_parse: Option<ParseResult> = None;
     let mut best = None;
     let mut best_costs = None;
     let mut best_score = usize::MAX;
 
     for _ in 0..optimization_passes {
-        let next = parse_range(input, candidates, block.clone(), costs);
+        let next = parse_range(input, candidates, block.clone(), &costs);
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
         if next_score.bits < best_score {
             best_score = next_score.bits;
-            best_costs = Some(next_costs);
+            best_costs = Some(next_costs.clone());
             best = Some(next.clone());
         }
-        if previous_tokens.as_ref() == Some(&next.tokens) {
+        if previous_parse
+            .as_ref()
+            .is_some_and(|previous| previous.tokens == next.tokens)
+        {
             break;
         }
-        previous_tokens = Some(next.tokens.clone());
+        // Retain the previous parse rather than cloning its token Vec every pass.
+        previous_parse = Some(next);
         costs = next_costs;
     }
 
@@ -2128,8 +2133,8 @@ fn consider_shift_candidate(
 fn fixed_cost_shift_candidates(
     left: &PlannedBlock,
     right: &PlannedBlock,
-    left_costs: TokenCosts,
-    right_costs: TokenCosts,
+    left_costs: &TokenCosts,
+    right_costs: &TokenCosts,
     left_histogram: &TokenHistogram,
     right_histogram: &TokenHistogram,
 ) -> Vec<BoundaryCandidate> {
@@ -2150,7 +2155,7 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += left_costs.token_cost(token) as i64 - right_costs.token_cost(token) as i64;
+        delta += i64::from(left_costs.token_cost(token)) - i64::from(right_costs.token_cost(token));
         shifted_left.add_token(token);
         shifted_right.remove_token(token);
         consider_shift_candidate(
@@ -2176,7 +2181,7 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += right_costs.token_cost(token) as i64 - left_costs.token_cost(token) as i64;
+        delta += i64::from(right_costs.token_cost(token)) - i64::from(left_costs.token_cost(token));
         shifted_left.remove_token(token);
         shifted_right.add_token(token);
         consider_shift_candidate(
@@ -2277,8 +2282,8 @@ pub fn optimize_token_partition(
     for candidate in fixed_cost_shift_candidates(
         left,
         right,
-        left_costs,
-        right_costs,
+        &left_costs,
+        &right_costs,
         &left_histogram,
         &right_histogram,
     ) {
@@ -2345,7 +2350,7 @@ pub fn parse_planned_block_source(
     range: Range<usize>,
     max_distance: usize,
     optimization_passes: usize,
-    previous_model: Option<ParseModel>,
+    previous_model: Option<&ParseModel>,
 ) -> PlannedBlockSource {
     let history_start = range.start.saturating_sub(max_distance);
     let context_end = range.end;
@@ -2403,8 +2408,8 @@ mod boundary_tests {
         let shifts = fixed_cost_shift_candidates(
             &left,
             &right,
-            left_costs,
-            right_costs,
+            &left_costs,
+            &right_costs,
             &left_histogram,
             &right_histogram,
         );
