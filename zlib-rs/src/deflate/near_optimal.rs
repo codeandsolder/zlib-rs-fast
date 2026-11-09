@@ -204,6 +204,15 @@ impl TokenCosts {
         }
     }
 
+    /// Finite priors for symbols unseen by a trained Huffman tree.
+    const fn unseen() -> Self {
+        Self {
+            literal: [13 * COST_SCALE; 256],
+            length: [13 * COST_SCALE; LENGTH_CODES],
+            distance: [10 * COST_SCALE; D_CODES],
+        }
+    }
+
     fn literal_cost(&self, byte: u8) -> u32 {
         u32::from(self.literal[usize::from(byte)])
     }
@@ -1814,7 +1823,7 @@ mod tests {
 pub const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
 pub const MAX_BLOCK_TOKENS: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 2;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlockScore {
     bits: usize,
     encoded_bytes: usize,
@@ -1994,7 +2003,8 @@ impl PlannedBlockSource {
 
         let context = &input[self.context_start..self.context_end];
         let local_range = (self.block.range.start - self.context_start)..context.len();
-        let (_, mut best_score) = costs_and_block_score(state, &self.block.tokens);
+        let histogram = TokenHistogram::from_tokens(&self.block.tokens);
+        let mut best_score = score_histogram(state, &histogram, None);
         let (default_costs, observations) =
             initial_statistical_costs(context, &self.candidates, local_range.clone());
         let mut costs = previous_model
@@ -2325,55 +2335,43 @@ fn costs_and_block_score(
     tokens: &[ParseToken],
 ) -> (TokenCosts, BlockScore) {
     let histogram = TokenHistogram::from_tokens(tokens);
-    costs_and_block_score_from_histogram(state, &histogram)
+    let mut costs = TokenCosts::unseen();
+    let score = score_histogram(state, &histogram, Some(&mut costs));
+    (costs, score)
 }
 
-fn costs_and_block_score_from_histogram(
+/// Build the same production Huffman trees for scoring and cost-model learning.
+/// Most boundary alternatives need only the bit count, not all symbol costs.
+fn score_histogram(
     state: &mut super::State<'_>,
     histogram: &TokenHistogram,
-) -> (TokenCosts, BlockScore) {
+    learned_costs: Option<&mut TokenCosts>,
+) -> BlockScore {
     histogram.apply_to_state(state);
-
-    let literal_used =
-        core::array::from_fn::<_, 256, _>(|index| histogram.literal_length[index] != 0);
-    let length_used = core::array::from_fn::<_, LENGTH_CODES, _>(|index| {
-        histogram.literal_length[257 + index] != 0
-    });
-    let distance_used =
-        core::array::from_fn::<_, D_CODES, _>(|index| histogram.distance[index] != 0);
-
-    // Build directly in the state-owned descriptors. Only the bit-cost
-    // counters are shared across trees; no temporary descriptor swap is needed.
     super::build_tree(&mut state.l_desc, &mut state.opt_len, &mut state.static_len);
     super::build_tree(&mut state.d_desc, &mut state.opt_len, &mut state.static_len);
 
-    // Keep unseen symbols available to later passes, but price them high enough that a pass does not
-    // churn the tree merely because fixed-Huffman fallback made an absent symbol look cheap.
-    let mut costs = TokenCosts {
-        literal: [13 * COST_SCALE; 256],
-        length: [13 * COST_SCALE; LENGTH_CODES],
-        distance: [10 * COST_SCALE; D_CODES],
-    };
-    for (index, &used) in literal_used.iter().enumerate() {
-        if used {
-            costs.literal[index] = state.l_desc.dyn_tree[index].len() * COST_SCALE;
+    if let Some(costs) = learned_costs {
+        // The original histogram is required: build_tree replaces frequency
+        // storage with Huffman codes. Unseen symbols retain finite priors.
+        for (index, cost) in costs.literal.iter_mut().enumerate() {
+            if histogram.literal_length[index] != 0 {
+                *cost = state.l_desc.dyn_tree[index].len() * COST_SCALE;
+            }
         }
-    }
-    for (index, &used) in length_used.iter().enumerate() {
-        if used {
-            costs.length[index] = state.l_desc.dyn_tree[257 + index].len() * COST_SCALE;
+        for (index, cost) in costs.length.iter_mut().enumerate() {
+            if histogram.literal_length[257 + index] != 0 {
+                *cost = state.l_desc.dyn_tree[257 + index].len() * COST_SCALE;
+            }
         }
-    }
-    for (index, &used) in distance_used.iter().enumerate() {
-        if used {
-            costs.distance[index] = state.d_desc.dyn_tree[index].len() * COST_SCALE;
+        for (index, cost) in costs.distance.iter_mut().enumerate() {
+            if histogram.distance[index] != 0 {
+                *cost = state.d_desc.dyn_tree[index].len() * COST_SCALE;
+            }
         }
     }
 
-    // Add the exact dynamic-tree representation cost. Mirror the production block chooser: it
-    // rounds static/dynamic candidates to bytes first and prefers static on a rounded tie, then emits
-    // the selected representation without byte-aligning it. Stored-block choice is parse-independent
-    // and therefore cannot make a worse token parse preferable to a better one.
+    // Exact production tree chooser: prefer static on rounded encoded-byte ties.
     let _ = super::build_bl_tree(state);
     let dynamic_bytes = (state.opt_len + 3 + 7) >> 3;
     let static_bytes = (state.static_len + 3 + 7) >> 3;
@@ -2389,20 +2387,21 @@ fn costs_and_block_score_from_histogram(
         }
     };
     state.init_block();
-    (costs, score)
+    score
 }
 
 fn compressed_histogram_score(
     state: &mut super::State<'_>,
     histogram: &TokenHistogram,
     input_len: usize,
-) -> Option<(TokenCosts, BlockScore)> {
-    let (costs, score) = costs_and_block_score_from_histogram(state, histogram);
+    learned_costs: Option<&mut TokenCosts>,
+) -> Option<BlockScore> {
+    let score = score_histogram(state, histogram, learned_costs);
     // Stored blocks byte-align before their payload, so their exact cost depends on the preceding
     // block's residual bit count. Boundary optimization is intentionally limited to pairs for which
     // production would choose a Huffman-coded representation; stored-block regions keep the cheap
     // splitter's boundary unchanged.
-    (input_len > super::MAX_STORED || input_len + 4 > score.encoded_bytes).then_some((costs, score))
+    (input_len > super::MAX_STORED || input_len + 4 > score.encoded_bytes).then_some(score)
 }
 
 const EXACT_BOUNDARY_CANDIDATES: usize = 4;
@@ -2648,14 +2647,22 @@ pub fn optimize_token_partition(
 
     let left_histogram = TokenHistogram::from_tokens(&left.tokens);
     let right_histogram = TokenHistogram::from_tokens(&right.tokens);
-    let Some((left_costs, left_score)) =
-        compressed_histogram_score(state, &left_histogram, left.input_len())
-    else {
+    let mut left_costs = TokenCosts::unseen();
+    let Some(left_score) = compressed_histogram_score(
+        state,
+        &left_histogram,
+        left.input_len(),
+        Some(&mut left_costs),
+    ) else {
         return BoundaryOptimization::Unchanged;
     };
-    let Some((right_costs, right_score)) =
-        compressed_histogram_score(state, &right_histogram, right.input_len())
-    else {
+    let mut right_costs = TokenCosts::unseen();
+    let Some(right_score) = compressed_histogram_score(
+        state,
+        &right_histogram,
+        right.input_len(),
+        Some(&mut right_costs),
+    ) else {
         return BoundaryOptimization::Unchanged;
     };
 
@@ -2666,8 +2673,8 @@ pub fn optimize_token_partition(
     let merged_len = left.input_len() + right.input_len();
     if left.tokens.len() + right.tokens.len() <= MAX_BLOCK_TOKENS {
         let merged_histogram = TokenHistogram::merged(&left_histogram, &right_histogram);
-        if let Some((_, merged_score)) =
-            compressed_histogram_score(state, &merged_histogram, merged_len)
+        if let Some(merged_score) =
+            compressed_histogram_score(state, &merged_histogram, merged_len, None)
         {
             if merged_score.bits < best_total_bits {
                 best_total_bits = merged_score.bits;
@@ -2693,13 +2700,13 @@ pub fn optimize_token_partition(
         let Some(boundary) = candidate.shift.boundary(left.range.end) else {
             continue;
         };
-        let Some((_, new_left_score)) =
-            compressed_histogram_score(state, &shifted_left, new_left_len)
+        let Some(new_left_score) =
+            compressed_histogram_score(state, &shifted_left, new_left_len, None)
         else {
             continue;
         };
-        let Some((_, new_right_score)) =
-            compressed_histogram_score(state, &shifted_right, new_right_len)
+        let Some(new_right_score) =
+            compressed_histogram_score(state, &shifted_right, new_right_len, None)
         else {
             continue;
         };
@@ -2783,6 +2790,56 @@ pub fn parse_planned_block_source(
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn exact_score_with_and_without_learned_costs_agree() {
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9));
+        let state = &mut *stream.state;
+        let samples = [
+            vec![ParseToken::Literal(b'a'); 96],
+            (0u8..=250)
+                .cycle()
+                .take(4_096)
+                .map(ParseToken::Literal)
+                .collect(),
+            vec![
+                ParseToken::Literal(b'a'),
+                ParseToken::Literal(b'b'),
+                ParseToken::Match {
+                    length: 3,
+                    distance: 1,
+                },
+                ParseToken::Match {
+                    length: 258,
+                    distance: 32_768,
+                },
+                ParseToken::Match {
+                    length: 25,
+                    distance: 2_048,
+                },
+            ],
+        ];
+        for tokens in samples {
+            let histogram = TokenHistogram::from_tokens(&tokens);
+            let (expected_costs, expected_score) = costs_and_block_score(state, &tokens);
+            assert_eq!(score_histogram(state, &histogram, None), expected_score);
+
+            let mut costs = TokenCosts::unseen();
+            assert_eq!(
+                score_histogram(state, &histogram, Some(&mut costs)),
+                expected_score
+            );
+            assert_eq!(costs, expected_costs);
+
+            let input_len = tokens.iter().map(|token| token.input_len()).sum();
+            let without_costs = compressed_histogram_score(state, &histogram, input_len, None);
+            let mut filtered_costs = TokenCosts::unseen();
+            let with_costs =
+                compressed_histogram_score(state, &histogram, input_len, Some(&mut filtered_costs));
+            assert_eq!(without_costs, with_costs);
+            assert_eq!(filtered_costs, expected_costs);
+        }
+    }
 
     #[test]
     fn boundary_shift_supports_full_usize_positions_and_checks_lengths() {
