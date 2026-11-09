@@ -2003,8 +2003,10 @@ impl PlannedBlockSource {
 
         let context = &input[self.context_start..self.context_end];
         let local_range = (self.block.range.start - self.context_start)..context.len();
-        let histogram = TokenHistogram::from_tokens(&self.block.tokens);
-        let mut best_score = score_histogram(state, &histogram, None);
+        // The original block is one of the possible winners. Learn its costs
+        // now so the final model can be retained without rebuilding the same
+        // Huffman trees after the optimization loop.
+        let (mut best_costs, mut best_score) = costs_and_block_score(state, &self.block.tokens);
         let (default_costs, observations) =
             initial_statistical_costs(context, &self.candidates, local_range.clone());
         let mut costs = previous_model
@@ -2025,17 +2027,21 @@ impl PlannedBlockSource {
             if reparsed.tokens.len() > MAX_BLOCK_TOKENS {
                 break;
             }
-            let converged = previous.converged(best_tokens.as_deref(), &reparsed.tokens);
+            // A repeated token sequence has the same histogram, exact
+            // Huffman score and learned model as the preceding iteration.
+            // That preceding result was already evaluated, even if worse
+            // than the best parse, so there is no reason to build its trees.
+            if previous.converged(best_tokens.as_deref(), &reparsed.tokens) {
+                break;
+            }
             let (next_costs, reparsed_score) = costs_and_block_score(state, &reparsed.tokens);
             if reparsed_score.bits < best_score.bits {
                 best_score = reparsed_score;
+                best_costs = next_costs.clone();
                 best_tokens = Some(reparsed.tokens);
                 previous = PreviousParse::Best;
             } else {
                 previous = PreviousParse::Other(reparsed.tokens);
-            }
-            if converged {
-                break;
             }
             costs = next_costs;
         }
@@ -2046,7 +2052,12 @@ impl PlannedBlockSource {
         } else {
             false
         };
-        self.refresh_model(state);
+        // The exact-score winner's cost model was captured with its tree;
+        // only its observations depend on which token vector was selected.
+        self.model = ParseModel {
+            costs: best_costs,
+            observations: BlockObservations::from_tokens(&self.block.tokens),
+        };
         debug_assert_eq!(self.block.token_input_len(), self.block.range.len());
         changed
     }
@@ -2277,8 +2288,11 @@ pub fn optimized_parse_range(
 
     for _ in 0..optimization_passes {
         let next = parse_range_with_scratch(input, candidates, block.clone(), &costs, &mut scratch);
-        let converged =
-            previous.converged(best.as_ref().map(|p| p.tokens.as_slice()), &next.tokens);
+        // Identical paths have identical learned trees and exact scores.
+        // Their prior evaluation has already recorded a possible winner.
+        if previous.converged(best.as_ref().map(|p| p.tokens.as_slice()), &next.tokens) {
+            break;
+        }
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
         if next_score.bits < best_score {
             best_score = next_score.bits;
@@ -2287,9 +2301,6 @@ pub fn optimized_parse_range(
             previous = PreviousParse::Best;
         } else {
             previous = PreviousParse::Other(next.tokens);
-        }
-        if converged {
-            break;
         }
         costs = next_costs;
     }
@@ -2790,6 +2801,41 @@ pub fn parse_planned_block_source(
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn boundary_reparse_keeps_exact_model_of_selected_tokens() {
+        // Test both a warm previous model and no previous model. A reparse
+        // may retain the original path, select an improved path, or converge
+        // after a worse intermediate iteration; in all cases the retained
+        // model must describe the exact final token histogram.
+        let input = (0..15_000)
+            .map(|index| {
+                if index % 257 < 220 {
+                    b"abcde"[index % 5]
+                } else {
+                    b"0123456789"[index % 10]
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9));
+        let state = &mut *stream.state;
+        for passes in [1, 2, 4] {
+            let mut block =
+                parse_planned_block_source(state, &input, 4_000..13_000, 32_768, passes, None);
+            let previous = model_from_tokens(state, &block.block.tokens);
+            for prior in [None, Some(&previous)] {
+                let _changed = block.reparse_with_existing_candidates(state, &input, passes, prior);
+                let independently_scored = model_from_tokens(state, &block.block.tokens);
+                assert_eq!(
+                    block.model,
+                    independently_scored,
+                    "passes={passes}, previous_model={}",
+                    prior.is_some()
+                );
+                assert_eq!(block.block.token_input_len(), block.block.range.len());
+            }
+        }
+    }
 
     #[test]
     fn exact_score_with_and_without_learned_costs_agree() {
