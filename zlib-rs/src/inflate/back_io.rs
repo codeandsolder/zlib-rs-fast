@@ -133,7 +133,7 @@ impl BackInput {
         let mut next = core::ptr::null();
         // SAFETY: the callback contract is established once by `BackInput::new` and retained as a
         // cursor invariant. No shared slice from the previous span can exist through this `&mut`.
-        let available = unsafe { (self.callback)(self.descriptor, &mut next) } as usize;
+        let available = unsafe { (self.callback)(self.descriptor, &raw mut next) } as usize;
         if available == 0 || next.is_null() {
             self.next = core::ptr::null();
             self.remaining = 0;

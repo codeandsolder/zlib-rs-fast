@@ -394,7 +394,7 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     };
 
     let mut stream = z_stream {
-        next_in: input.as_ptr() as *mut u8,
+        next_in: input.as_ptr().cast_mut(),
         avail_in: 0,
 
         zalloc: None,
@@ -412,7 +412,7 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     stream.next_out = dest;
     stream.avail_out = 0;
 
-    let Some(stream) = (unsafe { InflateStream::from_stream_mut(&mut stream) }) else {
+    let Some(stream) = (unsafe { InflateStream::from_stream_mut(&raw mut stream) }) else {
         return (0, 0, ReturnCode::StreamError);
     };
 
@@ -2862,7 +2862,7 @@ fn inflate_bound_io(
 
     stream.avail_in = avail_in as u32;
     if let Some(next_in) = next_in {
-        stream.next_in = next_in as *mut u8;
+        stream.next_in = next_in.cast_mut();
     }
     state.bit_buffer = bit_reader.into_buffer();
 
@@ -2899,7 +2899,7 @@ fn inflate_bound_io(
 
     if let Some(msg) = state.error_message {
         assert!(msg.ends_with('\0'));
-        stream.msg = msg.as_ptr() as *mut u8 as *mut core::ffi::c_char;
+        stream.msg = msg.as_ptr().cast_mut() as *mut core::ffi::c_char;
     }
 
     stream.data_type = state.decoding_state();
@@ -3435,7 +3435,7 @@ mod tests {
     fn end_leaves_null_abi_state_pointer() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         assert!(end(stream).state.is_null());
         assert!(end(stream).state.is_null());
@@ -3445,7 +3445,7 @@ mod tests {
     fn inflate_copy_owns_independent_state_and_window_storage() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let source = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let source = unsafe { InflateStream::from_stream_mut(&raw mut raw) }.unwrap();
         let source_state = source.state.as_ptr();
         let source_window = source.state.window.as_ptr();
 
@@ -3498,7 +3498,7 @@ mod tests {
             init(&mut source_stream, InflateConfig { window_bits: 47 }),
             ReturnCode::Ok
         );
-        let source = unsafe { InflateStream::from_stream_mut(&mut source_stream) }.unwrap();
+        let source = unsafe { InflateStream::from_stream_mut(&raw mut source_stream) }.unwrap();
         assert_eq!(
             unsafe { get_header(source, Some(&mut header)) },
             ReturnCode::Ok
@@ -3507,7 +3507,7 @@ mod tests {
         // Configure I/O before copying, but do not call inflate yet: both states must retain the
         // same caller-owned header destination just as zlib's copied C pointer does.
         let mut source_out = [0u8; 1];
-        source.next_in = input.as_ptr() as *mut _;
+        source.next_in = input.as_ptr().cast_mut();
         source.avail_in = input.len() as _;
         source.next_out = source_out.as_mut_ptr();
         source.avail_out = source_out.len() as _;
@@ -3546,7 +3546,7 @@ mod tests {
     ) {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         let mut output = vec![0u8; expected.len() + output_chunk];
         let mut next_input = 0usize;
@@ -3555,7 +3555,7 @@ mod tests {
         loop {
             if stream.avail_in == 0 && next_input < compressed.len() {
                 let len = input_chunk.min(compressed.len() - next_input);
-                stream.next_in = compressed[next_input..].as_ptr() as *mut u8;
+                stream.next_in = compressed[next_input..].as_ptr().cast_mut();
                 stream.avail_in = len as u32;
                 next_input += len;
             }

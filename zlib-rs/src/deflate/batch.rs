@@ -453,7 +453,7 @@ impl<'a> BatchRuntime<'a> {
             job_index,
             raw,
             driver: {
-                let stream = unsafe { DeflateStream::from_stream_ref(&raw) }
+                let stream = unsafe { DeflateStream::from_stream_ref(&raw const raw) }
                     .expect("successful init creates a typed deflate stream");
                 StandardDriver::for_algorithm_with_match_source(
                     algorithm,
@@ -492,18 +492,18 @@ impl<'a> BatchRuntime<'a> {
             }
         }
 
-        runtime.raw.next_in = input.as_ptr() as *mut u8;
+        runtime.raw.next_in = input.as_ptr().cast_mut();
         runtime.offer_input();
         Ok(runtime)
     }
 
     fn stream_mut(&mut self) -> &mut DeflateStream<'_> {
-        unsafe { DeflateStream::from_stream_mut(&mut self.raw) }
+        unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }
             .expect("live batch runtime has initialized state")
     }
 
     fn stream_ref(&self) -> &DeflateStream<'_> {
-        unsafe { DeflateStream::from_stream_ref(&self.raw) }
+        unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }
             .expect("live batch runtime has initialized state")
     }
 
@@ -689,7 +689,7 @@ impl<'a> BatchRuntime<'a> {
 
 impl Drop for BatchRuntime<'_> {
     fn drop(&mut self) {
-        if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut self.raw) } {
+        if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) } {
             let _ = end(stream);
         }
     }

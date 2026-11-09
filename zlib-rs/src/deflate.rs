@@ -3395,7 +3395,7 @@ pub fn compress_slice_near_optimal<'a>(
     }
 
     let produced = {
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
             .expect("successful deflate init creates typed state");
         let state = &mut *stream.state;
         // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
@@ -3499,7 +3499,7 @@ pub fn compress_slice_near_optimal<'a>(
         ok.then_some(produced)
     };
 
-    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut raw) } {
+    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut raw) } {
         stream.state.status = Status::Finish;
         let _ = end(stream);
     }
@@ -3573,7 +3573,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
 ) -> (usize, ReturnCode) {
     let output_len = output.len();
     let mut stream = z_stream {
-        next_in: input.as_ptr() as *mut u8,
+        next_in: input.as_ptr().cast_mut(),
         avail_in: 0, // for special logic in the first iteration
         total_in: 0,
         next_out: output.byte_ptr(),
@@ -3615,7 +3615,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
             final_flush
         };
 
-        let err = if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {
+        let err = if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut stream) } {
             deflate(stream, flush)
         } else {
             ReturnCode::StreamError
@@ -3633,7 +3633,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
     let produced = crate::output_buffer::written_from_budget(output_len, left, stream.avail_out);
 
     // may DataError if insufficient output space
-    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {
+    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut stream) } {
         let _ = end(stream);
     }
 
@@ -4528,7 +4528,7 @@ mod test {
     fn data_type_override_round_trips_through_state_only_encoder() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         // zlib only auto-detects when this field is Z_UNKNOWN. Preserve arbitrary caller metadata.
         const CALLER_DATA_TYPE: i32 = 12_345;
@@ -4536,7 +4536,7 @@ mod test {
 
         let input = b"plain text that is compressible plain text that is compressible";
         let mut output = [0u8; 1024];
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
         stream.next_out = output.as_mut_ptr();
         stream.avail_out = output.len() as _;
@@ -4553,13 +4553,13 @@ mod test {
             assert!(DeflateStream::from_stream_mut(core::ptr::null_mut()).is_none());
 
             let mut stream = z_stream::default();
-            assert!(DeflateStream::from_stream_mut(&mut stream).is_none());
+            assert!(DeflateStream::from_stream_mut(&raw mut stream).is_none());
 
             // state is still NULL
-            assert!(DeflateStream::from_stream_mut(&mut stream).is_none());
+            assert!(DeflateStream::from_stream_mut(&raw mut stream).is_none());
 
             init(&mut stream, DeflateConfig::default());
-            let stream = DeflateStream::from_stream_mut(&mut stream);
+            let stream = DeflateStream::from_stream_mut(&raw mut stream);
             assert!(stream.is_some());
 
             assert!(end(stream.unwrap()).is_ok());
@@ -4592,7 +4592,7 @@ mod test {
             let mut stream = z_stream {
                 zalloc: Some(fail_nth_allocation::<0>),
                 zfree: Some(crate::allocate::C.zfree),
-                opaque: &atomic as *const _ as *const core::ffi::c_void as *mut _,
+                opaque: (&raw const atomic).cast::<core::ffi::c_void>().cast_mut(),
                 ..z_stream::default()
             };
             assert_eq!(
@@ -4638,7 +4638,7 @@ mod test {
             ),
             ReturnCode::Ok
         );
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
         let mut left = near_optimal::PlannedBlock {
             range: 0..60_000,
             tokens: repeated_tokens(60_000),
@@ -4676,7 +4676,7 @@ mod test {
             ),
             ReturnCode::Ok
         );
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         let half = near_optimal::MAX_BLOCK_TOKENS / 2;
         let mut left = literal_block(0..half);
@@ -4722,7 +4722,7 @@ mod test {
         );
 
         let produced = {
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
             let state = &mut *stream.state;
             state
                 .bit_writer
@@ -4754,7 +4754,7 @@ mod test {
             produced
         };
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
         assert!(end(stream).is_ok());
         let mut decoded = vec![0u8; input.len()];
         let (decoded, code) =
@@ -4773,7 +4773,7 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
             let effective_window_bits = if window_bits == 8 { 9 } else { window_bits };
             let w_size = 1usize << effective_window_bits;
@@ -4804,13 +4804,13 @@ mod test {
     fn set_dictionary_keeps_abi_input_cursor_detached() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         // A caller may have already populated the next input cursor even though no bytes have been
         // consumed yet. Dictionary setup must not temporarily publish its own slice through these
         // ABI fields or disturb the caller's cursor.
         let caller_input = b"future caller input";
-        stream.next_in = caller_input.as_ptr() as *mut u8;
+        stream.next_in = caller_input.as_ptr().cast_mut();
         stream.avail_in = caller_input.len() as _;
         let original_next = stream.next_in;
         let original_avail = stream.avail_in;
@@ -4842,14 +4842,14 @@ mod test {
         let mut stream = z_stream::default();
 
         let atomic = AtomicUsize::new(0);
-        stream.opaque = &atomic as *const _ as *const core::ffi::c_void as *mut _;
+        stream.opaque = (&raw const atomic).cast::<core::ffi::c_void>().cast_mut();
         stream.zalloc = Some(fail_nth_allocation::<1>);
         stream.zfree = Some(crate::allocate::C.zfree);
 
         // Init consumes the first state allocation; fail the second allocation used by copy.
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
 
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
+        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
             unreachable!()
         };
 
@@ -4872,7 +4872,7 @@ mod test {
             assert!(stream.zfree.is_some());
 
             // this should be the default level
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
             assert_eq!(stream.state.level, 6);
 
             assert!(end(stream).is_ok());
@@ -4887,7 +4887,7 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
             assert_eq!(stream.state.w_bits(), 9);
 
             assert!(end(stream).is_ok());
@@ -4919,7 +4919,7 @@ mod test {
     fn end_leaves_null_abi_state_pointer() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         assert!(end(stream).is_ok());
         assert!(stream.as_z_stream_mut().state.is_null());
@@ -4931,11 +4931,11 @@ mod test {
     fn end_data_error() {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
 
         // next deflate into too little space
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
         let output = &mut [0, 0, 0];
         stream.next_out = output.as_mut_ptr();
@@ -4952,11 +4952,11 @@ mod test {
     fn test_reset_keep() {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
 
         // next deflate into too little space
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         let output = &mut [0; 1024];
@@ -4983,7 +4983,7 @@ mod test {
             ..Default::default()
         };
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         // Make the gzip name larger than the small mem_level=1 pending buffer. One deflate call
         // fills that buffer and drains only part of it, leaving `Pending::out` advanced while
@@ -5041,7 +5041,7 @@ mod test {
             ..Default::default()
         };
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         let calls = stream.state.bit_writer.pending.capacity() / 2;
         for _ in 0..calls {
@@ -5163,14 +5163,14 @@ mod test {
     ) -> Vec<u8> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         let mut output = vec![0u8; compress_bound(input.len()) + 64];
         stream.next_out = output.as_mut_ptr();
         stream.avail_out = output.len() as _;
 
         for chunk in input.chunks(chunk_size) {
-            stream.next_in = chunk.as_ptr() as *mut u8;
+            stream.next_in = chunk.as_ptr().cast_mut();
             stream.avail_in = chunk.len() as _;
             while stream.avail_in != 0 {
                 assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
@@ -5206,8 +5206,8 @@ mod test {
     ) -> Vec<u8> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input.as_ptr() as *mut u8;
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         let mut output = Vec::new();
@@ -5252,8 +5252,8 @@ mod test {
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
             let driver = {
-                let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-                stream.next_in = input.as_ptr() as *mut u8;
+                let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+                stream.next_in = input.as_ptr().cast_mut();
                 stream.avail_in = input.len() as _;
                 algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state).unwrap()
             };
@@ -5274,7 +5274,7 @@ mod test {
         /// Perform exactly one production scheduler turn using the same driver as the zlib path.
         fn step(&mut self) -> Option<crate::deflate::longest_match::MatchSearchWork> {
             assert!(!self.done);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.unwrap();
 
             // Match computation and result delivery are distinct scheduler turns. This keeps the
             // test honest: a batch scheduler may collect work from several paused streams before
@@ -5341,13 +5341,13 @@ mod test {
             &self,
             work: crate::deflate::longest_match::MatchSearchWork,
         ) -> crate::deflate::longest_match::MatchSearchRequest<'_> {
-            let stream = unsafe { DeflateStream::from_stream_ref(&self.raw) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }.unwrap();
             work.request(&*stream.state)
         }
 
         fn into_output(mut self) -> Vec<u8> {
             assert!(self.done);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.unwrap();
             assert_eq!(stream.avail_in, 0);
             assert_eq!(stream.total_out as usize, self.output.len());
             assert!(end(stream).is_ok());
@@ -5360,8 +5360,8 @@ mod test {
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
         let mut output = vec![0u8; compress_bound(input.len()) + 64];
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input.as_ptr() as *mut u8;
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
         stream.next_out = output.as_mut_ptr();
         stream.avail_out = output.len() as _;
@@ -5383,7 +5383,7 @@ mod test {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
         let mut output = vec![0u8; compress_bound(input.len()) + 64];
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         // Use the real zlib framing/status path with no caller input attached. `reset_keep()`
         // initializes last_flush to zlib's -2 sentinel, so this emits any zlib/gzip header without
@@ -5399,7 +5399,7 @@ mod test {
         let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state)
             .expect("proof only covers the five standard token-producing algorithms");
 
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len().try_into().expect("proof input fits zlib uInt");
 
         let mut turns = 0usize;
@@ -5644,9 +5644,9 @@ mod test {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
         assert_eq!(tune(stream, 8, 16, 128, 129), ReturnCode::Ok);
-        stream.next_in = input_bytes.as_ptr() as *mut u8;
+        stream.next_in = input_bytes.as_ptr().cast_mut();
         stream.avail_in = input_bytes.len() as _;
         let mut core =
             algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &*stream.state)
@@ -5699,8 +5699,8 @@ mod test {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input_bytes.as_ptr() as *mut u8;
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        stream.next_in = input_bytes.as_ptr().cast_mut();
         stream.avail_in = input_bytes.len() as _;
         let mut core =
             algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Slow, &*stream.state)
@@ -5774,8 +5774,8 @@ mod test {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input_bytes.as_ptr() as *mut u8;
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        stream.next_in = input_bytes.as_ptr().cast_mut();
         stream.avail_in = input_bytes.len() as _;
         let mut core =
             algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &*stream.state)
@@ -6031,7 +6031,7 @@ mod test {
             extra: core::ptr::null_mut(),
             extra_len: 0,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
             comment: core::ptr::null_mut(),
             comm_max: 0,
@@ -6045,7 +6045,7 @@ mod test {
         };
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
         assert_eq!(
             unsafe { set_header(stream, Some(&mut header)) },
             ReturnCode::Ok
@@ -6056,7 +6056,7 @@ mod test {
 
         let input = b"gzip after reset";
         let mut output = [0u8; 128];
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
         stream.next_out = output.as_mut_ptr();
         stream.avail_out = output.len() as _;
@@ -6126,12 +6126,12 @@ mod test {
             time: 0,
             xflags: 0,
             os: 0,
-            extra: extra.as_ptr() as *mut _,
+            extra: extra.as_ptr().cast_mut(),
             extra_len: extra.len() as _,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
@@ -6146,14 +6146,14 @@ mod test {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, config), ReturnCode::Ok);
 
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
+        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
             unreachable!()
         };
 
         unsafe { set_header(stream, Some(&mut header)) };
 
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         let mut output = [0u8; 1024];
@@ -6185,14 +6185,14 @@ mod test {
     fn deflate_copy_owns_independent_state_and_buffer_storage() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let source = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let source = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
 
         let initial_window_byte = 0x11u8;
         unsafe {
             source
                 .state
                 .window
-                .copy_and_initialize(0..1, &initial_window_byte)
+                .copy_and_initialize(0..1, &raw const initial_window_byte)
         };
         source.state.prev.as_mut_slice()[0] = 0x1234;
         source.state.head.as_mut_slice()[0] = 0x2345;
@@ -6248,12 +6248,12 @@ mod test {
             time: 0x1234_5678,
             xflags: 0,
             os: 3,
-            extra: extra.as_ptr() as *mut _,
+            extra: extra.as_ptr().cast_mut(),
             extra_len: extra.len() as _,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
@@ -6265,7 +6265,7 @@ mod test {
         };
         let mut source_stream = z_stream::default();
         assert_eq!(init(&mut source_stream, config), ReturnCode::Ok);
-        let source = unsafe { DeflateStream::from_stream_mut(&mut source_stream) }.unwrap();
+        let source = unsafe { DeflateStream::from_stream_mut(&raw mut source_stream) }.unwrap();
         assert_eq!(
             unsafe { set_header(source, Some(&mut header)) },
             ReturnCode::Ok
@@ -6279,13 +6279,13 @@ mod test {
 
         let input = b"same payload through both copied streams";
         let mut source_output = [0u8; 256];
-        source.next_in = input.as_ptr() as *mut _;
+        source.next_in = input.as_ptr().cast_mut();
         source.avail_in = input.len() as _;
         source.next_out = source_output.as_mut_ptr();
         source.avail_out = source_output.len() as _;
 
         let mut copied_output = [0u8; 256];
-        copied.next_in = input.as_ptr() as *mut _;
+        copied.next_in = input.as_ptr().cast_mut();
         copied.avail_in = input.len() as _;
         copied.next_out = copied_output.as_mut_ptr();
         copied.avail_out = copied_output.len() as _;
@@ -6316,12 +6316,12 @@ mod test {
             time: 0,
             xflags: 0,
             os: 0,
-            extra: extra.as_ptr() as *mut _,
+            extra: extra.as_ptr().cast_mut(),
             extra_len: extra.len() as _,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
@@ -6335,14 +6335,14 @@ mod test {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, config), ReturnCode::Ok);
 
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
+        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
             unreachable!()
         };
 
         unsafe { set_header(stream, Some(&mut header)) };
 
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         let mut output = [0u8; 256];
@@ -6368,7 +6368,7 @@ mod test {
 
             assert_eq!(crate::inflate::init(&mut stream, config), ReturnCode::Ok);
 
-            let Some(stream) = (unsafe { InflateStream::from_stream_mut(&mut stream) }) else {
+            let Some(stream) = (unsafe { InflateStream::from_stream_mut(&raw mut stream) }) else {
                 unreachable!();
             };
 
