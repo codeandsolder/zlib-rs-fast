@@ -1,6 +1,7 @@
 use core::{ffi::CStr, marker::PhantomData, mem::MaybeUninit, ops::ControlFlow, ptr::NonNull};
 
 use crate::{
+    abi_cursor::advance_abi_bytes,
     adler32::adler32,
     allocate::Allocator,
     c_api::{gz_header, internal_state, z_checksum, z_stream},
@@ -96,28 +97,6 @@ const _: () = {
     assert!(offset_of!(D, adler) == offset_of!(Z, adler));
     assert!(offset_of!(D, reserved) == offset_of!(Z, reserved));
 };
-
-/// Advance one ABI byte pointer and its two public zlib counters together.
-///
-/// Internal callers prove that len is within the advertised available span
-/// before touching the memory. Keeping all three updates in one place makes
-/// input and output use exactly the same unsigned-width and wrap semantics.
-#[inline]
-fn advance_abi_bytes(
-    pointer: &mut *mut crate::c_api::Bytef,
-    available: &mut crate::c_api::uInt,
-    total: &mut crate::c_api::z_size,
-    len: usize,
-) {
-    debug_assert!(len <= *available as usize);
-    let Ok(consumed) = crate::c_api::uInt::try_from(len) else {
-        unreachable!("ABI byte progress cannot exceed caller availability");
-    };
-    *pointer = pointer.wrapping_add(len);
-    *available -= consumed;
-    // zlib totals use modular arithmetic in their native C ABI counter width.
-    *total = total.wrapping_add(crate::c_api::z_size::from(consumed));
-}
 
 #[derive(Clone, Copy)]
 pub struct InputCursor {

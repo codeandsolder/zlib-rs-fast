@@ -12,6 +12,7 @@ mod inftrees;
 mod window;
 mod writer;
 
+use crate::abi_cursor::advance_abi_bytes;
 use crate::allocate::Allocator;
 use crate::c_api::{in_func, internal_state, out_func};
 use crate::output_buffer::{assume_init_prefix, WritableBytes};
@@ -2801,6 +2802,22 @@ pub fn codes_used(stream: &InflateStream) -> usize {
     stream.state.next
 }
 
+/// Bind a caller-owned input span; null-and-empty is a valid C representation.
+///
+/// # Safety
+/// A nonnull pointer with a nonzero length must remain readable for the
+/// returned borrow, whose lifetime belongs to the caller.
+unsafe fn caller_input<'a>(pointer: *const u8, available: crate::c_api::uInt) -> Option<&'a [u8]> {
+    if available == 0 {
+        return Some(&[]);
+    }
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the caller supplies readable input of the advertised length.
+    Some(unsafe { core::slice::from_raw_parts(pointer, available as usize) })
+}
+
 /// Bind one zlib ABI input/output pair and run ordinary inflate.
 ///
 /// # Safety
@@ -2809,18 +2826,14 @@ pub fn codes_used(stream: &InflateStream) -> usize {
 /// or the live stream/state objects. Null input with zero length is valid; null output is rejected
 /// before it is dereferenced.
 pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> ReturnCode {
-    if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
+    if stream.next_out.is_null() {
         return ReturnCode::StreamError;
     }
-
-    let input = if stream.avail_in == 0 {
-        &[][..]
-    } else {
-        // SAFETY: `inflate` requires `next_in` to address `avail_in` readable bytes. The slice is
-        // call-local and cannot survive this invocation.
-        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
+    // SAFETY: the public inflate contract guarantees a live readable input span.
+    let Some(input) = (unsafe { caller_input(stream.next_in, stream.avail_in) }) else {
+        return ReturnCode::StreamError;
     };
-    // SAFETY: `stream.next_out` is non-null and points to at least `stream.avail_out` writable bytes.
+    // SAFETY: the public inflate contract guarantees a live writable output span.
     let output =
         unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
 
@@ -2847,24 +2860,18 @@ fn inflate_bound_io(
     let mut bit_reader = BitReader::from_buffer(state.bit_buffer, input);
     let err = state.dispatch(&mut bit_reader, &mut output, flush);
 
-    let avail_in = bit_reader.bytes_remaining();
-    let in_read = initial_avail_in - avail_in;
-    // Preserve the exact caller pointer when no input was consumed. This matters for zlib's legal
-    // NULL + zero-length input representation; Rust's canonical empty slice has a non-null sentinel
-    // pointer that must not leak back through the C ABI.
-    let next_in = (in_read != 0).then(|| bit_reader.next_input_ptr());
+    let in_read = initial_avail_in - bit_reader.bytes_remaining();
     let out_written = output.written_since_accounted();
-
-    // The public zlib counter is an unsigned C integer, which must wrap rather than panic
-    // when a caller has already consumed more than the ABI width can represent.
-    stream.total_in = stream.total_in.wrapping_add(in_read as z_size);
+    // The shared ABI cursor preserves null input on zero consumption and wraps C totals.
+    advance_abi_bytes(
+        &mut stream.next_in,
+        &mut stream.avail_in,
+        &mut stream.total_in,
+        in_read,
+    );
     state.total = state.total.wrapping_add(out_written);
     stream.total_out = state.total as _;
 
-    stream.avail_in = avail_in as u32;
-    if let Some(next_in) = next_in {
-        stream.next_in = next_in.cast_mut();
-    }
     state.bit_buffer = bit_reader.into_buffer();
 
     stream.avail_out = output.remaining() as u32;
@@ -2932,13 +2939,19 @@ fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
     (got, next)
 }
 
-pub fn sync(stream: &mut InflateStream) -> ReturnCode {
+/// Find a recoverable full-flush marker in the caller's raw input.
+///
+/// # Safety
+/// If avail_in is nonzero, next_in must point to that many readable bytes.
+/// Buffers may be replaced between calls.
+pub unsafe fn sync(stream: &mut InflateStream) -> ReturnCode {
     let state = &mut *stream.state;
 
-    if stream.next_in.is_null() && stream.avail_in != 0 {
+    // SAFETY: the caller supplies a live readable input span.
+    let Some(input) = (unsafe { caller_input(stream.next_in, stream.avail_in) }) else {
         return ReturnCode::StreamError;
-    }
-    if stream.avail_in == 0 && state.bit_buffer.bits_in_buffer() < 8 {
+    };
+    if input.is_empty() && state.bit_buffer.bits_in_buffer() < 8 {
         return ReturnCode::BufError;
     }
     /* if first time, start search in bit buffer */
@@ -2950,27 +2963,14 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
         (state.have, _) = syncsearch(0, &buf[..len]);
     }
 
-    // Search available input. A zlib caller may legitimately provide NULL when `avail_in == 0`;
-    // Rust slices still require a non-null pointer even at length zero, so represent that case with
-    // the canonical empty slice instead of materializing `from_raw_parts(NULL, 0)`.
-    let slice = if stream.avail_in == 0 {
-        &[][..]
-    } else {
-        // SAFETY: the public FFI contract requires the non-null input span to be readable for
-        // `avail_in` bytes, and the null/nonzero case was rejected above.
-        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
-    };
-
     let len;
-    (state.have, len) = syncsearch(state.have, slice);
-    if len != 0 {
-        // SAFETY: `syncsearch` returns an in-bounds consumed prefix; `len != 0` also proves the
-        // source pointer came from the non-empty, non-null branch above.
-        stream.next_in = unsafe { stream.next_in.add(len) };
-    }
-    stream.avail_in -= len as u32;
-    // inflateSync advances the same unsigned ABI counter as regular inflate.
-    stream.total_in = stream.total_in.wrapping_add(len as z_size);
+    (state.have, len) = syncsearch(state.have, input);
+    advance_abi_bytes(
+        &mut stream.next_in,
+        &mut stream.avail_in,
+        &mut stream.total_in,
+        len,
+    );
 
     /* return no joy or set up to restart inflate() on a new block */
     if state.have != 4 {
@@ -3398,9 +3398,54 @@ mod tests {
         stream.avail_in = 4; // Four-byte stored-block sync marker.
         stream.total_in = z_size::MAX - 1;
 
-        assert_eq!(sync(stream), ReturnCode::Ok);
+        // SAFETY: the marker is a live, readable caller input span.
+        assert_eq!(unsafe { sync(stream) }, ReturnCode::Ok);
         assert_eq!(stream.total_in, 2);
         assert_eq!(stream.avail_in, 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_sync_rebinds_disjoint_buffers_and_preserves_null_input() -> Result<(), &'static str>
+    {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let mut marker = [0u8, 0, 0xff, 0xff];
+        // SAFETY: the initialized stream owns a live exclusively borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("initialized inflate stream is unavailable")?;
+        stream.total_in = z_size::MAX - 2;
+
+        for index in 0..marker.len() {
+            stream.next_in = marker[index..].as_mut_ptr();
+            stream.avail_in = 1;
+            // SAFETY: the supplied byte is readable for this call.
+            let result = unsafe { sync(stream) };
+            assert_eq!(
+                result,
+                if index == 3 {
+                    ReturnCode::Ok
+                } else {
+                    ReturnCode::DataError
+                }
+            );
+            assert_eq!(stream.avail_in, 0);
+            assert_eq!(stream.next_in, marker[index..].as_mut_ptr().wrapping_add(1));
+            assert_eq!(
+                stream.total_in,
+                (z_size::MAX - 2).wrapping_add(index as z_size + 1)
+            );
+
+            if index == 0 {
+                stream.next_in = core::ptr::null_mut();
+                // SAFETY: zero available bytes require no input allocation.
+                assert_eq!(unsafe { sync(stream) }, ReturnCode::BufError);
+                assert!(stream.next_in.is_null());
+                assert_eq!(stream.avail_in, 0);
+                assert_eq!(stream.total_in, z_size::MAX - 1);
+            }
+        }
         assert_eq!(end(stream).state, core::ptr::null_mut());
         Ok(())
     }

@@ -132,11 +132,6 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline(always)]
-    pub fn next_input_ptr(&self) -> *const u8 {
-        self.input.as_ptr().wrapping_add(self.position)
-    }
-
-    #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         &self.input[self.position..]
     }

@@ -930,7 +930,8 @@ pub unsafe extern "C" fn inflateMark(strm: *const z_stream) -> c_long {
 pub unsafe extern "C" fn inflateSync(strm: *mut z_stream) -> i32 {
     // SAFETY: the `inflateSync` FFI contract requires any non-null stream pointer to reference a live, initialized stream of the matching kind; the converter handles null.
     if let Some(stream) = unsafe { InflateStream::from_stream_mut(strm) } {
-        zlib_rs::inflate::sync(stream) as _
+        // SAFETY: the FFI contract supplies readable nonempty input.
+        (unsafe { zlib_rs::inflate::sync(stream) }) as _
     } else {
         ReturnCode::StreamError as _
     }

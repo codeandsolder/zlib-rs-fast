@@ -33,6 +33,7 @@ cfg_select! {
     }
 }
 
+mod abi_cursor;
 mod cpu_features;
 mod output_buffer;
 mod stable;
