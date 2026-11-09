@@ -172,8 +172,9 @@ const _: () = {
     assert!(offset_of!(I, reserved) == offset_of!(Z, reserved));
 };
 
-unsafe impl Sync for InflateStream<'_> {}
-unsafe impl Send for InflateStream<'_> {}
+// This C ABI view contains caller-owned pointers and mutable inflate state.
+// It deliberately does not claim Send or Sync; independent owned streams can
+// be scheduled concurrently without sharing this borrowed raw-pointer view.
 
 #[cfg(feature = "__internal-test")]
 #[doc(hidden)]

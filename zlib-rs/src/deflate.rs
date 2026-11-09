@@ -97,6 +97,28 @@ const _: () = {
     assert!(offset_of!(D, reserved) == offset_of!(Z, reserved));
 };
 
+/// Advance one ABI byte pointer and its two public zlib counters together.
+///
+/// Internal callers prove that len is within the advertised available span
+/// before touching the memory. Keeping all three updates in one place makes
+/// input and output use exactly the same unsigned-width and wrap semantics.
+#[inline]
+fn advance_abi_bytes(
+    pointer: &mut *mut crate::c_api::Bytef,
+    available: &mut crate::c_api::uInt,
+    total: &mut crate::c_api::z_size,
+    len: usize,
+) {
+    debug_assert!(len <= *available as usize);
+    let Ok(consumed) = crate::c_api::uInt::try_from(len) else {
+        unreachable!("ABI byte progress cannot exceed caller availability");
+    };
+    *pointer = pointer.wrapping_add(len);
+    *available -= consumed;
+    // zlib totals use modular arithmetic in their native C ABI counter width.
+    *total = total.wrapping_add(crate::c_api::z_size::from(consumed));
+}
+
 #[derive(Clone, Copy)]
 pub struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
@@ -190,12 +212,12 @@ impl InputCursor {
     }
 
     fn consume(&mut self, len: usize) {
-        debug_assert!(len <= self.avail_in as usize);
-        self.next_in = self.next_in.wrapping_add(len);
-        let len = crate::c_api::uInt::try_from(len)
-            .expect("input consumption is bounded by the caller's uInt availability");
-        self.avail_in -= len;
-        self.total_in = self.total_in.wrapping_add(len as crate::c_api::z_size);
+        advance_abi_bytes(
+            &mut self.next_in,
+            &mut self.avail_in,
+            &mut self.total_in,
+            len,
+        );
     }
 }
 
@@ -380,13 +402,51 @@ impl OutputCursor {
     }
 
     fn advance(&mut self, len: usize) {
-        debug_assert!(len <= self.avail_out as usize);
-        self.next_out = self.next_out.wrapping_add(len);
-        let len = crate::c_api::uInt::try_from(len)
-            .expect("output emission is bounded by the caller's uInt availability");
-        self.avail_out -= len;
-        // The public zlib total_out is an unsigned C counter and wraps at its ABI width.
-        self.total_out = self.total_out.wrapping_add(len as crate::c_api::z_size);
+        advance_abi_bytes(
+            &mut self.next_out,
+            &mut self.avail_out,
+            &mut self.total_out,
+            len,
+        );
+    }
+}
+
+/// One snapshot of the three independent caller-I/O domains.
+///
+/// A driver turn borrows the snapshots while compression state is borrowed
+/// separately. Every turn commits the input, output, and checksum together,
+/// including when it yields for more input, output, or match-search work.
+struct CallCursors {
+    input: InputCursor,
+    output: OutputCursor,
+    checksum: StreamChecksum,
+}
+
+impl CallCursors {
+    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+        Self {
+            input: InputCursor::from_stream(stream),
+            output: OutputCursor::from_stream(stream),
+            checksum: StreamChecksum::from_stream(stream),
+        }
+    }
+
+    fn apply(self, stream: &mut DeflateStream<'_>) {
+        self.input.apply(stream);
+        self.output.apply(stream);
+        self.checksum.apply(stream);
+    }
+
+    /// The stream's raw ABI fields are only rebound on entry and commit.
+    #[inline]
+    fn with_state<'state, R>(
+        stream: &mut DeflateStream<'state>,
+        operation: impl FnOnce(&mut State<'state>, &mut Self) -> R,
+    ) -> R {
+        let mut cursors = Self::from_stream(stream);
+        let result = operation(&mut stream.state, &mut cursors);
+        cursors.apply(stream);
+        result
     }
 }
 
@@ -397,17 +457,17 @@ impl OutputCursor {
 /// output cursors, which are committed back to the ABI shell when the algorithm returns.
 pub struct Compressor<'a, 'state> {
     pub(crate) state: &'a mut State<'state>,
-    pub(crate) input: InputCursor,
-    pub(crate) output: OutputCursor,
-    pub(crate) checksum: StreamChecksum,
+    pub(crate) input: &'a mut InputCursor,
+    pub(crate) output: &'a mut OutputCursor,
+    pub(crate) checksum: &'a mut StreamChecksum,
 }
 
 impl<'a, 'state> Compressor<'a, 'state> {
-    fn new(
+    const fn new(
         state: &'a mut State<'state>,
-        input: InputCursor,
-        output: OutputCursor,
-        checksum: StreamChecksum,
+        input: &'a mut InputCursor,
+        output: &'a mut OutputCursor,
+        checksum: &'a mut StreamChecksum,
     ) -> Self {
         Self {
             state,
@@ -417,26 +477,16 @@ impl<'a, 'state> Compressor<'a, 'state> {
         }
     }
 
-    fn into_call_state(self) -> (InputCursor, OutputCursor, StreamChecksum) {
-        (self.input, self.output, self.checksum)
-    }
-
     pub(crate) fn fill_window(&mut self) {
-        fill_window_core(self.state, &mut self.input, &mut self.checksum);
+        fill_window_core(self.state, self.input, self.checksum);
     }
 
     fn drain_pending(&mut self) -> DrainOutcome {
-        drain_pending_output(self.state, &mut self.output)
+        drain_pending_output(self.state, self.output)
     }
 
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
-        read_buf_window_core(
-            self.state,
-            &mut self.input,
-            &mut self.checksum,
-            offset,
-            size,
-        )
+        read_buf_window_core(self.state, self.input, self.checksum, offset, size)
     }
 
     /// Copy initialized history bytes to the caller's output buffer.
@@ -462,7 +512,7 @@ impl<'a, 'state> Compressor<'a, 'state> {
 
         // SAFETY: zlib's direct stored-copy contract requires the caller input/output spans not to
         // overlap. Input/output bounds and cursor accounting are confined to the cursor methods.
-        let copied = unsafe { self.input.copy_to_output(&mut self.output, len) };
+        let copied = unsafe { self.input.copy_to_output(self.output, len) };
         match self.state.wrap {
             2 => self.state.crc_fold.fold(copied),
             1 => self.checksum.update_adler(copied),
@@ -494,25 +544,22 @@ fn with_compressor<'state, R>(
     // `data_type` is public z_stream metadata, so honor caller overrides at each ABI entry. The
     // encoder owns the working copy in State and publishes any lazy detection result on return.
     stream.state.data_type = stream.data_type;
-    let input = InputCursor::from_stream(stream);
-    let output = OutputCursor::from_stream(stream);
-    let checksum = StreamChecksum::from_stream(stream);
-    let (result, input, output, checksum, data_type) = {
-        let mut compressor = Compressor::new(&mut *stream.state, input, output, checksum);
-        let result = f(&mut compressor);
-        let data_type = compressor.state.data_type;
-        let (input, output, checksum) = compressor.into_call_state();
-        (result, input, output, checksum, data_type)
-    };
-    input.apply(stream);
-    output.apply(stream);
-    checksum.apply(stream);
-    stream.data_type = data_type;
+    let result = CallCursors::with_state(stream, |state, cursors| {
+        let mut compressor = Compressor::new(
+            state,
+            &mut cursors.input,
+            &mut cursors.output,
+            &mut cursors.checksum,
+        );
+        f(&mut compressor)
+    });
+    stream.data_type = stream.state.data_type;
     result
 }
 
-unsafe impl Sync for DeflateStream<'_> {}
-unsafe impl Send for DeflateStream<'_> {}
+// This ABI view contains non-owning caller pointers and mutable state
+// allocations. Thread safety belongs to independently owned compression jobs,
+// not to a blanket Send/Sync assertion on the raw-pointer-backed view.
 
 impl<'a> DeflateStream<'a> {
     /// # Safety
@@ -5200,6 +5247,70 @@ mod test {
         assert_eq!(stream.state.max_chain_length, u16::MAX);
         assert!(end(stream).is_ok());
         Ok(())
+    }
+
+    #[test]
+    fn call_cursors_commit_all_abi_fields_and_rebind_history_per_turn() {
+        let source = *b"cursorruntime";
+        let mut destination = [0u8; 16];
+        let mut stream = DeflateStream::new(DeflateConfig::new(6));
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in = 8;
+        stream.total_in = crate::c_api::z_size::MAX - 2;
+        stream.next_out = destination.as_mut_ptr();
+        stream.avail_out = 16;
+        stream.total_out = crate::c_api::z_size::MAX - 1;
+        stream.data_type = crate::c_api::Z_TEXT;
+
+        let first = with_compressor(&mut stream, |compressor| {
+            assert_eq!(compressor.state.data_type, crate::c_api::Z_TEXT);
+            assert_eq!(compressor.input.consumed_here(), 0);
+            compressor
+                .input
+                .copy_to_window(&mut compressor.state.window, 0..5);
+            compressor.output.write_all(&source[..3]);
+            compressor.checksum.update_adler(&source[..5]);
+            compressor.state.data_type = crate::c_api::Z_BINARY;
+            compressor.input.consumed_here()
+        });
+        assert_eq!(first, 5);
+        assert_eq!(stream.avail_in, 3);
+        assert_eq!(stream.avail_out, 13);
+        assert_eq!(stream.total_in, 2);
+        assert_eq!(stream.total_out, 1);
+        assert_eq!(stream.next_in, source.as_ptr().wrapping_add(5).cast_mut());
+        assert_eq!(stream.next_out, destination.as_mut_ptr().wrapping_add(3));
+        assert_eq!(&destination[..3], &source[..3]);
+        assert_eq!(&stream.state.window.filled()[..5], &source[..5]);
+        assert_eq!(
+            stream.adler,
+            crate::adler32::adler32(1u32, &source[..5]) as _
+        );
+        assert_eq!(stream.data_type, crate::c_api::Z_BINARY);
+
+        // A second invocation must not reuse the previous call's readable
+        // history allowance or reset the newly committed public counters.
+        let stream_adler = stream.adler;
+        let second = with_compressor(&mut stream, |compressor| {
+            assert_eq!(compressor.input.consumed_here(), 0);
+            assert_eq!(compressor.input.avail_in, 3);
+            assert_eq!(compressor.output.avail_out, 13);
+            assert_eq!(compressor.checksum.value(), stream_adler);
+            compressor.input.consume(2);
+            compressor.output.write_all(&source[5..7]);
+            (
+                compressor.input.consumed_here(),
+                compressor.output.total_out,
+            )
+        });
+        assert_eq!(second, (2, 3));
+        assert_eq!(stream.avail_in, 1);
+        assert_eq!(stream.avail_out, 11);
+        assert_eq!(stream.total_in, 4);
+        assert_eq!(stream.total_out, 3);
+        assert_eq!(&destination[..3], &source[..3]);
+        assert_eq!(&destination[3..5], &source[5..7]);
+        assert!(end(&mut stream).is_ok());
     }
 
     #[test]

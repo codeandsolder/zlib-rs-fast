@@ -15,8 +15,7 @@ use super::{
         execute_match_search_batch_with_backend, MatchSearchRequest, MatchSearchResult,
         MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
-    DeflateConfig, DeflateFlush, DeflateStream, InputCursor, OutputCursor, ReturnCode, Status,
-    StreamChecksum,
+    CallCursors, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode, Status,
 };
 use crate::c_api::z_stream;
 #[cfg(feature = "gpu")]
@@ -552,19 +551,15 @@ impl<'a> BatchRuntime<'a> {
         let Self { raw, driver, .. } = self;
         let stream = unsafe { DeflateStream::from_stream_mut(raw) }
             .expect("live batch runtime has initialized state");
-        let mut input = InputCursor::from_stream(stream);
-        let mut output = OutputCursor::from_stream(stream);
-        let mut checksum = StreamChecksum::from_stream(stream);
-        let outcome = driver.step(
-            &mut *stream.state,
-            &mut input,
-            &mut output,
-            &mut checksum,
-            mode,
-        );
-        input.apply(stream);
-        output.apply(stream);
-        checksum.apply(stream);
+        let outcome = CallCursors::with_state(stream, |state, cursors| {
+            driver.step(
+                state,
+                &mut cursors.input,
+                &mut cursors.output,
+                &mut cursors.checksum,
+                mode,
+            )
+        });
 
         match outcome {
             StandardTurnOutcome::Progress => RuntimeStep::Progress,
