@@ -959,19 +959,59 @@ pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: &TokenCost
     parse_range(input, candidates, 0..input.len(), costs)
 }
 
+/// Reuse the block-sized dynamic-programming arrays across cost-model passes;
+/// each completed parse still owns its token output independently.
+#[derive(Default)]
+struct ParseScratch {
+    best_cost: Vec<u64>,
+    steps: Vec<ParseStep>,
+}
+
+impl ParseScratch {
+    const INF: u64 = u64::MAX / 4;
+
+    fn reset(&mut self, block_len: usize) {
+        assert!(block_len < usize::MAX, "DP block has too many positions");
+        let slots = block_len + 1;
+        // clear() retains each Vec's allocation; resize() then initializes
+        // every slot exactly once, including after a shorter previous parse.
+        self.best_cost.clear();
+        self.best_cost.resize(slots, Self::INF);
+        self.best_cost[0] = 0;
+        self.steps.clear();
+        self.steps.resize(slots, ParseStep(0));
+    }
+}
+
 pub fn parse_range(
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
     costs: &TokenCosts,
 ) -> ParseResult {
+    parse_range_with_scratch(
+        input,
+        candidates,
+        block,
+        costs,
+        &mut ParseScratch::default(),
+    )
+}
+
+fn parse_range_with_scratch(
+    input: &[u8],
+    candidates: &MatchCandidates,
+    block: Range<usize>,
+    costs: &TokenCosts,
+    scratch: &mut ParseScratch,
+) -> ParseResult {
     assert_eq!(candidates.len_for_parse(), input.len());
     assert!(block.start <= block.end && block.end <= input.len());
 
-    const INF: u64 = u64::MAX / 4;
     let block_len = block.len();
-    let mut best_cost = vec![INF; block_len + 1];
-    let mut steps = vec![ParseStep(0); block_len + 1];
+    scratch.reset(block_len);
+    let (best_cost, steps) = (&mut scratch.best_cost, &mut scratch.steps);
+    const INF: u64 = ParseScratch::INF;
     let mut length_costs = [0u32; STD_MAX_MATCH + 1];
     for (length, cost) in length_costs.iter_mut().enumerate().skip(STD_MIN_MATCH) {
         let code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
@@ -997,16 +1037,14 @@ pub fn parse_range(
         cost: 0,
         distance: 0,
     }; STD_MAX_MATCH + 1];
-    best_cost[0] = 0;
-
     for local_position in 0..block_len {
         let position = block.start + local_position;
         let prefix_cost = best_cost[local_position];
         debug_assert_ne!(prefix_cost, INF);
 
         relax(
-            &mut best_cost,
-            &mut steps,
+            best_cost.as_mut_slice(),
+            steps.as_mut_slice(),
             local_position + 1,
             prefix_cost + u64::from(costs.literal_cost(input[position])),
             ParseToken::Literal(input[position]),
@@ -1050,8 +1088,8 @@ pub fn parse_range(
             };
             let token_cost = u64::from(length_costs[length]) + u64::from(distance_cost);
             relax(
-                &mut best_cost,
-                &mut steps,
+                best_cost.as_mut_slice(),
+                steps.as_mut_slice(),
                 local_position + length,
                 prefix_cost + token_cost,
                 ParseToken::matching(length, distance),
@@ -1715,6 +1753,39 @@ mod tests {
     }
 
     #[test]
+    fn reused_parse_scratch_resets_across_ranges_and_cost_models() {
+        let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
+        let candidates = build_match_candidates(input, 32);
+        let fixed = TokenCosts::fixed();
+        let mut varied = fixed.clone();
+        varied.literal[b'a' as usize] = 2 * COST_SCALE;
+        varied.distance.fill(5 * COST_SCALE);
+
+        let mut scratch = ParseScratch::default();
+        let mut capacity = None;
+        for (range, costs) in [
+            (0..input.len(), &fixed),
+            (12..36, &varied),
+            (24..24, &fixed),
+            (4..input.len(), &varied),
+            (0..input.len(), &fixed),
+        ] {
+            let expected = parse_range(input, &candidates, range.clone(), costs);
+            let actual =
+                parse_range_with_scratch(input, &candidates, range.clone(), costs, &mut scratch);
+            assert_eq!(actual, expected, "range={range:?}");
+            assert_eq!(scratch.best_cost.len(), range.len() + 1);
+            assert_eq!(scratch.steps.len(), range.len() + 1);
+            if let Some((cost_capacity, step_capacity)) = capacity {
+                assert_eq!(scratch.best_cost.capacity(), cost_capacity);
+                assert_eq!(scratch.steps.capacity(), step_capacity);
+            } else {
+                capacity = Some((scratch.best_cost.capacity(), scratch.steps.capacity()));
+            }
+        }
+    }
+
+    #[test]
     fn distance_code_reduction_is_valid_for_non_monotone_huffman_costs() {
         let input = b"aaaaaaaaabaaaaaaaaacaaaaaaaaadaaaaaaaaa";
         let table = build_match_candidates(input, 32);
@@ -1931,9 +2002,16 @@ impl PlannedBlockSource {
             .unwrap_or(default_costs);
         let mut previous = PreviousParse::None;
         let mut best_tokens: Option<Vec<ParseToken>> = None;
+        let mut scratch = ParseScratch::default();
 
         for _ in 0..optimization_passes {
-            let reparsed = parse_range(context, &self.candidates, local_range.clone(), &costs);
+            let reparsed = parse_range_with_scratch(
+                context,
+                &self.candidates,
+                local_range.clone(),
+                &costs,
+                &mut scratch,
+            );
             if reparsed.tokens.len() > MAX_BLOCK_TOKENS {
                 break;
             }
@@ -2185,9 +2263,10 @@ pub fn optimized_parse_range(
     let mut best: Option<ParseResult> = None;
     let mut best_costs = None;
     let mut best_score = usize::MAX;
+    let mut scratch = ParseScratch::default();
 
     for _ in 0..optimization_passes {
-        let next = parse_range(input, candidates, block.clone(), &costs);
+        let next = parse_range_with_scratch(input, candidates, block.clone(), &costs, &mut scratch);
         let converged =
             previous.converged(best.as_ref().map(|p| p.tokens.as_slice()), &next.tokens);
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
