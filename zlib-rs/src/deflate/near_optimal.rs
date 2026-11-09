@@ -130,17 +130,17 @@ impl TokenCosts {
     pub(crate) fn fixed() -> Self {
         let mut literal = [0; 256];
         for (byte, cost) in literal.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_LTREE[byte].len() as u16 * COST_SCALE;
+            *cost = trees_tbl::STATIC_LTREE[byte].len() * COST_SCALE;
         }
 
         let mut length = [0; LENGTH_CODES];
         for (code, cost) in length.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_LTREE[257 + code].len() as u16 * COST_SCALE;
+            *cost = trees_tbl::STATIC_LTREE[257 + code].len() * COST_SCALE;
         }
 
         let mut distance = [0; D_CODES];
         for (code, cost) in distance.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_DTREE[code].len() as u16 * COST_SCALE;
+            *cost = trees_tbl::STATIC_DTREE[code].len() * COST_SCALE;
         }
 
         Self {
@@ -2034,17 +2034,17 @@ fn costs_and_block_score_from_histogram(
     };
     for (index, &used) in literal_used.iter().enumerate() {
         if used {
-            costs.literal[index] = state.l_desc.dyn_tree[index].len() as u16 * COST_SCALE;
+            costs.literal[index] = state.l_desc.dyn_tree[index].len() * COST_SCALE;
         }
     }
     for (index, &used) in length_used.iter().enumerate() {
         if used {
-            costs.length[index] = state.l_desc.dyn_tree[257 + index].len() as u16 * COST_SCALE;
+            costs.length[index] = state.l_desc.dyn_tree[257 + index].len() * COST_SCALE;
         }
     }
     for (index, &used) in distance_used.iter().enumerate() {
         if used {
-            costs.distance[index] = state.d_desc.dyn_tree[index].len() as u16 * COST_SCALE;
+            costs.distance[index] = state.d_desc.dyn_tree[index].len() * COST_SCALE;
         }
     }
 
@@ -2086,10 +2086,44 @@ fn compressed_histogram_score(
 const EXACT_BOUNDARY_CANDIDATES: usize = 4;
 const BOUNDARY_CANDIDATE_SEPARATION: usize = 256;
 
+/// Shift a block boundary by an unsigned byte count. The direction is part
+/// of the type, so neither the input length nor the absolute input position
+/// ever needs conversion through isize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryShift {
+    Right(usize),
+    Left(usize),
+}
+
+impl BoundaryShift {
+    fn is_near(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Right(a), Self::Right(b)) | (Self::Left(a), Self::Left(b)) => {
+                a.abs_diff(b) < BOUNDARY_CANDIDATE_SEPARATION
+            }
+            _ => false,
+        }
+    }
+
+    fn lengths(self, left: usize, right: usize) -> Option<(usize, usize)> {
+        match self {
+            Self::Right(bytes) => Some((left.checked_add(bytes)?, right.checked_sub(bytes)?)),
+            Self::Left(bytes) => Some((left.checked_sub(bytes)?, right.checked_add(bytes)?)),
+        }
+    }
+
+    fn boundary(self, offset: usize) -> Option<usize> {
+        match self {
+            Self::Right(bytes) => offset.checked_add(bytes),
+            Self::Left(bytes) => offset.checked_sub(bytes),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BoundaryCandidate {
     delta: i64,
-    shift: isize,
+    shift: BoundaryShift,
     left_histogram: TokenHistogram,
     right_histogram: TokenHistogram,
 }
@@ -2097,18 +2131,18 @@ struct BoundaryCandidate {
 fn consider_shift_candidate(
     candidates: &mut Vec<BoundaryCandidate>,
     delta: i64,
-    shift: isize,
+    shift: BoundaryShift,
     left_histogram: &TokenHistogram,
     right_histogram: &TokenHistogram,
 ) {
-    if delta >= 0 || shift == 0 {
+    if delta >= 0 {
         return;
     }
 
-    if let Some(existing) = candidates.iter_mut().find(|candidate| {
-        candidate.shift.signum() == shift.signum()
-            && candidate.shift.abs_diff(shift) < BOUNDARY_CANDIDATE_SEPARATION
-    }) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|candidate| candidate.shift.is_near(shift))
+    {
         if delta < existing.delta {
             *existing = BoundaryCandidate {
                 delta,
@@ -2161,7 +2195,7 @@ fn fixed_cost_shift_candidates(
         consider_shift_candidate(
             &mut candidates,
             delta,
-            moved as isize,
+            BoundaryShift::Right(moved),
             &shifted_left,
             &shifted_right,
         );
@@ -2187,7 +2221,7 @@ fn fixed_cost_shift_candidates(
         consider_shift_candidate(
             &mut candidates,
             delta,
-            -(moved as isize),
+            BoundaryShift::Left(moved),
             &shifted_left,
             &shifted_right,
         );
@@ -2197,34 +2231,33 @@ fn fixed_cost_shift_candidates(
     candidates
 }
 
-fn shifted_tokens(
-    left: &PlannedBlock,
-    right: &PlannedBlock,
-    shift: isize,
-) -> (Vec<ParseToken>, Vec<ParseToken>) {
-    if shift > 0 {
-        let mut bytes = 0usize;
-        let mut split = 0usize;
-        while split < right.tokens.len() && bytes < shift as usize {
-            bytes += right.tokens[split].input_len();
-            split += 1;
+/// Apply a chosen shift directly to the owned token vectors. Partition scoring
+/// is complete before this is called, so copying both blocks to construct the
+/// new partition would add work without preserving anything useful.
+fn shift_tokens(left: &mut PlannedBlock, right: &mut PlannedBlock, shift: BoundaryShift) {
+    match shift {
+        BoundaryShift::Right(wanted) => {
+            let mut bytes = 0usize;
+            let mut split = 0usize;
+            while split < right.tokens.len() && bytes < wanted {
+                bytes += right.tokens[split].input_len();
+                split += 1;
+            }
+            assert_eq!(bytes, wanted, "boundary shift must end between tokens");
+            left.tokens.extend(right.tokens.drain(..split));
         }
-        debug_assert_eq!(bytes, shift as usize);
-        let mut left_tokens = left.tokens.clone();
-        left_tokens.extend_from_slice(&right.tokens[..split]);
-        (left_tokens, right.tokens[split..].to_vec())
-    } else {
-        let wanted = (-shift) as usize;
-        let mut bytes = 0usize;
-        let mut split = left.tokens.len();
-        while split > 0 && bytes < wanted {
-            split -= 1;
-            bytes += left.tokens[split].input_len();
+        BoundaryShift::Left(wanted) => {
+            let mut bytes = 0usize;
+            let mut split = left.tokens.len();
+            while split > 0 && bytes < wanted {
+                split -= 1;
+                bytes += left.tokens[split].input_len();
+            }
+            assert_eq!(bytes, wanted, "boundary shift must end between tokens");
+            let mut moved = left.tokens.split_off(split);
+            moved.append(&mut right.tokens);
+            right.tokens = moved;
         }
-        debug_assert_eq!(bytes, wanted);
-        let mut right_tokens = left.tokens[split..].to_vec();
-        right_tokens.extend_from_slice(&right.tokens);
-        (left.tokens[..split].to_vec(), right_tokens)
     }
 }
 
@@ -2242,6 +2275,9 @@ pub enum BoundaryOptimization {
 /// single cheapest of unchanged / shifted / merged is applied. Match discovery and token parsing are
 /// deliberately not repeated here; a caller may use the retained right-hand candidate table for a
 /// follow-up DP-only reparse after the partition changes.
+///
+/// A merged result takes ownership of both blocks' token vectors, leaving them empty.
+/// A shifted result edits the original vectors in place without cloning either one.
 pub fn optimize_token_partition(
     state: &mut super::State<'_>,
     left: &mut PlannedBlock,
@@ -2287,8 +2323,14 @@ pub fn optimize_token_partition(
         &left_histogram,
         &right_histogram,
     ) {
-        let new_left_len = (left.input_len() as isize + candidate.shift) as usize;
-        let new_right_len = (right.input_len() as isize - candidate.shift) as usize;
+        let Some((new_left_len, new_right_len)) =
+            candidate.shift.lengths(left.input_len(), right.input_len())
+        else {
+            continue;
+        };
+        let Some(boundary) = candidate.shift.boundary(left.range.end) else {
+            continue;
+        };
         let Some((_, new_left_score)) =
             compressed_histogram_score(state, &candidate.left_histogram, new_left_len)
         else {
@@ -2302,25 +2344,22 @@ pub fn optimize_token_partition(
         let total_bits = new_left_score.bits + new_right_score.bits;
         if total_bits < best_total_bits {
             best_total_bits = total_bits;
-            best_shift = Some(candidate.shift);
+            best_shift = Some((candidate.shift, boundary));
             merge_is_best = false;
         }
     }
 
     let outcome = if merge_is_best {
-        let mut tokens = left.tokens.clone();
-        tokens.extend_from_slice(&right.tokens);
+        let mut tokens = core::mem::take(&mut left.tokens);
+        tokens.append(&mut right.tokens);
         BoundaryOptimization::Merged(PlannedBlock {
             range: left.range.start..right.range.end,
             tokens,
         })
-    } else if let Some(shift) = best_shift {
-        let boundary = (left.range.end as isize + shift) as usize;
-        let (new_left, new_right) = shifted_tokens(left, right, shift);
+    } else if let Some((shift, boundary)) = best_shift {
+        shift_tokens(left, right, shift);
         left.range.end = boundary;
         right.range.start = boundary;
-        left.tokens = new_left;
-        right.tokens = new_right;
         BoundaryOptimization::Shifted
     } else {
         BoundaryOptimization::Unchanged
@@ -2384,14 +2423,83 @@ mod boundary_tests {
     use super::*;
 
     #[test]
+    fn boundary_shift_supports_full_usize_positions_and_checks_lengths() {
+        let boundary = (isize::MAX as usize) + 16;
+        assert_eq!(
+            BoundaryShift::Right(7).boundary(boundary),
+            Some(boundary + 7)
+        );
+        assert_eq!(
+            BoundaryShift::Left(7).boundary(boundary),
+            Some(boundary - 7)
+        );
+        assert_eq!(BoundaryShift::Left(7).lengths(30, 40), Some((23, 47)));
+        assert_eq!(BoundaryShift::Right(7).lengths(30, 40), Some((37, 33)));
+        assert_eq!(BoundaryShift::Left(31).lengths(30, 40), None);
+        assert_eq!(BoundaryShift::Right(41).lengths(30, 40), None);
+        assert_eq!(BoundaryShift::Left(1).boundary(0), None);
+        assert_eq!(BoundaryShift::Right(1).boundary(usize::MAX), None);
+        assert!(BoundaryShift::Left(256).is_near(BoundaryShift::Left(257)));
+        assert!(!BoundaryShift::Left(256).is_near(BoundaryShift::Right(256)));
+        assert!(!BoundaryShift::Right(256).is_near(BoundaryShift::Right(512)));
+    }
+
+    #[test]
+    fn fixed_cost_boundary_shift_left_preserves_whole_tokens() {
+        let mut left_tokens = vec![ParseToken::Literal(b'a'); 5_500];
+        left_tokens.extend(core::iter::repeat_n(ParseToken::Literal(b'b'), 500));
+        let mut left = PlannedBlock {
+            range: 0..6_000,
+            tokens: left_tokens,
+        };
+        let mut right = PlannedBlock {
+            range: 6_000..12_000,
+            tokens: vec![ParseToken::Literal(b'b'); 6_000],
+        };
+        let mut left_costs = TokenCosts::fixed();
+        let mut right_costs = TokenCosts::fixed();
+        left_costs.literal[usize::from(b'a')] = COST_SCALE;
+        left_costs.literal[usize::from(b'b')] = 8 * COST_SCALE;
+        right_costs.literal[usize::from(b'a')] = 8 * COST_SCALE;
+        right_costs.literal[usize::from(b'b')] = COST_SCALE;
+        let left_histogram = TokenHistogram::from_tokens(&left.tokens);
+        let right_histogram = TokenHistogram::from_tokens(&right.tokens);
+        let shifts = fixed_cost_shift_candidates(
+            &left,
+            &right,
+            &left_costs,
+            &right_costs,
+            &left_histogram,
+            &right_histogram,
+        );
+        assert_eq!(shifts[0].shift, BoundaryShift::Left(500));
+        shift_tokens(&mut left, &mut right, shifts[0].shift);
+        let new_left = &left.tokens;
+        let new_right = &right.tokens;
+        assert_eq!(new_left.len(), 5_500);
+        assert_eq!(new_right.len(), 6_500);
+        assert_eq!(
+            shifts[0].left_histogram,
+            TokenHistogram::from_tokens(&new_left)
+        );
+        assert_eq!(
+            shifts[0].right_histogram,
+            TokenHistogram::from_tokens(&new_right)
+        );
+        assert!(new_right[..500]
+            .iter()
+            .all(|token| *token == ParseToken::Literal(b'b')));
+    }
+
+    #[test]
     fn fixed_cost_boundary_shift_moves_whole_tokens_and_conserves_input() {
-        let left = PlannedBlock {
+        let mut left = PlannedBlock {
             range: 0..6_000,
             tokens: vec![ParseToken::Literal(b'a'); 6_000],
         };
         let mut right_tokens = vec![ParseToken::Literal(b'a'); 500];
         right_tokens.extend(core::iter::repeat_n(ParseToken::Literal(b'b'), 5_500));
-        let right = PlannedBlock {
+        let mut right = PlannedBlock {
             range: 6_000..12_000,
             tokens: right_tokens,
         };
@@ -2413,9 +2521,11 @@ mod boundary_tests {
             &left_histogram,
             &right_histogram,
         );
-        assert_eq!(shifts[0].shift, 500);
+        assert_eq!(shifts[0].shift, BoundaryShift::Right(500));
         let shift = shifts[0].shift;
-        let (shifted_left, shifted_right) = shifted_tokens(&left, &right, shift);
+        shift_tokens(&mut left, &mut right, shift);
+        let shifted_left = &left.tokens;
+        let shifted_right = &right.tokens;
         assert_eq!(
             shifts[0].left_histogram,
             TokenHistogram::from_tokens(&shifted_left)

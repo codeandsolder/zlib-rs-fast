@@ -5558,6 +5558,8 @@ mod test {
         };
         assert_eq!(merged.range, 0..120_000);
         assert!(merged.tokens.len() <= near_optimal::MAX_BLOCK_TOKENS);
+        assert!(left.tokens.is_empty());
+        assert!(right.tokens.is_empty());
         assert!(end(stream).is_ok());
     }
 
