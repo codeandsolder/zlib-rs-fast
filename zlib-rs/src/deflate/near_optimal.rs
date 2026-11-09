@@ -2015,18 +2015,10 @@ fn costs_and_block_score_from_histogram(
     let distance_used =
         core::array::from_fn::<_, D_CODES, _>(|index| histogram.distance[index] != 0);
 
-    {
-        let mut tree = super::TreeDesc::EMPTY;
-        core::mem::swap(&mut tree, &mut state.l_desc);
-        super::build_tree(state, &mut tree);
-        core::mem::swap(&mut tree, &mut state.l_desc);
-    }
-    {
-        let mut tree = super::TreeDesc::EMPTY;
-        core::mem::swap(&mut tree, &mut state.d_desc);
-        super::build_tree(state, &mut tree);
-        core::mem::swap(&mut tree, &mut state.d_desc);
-    }
+    // Build directly in the state-owned descriptors. Only the bit-cost
+    // counters are shared across trees; no temporary descriptor swap is needed.
+    super::build_tree(&mut state.l_desc, &mut state.opt_len, &mut state.static_len);
+    super::build_tree(&mut state.d_desc, &mut state.opt_len, &mut state.static_len);
 
     // Keep unseen symbols available to later passes, but price them high enough that a pass does not
     // churn the tree merely because fixed-Huffman fallback made an absent symbol look cheap.
