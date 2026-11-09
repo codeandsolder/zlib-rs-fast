@@ -1561,67 +1561,29 @@ impl<'a> BitWriter<'a> {
     }
 
     fn send_tree(&mut self, tree: &[Value], bl_tree: &[Value], max_code: usize) {
-        /* tree: the tree to be scanned */
-        /* max_code and its largest code of non zero frequency */
-        let mut prevlen: isize = -1; /* last emitted length */
-        let mut curlen; /* length of current code */
-        let mut nextlen = tree[0].len(); /* length of next code */
-        let mut count = 0; /* repeat count of the current code */
-        let mut max_count = 7; /* max repeat count */
-        let mut min_count = 4; /* min repeat count */
-
-        /* tree[max_code+1].Len = -1; */
-        /* guard already set */
-        if nextlen == 0 {
-            max_count = 138;
-            min_count = 3;
-        }
-
-        for n in 0..=max_code {
-            curlen = nextlen;
-            nextlen = tree[n + 1].len();
-            count += 1;
-            if count < max_count && curlen == nextlen {
-                continue;
-            } else if count < min_count {
-                loop {
-                    self.send_code(curlen as usize, bl_tree);
-
-                    count -= 1;
-                    if count == 0 {
-                        break;
-                    }
+        for_each_code_length_run(tree, max_code, |run| match run {
+            CodeLengthRun::Literal { length, count } => {
+                for _ in 0..count {
+                    self.send_code(usize::from(length), bl_tree);
                 }
-            } else if curlen != 0 {
-                if curlen as isize != prevlen {
-                    self.send_code(curlen as usize, bl_tree);
-                    count -= 1;
+            }
+            CodeLengthRun::RepeatPrevious {
+                length,
+                count,
+                emit_initial,
+            } => {
+                if emit_initial {
+                    self.send_code(usize::from(length), bl_tree);
                 }
-                assert!((3..=6).contains(&count), " 3_6?");
                 self.send_code(REP_3_6, bl_tree);
-                self.send_bits(count - 3, 2);
-            } else if count <= 10 {
-                self.send_code(REPZ_3_10, bl_tree);
-                self.send_bits(count - 3, 3);
-            } else {
-                self.send_code(REPZ_11_138, bl_tree);
-                self.send_bits(count - 11, 7);
+                self.send_bits(u64::from(count - 3), 2);
             }
-
-            count = 0;
-            prevlen = curlen as isize;
-
-            if nextlen == 0 {
-                max_count = 138;
-                min_count = 3;
-            } else if curlen == nextlen {
-                max_count = 6;
-                min_count = 3;
-            } else {
-                max_count = 7;
-                min_count = 4;
+            CodeLengthRun::RepeatZero { code, count } => {
+                self.send_code(code, bl_tree);
+                let (base, bits) = if code == REPZ_3_10 { (3, 3) } else { (11, 7) };
+                self.send_bits(u64::from(count - base), bits);
             }
-        }
+        });
     }
 }
 
@@ -2721,51 +2683,86 @@ const REPZ_3_10: usize = 17;
 /// repeat a zero length 11-138 times  (7 bits of repeat count)
 const REPZ_11_138: usize = 18;
 
-fn scan_tree(bl_desc: &mut TreeDesc<{ 2 * BL_CODES + 1 }>, tree: &mut [Value], max_code: usize) {
-    /* tree: the tree to be scanned */
-    /* max_code: and its largest code of non zero frequency */
-    let mut prevlen = -1isize; /* last emitted length */
-    let mut curlen: isize; /* length of current code */
-    let mut nextlen = tree[0].len(); /* length of next code */
-    let mut count = 0; /* repeat count of the current code */
-    let mut max_count = 7; /* max repeat count */
-    let mut min_count = 4; /* min repeat count */
+/// One shared representation of the RFC 1951 code-length RLE decisions.
+///
+/// The frequency pass and bitstream pass must agree on these events. Previously
+/// they independently maintained their own zero/nonzero repeat state, which
+/// allowed the Huffman model to drift from what the encoder actually emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeLengthRun {
+    Literal {
+        length: u16,
+        count: u16,
+    },
+    RepeatPrevious {
+        length: u16,
+        count: u16,
+        emit_initial: bool,
+    },
+    RepeatZero {
+        code: usize,
+        count: u16,
+    },
+}
 
-    if nextlen == 0 {
-        max_count = 138;
-        min_count = 3;
-    }
+/// Visit code-length RLE decisions in wire order. The final sentinel is
+/// virtual: callers no longer need to mutate the tree's guard entry.
+fn for_each_code_length_run(tree: &[Value], max_code: usize, mut visit: impl FnMut(CodeLengthRun)) {
+    assert!(max_code < tree.len(), "code-length tree bound is invalid");
+    let mut previous = None;
+    let mut next_length = tree[0].len();
+    let mut count = 0u16;
+    let (mut max_count, mut min_count) = if next_length == 0 {
+        (138u16, 3u16)
+    } else {
+        (7u16, 4u16)
+    };
 
-    *tree[max_code + 1].len_mut() = 0xffff; /* guard */
-
-    let bl_tree = &mut bl_desc.dyn_tree;
-
-    for n in 0..=max_code {
-        curlen = nextlen as isize;
-        nextlen = tree[n + 1].len();
-        count += 1;
-        if count < max_count && curlen == nextlen as isize {
-            continue;
-        } else if count < min_count {
-            *bl_tree[curlen as usize].freq_mut() += count;
-        } else if curlen != 0 {
-            if curlen != prevlen {
-                *bl_tree[curlen as usize].freq_mut() += 1;
-            }
-            *bl_tree[REP_3_6].freq_mut() += 1;
-        } else if count <= 10 {
-            *bl_tree[REPZ_3_10].freq_mut() += 1;
+    for index in 0..=max_code {
+        let length = next_length;
+        next_length = if index == max_code {
+            u16::MAX
         } else {
-            *bl_tree[REPZ_11_138].freq_mut() += 1;
+            tree[index + 1].len()
+        };
+        count += 1;
+        if count < max_count && length == next_length {
+            continue;
         }
 
-        count = 0;
-        prevlen = curlen;
+        let run = if count < min_count {
+            CodeLengthRun::Literal { length, count }
+        } else if length != 0 {
+            let emit_initial = previous != Some(length);
+            let repeat_count = count - u16::from(emit_initial);
+            assert!(
+                (3..=6).contains(&repeat_count),
+                "nonzero code-length repetition exceeds DEFLATE bounds"
+            );
+            CodeLengthRun::RepeatPrevious {
+                length,
+                count: repeat_count,
+                emit_initial,
+            }
+        } else if count <= 10 {
+            CodeLengthRun::RepeatZero {
+                code: REPZ_3_10,
+                count,
+            }
+        } else {
+            CodeLengthRun::RepeatZero {
+                code: REPZ_11_138,
+                count,
+            }
+        };
+        visit(run);
 
-        if nextlen == 0 {
+        count = 0;
+        previous = Some(length);
+        if next_length == 0 {
             max_count = 138;
             min_count = 3;
-        } else if curlen == nextlen as isize {
+        } else if length == next_length {
             max_count = 6;
             min_count = 3;
         } else {
@@ -2773,6 +2770,28 @@ fn scan_tree(bl_desc: &mut TreeDesc<{ 2 * BL_CODES + 1 }>, tree: &mut [Value], m
             min_count = 4;
         }
     }
+}
+
+fn scan_tree(bl_desc: &mut TreeDesc<{ 2 * BL_CODES + 1 }>, tree: &[Value], max_code: usize) {
+    let bl_tree = &mut bl_desc.dyn_tree;
+    for_each_code_length_run(tree, max_code, |run| match run {
+        CodeLengthRun::Literal { length, count } => {
+            *bl_tree[usize::from(length)].freq_mut() += count;
+        }
+        CodeLengthRun::RepeatPrevious {
+            length,
+            emit_initial,
+            ..
+        } => {
+            if emit_initial {
+                *bl_tree[usize::from(length)].freq_mut() += 1;
+            }
+            *bl_tree[REP_3_6].freq_mut() += 1;
+        }
+        CodeLengthRun::RepeatZero { code, .. } => {
+            *bl_tree[code].freq_mut() += 1;
+        }
+    });
 }
 
 fn send_all_trees(state: &mut State, lcodes: usize, dcodes: usize, blcodes: usize) {
@@ -4386,6 +4405,122 @@ mod test {
         // Existing zlib-sized requests keep exactly their historical bound.
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn code_length_runs_cover_literal_repeat_and_zero_boundaries() {
+        use CodeLengthRun::{Literal, RepeatPrevious, RepeatZero};
+
+        let cases: &[(Vec<u16>, Vec<CodeLengthRun>)] = &[
+            (
+                vec![0; 2],
+                vec![Literal {
+                    length: 0,
+                    count: 2,
+                }],
+            ),
+            (
+                vec![0; 3],
+                vec![RepeatZero {
+                    code: REPZ_3_10,
+                    count: 3,
+                }],
+            ),
+            (
+                vec![0; 10],
+                vec![RepeatZero {
+                    code: REPZ_3_10,
+                    count: 10,
+                }],
+            ),
+            (
+                vec![0; 11],
+                vec![RepeatZero {
+                    code: REPZ_11_138,
+                    count: 11,
+                }],
+            ),
+            (
+                vec![0; 138],
+                vec![RepeatZero {
+                    code: REPZ_11_138,
+                    count: 138,
+                }],
+            ),
+            (
+                vec![1; 3],
+                vec![Literal {
+                    length: 1,
+                    count: 3,
+                }],
+            ),
+            (
+                vec![1; 6],
+                vec![RepeatPrevious {
+                    length: 1,
+                    count: 5,
+                    emit_initial: true,
+                }],
+            ),
+            (
+                vec![1; 10],
+                vec![
+                    RepeatPrevious {
+                        length: 1,
+                        count: 6,
+                        emit_initial: true,
+                    },
+                    RepeatPrevious {
+                        length: 1,
+                        count: 3,
+                        emit_initial: false,
+                    },
+                ],
+            ),
+        ];
+        for (lengths, expected) in cases {
+            let tree: Vec<Value> = lengths.iter().map(|&len| Value::new(0, len)).collect();
+            let mut actual = Vec::new();
+            for_each_code_length_run(&tree, lengths.len() - 1, |run| actual.push(run));
+            assert_eq!(&actual, expected, "RLE boundary {lengths:?}");
+        }
+
+        // Every run expands to the original lengths, even when zeros and
+        // nonzero codes alternate and split across repeat boundaries.
+        for seed in 0..32u32 {
+            let mut state = seed ^ 0x9e37_79b9;
+            let mut lengths = Vec::with_capacity(512);
+            for _ in 0..512 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let raw = state.to_le_bytes()[0];
+                lengths.push(if raw & 3 == 0 { 0 } else { u16::from(raw % 16) });
+            }
+            let tree: Vec<Value> = lengths.iter().map(|&len| Value::new(0, len)).collect();
+            let mut rebuilt = Vec::new();
+            for_each_code_length_run(&tree, lengths.len() - 1, |run| match run {
+                Literal { length, count } => {
+                    rebuilt.extend(core::iter::repeat_n(length, usize::from(count)));
+                }
+                RepeatPrevious {
+                    length,
+                    count,
+                    emit_initial,
+                } => {
+                    if emit_initial {
+                        rebuilt.push(length);
+                    } else {
+                        assert_eq!(rebuilt.last().copied(), Some(length));
+                    }
+                    rebuilt.extend(core::iter::repeat_n(length, usize::from(count)));
+                }
+                RepeatZero { count, .. } => {
+                    rebuilt.extend(core::iter::repeat_n(0, usize::from(count)));
+                }
+            });
+            assert_eq!(rebuilt, lengths, "random RLE case seed {seed}");
         }
     }
 
