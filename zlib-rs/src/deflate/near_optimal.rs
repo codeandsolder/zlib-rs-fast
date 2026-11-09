@@ -9,6 +9,34 @@ use super::{
     STD_MIN_MATCH,
 };
 
+/// Convert a validated DEFLATE match length into its compact token width.
+/// Match candidates and DP-selected tokens must obey the same 3..=258 limit.
+#[inline]
+fn compact_match_length(length: usize) -> u16 {
+    assert!(
+        (STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length),
+        "match exceeds DEFLATE length limit"
+    );
+    let Ok(length) = u16::try_from(length) else {
+        unreachable!("DEFLATE match lengths fit in u16");
+    };
+    length
+}
+
+/// Distance bounds are independent of the compact field's u16 capacity:
+/// DEFLATE uses 1..=32768 bytes of history.
+#[inline]
+fn compact_match_distance(distance: usize) -> u16 {
+    assert!(
+        (1..=1usize << crate::MAX_WBITS).contains(&distance),
+        "match exceeds DEFLATE distance limit"
+    );
+    let Ok(distance) = u16::try_from(distance) else {
+        unreachable!("DEFLATE distances fit in u16");
+    };
+    distance
+}
+
 /// One useful LZ77 alternative at an input position.
 ///
 /// Candidates are reduced losslessly by DEFLATE distance symbol: within one distance-code bucket,
@@ -27,8 +55,8 @@ impl MatchCandidate {
     };
 
     /// Update the best match for one distance-code bucket. Both discovery
-    /// strategies deliver byte positions as usize; only this boundary converts
-    /// their bounded DEFLATE length/distance into the compact token encoding.
+    /// strategies deliver byte positions as usize; they share the same compact
+    /// match-length encoder as DP tokens, and store the bounded distance in u16.
     #[inline]
     fn consider(&mut self, length: usize, distance: usize) {
         if length < STD_MIN_MATCH {
@@ -45,13 +73,10 @@ impl MatchCandidate {
         if length > usize::from(self.length)
             || (length == usize::from(self.length) && distance < usize::from(self.distance))
         {
-            let Ok(length) = u16::try_from(length) else {
-                unreachable!("bounded DEFLATE length always fits u16");
+            *self = Self {
+                length: compact_match_length(length),
+                distance: compact_match_distance(distance),
             };
-            let Ok(distance) = u16::try_from(distance) else {
-                unreachable!("bounded DEFLATE distance always fits u16");
-            };
-            *self = Self { length, distance };
         }
     }
 }
@@ -183,16 +208,25 @@ impl TokenCosts {
         u32::from(self.literal[usize::from(byte)])
     }
 
+    #[inline]
+    fn length_symbol_cost(&self, code: usize) -> u32 {
+        u32::from(self.length[code])
+            + u32::from(StaticTreeDesc::EXTRA_LBITS[code]) * u32::from(COST_SCALE)
+    }
+
+    #[inline]
+    fn distance_symbol_cost(&self, code: usize) -> u32 {
+        u32::from(self.distance[code])
+            + u32::from(StaticTreeDesc::EXTRA_DBITS[code]) * u32::from(COST_SCALE)
+    }
+
     fn match_cost(&self, length: usize, distance: usize) -> u32 {
         debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length));
-        debug_assert!(distance > 0);
+        debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&distance));
 
-        let length_code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
-        let distance_code = State::d_code(distance - 1) as usize;
-        u32::from(self.length[length_code])
-            + u32::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u32::from(COST_SCALE)
-            + u32::from(self.distance[distance_code])
-            + u32::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u32::from(COST_SCALE)
+        let length_code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
+        let distance_code = usize::from(State::d_code(distance - 1));
+        self.length_symbol_cost(length_code) + self.distance_symbol_cost(distance_code)
     }
 
     /// One token fits u32; whole-parse dynamic-programming totals use u64.
@@ -213,6 +247,15 @@ pub enum ParseToken {
 }
 
 impl ParseToken {
+    #[inline]
+    fn matching(length: usize, distance: u16) -> Self {
+        debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&usize::from(distance)));
+        Self::Match {
+            length: compact_match_length(length),
+            distance,
+        }
+    }
+
     fn input_len(self) -> usize {
         match self {
             Self::Literal(_) => 1,
@@ -929,28 +972,23 @@ pub fn parse_range(
     let block_len = block.len();
     let mut best_cost = vec![INF; block_len + 1];
     let mut steps = vec![ParseStep(0); block_len + 1];
-    let mut length_costs = [0u16; STD_MAX_MATCH + 1];
-    for (length, cost) in length_costs
-        .iter_mut()
-        .enumerate()
-        .take(STD_MAX_MATCH + 1)
-        .skip(STD_MIN_MATCH)
-    {
-        let code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
-        *cost = costs.length[code] + u16::from(StaticTreeDesc::EXTRA_LBITS[code]) * COST_SCALE;
+    let mut length_costs = [0u32; STD_MAX_MATCH + 1];
+    for (length, cost) in length_costs.iter_mut().enumerate().skip(STD_MIN_MATCH) {
+        let code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
+        *cost = costs.length_symbol_cost(code);
     }
-    let mut distance_costs = vec![0u16; 32_768 + 1];
-    for (distance, cost) in distance_costs.iter_mut().enumerate().skip(1) {
-        let code = State::d_code(distance - 1) as usize;
-        *cost = costs.distance[code] + u16::from(StaticTreeDesc::EXTRA_DBITS[code]) * COST_SCALE;
-    }
+    // DEFLATE distance cost depends on the Huffman distance symbol, not the
+    // numeric distance. Build 30 entries rather than allocating and filling
+    // one entry per possible byte offset in the 32 KiB window.
+    let distance_costs: [u32; D_CODES] =
+        core::array::from_fn(|code| costs.distance_symbol_cost(code));
     // One candidate can become newly capable at each maximum match length. Keep the sparse values
     // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
     // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
     #[derive(Clone, Copy)]
     struct DistanceAtMax {
         generation: u32,
-        cost: u16,
+        cost: u32,
         distance: u16,
     }
     assert!(block_len <= u32::MAX as usize);
@@ -984,7 +1022,8 @@ pub fn parse_range(
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
             longest_match = longest_match.max(max_len);
-            let cost = distance_costs[usize::from(candidate.distance)];
+            let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
+            let cost = distance_costs[code];
             let slot = &mut distance_cost_at_max[max_len];
             if slot.generation != generation || cost < slot.cost {
                 *slot = DistanceAtMax {
@@ -998,7 +1037,7 @@ pub fn parse_range(
         if longest_match < STD_MIN_MATCH {
             continue;
         }
-        let mut cheapest_capable = None::<(u16, u16)>;
+        let mut cheapest_capable = None::<(u32, u16)>;
         for length in (STD_MIN_MATCH..=longest_match).rev() {
             let candidate = distance_cost_at_max[length];
             if candidate.generation == generation
@@ -1015,10 +1054,7 @@ pub fn parse_range(
                 &mut steps,
                 local_position + length,
                 prefix_cost + token_cost,
-                ParseToken::Match {
-                    length: length as u16,
-                    distance,
-                },
+                ParseToken::matching(length, distance),
             );
         }
     }
@@ -1613,6 +1649,41 @@ mod tests {
         let parsed = parse_block(input, &table, &fixed);
         assert_eq!(parsed.cost_x16, brute_cost(input, &fixed, 32));
         assert_eq!(expand(&parsed.tokens), input);
+    }
+
+    #[test]
+    fn maximal_symbol_weights_keep_dp_exact_without_u16_overflow() {
+        // A cost model may assign u16::MAX to a Huffman symbol. Extra-bit
+        // costs are then added before DP comparison and must not wrap u16,
+        // including for distance symbols spanning the full DEFLATE window.
+        let input = vec![b'a'; 96];
+        let candidates = build_match_candidates(&input, 64);
+        let mut costs = TokenCosts::fixed();
+        costs.literal.fill(u16::MAX);
+        costs.length.fill(u16::MAX);
+        costs.distance.fill(u16::MAX);
+
+        let parsed = parse_block(&input, &candidates, &costs);
+        assert_eq!(parsed.cost_x16, brute_cost(&input, &costs, 64));
+        assert_eq!(expand(&parsed.tokens), input);
+        assert!(parsed
+            .tokens
+            .iter()
+            .any(|token| matches!(token, ParseToken::Match { .. })));
+
+        let length_code = usize::from(trees_tbl::LENGTH_CODE[STD_MAX_MATCH - STD_MIN_MATCH]);
+        let expected_length = u32::from(costs.length[length_code])
+            + u32::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u32::from(COST_SCALE);
+        for distance in 1..=1usize << crate::MAX_WBITS {
+            let distance_code = usize::from(State::d_code(distance - 1));
+            let expected_distance = u32::from(costs.distance[distance_code])
+                + u32::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u32::from(COST_SCALE);
+            assert_eq!(
+                costs.match_cost(STD_MAX_MATCH, distance),
+                expected_length + expected_distance,
+                "distance={distance}",
+            );
+        }
     }
 
     #[test]
