@@ -249,6 +249,42 @@ impl TokenCosts {
     }
 }
 
+/// Frozen token reassignment cost, computed once from both Huffman models.
+/// DEFLATE extra-bit counts are token-dependent and cancel in their difference.
+struct TokenCostDelta {
+    literal: [i32; 256],
+    length: [i32; LENGTH_CODES],
+    distance: [i32; D_CODES],
+}
+
+impl TokenCostDelta {
+    fn between(left: &TokenCosts, right: &TokenCosts) -> Self {
+        Self {
+            literal: core::array::from_fn(|i| {
+                i32::from(left.literal[i]) - i32::from(right.literal[i])
+            }),
+            length: core::array::from_fn(|i| {
+                i32::from(left.length[i]) - i32::from(right.length[i])
+            }),
+            distance: core::array::from_fn(|i| {
+                i32::from(left.distance[i]) - i32::from(right.distance[i])
+            }),
+        }
+    }
+
+    fn token_delta(&self, token: ParseToken) -> i64 {
+        match token {
+            ParseToken::Literal(byte) => i64::from(self.literal[usize::from(byte)]),
+            ParseToken::Match { length, distance } => {
+                let length_code =
+                    usize::from(trees_tbl::LENGTH_CODE[usize::from(length) - STD_MIN_MATCH]);
+                let distance_code = usize::from(State::d_code(usize::from(distance) - 1));
+                i64::from(self.length[length_code]) + i64::from(self.distance[distance_code])
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseToken {
     Literal(u8),
@@ -2526,6 +2562,7 @@ fn fixed_cost_shift_candidates(
 ) -> BoundaryShortlist {
     debug_assert_eq!(left.range.end, right.range.start);
     let mut candidates = BoundaryShortlist::default();
+    let token_deltas = TokenCostDelta::between(left_costs, right_costs);
 
     // Positive shift: move a prefix of the right block into the left block.
     let mut moved = 0usize;
@@ -2539,7 +2576,7 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += i64::from(left_costs.token_cost(token)) - i64::from(right_costs.token_cost(token));
+        delta += token_deltas.token_delta(token);
         candidates.consider(delta, BoundaryShift::Right(moved));
     }
 
@@ -2555,7 +2592,7 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += i64::from(right_costs.token_cost(token)) - i64::from(left_costs.token_cost(token));
+        delta -= token_deltas.token_delta(token);
         candidates.consider(delta, BoundaryShift::Left(moved));
     }
 
@@ -2939,6 +2976,48 @@ mod boundary_tests {
                 compressed_histogram_score(state, &histogram, input_len, Some(&mut filtered_costs));
             assert_eq!(without_costs, with_costs);
             assert_eq!(filtered_costs, expected_costs);
+        }
+    }
+
+    #[test]
+    fn relative_frozen_token_cost_matches_full_cost_difference() {
+        // Exercise all 256 length values, boundary distance symbols, and
+        // literal codes, with asymmetric and extreme valid u16 cost models.
+        let mut left = TokenCosts::unseen();
+        let mut right = TokenCosts::unseen();
+        for byte in u8::MIN..=u8::MAX {
+            let index = usize::from(byte);
+            left.literal[index] = u16::from(byte) * 199 + 13;
+            right.literal[index] = u16::from(byte) * 127 + 123;
+        }
+        for index in 0..LENGTH_CODES {
+            left.length[index] = if index % 2 == 0 { 0 } else { u16::MAX };
+            right.length[index] = if index % 2 == 0 { u16::MAX } else { 0 };
+        }
+        for index in 0..D_CODES {
+            left.distance[index] = if index % 3 == 0 { u16::MAX } else { 7 };
+            right.distance[index] = if index % 3 == 0 { 0 } else { u16::MAX };
+        }
+
+        let deltas = TokenCostDelta::between(&left, &right);
+        let reverse = TokenCostDelta::between(&right, &left);
+        for byte in u8::MIN..=u8::MAX {
+            let token = ParseToken::Literal(byte);
+            let expected = i64::from(left.token_cost(token)) - i64::from(right.token_cost(token));
+            assert_eq!(deltas.token_delta(token), expected);
+            assert_eq!(reverse.token_delta(token), -expected);
+        }
+
+        for length in 3_u16..=258 {
+            for distance in 1_u16..=32_768 {
+                // Every valid length/distance combination is representable
+                // by the DEFLATE coding tables; verify the exact cancellation.
+                let token = ParseToken::Match { length, distance };
+                let expected =
+                    i64::from(left.token_cost(token)) - i64::from(right.token_cost(token));
+                assert_eq!(deltas.token_delta(token), expected);
+                assert_eq!(reverse.token_delta(token), -expected);
+            }
         }
     }
 
