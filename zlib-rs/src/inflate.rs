@@ -12,7 +12,7 @@ mod inftrees;
 mod window;
 mod writer;
 
-use crate::abi_cursor::advance_abi_bytes;
+use crate::abi_cursor::{advance_abi_bytes, SliceBudget};
 use crate::allocate::Allocator;
 use crate::c_api::{in_func, internal_state, out_func};
 use crate::output_buffer::{assume_init_prefix, WritableBytes};
@@ -387,8 +387,8 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     // For zero-capacity output, zlib needs one scratch byte to distinguish an empty
     // stream from a stream that would produce data. This byte is never exposed to Rust.
     let mut scratch = [0u8];
-    let mut left = if output_len == 0 { 1 } else { output_len };
-    let mut len = input.len();
+    let mut output_budget = SliceBudget::new(if output_len == 0 { 1 } else { output_len });
+    let mut input_budget = SliceBudget::new(input.len());
     let dest = if output_len == 0 {
         scratch.as_mut_ptr()
     } else {
@@ -419,15 +419,8 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     };
 
     let err = loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = u32::try_from(left).unwrap_or(u32::MAX);
-            left -= stream.avail_out as usize;
-        }
-
-        if stream.avail_in == 0 {
-            stream.avail_in = u32::try_from(len).unwrap_or(u32::MAX);
-            len -= stream.avail_in as usize;
-        }
+        output_budget.refill(&mut stream.avail_out);
+        input_budget.refill(&mut stream.avail_in);
 
         let err = unsafe { inflate(stream, InflateFlush::NoFlush) };
 
@@ -436,29 +429,24 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
         }
     };
 
-    // `len` and `avail_in` are the unconsumed input, not bytes consumed. The
-    // Rust-facing API returns the actual prefix processed, including on errors.
-    let consumed = input.len() - len - stream.avail_in as usize;
-    // Preserve the full Rust slice length even if z_stream.total_out wraps.
+    // Unoffered or unconsumed input is not part of the processed prefix.
+    let consumed = input_budget.processed(stream.avail_in);
+    // Preserve full Rust slice lengths even if the C total_out counter wraps.
     let produced = if output_len == 0 {
         0
     } else {
-        crate::output_buffer::written_from_budget(output_len, left, stream.avail_out)
+        output_budget.processed(stream.avail_out)
     };
 
-    // A filled scratch byte proves a zero-capacity destination was too small.
-    // Retain the legacy Z_DATA_ERROR distinction for that special case.
-    if output_len == 0 && stream.total_out != 0 && err == ReturnCode::BufError {
-        left = 1;
-    }
-
-    let avail_out = stream.avail_out;
+    // A scratch byte means a zero-capacity caller destination was too small.
+    let scratch_overflow = output_len == 0 && stream.total_out != 0;
+    let capacity_left = output_budget.pending() != 0 || stream.avail_out != 0;
     end(stream);
 
     let ret = match err {
         ReturnCode::StreamEnd => ReturnCode::Ok,
         ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if left + avail_out as usize != 0 => ReturnCode::DataError,
+        ReturnCode::BufError if capacity_left || scratch_overflow => ReturnCode::DataError,
         _ => err,
     };
 
@@ -3387,6 +3375,31 @@ mod tests {
             assert_eq!(decoded, plain);
             assert_eq!(consumed, compressed.len(), "trailing {trailing} bytes");
         }
+    }
+
+    #[test]
+    fn whole_slice_inflate_distinguishes_empty_stream_from_exhausted_output() {
+        // RFC1950 stream containing no uncompressed bytes.
+        const EMPTY_STREAM: &[u8] = &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut empty_dest = [MaybeUninit::<u8>::uninit(); 0];
+        let (consumed, decoded, code) =
+            uncompress2(&mut empty_dest, EMPTY_STREAM, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(consumed, EMPTY_STREAM.len());
+        assert!(decoded.is_empty());
+
+        let mut compressed = [0u8; 128];
+        let (encoded, code) = crate::compress_slice(
+            &mut compressed,
+            b"nonempty",
+            crate::DeflateConfig::default(),
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        let (consumed, decoded, code) =
+            uncompress2(&mut empty_dest, encoded, InflateConfig::default());
+        assert_eq!(code, ReturnCode::DataError);
+        assert!(consumed <= encoded.len());
+        assert!(decoded.is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use core::{ffi::CStr, marker::PhantomData, mem::MaybeUninit, ops::ControlFlow, ptr::NonNull};
 
 use crate::{
-    abi_cursor::advance_abi_bytes,
+    abi_cursor::{advance_abi_bytes, SliceBudget},
     adler32::adler32,
     allocate::Allocator,
     c_api::{gz_header, internal_state, z_checksum, z_stream},
@@ -3710,32 +3710,22 @@ fn compress_into<O: WritableBytes + ?Sized>(
         return (0, err);
     }
 
-    let mut left = output_len;
-    let mut source_len = input.len();
+    let mut output_budget = SliceBudget::new(output_len);
+    let mut input_budget = SliceBudget::new(input.len());
+    let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
+        return (0, ReturnCode::StreamError);
+    };
 
     let return_code = loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = core::ffi::c_uint::try_from(left).unwrap_or(core::ffi::c_uint::MAX);
-            left -= stream.avail_out as usize;
-        }
+        output_budget.refill(&mut stream.avail_out);
+        input_budget.refill(&mut stream.avail_in);
 
-        if stream.avail_in == 0 {
-            stream.avail_in =
-                core::ffi::c_uint::try_from(source_len).unwrap_or(core::ffi::c_uint::MAX);
-            source_len -= stream.avail_in as usize;
-        }
-
-        let flush = if source_len > 0 {
+        let flush = if input_budget.pending() > 0 {
             DeflateFlush::NoFlush
         } else {
             final_flush
         };
-
-        let err = if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut stream) } {
-            deflate(stream, flush)
-        } else {
-            ReturnCode::StreamError
-        };
+        let err = deflate(stream, flush);
 
         match err {
             ReturnCode::Ok => continue,
@@ -3746,12 +3736,8 @@ fn compress_into<O: WritableBytes + ?Sized>(
 
     // The public zlib total_out counter may wrap on 64-bit Windows (32-bit c_ulong).
     // Recover the exact Rust-slice length from caller output budgets instead.
-    let produced = crate::output_buffer::written_from_budget(output_len, left, stream.avail_out);
-
-    // may DataError if insufficient output space
-    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut stream) } {
-        let _ = end(stream);
-    }
+    let produced = output_budget.processed(stream.avail_out);
+    let _ = end(stream);
 
     (produced, return_code)
 }
