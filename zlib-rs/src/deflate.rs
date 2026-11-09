@@ -2469,17 +2469,15 @@ fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
     let mut synthetic_static_len = 0usize;
     while heap.heap_len < 2 {
         heap.heap_len += 1;
-        let node = if max_code < 2 {
-            max_code += 1;
-            max_code
+        let node = if max_code.is_none_or(|code| code < 2) {
+            let next = max_code.map_or(0, |code| code + 1);
+            max_code = Some(next);
+            next
         } else {
             0
         };
 
-        debug_assert!(node >= 0);
-        let node = node as usize;
-
-        heap.heap[heap.heap_len] = node as u32;
+        heap.heap[heap.heap_len] = node;
         *tree[node].freq_mut() = 1;
         heap.depth[node] = 0;
         synthetic_opt_len += 1;
@@ -2489,8 +2487,11 @@ fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
         /* node is 0 or 1 so it does not have extra bits */
     }
 
-    debug_assert!(max_code >= 0);
-    let max_code = max_code as usize;
+    // A DEFLATE Huffman alphabet always needs at least two symbols,
+    // including synthetic leaves for an initially empty alphabet.
+    let Some(max_code) = max_code else {
+        unreachable!("the two-leaf Huffman tree must have a largest symbol");
+    };
     desc.max_code = max_code;
 
     // The elements heap[heap_len/2+1 .. heap_len] are leaves of the tree,
@@ -2529,13 +2530,12 @@ fn gen_bitlen<const N: usize>(
 
     // In a first pass, compute the optimal bit lengths (which may
     // overflow in the case of the bit length tree).
-    *tree[heap.heap[heap.heap_max] as usize].len_mut() = 0; /* root of the heap */
+    *tree[heap.heap[heap.heap_max]].len_mut() = 0; /* root of the heap */
 
     // number of elements with bit length too large
     let mut overflow: i32 = 0;
 
     for &n in &heap.heap[heap.heap_max + 1..HEAP_SIZE] {
-        let n = n as usize;
         let mut bits = tree[usize::from(tree[n].dad())].len() + 1;
 
         if bits > max_length {
@@ -2597,7 +2597,7 @@ fn gen_bitlen<const N: usize>(
         let mut n = bl_count[bits as usize];
         while n != 0 {
             h -= 1;
-            let m = heap.heap[h] as usize;
+            let m = heap.heap[h];
             if m > max_code {
                 continue;
             }
@@ -3781,7 +3781,8 @@ const fn compress_bound_help(source_len: usize, wrap_len: usize) -> usize {
 /// The same heap array is used to build all trees.
 #[derive(Clone)]
 struct Heap {
-    heap: [u32; 2 * L_CODES + 1],
+    // Native indices address the heap and tree arrays, not DEFLATE wire fields.
+    heap: [usize; 2 * L_CODES + 1],
 
     /// number of elements in the heap
     heap_len: usize,
@@ -3805,8 +3806,8 @@ impl Heap {
 
     /// Construct the initial heap, with least frequent element in
     /// heap[SMALLEST]. The sons of heap[n] are heap[2*n] and heap[2*n+1]. heap[0] is not used.
-    fn initialize(&mut self, tree: &mut [Value]) -> isize {
-        let mut max_code = -1;
+    fn initialize(&mut self, tree: &mut [Value]) -> Option<usize> {
+        let mut max_code = None;
 
         self.heap_len = 0;
         self.heap_max = HEAP_SIZE;
@@ -3814,8 +3815,8 @@ impl Heap {
         for (n, node) in tree.iter_mut().enumerate() {
             if node.freq() > 0 {
                 self.heap_len += 1;
-                self.heap[self.heap_len] = n as u32;
-                max_code = n as isize;
+                self.heap[self.heap_len] = n;
+                max_code = Some(n);
                 self.depth[n] = 0;
             } else {
                 *node.len_mut() = 0;
@@ -3838,7 +3839,7 @@ impl Heap {
         // possible to sort with fewer comparison operations.
         macro_rules! freq_and_depth {
             ($i:expr) => {
-                (tree[$i as usize].freq() as u32) << 8 | self.depth[$i as usize] as u32
+                (u32::from(tree[$i].freq()) << 8) | u32::from(self.depth[$i])
             };
         }
 
@@ -3875,7 +3876,7 @@ impl Heap {
 
     /// Remove the smallest element from the heap and recreate the heap with
     /// one less element. Updates heap and heap_len.
-    fn pqremove(&mut self, tree: &[Value]) -> u32 {
+    fn pqremove(&mut self, tree: &[Value]) -> usize {
         let top = self.heap[Self::SMALLEST];
         self.heap[Self::SMALLEST] = self.heap[self.heap_len];
         self.heap_len -= 1;
@@ -3888,23 +3889,26 @@ impl Heap {
     /// Construct the Huffman tree by repeatedly combining the least two frequent nodes.
     fn construct_huffman_tree(&mut self, tree: &mut [Value], mut node: usize) {
         loop {
-            let n = self.pqremove(tree) as usize; /* n = node of least frequency */
-            let m = self.heap[Heap::SMALLEST] as usize; /* m = node of next least frequency */
+            let n = self.pqremove(tree); /* n = node of least frequency */
+            let m = self.heap[Heap::SMALLEST]; /* m = node of next least frequency */
 
             self.heap_max -= 1;
-            self.heap[self.heap_max] = n as u32; /* keep the nodes sorted by frequency */
+            self.heap[self.heap_max] = n; /* keep the nodes sorted by frequency */
             self.heap_max -= 1;
-            self.heap[self.heap_max] = m as u32;
+            self.heap[self.heap_max] = m;
 
             /* Create a new node father of n and m */
             *tree[node].freq_mut() = tree[n].freq() + tree[m].freq();
             self.depth[node] = Ord::max(self.depth[n], self.depth[m]) + 1;
 
-            *tree[n].dad_mut() = node as u16;
-            *tree[m].dad_mut() = node as u16;
+            let Ok(parent) = u16::try_from(node) else {
+                unreachable!("the fixed Huffman alphabet cannot exceed u16 parent indices");
+            };
+            *tree[n].dad_mut() = parent;
+            *tree[m].dad_mut() = parent;
 
             /* and insert the new node in the heap */
-            self.heap[Heap::SMALLEST] = node as u32;
+            self.heap[Heap::SMALLEST] = node;
             node += 1;
 
             self.pqdownheap(tree, Heap::SMALLEST);
@@ -4405,6 +4409,52 @@ mod test {
         // Existing zlib-sized requests keep exactly their historical bound.
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn huffman_heap_initialization_has_explicit_empty_and_sparse_origins() {
+        for active in [None, Some(0usize), Some(1), Some(D_CODES - 1)] {
+            let mut leaves = [Value::new(0, 0); D_CODES];
+            if let Some(code) = active {
+                *leaves[code].freq_mut() = 1;
+            }
+
+            let mut heap = Heap::new();
+            assert_eq!(heap.initialize(&mut leaves), active);
+            assert_eq!(heap.heap_len, usize::from(active.is_some()));
+            if let Some(code) = active {
+                assert_eq!(heap.heap[Heap::SMALLEST], code);
+            }
+
+            let mut stream = DeflateStream::new(DeflateConfig::new(6));
+            let mut desc = TreeDesc::<{ 2 * D_CODES + 1 }>::EMPTY;
+            desc.stat_desc = &StaticTreeDesc::D;
+            if let Some(code) = active {
+                *desc.dyn_tree[code].freq_mut() = 1;
+            }
+            build_tree(&mut stream.state, &mut desc);
+            let expected_max = match active {
+                None | Some(0) => 1,
+                Some(1) => 2,
+                Some(code) => code,
+            };
+            assert_eq!(desc.max_code, expected_max);
+            let used: Vec<usize> = desc.dyn_tree[..D_CODES]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| (v.len() != 0).then_some(i))
+                .collect();
+            assert_eq!(used.len(), 2, "sparse Huffman alphabet {active:?}");
+            if let Some(code) = active {
+                assert!(used.contains(&code));
+            } else {
+                assert_eq!(used, [0, 1]);
+            }
+            for &code in &used {
+                assert_eq!(desc.dyn_tree[code].len(), 1);
+            }
+            assert!(end(&mut stream).is_ok());
         }
     }
 
