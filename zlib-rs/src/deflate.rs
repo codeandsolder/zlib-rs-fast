@@ -959,21 +959,22 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     ReturnCode::Ok
 }
 
-pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCode {
-    let state = &mut *stream.state;
-
-    if bits < 0
-        || bits > BitWriter::BIT_BUF_SIZE as i32
-        || bits > (core::mem::size_of_val(&value) << 3) as i32
-    {
+pub fn prime(stream: &mut DeflateStream, bits: i32, value: i32) -> ReturnCode {
+    // The public zlib argument is signed, while the bit writer works with
+    // byte-sized widths. Reject out-of-range values before changing state.
+    let Ok(mut bits) = u8::try_from(bits) else {
+        return ReturnCode::BufError;
+    };
+    if bits > BitWriter::BIT_BUF_SIZE || usize::from(bits) > core::mem::size_of_val(&value) * 8 {
         return ReturnCode::BufError;
     }
+    let state = &mut *stream.state;
 
     // `flush_bits()` writes every complete byte from the combined reservoir. Preflight the
     // complete call so a full pending buffer reports zlib's Z_BUF_ERROR instead of reaching the
     // infallible internal append operation. zlib-ng's 64-bit reservoir accepts up to 32 input
     // bits here (bounded by `value`), despite the public compatibility documentation saying 16.
-    let bytes_to_flush = (usize::from(state.bit_writer.bits_valid) + bits as usize) / 8;
+    let bytes_to_flush = (usize::from(state.bit_writer.bits_valid) + usize::from(bits)) / 8;
     if state.bit_writer.pending.remaining() < bytes_to_flush {
         return ReturnCode::BufError;
     }
@@ -982,11 +983,8 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
     // before the reservoir can inherit high or sign-extended caller bits.
     let mut value64 = u64::from(value.cast_unsigned()) & ((1u64 << bits) - 1);
 
-    let mut put;
-
     loop {
-        put = BitWriter::BIT_BUF_SIZE - state.bit_writer.bits_valid;
-        let put = Ord::min(put as i32, bits);
+        let put = (BitWriter::BIT_BUF_SIZE - state.bit_writer.bits_valid).min(bits);
 
         if state.bit_writer.bits_valid == 0 {
             state.bit_writer.bit_buffer = value64;
@@ -995,7 +993,7 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
                 (value64 & ((1 << put) - 1)) << state.bit_writer.bits_valid;
         }
 
-        state.bit_writer.bits_valid += put as u8;
+        state.bit_writer.bits_valid += put;
         state.bit_writer.flush_bits();
         value64 >>= put;
         bits -= put;
@@ -1970,15 +1968,30 @@ impl<'a> State<'a> {
     }
 
     #[inline(always)]
-    fn tally_dist_with_limit(&mut self, mut dist: usize, len: usize, max_distance: usize) -> bool {
-        self.sym_buf.push_dist(dist as u16, len as u8);
+    fn tally_dist_with_limit(&mut self, dist: usize, len: usize, max_distance: usize) -> bool {
+        // Validate the entire token before writing any of its three bytes
+        // or incrementing Huffman frequencies. A distance is one-based and
+        // must fit both the configured DEFLATE window and the wire encoding.
+        assert!(
+            (1..=max_distance.min(1usize << crate::MAX_WBITS)).contains(&dist),
+            "tally_dist: bad match"
+        );
+        assert!(
+            len <= STD_MAX_MATCH - STD_MIN_MATCH,
+            "tally_dist: bad match length"
+        );
+        let Ok(encoded_dist) = u16::try_from(dist) else {
+            unreachable!("distance was checked against u16::MAX");
+        };
+        let Ok(encoded_len) = u8::try_from(len) else {
+            unreachable!("match length was checked against the 255-byte DEFLATE delta");
+        };
 
+        self.sym_buf.push_dist(encoded_dist, encoded_len);
         self.matches = self.matches.saturating_add(1);
-        dist -= 1;
+        let dist = dist - 1;
 
-        assert!(dist < max_distance, "tally_dist: bad match");
-
-        let index = self::trees_tbl::LENGTH_CODE[len] as usize + LITERALS + 1;
+        let index = usize::from(self::trees_tbl::LENGTH_CODE[len]) + LITERALS + 1;
         *self.l_desc.dyn_tree[index].freq_mut() += 1;
 
         *self.d_desc.dyn_tree[Self::d_code(dist) as usize].freq_mut() += 1;
@@ -4502,6 +4515,89 @@ mod test {
     }
 
     #[test]
+    fn invalid_match_tokens_do_not_modify_encoder_state() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init created the live uniquely owned Deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("initialized stream has no state")?;
+        {
+            let state = &mut *stream.state;
+            let max_distance = state.w_mask() + 1;
+            let original = (
+                state.matches,
+                state.sym_buf.iter().collect::<Vec<_>>(),
+                state
+                    .l_desc
+                    .dyn_tree
+                    .iter()
+                    .map(|value| value.freq())
+                    .collect::<Vec<_>>(),
+                state
+                    .d_desc
+                    .dyn_tree
+                    .iter()
+                    .map(|value| value.freq())
+                    .collect::<Vec<_>>(),
+            );
+
+            for (distance, len, limit) in [
+                (0, 0, max_distance),
+                (max_distance + 1, 0, max_distance),
+                (usize::from(u16::MAX) + 1, 0, max_distance),
+                (1, usize::from(u8::MAX) + 1, max_distance),
+                (max_distance + 1, 0, max_distance + 1),
+            ] {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.tally_dist_with_limit(distance, len, limit);
+                    }))
+                    .is_err(),
+                    "invalid match {distance}/{len} must be rejected"
+                );
+                assert_eq!(
+                    (
+                        state.matches,
+                        state.sym_buf.iter().collect::<Vec<_>>(),
+                        state
+                            .l_desc
+                            .dyn_tree
+                            .iter()
+                            .map(|value| value.freq())
+                            .collect::<Vec<_>>(),
+                        state
+                            .d_desc
+                            .dyn_tree
+                            .iter()
+                            .map(|value| value.freq())
+                            .collect::<Vec<_>>(),
+                    ),
+                    original,
+                    "failed match must leave tokens and Huffman frequencies intact"
+                );
+            }
+
+            // Full window distance and the 258-byte maximum are both legal.
+            let _ = state.tally_dist_with_limit(
+                max_distance,
+                STD_MAX_MATCH - STD_MIN_MATCH,
+                max_distance,
+            );
+            assert_eq!(state.matches, original.0 + 1);
+            assert_eq!(
+                state
+                    .sym_buf
+                    .iter()
+                    .last()
+                    .map(|(dist, len)| (usize::from(dist), len)),
+                Some((max_distance, u8::MAX))
+            );
+        }
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn detect_data_type_basic() {
         let empty = || [Value::new(0, 0); LITERALS];
 
@@ -5030,6 +5126,38 @@ mod test {
         );
 
         assert!(end(stream).is_ok());
+    }
+
+    #[test]
+    fn prime_invalid_width_preserves_existing_bit_reservoir() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init created the live uniquely owned Deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("initialized stream has no state")?;
+        assert_eq!(prime(stream, 3, 0b101), ReturnCode::Ok);
+
+        let writer = &stream.state.bit_writer;
+        let original = (
+            writer.bit_buffer,
+            writer.bits_valid,
+            writer.pending.pending().to_vec(),
+        );
+        for invalid_bits in [-1, 33, i32::MAX] {
+            assert_eq!(prime(stream, invalid_bits, -1), ReturnCode::BufError);
+            let writer = &stream.state.bit_writer;
+            assert_eq!(
+                (
+                    writer.bit_buffer,
+                    writer.bits_valid,
+                    writer.pending.pending().to_vec()
+                ),
+                original
+            );
+        }
+        assert_eq!(prime(stream, 0, -1), ReturnCode::Ok);
+        assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
