@@ -35,14 +35,18 @@ impl MatchCandidate {
 /// Fast/Medium/Slow parsing to consume more than its current single-best projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchCandidates {
-    offsets: Vec<u32>,
+    // CSR offsets count candidate *entries*, not input bytes. A position may
+    // contribute up to D_CODES entries, so an input fitting in a u32 index can
+    // still produce more than u32::MAX entries. Keep the offsets in the same
+    // index domain as the backing Vec instead of silently wrapping them.
+    offsets: Vec<usize>,
     entries: Vec<MatchCandidate>,
 }
 
 impl MatchCandidates {
     pub(crate) fn for_position(&self, position: usize) -> &[MatchCandidate] {
-        let start = self.offsets[position] as usize;
-        let end = self.offsets[position + 1] as usize;
+        let start = self.offsets[position];
+        let end = self.offsets[position + 1];
         &self.entries[start..end]
     }
 
@@ -232,12 +236,21 @@ impl ParseStep {
 /// maximizes LCP over that set, so two probes recover the longest match for the whole distance class.
 /// Retaining that one maximum per class is lossless for arbitrary DEFLATE Huffman code lengths.
 pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandidates {
-    assert!(max_distance <= u16::MAX as usize);
-    assert!(input.len() <= u32::MAX as usize);
+    const DIRECT_SCAN_MAX: usize = 8;
+    // The parser emits DEFLATE tokens, not arbitrary 16-bit offsets.
+    assert!(
+        max_distance <= 1usize << crate::MAX_WBITS,
+        "candidate history exceeds the DEFLATE window"
+    );
+    // Suffix ranks and positions are stored as u32. Candidate entry offsets
+    // are not: their count can grow by up to D_CODES per input byte.
+    assert!(
+        u32::try_from(input.len()).is_ok(),
+        "input exceeds the suffix-rank index range"
+    );
 
     let suffixes = SuffixRanks::new(input);
     let ranges = distance_code_ranges(max_distance);
-    const DIRECT_SCAN_MAX: usize = 8;
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
         (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
@@ -319,7 +332,7 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
                 entries.push(best);
             }
         }
-        offsets.push(entries.len() as u32);
+        offsets.push(entries.len());
     }
 
     MatchCandidates { offsets, entries }
@@ -1187,6 +1200,15 @@ mod tests {
         ] {
             assert_eq!(choose_min_match_len(used_literals), expected);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "candidate history exceeds the DEFLATE window")]
+    fn exact_frontier_rejects_distances_outside_deflate_window() {
+        // A u16 can encode more than the 32 KiB permitted by DEFLATE.
+        // Reject that input at the candidate boundary, not when the token
+        // eventually reaches the Huffman writer.
+        let _ = build_match_candidates(b"aaaaaaa", (1usize << crate::MAX_WBITS) + 1);
     }
 
     #[test]
