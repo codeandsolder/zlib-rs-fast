@@ -2164,6 +2164,20 @@ pub enum BlockState {
 // Maximum stored block length in deflate format (not including header).
 pub const MAX_STORED: usize = 65535; // so u16::max
 
+/// Serialize the length and one's complement shared by pending and direct
+/// stored-block emission. Validate the complete field before either caller
+/// modifies its output: a stored block can hold at most 65,535 bytes.
+#[inline]
+pub(crate) fn stored_block_length_fields(length: usize) -> [u8; 4] {
+    assert!(
+        length <= MAX_STORED,
+        "DEFLATE stored block payload must fit in 16 bits"
+    );
+    let bytes = length.to_le_bytes();
+    let complement = (!length).to_le_bytes();
+    [bytes[0], bytes[1], complement[0], complement[1]]
+}
+
 fn read_buf_window_core(
     state: &mut State<'_>,
     input: &mut InputCursor,
@@ -2210,11 +2224,7 @@ pub fn zng_tr_stored_block(
 ) {
     let input_block: &[u8] = &state.window.filled()[window_range];
     let stored_len = input_block.len();
-    // Check before emitting a header; a stored block cannot represent more than 65535 bytes.
-    assert!(
-        u16::try_from(stored_len).is_ok(),
-        "DEFLATE stored block payload must fit in 16 bits"
-    );
+    let length_fields = stored_block_length_fields(stored_len);
 
     // send block type
     state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
@@ -2224,17 +2234,7 @@ pub fn zng_tr_stored_block(
 
     state.bit_writer.cmpr_bits_align();
 
-    // The length and its complement are exactly 16-bit little-endian fields.
-    // Extract their low bytes after validating the range, without truncating
-    // the length used later for bit accounting.
-    state
-        .bit_writer
-        .pending
-        .extend(&stored_len.to_le_bytes()[..2]);
-    state
-        .bit_writer
-        .pending
-        .extend(&(!stored_len).to_le_bytes()[..2]);
+    state.bit_writer.pending.extend(&length_fields);
 
     state.bit_writer.cmpr_bits_add(32);
     state.bit_writer.sent_bits_add(32);
@@ -4342,6 +4342,38 @@ mod test {
         for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
             assert_eq!(compress_bound(n), compress_bound_abi(n));
         }
+    }
+
+    #[test]
+    fn stored_length_fields_cover_entire_wire_range() {
+        for length in [0usize, 1, 255, 256, 8_192, 32_768, MAX_STORED] {
+            let fields = stored_block_length_fields(length);
+            assert_eq!(&fields[..2], &length.to_le_bytes()[..2]);
+            assert_eq!(&fields[2..], &(!length).to_le_bytes()[..2]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "DEFLATE stored block payload must fit in 16 bits")]
+    fn stored_length_fields_reject_overflow_before_writing() {
+        let _ = stored_block_length_fields(MAX_STORED + 1);
+    }
+
+    #[test]
+    fn stored_mode_never_reads_a_slid_out_block_start() {
+        let mut stream = DeflateStream::new(DeflateConfig::new(0));
+        stream.state.block_start = -1;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_compressor(&mut stream, |compressor| {
+                self::algorithm::run(compressor, DeflateFlush::Finish)
+            })
+        }));
+        assert!(
+            result.is_err(),
+            "unavailable stored history must fail before accessing output"
+        );
+        stream.state.block_start = 0;
+        assert!(end(&mut stream).is_ok());
     }
 
     #[test]

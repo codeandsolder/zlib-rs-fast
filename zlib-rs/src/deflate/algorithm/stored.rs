@@ -1,11 +1,22 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    deflate::{drain_pending_output, zng_tr_stored_block, BlockState, Compressor, MAX_STORED},
+    deflate::{
+        drain_pending_output, stored_block_length_fields, zng_tr_stored_block, BlockState,
+        Compressor, MAX_STORED,
+    },
     DeflateFlush,
 };
 
 pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
+    // Stored-mode output must be backed by bytes still in the sliding window.
+    // The compressed-level transition path flushes before switching modes;
+    // negative block_start is only meaningful for already-flushed history.
+    assert!(
+        stream.state.block_start >= 0
+            && stream.state.block_start.unsigned_abs() <= stream.state.strstart,
+        "stored block start must be present in the sliding window"
+    );
     // Smallest worthy block size when not flushing or finishing. By default
     // this is 32K. This can be as small as 507 bytes for memLevel == 1. For
     // large input and output buffers, the stored block size will be larger.
@@ -27,21 +38,23 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         let mut len = MAX_STORED;
 
         // number of header bytes
-        have = ((stream.state.bit_writer.bits_valid + 42) / 8) as usize;
+        have = usize::from((stream.state.bit_writer.bits_valid + 42) / 8);
 
         // we need room for at least the header
-        if stream.output.avail_out < have as u32 {
+        if (stream.output.avail_out as usize) < have {
             break;
         }
 
-        let left = stream.state.strstart as isize - stream.state.block_start;
-        let left = Ord::max(0, left) as usize;
+        let left = stream.state.strstart - stream.state.block_start.unsigned_abs();
+        // avail_in is a C uInt. On a 32-bit target its maximum can be
+        // usize::MAX, so adding buffered bytes must not wrap the total.
+        let available = left.saturating_add(stream.input.avail_in as usize);
 
         have = stream.output.avail_out as usize - have;
 
-        if len > left + stream.input.avail_in as usize {
+        if len > available {
             // limit len to the input
-            len = left + stream.input.avail_in as usize;
+            len = available;
         }
 
         len = Ord::min(len, have);
@@ -53,28 +66,20 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         if len < min_block
             && ((len == 0 && flush != DeflateFlush::Finish)
                 || flush == DeflateFlush::NoFlush
-                || len != left + stream.input.avail_in as usize)
+                || len != available)
         {
             break;
         }
 
         // Make a dummy stored block in pending to get the header bytes,
         // including any pending bits. This also updates the debugging counts.
-        last = flush == DeflateFlush::Finish && len == left + stream.input.avail_in as usize;
+        last = flush == DeflateFlush::Finish && len == available;
+        let length_fields = stored_block_length_fields(len);
         zng_tr_stored_block(stream.state, 0..0, last);
 
         /* Replace the lengths in the dummy stored block with len. */
         stream.state.bit_writer.pending.truncate_tail(4);
-        stream
-            .state
-            .bit_writer
-            .pending
-            .extend(&(len as u16).to_le_bytes());
-        stream
-            .state
-            .bit_writer
-            .pending
-            .extend(&(!len as u16).to_le_bytes());
+        stream.state.bit_writer.pending.extend(&length_fields);
 
         // Write the stored block header bytes.
         let _ = drain_pending_output(stream.state, &mut stream.output);
@@ -146,7 +151,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     if flush != DeflateFlush::NoFlush
         && flush != DeflateFlush::Finish
         && stream.input.avail_in == 0
-        && stream.state.strstart as isize == stream.state.block_start
+        && stream.state.strstart == stream.state.block_start.unsigned_abs()
     {
         return BlockState::BlockDone;
     }
@@ -154,7 +159,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // Fill the window with any remaining input
     let mut have = stream.state.window_size - stream.state.strstart;
     if stream.input.avail_in as usize > have
-        && stream.state.block_start >= stream.state.w_size as isize
+        && stream.state.block_start.unsigned_abs() >= stream.state.w_size
     {
         // slide the window down
         let state = &mut stream.state;
@@ -194,24 +199,19 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // maximum stored block length that will fit in pending:
     let have = Ord::min(state.bit_writer.pending.capacity() - have, MAX_STORED);
     let min_block = Ord::min(have, state.w_size);
-    let left = state.strstart as isize - state.block_start;
+    let left = state.strstart - state.block_start.unsigned_abs();
 
-    if left >= min_block as isize
+    if left >= min_block
         || ((left > 0 || flush == DeflateFlush::Finish)
             && flush != DeflateFlush::NoFlush
             && stream.input.avail_in == 0
-            && left <= have as isize)
+            && left <= have)
     {
-        // The branch predicate above requires `left >= 0`: either it is at least
-        // `min_block`, or the flush arm requires `left > 0`. `deflateParams()`
-        // also flushes and resolves any algorithm transition before entering stored mode.
-        debug_assert!(left >= 0);
-        let len = Ord::min(left as usize, have);
-        last =
-            flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == (left as usize);
+        let len = left.min(have);
+        last = flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == left;
 
-        let range = state.block_start as usize..state.block_start as usize + len;
-        zng_tr_stored_block(state, range, last);
+        let start = state.block_start.unsigned_abs();
+        zng_tr_stored_block(state, start..start + len, last);
 
         state.block_start += len as isize;
         let _ = drain_pending_output(stream.state, &mut stream.output);
