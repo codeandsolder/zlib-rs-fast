@@ -2807,7 +2807,10 @@ pub fn codes_used(stream: &InflateStream) -> usize {
 /// # Safety
 /// A nonnull pointer with a nonzero length must remain readable for the
 /// returned borrow, whose lifetime belongs to the caller.
-unsafe fn caller_input<'a>(pointer: *const u8, available: crate::c_api::uInt) -> Option<&'a [u8]> {
+const unsafe fn caller_input<'a>(
+    pointer: *const u8,
+    available: crate::c_api::uInt,
+) -> Option<&'a [u8]> {
     if available == 0 {
         return Some(&[]);
     }

@@ -4,7 +4,7 @@ use crate::c_api::{uInt, z_size, Bytef};
 /// Length is bounded by the caller-provided available byte count. Zlib totals
 /// use modular arithmetic in the native unsigned C ABI width.
 #[inline]
-pub(crate) fn advance_abi_bytes(
+pub fn advance_abi_bytes(
     pointer: &mut *mut Bytef,
     available: &mut uInt,
     total: &mut z_size,
