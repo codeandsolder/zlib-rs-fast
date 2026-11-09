@@ -2442,20 +2442,18 @@ impl BoundaryShift {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Only the frozen-cost change and the token boundary are needed to rank
+/// nominees. Build full histograms for at most four winners after the scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BoundaryCandidate {
     delta: i64,
     shift: BoundaryShift,
-    left_histogram: TokenHistogram,
-    right_histogram: TokenHistogram,
 }
 
 fn consider_shift_candidate(
     candidates: &mut Vec<BoundaryCandidate>,
     delta: i64,
     shift: BoundaryShift,
-    left_histogram: &TokenHistogram,
-    right_histogram: &TokenHistogram,
 ) {
     if delta >= 0 {
         return;
@@ -2466,20 +2464,10 @@ fn consider_shift_candidate(
         .find(|candidate| candidate.shift.is_near(shift))
     {
         if delta < existing.delta {
-            *existing = BoundaryCandidate {
-                delta,
-                shift,
-                left_histogram: left_histogram.clone(),
-                right_histogram: right_histogram.clone(),
-            };
+            *existing = BoundaryCandidate { delta, shift };
         }
     } else {
-        candidates.push(BoundaryCandidate {
-            delta,
-            shift,
-            left_histogram: left_histogram.clone(),
-            right_histogram: right_histogram.clone(),
-        });
+        candidates.push(BoundaryCandidate { delta, shift });
     }
 
     candidates.sort_unstable_by_key(|candidate| candidate.delta);
@@ -2491,8 +2479,6 @@ fn fixed_cost_shift_candidates(
     right: &PlannedBlock,
     left_costs: &TokenCosts,
     right_costs: &TokenCosts,
-    left_histogram: &TokenHistogram,
-    right_histogram: &TokenHistogram,
 ) -> Vec<BoundaryCandidate> {
     debug_assert_eq!(left.range.end, right.range.start);
     let mut candidates = Vec::with_capacity(EXACT_BOUNDARY_CANDIDATES);
@@ -2501,8 +2487,6 @@ fn fixed_cost_shift_candidates(
     let mut moved = 0usize;
     let mut moved_tokens = 0usize;
     let mut delta = 0i64;
-    let mut shifted_left = left_histogram.clone();
-    let mut shifted_right = right_histogram.clone();
     for &token in &right.tokens {
         moved += token.input_len();
         moved_tokens += 1;
@@ -2512,23 +2496,13 @@ fn fixed_cost_shift_candidates(
             break;
         }
         delta += i64::from(left_costs.token_cost(token)) - i64::from(right_costs.token_cost(token));
-        shifted_left.add_token(token);
-        shifted_right.remove_token(token);
-        consider_shift_candidate(
-            &mut candidates,
-            delta,
-            BoundaryShift::Right(moved),
-            &shifted_left,
-            &shifted_right,
-        );
+        consider_shift_candidate(&mut candidates, delta, BoundaryShift::Right(moved));
     }
 
     // Negative shift: move a suffix of the left block into the right block.
     moved = 0;
     moved_tokens = 0;
     delta = 0;
-    shifted_left = left_histogram.clone();
-    shifted_right = right_histogram.clone();
     for &token in left.tokens.iter().rev() {
         moved += token.input_len();
         moved_tokens += 1;
@@ -2538,19 +2512,84 @@ fn fixed_cost_shift_candidates(
             break;
         }
         delta += i64::from(right_costs.token_cost(token)) - i64::from(left_costs.token_cost(token));
-        shifted_left.remove_token(token);
-        shifted_right.add_token(token);
-        consider_shift_candidate(
-            &mut candidates,
-            delta,
-            BoundaryShift::Left(moved),
-            &shifted_left,
-            &shifted_right,
-        );
+        consider_shift_candidate(&mut candidates, delta, BoundaryShift::Left(moved));
     }
 
     candidates.sort_unstable_by_key(|candidate| candidate.delta);
     candidates
+}
+
+/// Reconstruct exact Huffman frequencies only for shortlisted shifts. Each
+/// direction is replayed once up to its most distant nominee; snapshots retain
+/// the original delta-ranked order so exact-score tie handling does not change.
+fn shortlisted_shift_histograms(
+    left: &PlannedBlock,
+    right: &PlannedBlock,
+    left_histogram: &TokenHistogram,
+    right_histogram: &TokenHistogram,
+    candidates: &[BoundaryCandidate],
+) -> [Option<(TokenHistogram, TokenHistogram)>; EXACT_BOUNDARY_CANDIDATES] {
+    assert!(candidates.len() <= EXACT_BOUNDARY_CANDIDATES);
+    let mut snapshots = core::array::from_fn(|_| None);
+
+    for moving_right in [true, false] {
+        let furthest = candidates
+            .iter()
+            .filter_map(|candidate| match (moving_right, candidate.shift) {
+                (true, BoundaryShift::Right(bytes)) | (false, BoundaryShift::Left(bytes)) => {
+                    Some(bytes)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if furthest == 0 {
+            continue;
+        }
+
+        let mut left_counts = left_histogram.clone();
+        let mut right_counts = right_histogram.clone();
+        let mut moved = 0usize;
+        let token_count = if moving_right {
+            right.tokens.len()
+        } else {
+            left.tokens.len()
+        };
+        for index in 0..token_count {
+            let token = if moving_right {
+                right.tokens[index]
+            } else {
+                left.tokens[left.tokens.len() - 1 - index]
+            };
+            moved += token.input_len();
+            if moving_right {
+                left_counts.add_token(token);
+                right_counts.remove_token(token);
+            } else {
+                left_counts.remove_token(token);
+                right_counts.add_token(token);
+            }
+            let shift = if moving_right {
+                BoundaryShift::Right(moved)
+            } else {
+                BoundaryShift::Left(moved)
+            };
+            for (candidate, snapshot) in candidates.iter().zip(&mut snapshots) {
+                if candidate.shift == shift {
+                    *snapshot = Some((left_counts.clone(), right_counts.clone()));
+                }
+            }
+            if moved == furthest {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        snapshots.iter().take(candidates.len()).all(Option::is_some),
+        "every shortlisted shift must end at a token boundary"
+    );
+    snapshots
 }
 
 /// Apply a chosen shift directly to the owned token vectors. Partition scoring
@@ -2637,14 +2676,15 @@ pub fn optimize_token_partition(
         }
     }
 
-    for candidate in fixed_cost_shift_candidates(
-        left,
-        right,
-        &left_costs,
-        &right_costs,
-        &left_histogram,
-        &right_histogram,
-    ) {
+    let candidates = fixed_cost_shift_candidates(left, right, &left_costs, &right_costs);
+    let snapshots =
+        shortlisted_shift_histograms(left, right, &left_histogram, &right_histogram, &candidates);
+    for (candidate, snapshot) in candidates.into_iter().zip(snapshots) {
+        // All nominees are produced at exact token boundaries, verified by
+        // shortlisted_shift_histograms before any exact rescoring starts.
+        let Some((shifted_left, shifted_right)) = snapshot else {
+            continue;
+        };
         let Some((new_left_len, new_right_len)) =
             candidate.shift.lengths(left.input_len(), right.input_len())
         else {
@@ -2654,12 +2694,12 @@ pub fn optimize_token_partition(
             continue;
         };
         let Some((_, new_left_score)) =
-            compressed_histogram_score(state, &candidate.left_histogram, new_left_len)
+            compressed_histogram_score(state, &shifted_left, new_left_len)
         else {
             continue;
         };
         let Some((_, new_right_score)) =
-            compressed_histogram_score(state, &candidate.right_histogram, new_right_len)
+            compressed_histogram_score(state, &shifted_right, new_right_len)
         else {
             continue;
         };
@@ -2767,6 +2807,98 @@ mod boundary_tests {
     }
 
     #[test]
+    fn shortlisted_histograms_match_exact_mixed_token_repartitions() {
+        // Ranking is by frozen cost, not movement size or direction. Replaying
+        // both directions must preserve each nominee's original index while
+        // walking whole literal/match tokens with different DEFLATE codes.
+        let mut left_tokens = vec![ParseToken::Literal(b'a'); 512];
+        left_tokens.extend([
+            ParseToken::Match {
+                length: 7,
+                distance: 1,
+            },
+            ParseToken::Literal(b'c'),
+            ParseToken::Match {
+                length: 258,
+                distance: 32_768,
+            },
+            ParseToken::Literal(b'd'),
+        ]);
+        let mut right_tokens = vec![ParseToken::Literal(b'b'); 300];
+        right_tokens.extend([
+            ParseToken::Match {
+                length: 3,
+                distance: 12,
+            },
+            ParseToken::Literal(b'e'),
+            ParseToken::Match {
+                length: 258,
+                distance: 30_000,
+            },
+            ParseToken::Literal(b'f'),
+        ]);
+        let left = PlannedBlock {
+            range: 0..779,
+            tokens: left_tokens,
+        };
+        let right = PlannedBlock {
+            range: 779..1342,
+            tokens: right_tokens,
+        };
+        assert_eq!(left.token_input_len(), left.range.len());
+        assert_eq!(right.token_input_len(), right.range.len());
+        let nominees = [
+            BoundaryCandidate {
+                delta: -50,
+                shift: BoundaryShift::Left(259),
+            },
+            BoundaryCandidate {
+                delta: -40,
+                shift: BoundaryShift::Right(303),
+            },
+            BoundaryCandidate {
+                delta: -30,
+                shift: BoundaryShift::Left(1),
+            },
+            BoundaryCandidate {
+                delta: -20,
+                shift: BoundaryShift::Right(300),
+            },
+        ];
+        let snapshots = shortlisted_shift_histograms(
+            &left,
+            &right,
+            &TokenHistogram::from_tokens(&left.tokens),
+            &TokenHistogram::from_tokens(&right.tokens),
+            &nominees,
+        );
+        assert!(snapshots.iter().all(Option::is_some));
+        for (nominee, (left_hist, right_hist)) in
+            nominees.into_iter().zip(snapshots.into_iter().flatten())
+        {
+            let mut moved_left = left.clone();
+            let mut moved_right = right.clone();
+            shift_tokens(&mut moved_left, &mut moved_right, nominee.shift);
+            assert_eq!(
+                left_hist,
+                TokenHistogram::from_tokens(&moved_left.tokens),
+                "{:?}",
+                nominee.shift
+            );
+            assert_eq!(
+                right_hist,
+                TokenHistogram::from_tokens(&moved_right.tokens),
+                "{:?}",
+                nominee.shift
+            );
+            assert_eq!(
+                moved_left.token_input_len() + moved_right.token_input_len(),
+                left.input_len() + right.input_len()
+            );
+        }
+    }
+
+    #[test]
     fn fixed_cost_boundary_shift_left_preserves_whole_tokens() {
         let mut left_tokens = vec![ParseToken::Literal(b'a'); 5_500];
         left_tokens.extend(core::iter::repeat_n(ParseToken::Literal(b'b'), 500));
@@ -2786,14 +2918,10 @@ mod boundary_tests {
         right_costs.literal[usize::from(b'b')] = COST_SCALE;
         let left_histogram = TokenHistogram::from_tokens(&left.tokens);
         let right_histogram = TokenHistogram::from_tokens(&right.tokens);
-        let shifts = fixed_cost_shift_candidates(
-            &left,
-            &right,
-            &left_costs,
-            &right_costs,
-            &left_histogram,
-            &right_histogram,
-        );
+        let shifts = fixed_cost_shift_candidates(&left, &right, &left_costs, &right_costs);
+        let snapshots =
+            shortlisted_shift_histograms(&left, &right, &left_histogram, &right_histogram, &shifts);
+        let snapshot = &snapshots[0];
         assert_eq!(shifts[0].shift, BoundaryShift::Left(500));
         shift_tokens(&mut left, &mut right, shifts[0].shift);
         let new_left = &left.tokens;
@@ -2801,12 +2929,12 @@ mod boundary_tests {
         assert_eq!(new_left.len(), 5_500);
         assert_eq!(new_right.len(), 6_500);
         assert_eq!(
-            shifts[0].left_histogram,
-            TokenHistogram::from_tokens(&new_left)
+            snapshot.as_ref().map(|(left, _)| left),
+            Some(&TokenHistogram::from_tokens(new_left))
         );
         assert_eq!(
-            shifts[0].right_histogram,
-            TokenHistogram::from_tokens(&new_right)
+            snapshot.as_ref().map(|(_, right)| right),
+            Some(&TokenHistogram::from_tokens(new_right))
         );
         assert!(new_right[..500]
             .iter()
@@ -2835,26 +2963,22 @@ mod boundary_tests {
 
         let left_histogram = TokenHistogram::from_tokens(&left.tokens);
         let right_histogram = TokenHistogram::from_tokens(&right.tokens);
-        let shifts = fixed_cost_shift_candidates(
-            &left,
-            &right,
-            &left_costs,
-            &right_costs,
-            &left_histogram,
-            &right_histogram,
-        );
+        let shifts = fixed_cost_shift_candidates(&left, &right, &left_costs, &right_costs);
+        let snapshots =
+            shortlisted_shift_histograms(&left, &right, &left_histogram, &right_histogram, &shifts);
+        let snapshot = &snapshots[0];
         assert_eq!(shifts[0].shift, BoundaryShift::Right(500));
         let shift = shifts[0].shift;
         shift_tokens(&mut left, &mut right, shift);
         let shifted_left = &left.tokens;
         let shifted_right = &right.tokens;
         assert_eq!(
-            shifts[0].left_histogram,
-            TokenHistogram::from_tokens(&shifted_left)
+            snapshot.as_ref().map(|(left, _)| left),
+            Some(&TokenHistogram::from_tokens(shifted_left))
         );
         assert_eq!(
-            shifts[0].right_histogram,
-            TokenHistogram::from_tokens(&shifted_right)
+            snapshot.as_ref().map(|(_, right)| right),
+            Some(&TokenHistogram::from_tokens(shifted_right))
         );
         assert_eq!(shifted_left.len(), 6_500);
         assert_eq!(shifted_right.len(), 5_500);
