@@ -1231,101 +1231,136 @@ fn compute_adler32() {
 fn try_inflate(input: &[u8], expected_err: c_int) -> c_int {
     use libz_rs_sys::*;
 
-    let len = input.len();
+    // Inflate in Z_TREES mode to exercise malformed-block handling. Keep
+    // all emitted output instead of restarting the write pointer on each call.
+    let capacity = input.len().checked_mul(8);
+    assert!(capacity.is_some(), "test output capacity overflow");
+    let mut output = vec![0u8; capacity.unwrap_or_default().max(1)];
+    let mut stream = mem_setup();
+    stream.next_in = core::ptr::null_mut();
+    stream.avail_in = 0;
 
-    /* allocate work areas */
-    let size = len << 3;
-    let mut out = vec![0; size];
-
-    //    /* first with inflate */
-    //    strcpy(prefix, id);
-    //    strcat(prefix, "-late");
-
-    let mut strm = mem_setup();
-    strm.avail_in = 0;
-    strm.next_in = std::ptr::null_mut();
-
-    let mut ret = unsafe {
+    // SAFETY: mem_setup provided live C stream storage, allocator
+    // callbacks and matching ABI version/size.
+    let mut result = unsafe {
         inflateInit2_(
-            &raw mut strm,
+            &raw mut stream,
             if expected_err < 0 { 47 } else { -15 },
             VERSION,
             STREAM_SIZE,
         )
     };
-    assert_eq!(ret, Z_OK);
-    strm.avail_in = len as _;
-    strm.next_in = input.as_ptr().cast_mut();
+    assert_eq!(result, Z_OK);
+    stream.next_in = input.as_ptr().cast_mut();
+    stream.avail_in = test_c_uint_len(input.len());
+    stream.next_out = output.as_mut_ptr();
+    stream.avail_out = test_c_uint_len(output.len());
+    let mut stalled_calls = 0;
 
     loop {
-        strm.avail_out = size as _;
-        strm.next_out = out.as_mut_ptr();
-
-        ret = unsafe { inflate(&raw mut strm, InflateFlush::Trees as _) };
-        assert!(!matches!(ret, Z_STREAM_ERROR | Z_MEM_ERROR));
-
-        if matches!(ret, Z_DATA_ERROR | Z_NEED_DICT) {
+        let before_in = stream.avail_in;
+        let before_out = stream.total_out;
+        let before_type = stream.data_type;
+        // SAFETY: next_in refers to the live input fixture and next_out
+        // refers into a disjoint, writable suffix of the output allocation.
+        result = unsafe { inflate(&raw mut stream, InflateFlush::Trees as _) };
+        assert!(!matches!(result, Z_STREAM_ERROR | Z_MEM_ERROR));
+        assert!(
+            stream.avail_in <= before_in,
+            "inflate increased input availability"
+        );
+        assert!(
+            usize::try_from(stream.total_out).unwrap_or(usize::MAX) <= output.len(),
+            "inflate output exceeds allocated buffer"
+        );
+        if matches!(result, Z_DATA_ERROR | Z_NEED_DICT | Z_STREAM_END) {
             break;
         }
+        assert!(
+            matches!(result, Z_OK | Z_BUF_ERROR),
+            "unexpected Z_TREES status {result}"
+        );
 
-        if !(strm.avail_in > 0 || strm.avail_out == 0) {
+        if stream.avail_out == 0 {
+            let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert_eq!(written, output.len(), "output position mismatch");
+            let old_len = output.len();
+            let new_len = old_len.checked_mul(2).unwrap_or(old_len);
+            assert!(new_len > old_len, "output capacity overflow");
+            output.resize(new_len, 0);
+            stream.next_out = output[written..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(new_len - written);
+        }
+        if stream.avail_in == 0 {
             break;
+        }
+        // A Z_TREES boundary need not consume input or produce output,
+        // but infinitely repeating an identical state is not progress.
+        if stream.avail_in < before_in
+            || stream.total_out > before_out
+            || stream.data_type != before_type
+        {
+            stalled_calls = 0;
+        } else {
+            stalled_calls += 1;
+            assert!(stalled_calls < 3, "Z_TREES decoder stalled");
         }
     }
-
     if expected_err != Z_OK {
-        assert_eq!(ret, Z_DATA_ERROR);
+        assert_eq!(result, Z_DATA_ERROR);
     }
+    // SAFETY: the successfully initialized stream is ended exactly once.
+    assert_eq!(unsafe { inflateEnd(&raw mut stream) }, Z_OK);
+    mem_done(&mut stream);
 
-    unsafe { inflateEnd(&raw mut strm) };
-    mem_done(&mut strm);
-
-    /* then with inflateBack */
     if expected_err >= 0 {
-        ret = try_inflate_back(input, expected_err);
+        result = try_inflate_back(input, expected_err);
     }
-
-    ret
+    result
 }
 
 fn try_inflate_back(input: &[u8], expected_err: c_int) -> c_int {
     use libz_rs_sys::*;
 
-    let len = input.len();
+    let mut window = vec![0u8; 32768];
+    let mut stream = mem_setup();
 
-    /* allocate work areas */
-    let mut win = vec![0; 32768];
-
-    // re-setup the stream for inflateBack
-    let mut strm = mem_setup();
-
-    let mut ret =
-        unsafe { inflateBackInit_(&raw mut strm, 15, win.as_mut_ptr(), VERSION, STREAM_SIZE) };
-    assert_eq!(ret, Z_OK);
-
-    strm.avail_in = len as _;
-    strm.next_in = input.as_ptr().cast_mut();
-
-    // assumes you have `pull` and `push` extern "C" functions defined
-    ret = unsafe {
-        inflateBack(
-            &raw mut strm,
-            Some(pull),
-            std::ptr::null_mut(),
-            Some(push),
-            std::ptr::null_mut(),
+    // SAFETY: the custom allocator and 32 KiB window are live, and the
+    // supplied version and stream structure match the C ABI.
+    let result = unsafe {
+        inflateBackInit_(
+            &raw mut stream,
+            15,
+            window.as_mut_ptr(),
+            VERSION,
+            STREAM_SIZE,
         )
     };
-    assert_ne!(ret, Z_STREAM_ERROR);
+    assert_eq!(result, Z_OK);
+    stream.avail_in = test_c_uint_len(input.len());
+    stream.next_in = input.as_ptr().cast_mut();
 
-    if expected_err != Z_OK && ret != Z_BUF_ERROR {
-        assert_eq!(ret, Z_DATA_ERROR);
+    // SAFETY: input and the window remain live and disjoint during the
+    // callback-driven decode; the null pull context requests no more
+    // input beyond the initial span, and push discards output bytes.
+    let result = unsafe {
+        inflateBack(
+            &raw mut stream,
+            Some(pull),
+            core::ptr::null_mut(),
+            Some(push),
+            core::ptr::null_mut(),
+        )
+    };
+    assert_ne!(result, Z_STREAM_ERROR);
+    if expected_err != Z_OK && result != Z_BUF_ERROR {
+        assert_eq!(result, Z_DATA_ERROR);
     }
 
-    unsafe { inflateBackEnd(&raw mut strm) };
-    mem_done(&mut strm);
-
-    ret
+    // SAFETY: matching teardown for the initialized inflateBack state.
+    assert_eq!(unsafe { inflateBackEnd(&raw mut stream) }, Z_OK);
+    mem_done(&mut stream);
+    result
 }
 
 #[test]
@@ -3805,27 +3840,34 @@ extern "C" fn push(desc: *mut c_void, _buf: *mut c_uchar, _len: c_uint) -> c_int
     (!desc.is_null()) as _
 }
 
+// Callback input is per-invocation, not shared between parallel test runs.
+struct BackPullSource<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
 unsafe extern "C" fn pull(desc: *mut c_void, buf: *mut *const c_uchar) -> c_uint {
-    static mut NEXT: c_uint = 0;
-    static DAT: [c_uchar; 4] = [0x63 /* 99 */, 0, 2, 0];
-
-    let strm = desc.cast::<libz_rs_sys::z_stream>();
-    if strm.is_null() {
-        NEXT = 0;
-        return 0; // no input (already provided at next_in)
-    };
-
-    // In `infback` this is an unreachable state, triggering a StreamError.
-    zlib_rs::inflate::set_mode_sync(strm);
-
-    if (NEXT as usize) < DAT.len() {
-        *buf = DAT.as_ptr().add(NEXT as usize);
-        NEXT += 1;
-
-        1
-    } else {
-        0
+    if desc.is_null() || buf.is_null() {
+        return 0; // Initial input was supplied via next_in; no more data.
     }
+
+    // SAFETY: the live input descriptor is a unique, writable BackPullSource,
+    // independent of the z_stream and its internal state.
+    let source = unsafe { &mut *desc.cast::<BackPullSource<'_>>() };
+    let Some(remaining) = source.bytes.get(source.position..) else {
+        return 0;
+    };
+    let Ok(length) = c_uint::try_from(remaining.len()) else {
+        return 0; // Never panic across the extern "C" boundary.
+    };
+    if length == 0 {
+        return 0;
+    }
+    // SAFETY: buf is a writable callback output pointer; remaining stays
+    // alive, immutable, and readable for the rest of this decode call.
+    unsafe { *buf = remaining.as_ptr() };
+    source.position = source.bytes.len();
+    length
 }
 
 /// Cover `inflateBack` edge cases.
@@ -3869,80 +3911,118 @@ fn cover_back() {
     let ret = assert_eq_rs_ng!(unsafe { inflateBackEnd(core::ptr::null_mut(),) });
     assert_eq!(ret, Z_STREAM_ERROR);
 
-    unsafe {
-        use libz_rs_sys::*;
+    use libz_rs_sys::*;
 
-        let mut stream = mem_setup();
-        let ret = inflateBackInit_(
+    let mut stream = mem_setup();
+    // SAFETY: the custom allocator, C stream and full 32 KiB output window
+    // remain live throughout the initialized back-inflate lifetime.
+    assert_eq!(
+        unsafe {
+            inflateBackInit_(
+                &raw mut stream,
+                15,
+                window.as_mut_ptr(),
+                VERSION,
+                STREAM_SIZE,
+            )
+        },
+        Z_OK
+    );
+
+    // Exercise a real non-null callback context. The empty DEFLATE block
+    // is supplied by pull rather than through the initial next_in buffer.
+    stream.avail_in = 0;
+    stream.next_in = core::ptr::null_mut();
+    let mut pulled = BackPullSource {
+        bytes: b"\x03\0",
+        position: 0,
+    };
+    // SAFETY: the independent input descriptor owns the live compressed
+    // span and the decoder output window remains writable.
+    let ret = unsafe {
+        inflateBack(
             &raw mut stream,
-            15,
-            window.as_mut_ptr(),
-            VERSION,
-            STREAM_SIZE,
-        );
-        assert_eq!(ret, Z_OK);
+            Some(pull),
+            (&raw mut pulled).cast(),
+            Some(push),
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(ret, Z_STREAM_END);
+    assert_eq!(pulled.position, pulled.bytes.len());
 
-        let mut input = *b"\x03\0";
-        stream.avail_in = input.len() as _;
-        stream.next_in = input.as_mut_ptr();
-
-        let ret = libz_rs_sys::inflateBack(
+    // A non-null output callback descriptor requests a deliberate failure.
+    let mut input = *b"\x63\0\0";
+    stream.avail_in = test_c_uint_len(input.len());
+    stream.next_in = input.as_mut_ptr();
+    let mut output_error_context = 0u8;
+    // SAFETY: input remains live, and the push callback only checks
+    // descriptor nullness without touching decoder state or its window.
+    let ret = unsafe {
+        inflateBack(
             &raw mut stream,
             Some(pull),
             core::ptr::null_mut(),
             Some(push),
-            core::ptr::null_mut(),
-        );
-        assert_eq!(ret, Z_STREAM_END);
+            (&raw mut output_error_context).cast(),
+        )
+    };
+    assert_eq!(ret, Z_BUF_ERROR);
 
-        // Force output error.
-        let mut input = *b"\x63\0\0";
-        stream.avail_in = input.len() as _;
-        stream.next_in = input.as_mut_ptr();
-        let ret = {
-            let ptr = &mut stream as *mut z_stream;
-            libz_rs_sys::inflateBack(
-                ptr,
-                Some(pull),
-                core::ptr::null_mut(),
-                Some(push),
-                ptr.cast(), // Cursed!
-            )
-        };
-        assert_eq!(ret, Z_BUF_ERROR);
-
-        // Force mode error by mucking with state. We pass a pointer to the stream state twice, so
-        // this test is actually UB (violating aliasing), which miri will detect.
-        #[cfg(not(miri))]
-        {
-            let ret = {
-                let ptr = { &mut stream as *mut z_stream };
-                libz_rs_sys::inflateBack(
-                    ptr,
-                    Some(pull),
-                    ptr.cast(), // Cursed!
-                    Some(push),
-                    core::ptr::null_mut(),
-                )
-            };
-            assert_eq!(ret, Z_STREAM_ERROR);
-        }
-
-        let ret = { inflateBackEnd(&raw mut stream) };
-        assert_eq!(ret, Z_OK);
-        mem_done(&mut stream);
-
-        let ret = inflateBackInit_(
+    // Invalid callback configurations must produce StreamError without
+    // reading from or mutating the initialized decoder. This replaces the
+    // old UB-only test that altered Mode::Sync from inside a callback:
+    // inflateBack resets its state to Mode::Type at the start of every call.
+    // SAFETY: the initialized decoder remains live; the absent input
+    // callback is rejected before any callback-dependent buffer access.
+    let ret = unsafe {
+        inflateBack(
             &raw mut stream,
-            15,
-            window.as_mut_ptr(),
-            VERSION,
-            STREAM_SIZE,
-        );
-        assert_eq!(ret, Z_OK);
-        let ret = { inflateBackEnd(&raw mut stream) };
-        assert_eq!(ret, Z_OK);
-    }
+            None,
+            core::ptr::null_mut(),
+            Some(push),
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(ret, Z_STREAM_ERROR);
+
+    // SAFETY: likewise, a missing output callback is rejected without
+    // touching the output window or any initial input data.
+    let ret = unsafe {
+        inflateBack(
+            &raw mut stream,
+            Some(pull),
+            core::ptr::null_mut(),
+            None,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(ret, Z_STREAM_ERROR);
+
+    // SAFETY: this initialized back-inflate stream is closed once.
+    assert_eq!(unsafe { inflateBackEnd(&raw mut stream) }, Z_OK);
+    mem_done(&mut stream);
+
+    // Re-initialize the same caller-owned window with fresh allocator
+    // storage and verify the previous teardown left no stale state.
+    let mut stream = mem_setup();
+    // SAFETY: this newly allocated stream owns valid C ABI callbacks and
+    // uses the still-live independent window.
+    assert_eq!(
+        unsafe {
+            inflateBackInit_(
+                &raw mut stream,
+                15,
+                window.as_mut_ptr(),
+                VERSION,
+                STREAM_SIZE,
+            )
+        },
+        Z_OK
+    );
+    // SAFETY: matching closure of the second initialized stream.
+    assert_eq!(unsafe { inflateBackEnd(&raw mut stream) }, Z_OK);
+    mem_done(&mut stream);
 }
 
 #[test]
