@@ -1,5 +1,5 @@
 use core::ffi::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void, CStr};
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::MaybeUninit;
 
 use zlib_rs::c_api::{
     Z_DATA_ERROR, Z_ERRNO, Z_NEED_DICT, Z_OK, Z_STREAM_END, Z_STREAM_ERROR, Z_VERSION_ERROR,
@@ -42,11 +42,10 @@ unsafe extern "C" fn mem_alloc(mem: *mut c_void, count: u32, size: u32) -> *mut 
         return std::ptr::null_mut();
     }
 
-    // SAFETY: opaque is the live MemZone originally allocated by mem_setup;
-    // ManuallyDrop keeps ownership with the stream until mem_done.
-    // SAFETY: opaque is the live MemZone owned by mem_setup; the callback
-    // does not transfer ownership, so ManuallyDrop prevents double-free.
-    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(mem.cast::<MemZone>()) });
+    // SAFETY: opaque is the live MemZone allocated by mem_setup.
+    // The synchronous C allocator callback borrows it exclusively;
+    // mem_done alone reclaims the original Box.
+    let zone = unsafe { &mut *mem.cast::<MemZone>() };
 
     // Check the accounting even without a configured memory limit: the
     // callback must never allocate a smaller buffer than it advertises.
@@ -55,6 +54,12 @@ unsafe extern "C" fn mem_alloc(mem: *mut c_void, count: u32, size: u32) -> *mut 
     };
     if zone.limit != 0 && new_total > zone.limit {
         return std::ptr::null_mut();
+    }
+
+    // Keep the accounting vector fallible within the extern-C callback:
+    // a failed metadata reservation must be an allocation failure too.
+    if zone.items.try_reserve(1).is_err() {
+        return core::ptr::null_mut();
     }
 
     extern "C" {
@@ -91,14 +96,21 @@ unsafe extern "C" fn mem_free(mem: *mut c_void, ptr: *mut c_void) {
         fn free(p: *mut c_void);
     }
 
+    if ptr.is_null() {
+        // C free(NULL) is an ordinary no-op, not an unrecognized allocation.
+        return;
+    }
+
     if mem.is_null() {
-        // SAFETY: the C allocator callback contract passes only pointers
-        // previously allocated using the compatible libc allocator.
+        // SAFETY: the fallback callback requires an allocation originating
+        // from the matching libc allocator when no accounting zone is used.
         unsafe { free(ptr) };
         return;
     }
 
-    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(mem.cast::<MemZone>()) });
+    // SAFETY: this synchronous callback receives the live owned MemZone.
+    // Borrowing it does not transfer its Box ownership away from mem_done.
+    let zone = unsafe { &mut *mem.cast::<MemZone>() };
 
     let last = zone.items.pop();
     let mut found = None;
@@ -122,13 +134,15 @@ unsafe extern "C" fn mem_free(mem: *mut c_void, ptr: *mut c_void) {
 
     if let Some(item) = found {
         zone.total -= item.size;
+        // SAFETY: only tracked allocations were returned by our libc
+        // malloc callback; this pointer has been removed from the list
+        // before it can be released again.
+        unsafe { free(item.ptr) };
     } else {
+        // Do not call libc free with a pointer we cannot establish came
+        // from malloc. In particular, a repeated free must not double-free.
         zone.rogue += 1;
     }
-
-    // SAFETY: the C free callback requires a live pointer allocated by
-    // the corresponding libc allocator; null is also accepted by free.
-    unsafe { free(ptr) }
 }
 
 fn mem_setup() -> libz_rs_sys::z_stream {
@@ -165,9 +179,9 @@ fn mem_setup() -> libz_rs_sys::z_stream {
 fn mem_limit(stream: &mut libz_rs_sys::z_stream, limit: usize) {
     assert!(!stream.opaque.is_null());
 
-    // SAFETY: stream.opaque holds the owned, live MemZone; borrowing it
-    // temporarily does not relinquish stream ownership.
-    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(stream.opaque.cast::<MemZone>()) });
+    // SAFETY: stream.opaque holds the owned, live MemZone. The mutable
+    // stream reference excludes concurrent use of the allocation callback.
+    let zone = unsafe { &mut *stream.opaque.cast::<MemZone>() };
     zone.limit = limit;
 }
 
@@ -213,6 +227,37 @@ fn mem_done(stream: &mut libz_rs_sys::z_stream) {
 }
 
 #[test]
+fn mem_allocator_rejects_unknown_and_duplicate_free_without_touching_memory() {
+    let mut stream = mem_setup();
+    let opaque = stream.opaque;
+    // SAFETY: mem_alloc receives an owned, live MemZone and small valid counts.
+    let ptr = unsafe { mem_alloc(opaque, 1, 16) };
+    assert!(!ptr.is_null());
+
+    // The first free releases the malloc allocation, and the second is
+    // deliberately given only the dangling pointer value, not read.
+    // A rogue stack pointer must not be handed to libc free either.
+    // SAFETY: the callback only compares unknown pointers to its tracked
+    // allocations. It never dereferences or frees unmatched pointers.
+    unsafe {
+        mem_free(opaque, ptr);
+        mem_free(opaque, ptr);
+        let mut stack_byte = 0u8;
+        mem_free(opaque, (&raw mut stack_byte).cast::<c_void>());
+        mem_free(opaque, core::ptr::null_mut());
+    }
+
+    // SAFETY: the stream is still the exclusive owner of the accounting
+    // zone; callbacks have returned, so this read cannot race them.
+    let zone = unsafe { &mut *opaque.cast::<MemZone>() };
+    assert_eq!(zone.total, 0);
+    assert_eq!(zone.rogue, 2);
+    assert!(zone.items.is_empty());
+    zone.rogue = 0; // the test intentionally injected exactly two rogue frees
+    mem_done(&mut stream);
+}
+
+#[test]
 fn mem_allocator_rejects_overflow_without_unwinding_through_ffi() {
     let mut stream = mem_setup();
 
@@ -251,6 +296,40 @@ struct BackRoundTrip {
     output_calls: usize,
 }
 
+/// Convert a caller's desired chunk into a C input callback byte count.
+///
+/// Returning both representations from one checked conversion ensures that
+/// advancing the input cursor and reporting the C byte count cannot diverge
+/// when the host usize can represent more than c_uint.
+fn callback_chunk_size(requested: usize, remaining: usize) -> (usize, c_uint) {
+    let max_count = usize::try_from(c_uint::MAX).unwrap_or(usize::MAX);
+    let len = requested.min(remaining).min(max_count);
+    match c_uint::try_from(len) {
+        Ok(count) => (len, count),
+        Err(_) => (0, 0),
+    }
+}
+
+#[test]
+fn back_round_trip_callback_count_never_truncates() {
+    let (len, count) = callback_chunk_size(usize::MAX, usize::MAX);
+    assert_eq!(len, usize::try_from(count).unwrap_or(usize::MAX));
+    assert_eq!(count, c_uint::MAX);
+
+    // 64-bit hosts can express one more byte than a C unsigned int.
+    if let Some(larger_than_c_uint) = usize::try_from(c_uint::MAX)
+        .ok()
+        .and_then(|max| max.checked_add(1))
+    {
+        let (len, count) = callback_chunk_size(larger_than_c_uint, usize::MAX);
+        assert_eq!(count, c_uint::MAX);
+        assert_eq!(len, usize::try_from(c_uint::MAX).unwrap_or(usize::MAX));
+    }
+
+    assert_eq!(callback_chunk_size(7, 3), (3, 3));
+    assert_eq!(callback_chunk_size(0, usize::MAX), (0, 0));
+}
+
 unsafe extern "C" fn read_back_round_trip(
     descriptor: *mut c_void,
     next: *mut *const c_uchar,
@@ -258,17 +337,17 @@ unsafe extern "C" fn read_back_round_trip(
     // SAFETY: descriptor is a uniquely borrowed BackRoundTrip fixture during
     // each synchronous inflateBack callback.
     let context = unsafe { &mut *descriptor.cast::<BackRoundTrip>() };
-    let count = context.chunk_size.min(context.input.len() - context.next);
+    let (len, count) = callback_chunk_size(context.chunk_size, context.input.len() - context.next);
     if count == 0 {
         // SAFETY: next is a valid output pointer supplied by inflateBack.
         unsafe { *next = core::ptr::null() };
         return 0;
     }
-    // SAFETY: count is bounded by the remaining input bytes, whose Vec
+    // SAFETY: len is bounded by the remaining input bytes, whose Vec
     // remains unchanged for the duration of this inflateBack invocation.
     unsafe { *next = context.input.as_ptr().add(context.next) };
-    context.next += count;
-    count as c_uint
+    context.next += len;
+    count
 }
 
 unsafe extern "C" fn write_back_round_trip(
@@ -331,9 +410,9 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
             },
             Z_OK
         );
-        let count = chunk_size.min(fixture.input.len());
+        let (count, avail_in) = callback_chunk_size(chunk_size, fixture.input.len());
         stream.next_in = fixture.input.as_mut_ptr();
-        stream.avail_in = count as c_uint;
+        stream.avail_in = avail_in;
         fixture.next = count;
         let descriptor = (&raw mut fixture).cast::<c_void>();
         let result = unsafe {
@@ -393,19 +472,13 @@ fn gzip_header_check() {
         0x3b, 0x92,
     ];
 
-    let _what = "gzip header parsing";
-    let step = 0;
     let len = 1;
-    let err = Z_OK;
-
-    let err = Some(err);
     let mut stream = mem_setup();
 
+    // A gzip-header parsing test must fail if decoder initialization fails,
+    // rather than silently skipping all assertions after the error.
     let init_err = unsafe { inflateInit2_(&raw mut stream, 47, VERSION, STREAM_SIZE) };
-    if init_err != Z_OK {
-        mem_done(&mut stream);
-        return;
-    }
+    assert_eq!(init_err, Z_OK, "gzip header decoder initialization failed");
 
     let mut out = vec![0u8; len];
     let mut extra: [u8; 14] = [0; 14];
@@ -423,7 +496,7 @@ fn gzip_header_check() {
         extra_len: 0,
         extra_max: 14,
         name: name.as_mut_ptr(),
-        name_max: 9, // How / where should this be set?
+        name_max: 9,
         comment: comment.as_mut_ptr(),
         comm_max: 10,
         hcrc: 0,
@@ -433,10 +506,7 @@ fn gzip_header_check() {
     let ret = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
     assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
-    let have = input.len();
-    let step = if step == 0 || step > have { have } else { step };
-
-    stream.avail_in = step as _;
+    stream.avail_in = u32::try_from(input.len()).unwrap_or(u32::MAX);
     stream.next_in = input.as_ptr().cast_mut();
 
     stream.avail_out = len as _;
@@ -444,11 +514,7 @@ fn gzip_header_check() {
 
     let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
 
-    if let Some(err) = err {
-        if err != 9 {
-            assert_eq!(ret, err)
-        }
-    }
+    assert_eq!(ret, Z_OK);
 
     assert_eq!(header.text, 1);
     assert_eq!(header.time, 1699023428);
@@ -456,19 +522,10 @@ fn gzip_header_check() {
     assert_eq!(header.hcrc, 1);
     assert_eq!(header.done, 1);
 
-    // Check the header comment
-    let comment_string = match std::str::from_utf8(&comment) {
-        Ok(s) => s,
-        Err(_) => panic!("Invalid string found in comment"),
-    };
-    assert_eq!("A comment\0", comment_string);
-
-    // Check header original filename
-    let name_string = match std::str::from_utf8(&name) {
-        Ok(s) => s,
-        Err(_) => panic!("Invalid string found in name"),
-    };
-    assert_eq!("test.txt\0", name_string);
+    // Compare the exact bytes, including the NUL terminators. No UTF-8
+    // decoding or panic branch is needed to test these C header fields.
+    assert_eq!(&comment, b"A comment\0");
+    assert_eq!(&name, b"test.txt\0");
 
     // Check header extra
     let extra_bytes = [84, 71, 10, 0, 69, 88, 84, 82, 65, 32, 68, 65, 84, 65];
@@ -493,6 +550,11 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
     let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
     if init_err != Z_OK {
         mem_done(&mut stream);
+        // The single intentionally invalid initialization uses window_bits=1.
+        // Matching the final expected status is not enough: otherwise a
+        // failed setup could accidentally pass a test targeting inflate().
+        assert_eq!(win, 1, "unexpected init failure in {_what}");
+        assert_eq!(init_err, Z_STREAM_ERROR);
         return;
     }
 
@@ -1755,10 +1817,7 @@ fn inflate_get_header_non_gzip_stream() {
 
     let win = 15; // i.e. zlib compression (and not gzip)
     let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
-    if init_err != Z_OK {
-        mem_done(&mut stream);
-        return;
-    }
+    assert_eq!(init_err, Z_OK, "non-gzip decoder initialization failed");
 
     let mut header = gz_header::default();
 
