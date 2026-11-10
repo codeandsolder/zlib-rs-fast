@@ -2153,35 +2153,13 @@ fn gzip_header_fields_insufficient_space() {
         assert_eq!(err, ReturnCode::Ok as i32);
 
         assert!(!header.extra.is_null());
-        assert_eq!(
-            if extra_buf.last() != Some(&0) {
-                std::str::from_utf8(&extra_buf).unwrap()
-            } else {
-                CStr::from_bytes_until_nul(&extra_buf)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-            },
-            &extra[..extra_buf.len()]
-        );
-
+        assert_eq!(extra_buf.as_slice(), &extra.as_bytes()[..extra_buf.len()]);
         assert!(!header.name.is_null());
-        assert_eq!(
-            if name_buf.last() != Some(&0) {
-                std::str::from_utf8(&name_buf).unwrap()
-            } else {
-                CStr::from_bytes_until_nul(&name_buf)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-            },
-            &name[..name_buf.len()]
-        );
-
+        assert_eq!(name_buf.as_slice(), &name.as_bytes()[..name_buf.len()]);
         assert!(!header.comment.is_null());
         assert_eq!(
-            std::str::from_utf8(&comment_buf).unwrap(),
-            &comment.trim_end_matches('\0')[..comment_buf.len()]
+            comment_buf.as_slice(),
+            &comment.trim_end_matches('\0').as_bytes()[..comment_buf.len()]
         );
 
         (extra_buf, name_buf, comment_buf)
@@ -2365,23 +2343,16 @@ fn gzip_chunked(chunk_size: usize) {
         assert_eq!(err, ReturnCode::Ok as i32);
 
         assert!(!header.extra.is_null());
-        assert_eq!(
-            std::str::from_utf8(&extra_buf).unwrap(),
-            &extra[..extra_buf.len()]
-        );
-
+        assert_eq!(extra_buf.as_slice(), &extra.as_bytes()[..extra_buf.len()]);
         assert!(!header.name.is_null());
-        assert_eq!(
-            std::str::from_utf8(&name_buf).unwrap(),
-            &name[..name_buf.len()]
-        );
-
+        assert_eq!(name_buf.as_slice(), &name.as_bytes()[..name_buf.len()]);
         assert!(!header.comment.is_null());
+        // Scan only within the allocated header buffer, never beyond its end.
         assert_eq!(
-            unsafe { CStr::from_ptr(comment_buf.as_ptr().cast()) }
-                .to_str()
-                .unwrap(),
-            comment.trim_end_matches('\0')
+            CStr::from_bytes_until_nul(&comment_buf)
+                .ok()
+                .map(CStr::to_bytes),
+            Some(comment.trim_end_matches('\0').as_bytes())
         );
     }
 }
@@ -2503,19 +2474,44 @@ fn issue_109() {
         let stream = { stream.assume_init_mut() };
 
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
+        let input_size = c_uint::try_from(input.len());
+        assert!(
+            input_size.is_ok(),
+            "inflate fixture exceeds c_uint input limit"
+        );
+        stream.avail_in = input_size.unwrap_or_default();
 
         while stream.avail_in != 0 {
+            let available_before = stream.avail_in;
             stream.next_out = buf.as_mut_ptr();
-            stream.avail_out = buf.len() as _;
+            stream.avail_out = c_uint::try_from(buf.len()).unwrap_or_default();
 
             let err = { inflate(stream, InflateFlush::NoFlush as _) };
+            let remaining = stream.avail_out as usize;
+            assert!(
+                remaining <= buf.len(),
+                "inflate reported invalid output capacity"
+            );
+            let produced = buf.len() - remaining;
+            output.extend_from_slice(&buf[..produced]);
 
-            if ReturnCode::from(err) == ReturnCode::BufError {
-                output.extend(&buf[..stream.avail_out as usize]);
-                stream.avail_out = buf.len() as _;
-                continue;
+            assert!(
+                matches!(
+                    ReturnCode::from(err),
+                    ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd
+                ),
+                "unexpected inflate status: {err}"
+            );
+            if err == Z_STREAM_END {
+                break;
             }
+            // A truncated test stream may end without Z_STREAM_END, but
+            // a decoder that consumes no bytes and produces nothing is stuck.
+            assert!(
+                stream.avail_in < available_before || produced != 0,
+                "inflate made no progress with {} input bytes remaining",
+                stream.avail_in
+            );
         }
 
         let err = inflateEnd(stream);
@@ -2605,19 +2601,44 @@ fn op_len_edge_case() {
         let stream = { stream.assume_init_mut() };
 
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
+        let input_size = c_uint::try_from(input.len());
+        assert!(
+            input_size.is_ok(),
+            "inflate fixture exceeds c_uint input limit"
+        );
+        stream.avail_in = input_size.unwrap_or_default();
 
         while stream.avail_in != 0 {
+            let available_before = stream.avail_in;
             stream.next_out = buf.as_mut_ptr();
-            stream.avail_out = buf.len() as _;
+            stream.avail_out = c_uint::try_from(buf.len()).unwrap_or_default();
 
             let err = { inflate(stream, InflateFlush::NoFlush as _) };
+            let remaining = stream.avail_out as usize;
+            assert!(
+                remaining <= buf.len(),
+                "inflate reported invalid output capacity"
+            );
+            let produced = buf.len() - remaining;
+            output.extend_from_slice(&buf[..produced]);
 
-            if ReturnCode::from(err) == ReturnCode::BufError {
-                output.extend(&buf[..stream.avail_out as usize]);
-                stream.avail_out = buf.len() as _;
-                continue;
+            assert!(
+                matches!(
+                    ReturnCode::from(err),
+                    ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd
+                ),
+                "unexpected inflate status: {err}"
+            );
+            if err == Z_STREAM_END {
+                break;
             }
+            // A truncated test stream may end without Z_STREAM_END, but
+            // a decoder that consumes no bytes and produces nothing is stuck.
+            assert!(
+                stream.avail_in < available_before || produced != 0,
+                "inflate made no progress with {} input bytes remaining",
+                stream.avail_in
+            );
         }
 
         let err = inflateEnd(stream);
