@@ -69,7 +69,7 @@ pub(super) enum BlockContinuation {
 }
 
 impl BlockContinuation {
-    fn apply(self, state: &mut State<'_>) {
+    const fn apply(self, state: &mut State<'_>) {
         match self {
             Self::None => {}
             Self::AdvanceLazyMatch { match_len } => {
@@ -99,7 +99,7 @@ pub(super) struct TokenBlockWork {
 }
 
 impl TokenBlockWork {
-    fn new(continuation: BlockContinuation) -> Self {
+    const fn new(continuation: BlockContinuation) -> Self {
         Self { continuation }
     }
 
@@ -126,7 +126,7 @@ pub(super) struct EndOfInputWork {
 }
 
 impl EndOfInputWork {
-    fn new(insert: usize) -> Self {
+    const fn new(insert: usize) -> Self {
         Self { insert }
     }
 
@@ -191,7 +191,7 @@ enum StandardProducerKind {
 }
 
 impl StandardProducer {
-    fn for_algorithm(
+    const fn for_algorithm(
         algorithm: Algorithm,
         state: &State<'_>,
         match_source: MatchSourceKind,
@@ -239,7 +239,7 @@ impl TokenProducer for StandardProducer {
             StandardProducerKind::Medium(producer) => producer.complete_match_search(state, result),
             StandardProducerKind::Slow(producer) => producer.complete_match_search(state, result),
             StandardProducerKind::Huffman(producer) => {
-                producer.complete_match_search(state, result)
+                producer.complete_match_search(state, result);
             }
             StandardProducerKind::Rle(producer) => producer.complete_match_search(state, result),
         }
@@ -452,14 +452,14 @@ pub(super) enum StandardSegmentMode {
 }
 
 impl StandardSegmentMode {
-    fn input_completion(self) -> InputCompletion {
+    const fn input_completion(self) -> InputCompletion {
         match self {
             Self::Continue => InputCompletion::MoreMayArrive,
             Self::FlushBoundary | Self::Final => InputCompletion::EndOfSegment,
         }
     }
 
-    fn end_kind(self) -> Option<EndBlockKind> {
+    const fn end_kind(self) -> Option<EndBlockKind> {
         match self {
             Self::Continue => None,
             Self::FlushBoundary => Some(EndBlockKind::FlushBoundary),
@@ -623,13 +623,13 @@ pub(super) struct InputDemand {
 }
 
 impl InputDemand {
-    fn new(preferred_lookahead: usize) -> Self {
+    const fn new(preferred_lookahead: usize) -> Self {
         Self {
             preferred_lookahead,
         }
     }
 
-    fn is_satisfied(self, state: &State<'_>) -> bool {
+    const fn is_satisfied(self, state: &State<'_>) -> bool {
         state.lookahead >= self.preferred_lookahead
     }
 }
@@ -800,7 +800,7 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    pub(super) fn for_stream(level: i8, strategy: Strategy) -> Self {
+    pub(super) const fn for_stream(level: i8, strategy: Strategy) -> Self {
         if level == 0 {
             return Self::Stored;
         }
@@ -823,9 +823,9 @@ impl Algorithm {
                     .expect("ordinary algorithm must have a token producer");
                 drive_standard(
                     stream.state,
-                    &mut stream.input,
-                    &mut stream.output,
-                    &mut stream.checksum,
+                    stream.input,
+                    stream.output,
+                    stream.checksum,
                     flush,
                     &mut driver,
                 )
@@ -879,7 +879,7 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
 ];
 
-pub fn level_config(level: i8) -> LevelConfig {
+pub const fn level_config(level: i8) -> LevelConfig {
     LEVEL_CONFIGS[level as usize]
 }
 

@@ -10,40 +10,40 @@ pub struct BitBuffer {
 
 impl BitBuffer {
     #[inline(always)]
-    pub fn bits_in_buffer(&self) -> u8 {
+    pub const fn bits_in_buffer(&self) -> u8 {
         self.bits_used
     }
 
     #[inline(always)]
-    pub fn hold(&self) -> u64 {
+    pub const fn hold(&self) -> u64 {
         self.bit_buffer
     }
 
     #[inline(always)]
-    pub fn bits(&self, n: usize) -> u64 {
+    pub const fn bits(&self, n: usize) -> u64 {
         let lowest_n_bits = (1 << n) - 1;
         self.bit_buffer & lowest_n_bits
     }
 
     #[inline(always)]
-    pub fn drop_bits(&mut self, n: u8) {
+    pub const fn drop_bits(&mut self, n: u8) {
         self.bit_buffer >>= n;
         self.bits_used -= n;
     }
 
     #[inline(always)]
-    pub fn next_byte_boundary(&mut self) {
+    pub const fn next_byte_boundary(&mut self) {
         self.drop_bits(self.bits_used & 0b0111);
     }
 
     #[inline(always)]
-    pub fn init_bits(&mut self) {
+    pub const fn init_bits(&mut self) {
         self.bit_buffer = 0;
         self.bits_used = 0;
     }
 
     #[inline(always)]
-    pub fn prime(&mut self, bits: u8, value: u64) {
+    pub const fn prime(&mut self, bits: u8, value: u64) {
         let value = value & ((1 << bits) - 1);
         self.bit_buffer += value << self.bits_used;
         self.bits_used += bits;
@@ -107,7 +107,7 @@ pub struct BitReader<'input> {
 }
 
 impl<'input> BitReader<'input> {
-    pub fn from_buffer(bits: BitBuffer, input: &'input [u8]) -> Self {
+    pub const fn from_buffer(bits: BitBuffer, input: &'input [u8]) -> Self {
         Self {
             input,
             position: 0,
@@ -116,7 +116,7 @@ impl<'input> BitReader<'input> {
         }
     }
 
-    pub fn into_buffer(self) -> BitBuffer {
+    pub const fn into_buffer(self) -> BitBuffer {
         self.bits
     }
 
@@ -137,22 +137,22 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline(always)]
-    pub fn bits_in_buffer(&self) -> u8 {
+    pub const fn bits_in_buffer(&self) -> u8 {
         self.bits.bits_used
     }
 
     #[inline(always)]
-    pub fn hold(&self) -> u64 {
+    pub const fn hold(&self) -> u64 {
         self.bits.hold()
     }
 
     #[inline(always)]
-    pub fn bytes_remaining(&self) -> usize {
+    pub const fn bytes_remaining(&self) -> usize {
         self.input.len() - self.position
     }
 
     #[inline(always)]
-    pub fn bytes_remaining_including_buffer(&self) -> usize {
+    pub const fn bytes_remaining_including_buffer(&self) -> usize {
         self.bytes_remaining() + (self.bits.bits_used as usize >> 3)
     }
 
@@ -165,7 +165,7 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline(always)]
-    pub fn next_byte_boundary(&mut self) {
+    pub const fn next_byte_boundary(&mut self) {
         self.bits.next_byte_boundary();
     }
 
@@ -204,17 +204,17 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline(always)]
-    pub fn bits(&self, n: usize) -> u64 {
+    pub const fn bits(&self, n: usize) -> u64 {
         self.bits.bits(n)
     }
 
     #[inline(always)]
-    pub fn drop_bits(&mut self, n: u8) {
+    pub const fn drop_bits(&mut self, n: u8) {
         self.bits.drop_bits(n);
     }
 
     #[inline(always)]
-    pub fn init_bits(&mut self) {
+    pub const fn init_bits(&mut self) {
         self.bits.init_bits();
     }
 
@@ -298,7 +298,7 @@ mod tests {
 
         let reader = BitReader::from_buffer(bits, &[]);
         assert_eq!(reader.bytes_remaining(), 0);
-        assert!(reader.as_slice().is_empty());
+        assert_eq!(reader.as_slice(), []);
         assert_eq!(reader.bits_in_buffer(), 3);
     }
 
@@ -309,7 +309,7 @@ mod tests {
         reader.advance(2);
         assert_eq!(reader.as_slice(), &[3]);
         reader.advance(usize::MAX);
-        assert!(reader.as_slice().is_empty());
+        assert_eq!(reader.as_slice(), []);
         assert_eq!(reader.bytes_remaining(), 0);
     }
 

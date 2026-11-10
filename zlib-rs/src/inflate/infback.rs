@@ -39,12 +39,12 @@ pub(super) fn back_init_window(
     // allocator as the default, but `libz-rs-sys` configures the C allocator
     #[cfg(feature = "rust-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_rust_allocator()
+        stream.configure_default_rust_allocator();
     }
 
     #[cfg(feature = "c-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_c_allocator()
+        stream.configure_default_c_allocator();
     }
 
     if stream.zalloc.is_none() || stream.zfree.is_none() {

@@ -27,7 +27,7 @@ pub(super) struct MediumProducer {
 }
 
 impl MediumProducer {
-    pub(super) fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
+    pub(super) const fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
         Self {
             early_exit: state.level < 5,
             current_match: Match::EMPTY,
@@ -37,12 +37,12 @@ impl MediumProducer {
         }
     }
 
-    fn clear_saved_next(&mut self, state: &mut State<'_>) {
+    const fn clear_saved_next(&mut self, state: &mut State<'_>) {
         self.next_match = Match::EMPTY;
         state.medium_next_match = Match::EMPTY;
     }
 
-    fn save_next(&self, state: &mut State<'_>) {
+    const fn save_next(&self, state: &mut State<'_>) {
         state.medium_next_match = self.next_match;
     }
 

@@ -24,7 +24,7 @@ pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState
 
     loop {
         if pending_needs_drain(stream.state) {
-            if drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull {
+            if drain_pending_output(stream.state, stream.output) == DrainOutcome::OutputFull {
                 return if last
                     && stream.input.avail_in == 0
                     && stream.state.bit_writer.bits_valid == 0
@@ -80,12 +80,12 @@ fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> 
         let state = &mut stream.state;
         state
             .bit_writer
-            .emit_end_block_and_align(&StaticTreeDesc::L.static_tree, last);
+            .emit_end_block_and_align(StaticTreeDesc::L.static_tree, last);
         state.block_open = 0;
         state.block_start = state.strstart as isize;
     }
 
-    (drain_pending_output(stream.state, &mut stream.output) == DrainOutcome::OutputFull).then_some(
+    (drain_pending_output(stream.state, stream.output) == DrainOutcome::OutputFull).then_some(
         if last {
             BlockState::FinishStarted
         } else {

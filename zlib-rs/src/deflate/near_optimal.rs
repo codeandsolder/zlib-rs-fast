@@ -105,7 +105,7 @@ impl MatchCandidates {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 }
@@ -131,7 +131,7 @@ struct BlockObservations {
 }
 
 impl BlockObservations {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             counts: [0; SPLIT_OBSERVATION_TYPES],
             total: 0,
@@ -336,13 +336,14 @@ impl ParseStep {
     }
 
     #[inline]
-    fn token(self) -> ParseToken {
+    const fn token(self) -> ParseToken {
+        let packed = self.0.to_le_bytes();
         if self.0 & Self::MATCH_FLAG == 0 {
-            ParseToken::Literal(self.0 as u8)
+            ParseToken::Literal(packed[0])
         } else {
             ParseToken::Match {
                 length: ((self.0 >> 16) & 0x1ff) as u16,
-                distance: self.0 as u16,
+                distance: u16::from_le_bytes([packed[0], packed[1]]),
             }
         }
     }
@@ -576,7 +577,7 @@ impl RankSet {
 }
 
 #[inline]
-fn low_bits(bits: usize) -> u64 {
+const fn low_bits(bits: usize) -> u64 {
     if bits == 0 {
         0
     } else if bits >= 64 {
@@ -587,7 +588,7 @@ fn low_bits(bits: usize) -> u64 {
 }
 
 #[inline]
-fn highest_bit(word: u64) -> usize {
+const fn highest_bit(word: u64) -> usize {
     63 - word.leading_zeros() as usize
 }
 
@@ -618,7 +619,7 @@ const fn suffix_index(value: u32) -> usize {
 }
 
 /// A suffix permutation and its inverse. Both arrays remain packed u32; all
-/// consumers operate on ordinary slice indices through rank_of/position_at.
+/// consumers operate on ordinary slice indices through `rank_of/position_at`.
 /// This is the only boundary converting the compact rank/position storage.
 struct SuffixRanks {
     sa: Vec<u32>,
@@ -737,7 +738,7 @@ fn counts_to_offsets(counts: &mut [u32]) {
 }
 
 #[inline]
-fn suffix_second_rank(rank: &[u32], position: u32, span: usize) -> u32 {
+const fn suffix_second_rank(rank: &[u32], position: u32, span: usize) -> u32 {
     let position = suffix_index(position);
     if position < rank.len().saturating_sub(span) {
         rank[position + span]
@@ -758,7 +759,7 @@ const SPLIT_OBSERVATION_TYPES: usize = 10;
 const SPLIT_MATCH_SEARCH_DEPTH: usize = 300;
 
 #[inline]
-fn choose_min_match_len(used_literals: usize) -> usize {
+const fn choose_min_match_len(used_literals: usize) -> usize {
     match used_literals {
         0..=5 => 9,
         6..=7 => 8,
@@ -830,7 +831,7 @@ impl BlockSplitStats {
 
     /// Start a new block at the previous check while preserving the already-scanned recent chunk as
     /// the first statistics for that block.
-    fn keep_recent_as_new_block(&mut self) {
+    const fn keep_recent_as_new_block(&mut self) {
         self.old = self.recent;
         self.old_count = self.recent_count;
         self.recent = [0; SPLIT_OBSERVATION_TYPES];
@@ -872,11 +873,11 @@ impl BlockSplitStats {
 /// exact suffix-rank frontier; exact match discovery and dynamic programming happen only after a
 /// boundary has been selected.
 pub fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
+    const HASH_SIZE: usize = 1 << 16;
+
     if input.is_empty() {
         return core::iter::once(0..0).collect();
     }
-
-    const HASH_SIZE: usize = 1 << 16;
     let mut head = vec![usize::MAX; HASH_SIZE];
     // Keep one previous-link slot for every position in the legal distance window. Unlike storing a
     // link for the entire input, this stays bounded; a slot cannot be overwritten while its position
@@ -1052,13 +1053,21 @@ fn parse_range_with_scratch(
     costs: &TokenCosts,
     scratch: &mut ParseScratch,
 ) -> ParseResult {
+    const INF: u64 = ParseScratch::INF;
+
+    #[derive(Clone, Copy)]
+    struct DistanceAtMax {
+        generation: u32,
+        cost: u32,
+        distance: u16,
+    }
+
     assert_eq!(candidates.len_for_parse(), input.len());
     assert!(block.start <= block.end && block.end <= input.len());
 
     let block_len = block.len();
     scratch.reset(block_len);
     let (best_cost, steps) = (&mut scratch.best_cost, &mut scratch.steps);
-    const INF: u64 = ParseScratch::INF;
     let mut length_costs = [0u32; STD_MAX_MATCH + 1];
     for (length, cost) in length_costs.iter_mut().enumerate().skip(STD_MIN_MATCH) {
         let code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
@@ -1072,12 +1081,6 @@ fn parse_range_with_scratch(
     // One candidate can become newly capable at each maximum match length. Keep the sparse values
     // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
     // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
-    #[derive(Clone, Copy)]
-    struct DistanceAtMax {
-        generation: u32,
-        cost: u32,
-        distance: u16,
-    }
     assert!(block_len <= u32::MAX as usize);
     let mut distance_cost_at_max = [DistanceAtMax {
         generation: 0,
@@ -1102,7 +1105,8 @@ fn parse_range_with_scratch(
             continue;
         }
 
-        let generation = (local_position + 1) as u32;
+        let generation = u32::try_from(local_position + 1)
+            .unwrap_or_else(|_| unreachable!("the block-length limit was checked"));
         let mut longest_match = 0usize;
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
@@ -1164,7 +1168,7 @@ fn parse_range_with_scratch(
 }
 
 impl MatchCandidates {
-    fn len_for_parse(&self) -> usize {
+    const fn len_for_parse(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 }
@@ -1288,7 +1292,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = ((state >> 32) as u8) & 0x1f;
+            *byte = state.to_le_bytes()[4] & 0x1f;
         }
 
         let suffixes = SuffixRanks::new(&input);
@@ -1360,11 +1364,11 @@ mod tests {
             ParseToken::Literal(0),
             ParseToken::Literal(u8::MAX),
             ParseToken::Match {
-                length: STD_MIN_MATCH as u16,
+                length: compact_match_length(STD_MIN_MATCH),
                 distance: 1,
             },
             ParseToken::Match {
-                length: STD_MAX_MATCH as u16,
+                length: compact_match_length(STD_MAX_MATCH),
                 distance: 32_768,
             },
         ] {
@@ -1488,7 +1492,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 32) as u8;
+            *byte = state.to_le_bytes()[4];
         }
         let repeated = input[..STD_MAX_MATCH].to_vec();
         input.extend_from_slice(&repeated);
@@ -1508,7 +1512,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 32) as u8;
+            *byte = state.to_le_bytes()[4];
         }
         let repeated = input[..STD_MAX_MATCH].to_vec();
         assert_ne!(&input[1..=STD_MAX_MATCH], repeated.as_slice());
@@ -1539,8 +1543,8 @@ mod tests {
             let code = State::d_code(distance - 1) as usize;
             if length > usize::from(best[code].length) {
                 best[code] = MatchCandidate {
-                    length: length as u16,
-                    distance: distance as u16,
+                    length: compact_match_length(length),
+                    distance: compact_match_distance(distance),
                 };
             }
         }
@@ -1632,7 +1636,7 @@ mod tests {
                     state = state
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    *byte = (state >> 32) as u8 % alphabet;
+                    *byte = state.to_le_bytes()[4] % alphabet;
                 }
                 for max_distance in [1usize, 2, 3, 7, 16, 31, 50, 64] {
                     let max_distance = max_distance.min(32_506);
@@ -1656,13 +1660,13 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            input.push(b'a' + ((state >> 32) as u8 % 26));
+            input.push(b'a' + (state.to_le_bytes()[4] % 26));
         }
         for _ in 0..12_000 {
             state = state
                 .wrapping_mul(2_862_933_555_777_941_757)
                 .wrapping_add(3_037_000_493);
-            input.push(0x80 | ((state >> 32) as u8 & 0x7f));
+            input.push(0x80 | (state.to_le_bytes()[4] & 0x7f));
         }
         input
     }
@@ -1730,7 +1734,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 24) as u8;
+            *byte = state.to_le_bytes()[3];
         }
         let mut input = history.clone();
         input.extend_from_slice(&history);
@@ -1840,10 +1844,12 @@ mod tests {
         // Deliberately make farther distance symbols cheaper than nearby ones. Keeping the longest
         // match per distance *symbol* must remain exact even when distance costs are non-monotone.
         for (code, cost) in costs.distance.iter_mut().enumerate() {
-            *cost = (15 - (code % 15) as u16) * COST_SCALE;
+            let remainder = u16::try_from(code % 15).unwrap_or_else(|_| unreachable!());
+            *cost = (15 - remainder) * COST_SCALE;
         }
         for (byte, cost) in costs.literal.iter_mut().enumerate() {
-            *cost = (3 + (byte % 11) as u16) * COST_SCALE;
+            let remainder = u16::try_from(byte % 11).unwrap_or_else(|_| unreachable!());
+            *cost = (3 + remainder) * COST_SCALE;
         }
 
         let parsed = parse_block(input, &table, &costs);
@@ -1874,7 +1880,7 @@ struct TokenHistogram {
 }
 
 impl TokenHistogram {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         let mut literal_length = [0; L_CODES];
         literal_length[256] = 1;
         Self {
@@ -2118,16 +2124,19 @@ fn log2_x16(value: usize) -> u16 {
             fraction |= 1 << bit;
         }
     }
-    integer as u16 * COST_SCALE + fraction
+    u16::try_from(integer).unwrap_or_else(|_| unreachable!("log2 exponent is bounded to 31"))
+        * COST_SCALE
+        + fraction
 }
 
 #[inline]
 fn log2_ratio_x16(numerator: usize, denominator: usize) -> u16 {
+    const Q_BITS: u32 = 48;
+
     debug_assert!(numerator >= denominator && denominator != 0);
     // Represent the rational with 48 fractional bits before extracting four binary log2 fraction
     // bits. The inputs here are tiny DEFLATE alphabet sizes; Q48 makes the approximation error far
     // below a 1/16-bit boundary while preserving exact powers of two.
-    const Q_BITS: u32 = 48;
     let q = ((numerator as u128) << Q_BITS) / denominator as u128;
     let integer = u128::BITS - 1 - q.leading_zeros();
     debug_assert!((Q_BITS..=63).contains(&integer));
@@ -2140,7 +2149,9 @@ fn log2_ratio_x16(numerator: usize, denominator: usize) -> u16 {
             fraction |= 1 << bit;
         }
     }
-    ((integer - Q_BITS) as u16) * COST_SCALE + fraction
+    u16::try_from(integer - Q_BITS).unwrap_or_else(|_| unreachable!("bounded Q48 log2 exponent"))
+        * COST_SCALE
+        + fraction
 }
 
 fn initial_statistical_costs(
@@ -2223,11 +2234,12 @@ fn blend_cost(previous: u16, default: u16, change_amount: u8) -> u16 {
     let default = u32::from(default);
     let blended = match change_amount {
         0 => (default + 3 * previous) / 4,
-        1 => (default + previous) / 2,
+        1 => u32::midpoint(default, previous),
         2 => (5 * default + 3 * previous) / 8,
         _ => (3 * default + previous) / 4,
     };
-    blended as u16
+    u16::try_from(blended)
+        .unwrap_or_else(|_| unreachable!("a convex combination of u16 costs fits u16"))
 }
 
 fn blend_previous_model(
@@ -2255,10 +2267,8 @@ fn blend_previous_model(
         3
     } else if 2 * total_delta > 3 * cutoff {
         2
-    } else if 2 * total_delta > cutoff {
-        1
     } else {
-        0
+        u8::from(2 * total_delta > cutoff)
     };
 
     let mut blended = default.clone();
@@ -2466,7 +2476,7 @@ enum BoundaryShift {
 }
 
 impl BoundaryShift {
-    fn is_near(self, other: Self) -> bool {
+    const fn is_near(self, other: Self) -> bool {
         match (self, other) {
             (Self::Right(a), Self::Right(b)) | (Self::Left(a), Self::Left(b)) => {
                 a.abs_diff(b) < BOUNDARY_CANDIDATE_SEPARATION
@@ -2482,7 +2492,7 @@ impl BoundaryShift {
         }
     }
 
-    fn boundary(self, offset: usize) -> Option<usize> {
+    const fn boundary(self, offset: usize) -> Option<usize> {
         match self {
             Self::Right(bytes) => offset.checked_add(bytes),
             Self::Left(bytes) => offset.checked_sub(bytes),
@@ -3399,7 +3409,7 @@ mod encoded_tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 32) as u8;
+            *byte = state.to_le_bytes()[4];
         }
         let repeated = input[..STD_MAX_MATCH].to_vec();
         input.extend_from_slice(&repeated);
@@ -3411,7 +3421,7 @@ mod encoded_tests {
     fn every_tiny_input_length_round_trips() {
         for len in 0..=STD_MAX_MATCH + 1 {
             let input = (0..len)
-                .map(|index| ((index.wrapping_mul(73) ^ (index >> 3)) & 0xff) as u8)
+                .map(|index| (index.wrapping_mul(73) ^ (index >> 3)).to_le_bytes()[0])
                 .collect::<Vec<_>>();
             assert_round_trip(&input, 0);
         }

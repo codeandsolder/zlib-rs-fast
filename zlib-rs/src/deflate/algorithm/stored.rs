@@ -112,7 +112,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         emit_stored_block_header(stream.state, len, last);
 
         // Write the stored block header bytes.
-        let _ = drain_pending_output(stream.state, &mut stream.output);
+        let _ = drain_pending_output(stream.state, stream.output);
 
         // Update debugging counts for the data about to be copied.
         #[cfg(feature = "ZLIB_DEBUG")]
@@ -247,7 +247,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         zng_tr_stored_block(state, start..start + len, last);
 
         advance_resident_origin(state, len);
-        let _ = drain_pending_output(stream.state, &mut stream.output);
+        let _ = drain_pending_output(stream.state, stream.output);
     }
 
     // We've done all we can with the available input and output.

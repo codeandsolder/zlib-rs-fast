@@ -9,13 +9,13 @@ pub enum HashCalcVariant {
 }
 
 impl HashCalcVariant {
-    /// Use rolling hash for deflate_slow algorithm with level 9. It allows us to
-    /// properly lookup different hash chains to speed up longest_match search.
-    pub fn for_max_chain_length(max_chain_length: u16) -> Self {
+    /// Use rolling hash for `deflate_slow` algorithm with level 9. It allows us to
+    /// properly lookup different hash chains to speed up `longest_match` search.
+    pub const fn for_max_chain_length(max_chain_length: u16) -> Self {
         if max_chain_length > 1024 {
-            HashCalcVariant::Roll
+            Self::Roll
         } else {
-            HashCalcVariant::Standard
+            Self::Standard
         }
     }
 }
@@ -27,12 +27,12 @@ impl StandardHashCalc {
 
     const HASH_CALC_MASK: u32 = (HASH_SIZE - 1) as u32;
 
-    fn hash_calc(_: u32, val: u32) -> u32 {
+    const fn hash_calc(_: u32, val: u32) -> u32 {
         const HASH_SLIDE: u32 = 16;
         val.wrapping_mul(2_654_435_761) >> HASH_SLIDE
     }
 
-    pub fn update_hash(h: u32, val: u32) -> u32 {
+    pub const fn update_hash(h: u32, val: u32) -> u32 {
         Self::hash_calc(h, val) & Self::HASH_CALC_MASK
     }
 
@@ -42,7 +42,7 @@ impl StandardHashCalc {
     /// Array chunks express that precondition directly without an additional
     /// fallible slice-to-array conversion on the match-search hot path.
     #[inline]
-    pub(crate) fn first_four_bytes(bytes: &[u8]) -> u32 {
+    pub(crate) const fn first_four_bytes(bytes: &[u8]) -> u32 {
         u32::from_le_bytes(bytes.as_chunks::<4>().0[0])
     }
 
@@ -55,7 +55,7 @@ impl StandardHashCalc {
     }
 
     #[inline]
-    pub fn quick_insert_value(state: &mut State, string: usize, val: u32) -> u16 {
+    pub const fn quick_insert_value(state: &mut State, string: usize, val: u32) -> u16 {
         let hm = Self::update_hash(0, val) as usize;
 
         let head = state.head.as_slice()[hm];
@@ -99,17 +99,17 @@ impl RollHashCalc {
 
     const HASH_CALC_MASK: u32 = (1 << 15) - 1;
 
-    fn hash_calc(h: u32, val: u32) -> u32 {
+    const fn hash_calc(h: u32, val: u32) -> u32 {
         const HASH_SLIDE: u32 = 5;
         (h << HASH_SLIDE) ^ val
     }
 
-    pub fn update_hash(h: u32, val: u32) -> u32 {
+    pub const fn update_hash(h: u32, val: u32) -> u32 {
         Self::hash_calc(h, val) & Self::HASH_CALC_MASK
     }
 
     pub fn quick_insert_string(state: &mut State, string: usize) -> u16 {
-        let val = state.window.filled()[string + Self::HASH_CALC_OFFSET] as u32;
+        let val = u32::from(state.window.filled()[string + Self::HASH_CALC_OFFSET]);
 
         state.ins_h = Self::hash_calc(state.ins_h, val);
         state.ins_h &= Self::HASH_CALC_MASK;
@@ -133,7 +133,7 @@ impl RollHashCalc {
         for (i, val) in slice.iter().copied().enumerate() {
             let idx = string as u16 + i as u16;
 
-            state.ins_h = Self::hash_calc(state.ins_h, val as u32);
+            state.ins_h = Self::hash_calc(state.ins_h, u32::from(val));
             state.ins_h &= Self::HASH_CALC_MASK;
             let hm = state.ins_h as usize;
 

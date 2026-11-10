@@ -80,7 +80,7 @@ impl<'a> Writer<'a> {
         self.filled == self.buf.len()
     }
 
-    pub fn push(&mut self, byte: u8) {
+    pub const fn push(&mut self, byte: u8) {
         self.buf.as_mut_slice()[self.filled] = MaybeUninit::new(byte);
 
         self.filled += 1;
@@ -220,7 +220,7 @@ impl<'a> BackWriter<'a> {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, byte: u8) {
+    pub(crate) const fn push(&mut self, byte: u8) {
         self.writer.push(byte);
     }
 

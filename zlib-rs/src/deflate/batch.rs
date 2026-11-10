@@ -31,7 +31,7 @@ pub struct BatchCompressJob<'a> {
 }
 
 impl<'a> BatchCompressJob<'a> {
-    pub fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
+    pub const fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
         Self { input, output }
     }
 }
@@ -219,7 +219,7 @@ pub fn compress_slices_batch_gpu(
     ))
 }
 
-fn uses_match_search(algorithm: Algorithm) -> bool {
+const fn uses_match_search(algorithm: Algorithm) -> bool {
     matches!(
         algorithm,
         Algorithm::Fast | Algorithm::Medium | Algorithm::Slow
@@ -407,7 +407,7 @@ fn compress_synchronously(
         .collect()
 }
 
-fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
+const fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
     let level = match config.level {
         crate::c_api::Z_DEFAULT_COMPRESSION => 6,
         0..=9 => config.level as i8,
@@ -456,7 +456,7 @@ impl<'a> BatchRuntime<'a> {
                     .expect("successful init creates a typed deflate stream");
                 StandardDriver::for_algorithm_with_match_source(
                     algorithm,
-                    &*stream.state,
+                    &stream.state,
                     match_source,
                 )
                 .expect("batch runtime requires a standard token producer")
@@ -588,7 +588,7 @@ impl<'a> BatchRuntime<'a> {
     }
 
     fn match_request(&self, work: MatchSearchWork) -> MatchSearchRequest<'_> {
-        work.request(&*self.stream_ref().state)
+        work.request(&self.stream_ref().state)
     }
 
     #[cfg(feature = "gpu")]
@@ -641,7 +641,7 @@ impl<'a> BatchRuntime<'a> {
         let Self { raw, driver, .. } = self;
         let stream = unsafe { DeflateStream::from_stream_mut(raw) }
             .expect("live batch runtime has initialized state");
-        driver.complete_match_search(&mut *stream.state, result);
+        driver.complete_match_search(&mut stream.state, result);
     }
 
     fn finish_stream(&mut self) -> BatchCompressResult {
@@ -673,7 +673,7 @@ impl<'a> BatchRuntime<'a> {
         }
     }
 
-    fn finish_error(&mut self, code: ReturnCode) -> BatchCompressResult {
+    const fn finish_error(&mut self, code: ReturnCode) -> BatchCompressResult {
         self.done = true;
         BatchCompressResult {
             written: self.raw.total_out as usize,

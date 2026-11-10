@@ -210,32 +210,32 @@ impl InputCursor {
 pub struct StreamChecksum(crate::c_api::z_checksum);
 
 impl StreamChecksum {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self(stream.adler)
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.adler = self.0;
     }
 
-    fn value(self) -> crate::c_api::z_checksum {
+    const fn value(self) -> crate::c_api::z_checksum {
         self.0
     }
 
-    fn set(&mut self, value: crate::c_api::z_checksum) {
+    const fn set(&mut self, value: crate::c_api::z_checksum) {
         self.0 = value;
     }
 
-    fn reset_adler(&mut self) {
+    const fn reset_adler(&mut self) {
         self.0 = ADLER32_INITIAL_VALUE as _;
     }
 
     fn update_adler(&mut self, bytes: &[u8]) {
-        self.0 = adler32(self.0 as u32, bytes) as _;
+        self.0 = adler32(self.0 as u32, bytes).into();
     }
 
     fn update_crc(&mut self, bytes: &[u8]) {
-        self.0 = crc32(self.0 as u32, bytes) as _;
+        self.0 = crc32(self.0 as u32, bytes).into();
     }
 }
 
@@ -262,29 +262,29 @@ impl<'a> GzipHeaderRef<'a> {
         }
     }
 
-    fn header(&self) -> &gz_header {
+    const fn header(&self) -> &gz_header {
         // SAFETY: guaranteed once by `new`. The returned reference is deliberately tied to this
         // short borrow, so callers may still mutate the C header between compression operations.
         unsafe { self.ptr.as_ref() }
     }
 
-    fn flags(&self) -> u8 {
+    const fn flags(&self) -> u8 {
         self.header().flags()
     }
 
-    fn time(&self) -> u32 {
+    const fn time(&self) -> u32 {
         self.header().time as u32
     }
 
-    fn os(&self) -> u8 {
+    const fn os(&self) -> u8 {
         self.header().os as u8
     }
 
-    fn hcrc(&self) -> bool {
+    const fn hcrc(&self) -> bool {
         self.header().hcrc != 0
     }
 
-    fn extra(&self) -> Option<&[u8]> {
+    const fn extra(&self) -> Option<&[u8]> {
         let header = self.header();
         if header.extra.is_null() {
             return None;
@@ -298,7 +298,7 @@ impl<'a> GzipHeaderRef<'a> {
         self.extra().map(|extra| &extra[..extra.len() & 0xffff])
     }
 
-    fn name(&self) -> Option<&CStr> {
+    const fn name(&self) -> Option<&CStr> {
         let name = self.header().name;
         if name.is_null() {
             None
@@ -308,7 +308,7 @@ impl<'a> GzipHeaderRef<'a> {
         }
     }
 
-    fn comment(&self) -> Option<&CStr> {
+    const fn comment(&self) -> Option<&CStr> {
         let comment = self.header().comment;
         if comment.is_null() {
             None
@@ -402,7 +402,7 @@ struct CallCursors {
 }
 
 impl CallCursors {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             input: InputCursor::from_stream(stream),
             output: OutputCursor::from_stream(stream),
@@ -410,7 +410,7 @@ impl CallCursors {
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         self.input.apply(stream);
         self.output.apply(stream);
         self.checksum.apply(stream);
@@ -650,7 +650,7 @@ impl<'a> DeflateStream<'a> {
 
 /// number of elements in hash table
 pub const HASH_SIZE: usize = 65536;
-/// log2(HASH_SIZE)
+/// `log2(HASH_SIZE)`
 const HASH_BITS: usize = 16;
 
 /// Maximum value for memLevel in deflateInit2
@@ -783,12 +783,12 @@ fn init_with_lit_bufsize(
     // and can configure the C allocator
     #[cfg(feature = "rust-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_rust_allocator()
+        stream.configure_default_rust_allocator();
     }
 
     #[cfg(feature = "c-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_c_allocator()
+        stream.configure_default_c_allocator();
     }
 
     if stream.zalloc.is_none() || stream.zfree.is_none() {
@@ -1123,7 +1123,7 @@ pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
     let ret = reset_keep(stream);
 
     if ret == ReturnCode::Ok {
-        lm_init(&mut *stream.state);
+        lm_init(&mut stream.state);
     }
 
     ret
@@ -1151,7 +1151,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     stream.adler = match state.wrap {
         2 => {
             state.crc_fold = Crc32Fold::new();
-            CRC32_INITIAL_VALUE as _
+            CRC32_INITIAL_VALUE.into()
         }
         _ => ADLER32_INITIAL_VALUE as _,
     };
@@ -1186,7 +1186,7 @@ fn lm_init(state: &mut State) {
     state.ins_h = 0;
 }
 
-fn lm_set_level(state: &mut State, level: i8) {
+const fn lm_set_level(state: &mut State, level: i8) {
     let config = level_config(level);
     state.medium_next_match = MatchCandidate::EMPTY;
     state.max_insert_length = config.max_lazy;
@@ -1276,13 +1276,13 @@ impl Value {
     }
 }
 
-/// number of length codes, not counting the special END_BLOCK code
+/// number of length codes, not counting the special `END_BLOCK` code
 pub const LENGTH_CODES: usize = 29;
 
 /// number of literal bytes 0..255
 const LITERALS: usize = 256;
 
-/// number of Literal or Length codes, including the END_BLOCK code
+/// number of Literal or Length codes, including the `END_BLOCK` code
 pub const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
 
 /// number of distance codes
@@ -1294,10 +1294,10 @@ const BL_CODES: usize = 19;
 /// maximum heap size
 const HEAP_SIZE: usize = 2 * L_CODES + 1;
 
-/// all codes must not exceed MAX_BITS bits
+/// all codes must not exceed `MAX_BITS` bits
 const MAX_BITS: usize = 15;
 
-/// Bit length codes must not exceed MAX_BL_BITS bits
+/// Bit length codes must not exceed `MAX_BL_BITS` bits
 const MAX_BL_BITS: usize = 7;
 
 pub const DIST_CODE_LEN: usize = 512;
@@ -1308,7 +1308,7 @@ struct BitWriter<'a> {
     /// Output buffer. bits are inserted starting at the bottom (least significant bits).
     pub(crate) bit_buffer: u64,
 
-    /// Number of valid bits in bit_buffer. All bits above the last valid bit are always zero.
+    /// Number of valid bits in `bit_buffer`. All bits above the last valid bit are always zero.
     pub(crate) bits_valid: u8,
 
     /// Last number of used bits when going to a byte boundary.
@@ -1403,7 +1403,7 @@ const fn encode_dist(dtree: &[Value], dist: u16) -> PackedBits {
 impl<'a> BitWriter<'a> {
     pub(crate) const BIT_BUF_SIZE: u8 = 64;
 
-    fn from_pending(pending: Pending<'a>) -> Self {
+    const fn from_pending(pending: Pending<'a>) -> Self {
         Self {
             pending,
             bit_buffer: 0,
@@ -1417,7 +1417,7 @@ impl<'a> BitWriter<'a> {
         }
     }
 
-    fn clone_with_pending(&self, pending: Pending<'a>) -> Self {
+    const fn clone_with_pending(&self, pending: Pending<'a>) -> Self {
         Self {
             pending,
             bit_buffer: self.bit_buffer,
@@ -1440,7 +1440,7 @@ impl<'a> BitWriter<'a> {
         self.pending.extend(&src[..keep_bytes as usize]);
 
         self.bits_valid -= removed;
-        self.bit_buffer = self.bit_buffer.checked_shr(removed as u32).unwrap_or(0);
+        self.bit_buffer = self.bit_buffer.checked_shr(u32::from(removed)).unwrap_or(0);
     }
 
     fn emit_align(&mut self) {
@@ -1531,7 +1531,7 @@ impl<'a> BitWriter<'a> {
     }
 
     pub(crate) fn emit_tree(&mut self, block_type: BlockType, is_last_block: bool) {
-        let header_bits = ((block_type as u64) << 1) | (is_last_block as u64);
+        let header_bits = ((block_type as u64) << 1) | u64::from(is_last_block);
         self.send_bits(header_bits, 3);
         trace!("\n--- Emit Tree: Last: {}\n", is_last_block as u8);
     }
@@ -1597,7 +1597,7 @@ impl<'a> BitWriter<'a> {
             };
         }
 
-        self.emit_end_block(ltree, false)
+        self.emit_end_block(ltree, false);
     }
 
     fn send_tree(&mut self, tree: &[Value], bl_tree: &[Value], max_code: usize) {
@@ -1689,7 +1689,7 @@ pub struct State<'a> {
     /// deflated.
     pub(crate) prev: WeakSliceMut<'a, u16>,
     /// head[H] contains the offset of the last 4-character sequence seen so far in
-    /// the current window that hashes to H (as calculated using the hash_calc_variant).
+    /// the current window that hashes to H (as calculated using the `hash_calc_variant`).
     pub(crate) head: WeakArrayMut<'a, u16, HASH_SIZE>,
 
     /// Length of the best match at previous step. Matches not greater than this
@@ -1719,12 +1719,12 @@ pub struct State<'a> {
     _cache_line_1: (),
 
     /// Size of match buffer for literals/lengths.  There are 4 reasons for
-    /// limiting lit_bufsize to 64K:
+    /// limiting `lit_bufsize` to 64K:
     ///   - frequencies can be kept in 16 bit counters
     ///   - if compression is not successful for the first block, all input
     ///     data is still in the window so we can still emit a stored block even
     ///     when input comes from standard input.  (This can also be done for
-    ///     all blocks if lit_bufsize is not greater than 32K.)
+    ///     all blocks if `lit_bufsize` is not greater than 32K.)
     ///   - if compression is not successful for a file smaller than 64K, we can
     ///     even emit a stored file instead of a stored block (saving 5 bytes).
     ///     This is applicable only for zip (not gzip or zlib).
@@ -1737,7 +1737,7 @@ pub struct State<'a> {
     ///   - I can't count above 4
     lit_bufsize: usize,
 
-    /// Actual size of window: 2*w_size, except when the user input buffer is directly used as sliding window.
+    /// Actual size of window: 2*`w_size`, except when the user input buffer is directly used as sliding window.
     pub(crate) window_size: usize,
 
     bit_writer: BitWriter<'a>,
@@ -1769,7 +1769,7 @@ pub struct State<'a> {
     /// makes compression decisions independent of caller output chunking. It occupies bytes that
     /// were previously explicit alignment padding, so the hand-packed cache-line layout is stable.
     pub(crate) medium_next_match: MatchCandidate,
-    /// Working copy of z_stream::data_type. Kept in compression state so block encoding is
+    /// Working copy of `z_stream::data_type`. Kept in compression state so block encoding is
     /// independent of caller I/O and synchronized once at the outer compression-call boundary.
     pub(crate) data_type: core::ffi::c_int,
     _padding_0: [u8; 4],
@@ -1804,11 +1804,11 @@ impl TryFrom<i32> for Strategy {
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Strategy::Default),
-            1 => Ok(Strategy::Filtered),
-            2 => Ok(Strategy::HuffmanOnly),
-            3 => Ok(Strategy::Rle),
-            4 => Ok(Strategy::Fixed),
+            0 => Ok(Self::Default),
+            1 => Ok(Self::Filtered),
+            2 => Ok(Self::HuffmanOnly),
+            3 => Ok(Self::Rle),
+            4 => Ok(Self::Fixed),
             _ => Err(()),
         }
     }
@@ -1895,15 +1895,15 @@ impl<'a> State<'a> {
     }
 
     // log2(w_size)  (in the range MIN_WBITS..=MAX_WBITS)
-    pub(crate) fn w_bits(&self) -> u32 {
+    pub(crate) const fn w_bits(&self) -> u32 {
         self.w_size.trailing_zeros()
     }
 
-    pub(crate) fn w_mask(&self) -> usize {
+    pub(crate) const fn w_mask(&self) -> usize {
         self.w_size - 1
     }
 
-    pub(crate) fn max_dist(&self) -> usize {
+    pub(crate) const fn max_dist(&self) -> usize {
         self.w_size - MIN_LOOKAHEAD
     }
 
@@ -1923,7 +1923,7 @@ impl<'a> State<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn update_hash(&self, h: u32, val: u32) -> u32 {
+    pub(crate) const fn update_hash(&self, h: u32, val: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(h, val),
             HashCalcVariant::Roll => RollHashCalc::update_hash(h, val),
@@ -2073,7 +2073,7 @@ impl<'a> State<'a> {
             };
         }
 
-        self.bit_writer.emit_end_block(ltree, false)
+        self.bit_writer.emit_end_block(ltree, false);
     }
 
     fn compress_block_dynamic_trees(&mut self) {
@@ -2293,7 +2293,7 @@ pub const STD_MIN_MATCH: usize = 3;
 /// The maximum match length mandated by the deflate standard
 pub const STD_MAX_MATCH: usize = 258;
 
-/// The minimum wanted match length, affects deflate_quick, deflate_fast, deflate_medium and deflate_slow
+/// The minimum wanted match length, affects `deflate_quick`, `deflate_fast`, `deflate_medium` and `deflate_slow`
 pub const WANT_MIN_MATCH: usize = 4;
 
 pub const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
@@ -2415,7 +2415,7 @@ pub struct StaticTreeDesc {
     pub(crate) static_tree: &'static [Value],
     /// extra bits for each code or NULL
     extra_bits: &'static [u8],
-    /// base index for extra_bits
+    /// base index for `extra_bits`
     extra_base: usize,
     /// max number of elements in the tree
     elems: usize,
@@ -2885,7 +2885,7 @@ fn send_all_trees(state: &mut State, lcodes: usize, dcodes: usize, blcodes: usiz
 }
 
 /// Construct the Huffman tree for the bit lengths and return the index in
-/// bl_order of the last bit length code to send.
+/// `bl_order` of the last bit length code to send.
 fn build_bl_tree(state: &mut State) -> usize {
     /* Determine the bit length frequencies for literal and distance trees */
 
@@ -3367,7 +3367,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
     // write the trailer
     if stream.state.wrap == 2 {
         let crc_fold = core::mem::take(&mut stream.state.crc_fold);
-        stream.checksum.set(crc_fold.finish() as z_checksum);
+        stream.checksum.set(z_checksum::from(crc_fold.finish()));
 
         let adler = stream.checksum.value() as u32;
         stream.state.bit_writer.pending.extend(&adler.to_le_bytes());
@@ -3827,7 +3827,7 @@ impl Heap {
     }
 
     /// The sorted suffix contains the root followed by its children.
-    fn root(&self) -> usize {
+    const fn root(&self) -> usize {
         self.nodes[self.sorted_start]
     }
 
@@ -3913,7 +3913,7 @@ impl Heap {
     }
 
     /// Remove the smallest element from the heap and recreate the heap with
-    /// one less element. Updates heap and heap_len.
+    /// one less element. Updates heap and `heap_len`.
     fn pqremove(&mut self, tree: &[Value]) -> usize {
         let top = self.nodes[Self::SMALLEST];
         self.nodes[Self::SMALLEST] = self.nodes[self.active_len];
@@ -3928,7 +3928,7 @@ impl Heap {
     fn construct_huffman_tree(&mut self, tree: &mut [Value], mut node: usize) {
         loop {
             let n = self.pqremove(tree); /* n = node of least frequency */
-            let m = self.nodes[Heap::SMALLEST]; /* m = node of next least frequency */
+            let m = self.nodes[Self::SMALLEST]; /* m = node of next least frequency */
 
             self.sorted_start -= 1;
             self.nodes[self.sorted_start] = n; /* keep the nodes sorted by frequency */
@@ -3953,10 +3953,10 @@ impl Heap {
             *tree[m].dad_mut() = parent;
 
             /* and insert the new node in the heap */
-            self.nodes[Heap::SMALLEST] = node;
+            self.nodes[Self::SMALLEST] = node;
             node += 1;
 
-            self.pqdownheap(tree, Heap::SMALLEST);
+            self.pqdownheap(tree, Self::SMALLEST);
 
             if self.active_len < 2 {
                 break;
@@ -3964,7 +3964,7 @@ impl Heap {
         }
 
         self.sorted_start -= 1;
-        self.nodes[self.sorted_start] = self.nodes[Heap::SMALLEST];
+        self.nodes[self.sorted_start] = self.nodes[Self::SMALLEST];
     }
 }
 
@@ -4144,7 +4144,7 @@ struct DeflateAllocOffsets {
 }
 
 impl DeflateAllocOffsets {
-    fn new(window_bits: usize, lit_bufsize: usize) -> Self {
+    const fn new(window_bits: usize, lit_bufsize: usize) -> Self {
         use core::mem::size_of;
 
         let mut curr_size = 0usize;
@@ -4292,7 +4292,7 @@ impl DeflateAllocOffsets {
     ///
     /// `aligned` must be the aligned interior base of a writable allocation described by this
     /// layout, remain alive for `'a`, and not be aliased by another live deflate state.
-    unsafe fn initialize_buffers<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocBuffers<'a> {
+    const unsafe fn initialize_buffers<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocBuffers<'a> {
         let base = aligned.as_ptr();
         let w_size = 1usize << self.window_bits;
 
@@ -5249,7 +5249,7 @@ mod test {
         assert_eq!(&stream.state.window.filled()[..5], &source[..5]);
         assert_eq!(
             stream.adler,
-            crate::adler32::adler32(1u32, &source[..5]) as _
+            crate::adler32::adler32(1u32, &source[..5]).into()
         );
         assert_eq!(stream.data_type, crate::c_api::Z_BINARY);
 
@@ -5558,8 +5558,8 @@ mod test {
         };
         assert_eq!(merged.range, 0..120_000);
         assert!(merged.tokens.len() <= near_optimal::MAX_BLOCK_TOKENS);
-        assert!(left.tokens.is_empty());
-        assert!(right.tokens.is_empty());
+        assert_eq!(left.tokens.as_slice(), &[]);
+        assert_eq!(right.tokens.as_slice(), &[]);
         assert!(end(stream).is_ok());
     }
 
@@ -6192,7 +6192,7 @@ mod test {
                 let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
                 stream.next_in = input.as_ptr().cast_mut();
                 stream.avail_in = input.len() as _;
-                algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state).unwrap()
+                algorithm::StandardDriver::for_algorithm(algorithm, &stream.state).unwrap()
             };
 
             Self {
@@ -6217,8 +6217,7 @@ mod test {
             // test honest: a batch scheduler may collect work from several paused streams before
             // executing searches, then resume each producer later with its owned result.
             if let Some(result) = self.pending_match_result.take() {
-                self.driver
-                    .complete_match_search(&mut *stream.state, result);
+                self.driver.complete_match_search(&mut stream.state, result);
                 self.match_result_turns += 1;
                 return None;
             }
@@ -6232,7 +6231,7 @@ mod test {
             let mut output = OutputCursor::from_stream(stream);
             let mut checksum = StreamChecksum::from_stream(stream);
             let outcome = self.driver.step(
-                &mut *stream.state,
+                &mut stream.state,
                 &mut input,
                 &mut output,
                 &mut checksum,
@@ -6279,7 +6278,7 @@ mod test {
             work: crate::deflate::longest_match::MatchSearchWork,
         ) -> crate::deflate::longest_match::MatchSearchRequest<'_> {
             let stream = unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }.unwrap();
-            work.request(&*stream.state)
+            work.request(&stream.state)
         }
 
         fn into_output(mut self) -> Vec<u8> {
@@ -6333,7 +6332,7 @@ mod test {
         assert!(stream.state.bit_writer.pending.is_empty());
 
         let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy);
-        let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state)
+        let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &stream.state)
             .expect("proof only covers the five standard token-producing algorithms");
 
         stream.next_in = input.as_ptr().cast_mut();
@@ -6351,7 +6350,7 @@ mod test {
             let mut output_cursor = OutputCursor::from_stream(stream);
             let mut checksum = StreamChecksum::from_stream(stream);
             let outcome = driver.step(
-                &mut *stream.state,
+                &mut stream.state,
                 &mut input_cursor,
                 &mut output_cursor,
                 &mut checksum,
@@ -6364,7 +6363,7 @@ mod test {
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
                 algorithm::StandardTurnOutcome::MatchSearch(work) => {
-                    let request = work.request(&*stream.state);
+                    let request = work.request(&stream.state);
                     let mut results = [crate::deflate::longest_match::MatchSearchResult {
                         length: 0,
                         start: 0,
@@ -6373,7 +6372,7 @@ mod test {
                         core::slice::from_ref(&request),
                         &mut results,
                     );
-                    driver.complete_match_search(&mut *stream.state, results[0]);
+                    driver.complete_match_search(&mut stream.state, results[0]);
                 }
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("final proof supplied the complete caller input")
@@ -6586,16 +6585,16 @@ mod test {
         stream.next_in = input_bytes.as_ptr().cast_mut();
         stream.avail_in = input_bytes.len() as _;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &*stream.state)
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &stream.state)
                 .unwrap();
 
         let search = loop {
-            match core.next_event(&mut *stream.state) {
+            match core.next_event(&mut stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        &mut *stream.state,
+                        &mut stream.state,
                         &mut input,
                         &mut checksum,
                         demand,
@@ -6618,8 +6617,8 @@ mod test {
             }
         };
 
-        let result = search.request(&*stream.state).execute();
-        core.complete_match_search(&mut *stream.state, result);
+        let result = search.request(&stream.state).execute();
+        core.complete_match_search(&mut stream.state, result);
         let _ = end(stream);
     }
 
@@ -6640,16 +6639,16 @@ mod test {
         stream.next_in = input_bytes.as_ptr().cast_mut();
         stream.avail_in = input_bytes.len() as _;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Slow, &*stream.state)
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Slow, &stream.state)
                 .unwrap();
 
         let search = loop {
-            match core.next_event(&mut *stream.state) {
+            match core.next_event(&mut stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        &mut *stream.state,
+                        &mut stream.state,
                         &mut input,
                         &mut checksum,
                         demand,
@@ -6673,17 +6672,17 @@ mod test {
         };
 
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = core.next_event(&mut *stream.state);
+            let _ = core.next_event(&mut stream.state);
         }));
         assert!(
             rejected.is_err(),
             "production advanced with an outstanding match search"
         );
 
-        let result = search.request(&*stream.state).execute();
-        core.complete_match_search(&mut *stream.state, result);
+        let result = search.request(&stream.state).execute();
+        core.complete_match_search(&mut stream.state, result);
         assert!(matches!(
-            core.next_event(&mut *stream.state),
+            core.next_event(&mut stream.state),
             algorithm::CoreEvent::MatchSearch(_)
                 | algorithm::CoreEvent::TokenBlockReady(_)
                 | algorithm::CoreEvent::NeedInput(_)
@@ -6715,16 +6714,16 @@ mod test {
         stream.next_in = input_bytes.as_ptr().cast_mut();
         stream.avail_in = input_bytes.len() as _;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &*stream.state)
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &stream.state)
                 .unwrap();
 
         let pending = loop {
-            match core.next_event(&mut *stream.state) {
+            match core.next_event(&mut stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        &mut *stream.state,
+                        &mut stream.state,
                         &mut input,
                         &mut checksum,
                         demand,
@@ -6738,11 +6737,11 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => {
-                    let result = work.request(&*stream.state).execute();
-                    core.complete_match_search(&mut *stream.state, result);
+                    let result = work.request(&stream.state).execute();
+                    core.complete_match_search(&mut stream.state, result);
                 }
                 algorithm::CoreEvent::TokenBlockReady(work) => {
-                    break core.encode_token_block(&mut *stream.state, work);
+                    break core.encode_token_block(&mut stream.state, work);
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
                     panic!("test input exhausted before producing a token block")
@@ -6751,7 +6750,7 @@ mod test {
         };
 
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = core.next_event(&mut *stream.state);
+            let _ = core.next_event(&mut stream.state);
         }));
         assert!(
             rejected.is_err(),
@@ -6763,7 +6762,7 @@ mod test {
         stream.avail_out = output_bytes.len() as _;
         let mut output = OutputCursor::from_stream(stream);
         assert!(matches!(
-            core.drain_output(&mut *stream.state, &mut output, pending),
+            core.drain_output(&mut stream.state, &mut output, pending),
             algorithm::PendingOutputOutcome::Ready
         ));
         output.apply(stream);
@@ -7549,7 +7548,7 @@ mod test {
         assert_eq!(len2 as usize, input2.len());
 
         let crc1 = crate::crc32::crc32(0, input1.as_bytes());
-        let crc = crate::crc32::crc32_combine(crc1, crc2, len2 as u64);
+        let crc = crate::crc32::crc32_combine(crc1, crc2, u64::from(len2));
 
         // combined crc of the parts should be the crc of the whole
         let crc_cheating = crate::crc32::crc32(0, input.as_bytes());

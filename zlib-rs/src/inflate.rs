@@ -249,7 +249,7 @@ impl<'a> InflateStream<'a> {
         unsafe { strm.cast::<InflateStream>().as_mut() }
     }
 
-    /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
+    /// Convert a regular `inflateInit*` stream. `BackInit` streams are deliberately rejected.
     #[inline(always)]
     /// # Safety
     ///
@@ -260,7 +260,7 @@ impl<'a> InflateStream<'a> {
         unsafe { Self::from_stream_ref_kind(strm, InflateStateKind::Regular) }
     }
 
-    /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
+    /// Convert a regular `inflateInit*` stream. `BackInit` streams are deliberately rejected.
     #[inline(always)]
     /// # Safety
     ///
@@ -275,7 +275,7 @@ impl<'a> InflateStream<'a> {
     #[inline(always)]
     /// # Safety
     ///
-    /// If non-null, the pointer must reference a valid initialized BackInit
+    /// If non-null, the pointer must reference a valid initialized `BackInit`
     /// stream and callback-owned window. The caller must preserve both
     /// lifetimes and exclusive access while the returned view is borrowed.
     pub unsafe fn from_back_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
@@ -530,7 +530,7 @@ impl Flags {
     }
 
     #[inline(always)]
-    pub(crate) fn update(&mut self, other: Self, value: bool) {
+    pub(crate) const fn update(&mut self, other: Self, value: bool) {
         if value {
             *self = Self(self.0 | other.0);
         } else {
@@ -622,7 +622,7 @@ impl GzipHeaderOutput {
 
     /// Copy into a caller-owned gzip metadata field without crossing its capacity.
     ///
-    /// The nested buffer contracts are established by the unsafe get_header
+    /// The nested buffer contracts are established by the unsafe `get_header`
     /// boundary, while this helper confines raw writes to one checked operation.
     fn write_bounded(ptr: *mut u8, capacity: usize, offset: usize, bytes: &[u8]) -> usize {
         if ptr.is_null() || offset >= capacity {
@@ -873,7 +873,7 @@ impl<'a> State<'a> {
     }
 
     /// Record one transmitted code-length-alphabet entry in RFC 1951 order.
-    fn append_code_length_alphabet(&mut self, length: u16) {
+    const fn append_code_length_alphabet(&mut self, length: u16) {
         self.lens[CODE_LENGTH_ORDER[self.have]] = length;
         self.have += 1;
     }
@@ -967,7 +967,7 @@ impl<'a> State<'a> {
         Ok(())
     }
 
-    fn len_table_ref(&self) -> &[Code] {
+    const fn len_table_ref(&self) -> &[Code] {
         match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX,
             Codes::CodeLengths => &self.codes_codes,
@@ -976,7 +976,7 @@ impl<'a> State<'a> {
         }
     }
 
-    fn dist_table_ref(&self) -> &[Code] {
+    const fn dist_table_ref(&self) -> &[Code] {
         match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX,
             Codes::CodeLengths => &self.codes_codes,
@@ -985,11 +985,11 @@ impl<'a> State<'a> {
         }
     }
 
-    fn len_table_get(&self, index: usize) -> Code {
+    const fn len_table_get(&self, index: usize) -> Code {
         self.len_table_ref()[index]
     }
 
-    fn dist_table_get(&self, index: usize) -> Code {
+    const fn dist_table_get(&self, index: usize) -> Code {
         self.dist_table_ref()[index]
     }
 }
@@ -1014,7 +1014,7 @@ struct InflateOutput<'a> {
 }
 
 impl<'a> InflateOutput<'a> {
-    unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
+    const unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
         Self {
             writer: unsafe { Writer::new_uninit(ptr, len) },
             accounted_remaining: len,
@@ -1022,23 +1022,23 @@ impl<'a> InflateOutput<'a> {
     }
 
     #[inline]
-    fn mark_accounted(&mut self) {
+    const fn mark_accounted(&mut self) {
         self.accounted_remaining = self.writer.remaining();
     }
     #[inline]
-    fn written_since_accounted(&self) -> usize {
+    const fn written_since_accounted(&self) -> usize {
         self.accounted_remaining - self.writer.remaining()
     }
     #[inline]
-    fn remaining(&self) -> usize {
+    const fn remaining(&self) -> usize {
         self.writer.remaining()
     }
     #[inline]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.writer.len()
     }
     #[inline]
-    fn is_full(&self) -> bool {
+    const fn is_full(&self) -> bool {
         self.writer.is_full()
     }
     #[inline]
@@ -1046,16 +1046,16 @@ impl<'a> InflateOutput<'a> {
         self.writer.filled()
     }
     #[inline]
-    fn next_out(&mut self) -> *mut core::mem::MaybeUninit<u8> {
+    const fn next_out(&mut self) -> *mut core::mem::MaybeUninit<u8> {
         self.writer.next_out()
     }
     #[inline]
-    fn push(&mut self, byte: u8) {
-        self.writer.push(byte)
+    const fn push(&mut self, byte: u8) {
+        self.writer.push(byte);
     }
     #[inline]
     fn extend(&mut self, bytes: &[u8]) {
-        self.writer.extend(bytes)
+        self.writer.extend(bytes);
     }
     #[inline]
     fn fill_zero(&mut self, len: usize) {
@@ -1063,11 +1063,11 @@ impl<'a> InflateOutput<'a> {
     }
     #[inline]
     fn extend_from_window(&mut self, window: &Window<'_>, range: core::ops::Range<usize>) {
-        self.writer.extend_from_window(window, range)
+        self.writer.extend_from_window(window, range);
     }
     #[inline]
     fn copy_match(&mut self, offset_from_end: usize, length: usize) {
-        self.writer.copy_match(offset_from_end, length)
+        self.writer.copy_match(offset_from_end, length);
     }
 }
 
@@ -1085,7 +1085,7 @@ struct LenDecodeOutcome<'input> {
 }
 
 impl<'input> LenDecodeOutcome<'input> {
-    fn continue_with(mode: Mode, reader: BitReader<'input>) -> Self {
+    const fn continue_with(mode: Mode, reader: BitReader<'input>) -> Self {
         Self {
             mode,
             reader,
@@ -1093,7 +1093,7 @@ impl<'input> LenDecodeOutcome<'input> {
         }
     }
 
-    fn break_with(mode: Mode, reader: BitReader<'input>, code: ReturnCode) -> Self {
+    const fn break_with(mode: Mode, reader: BitReader<'input>, code: ReturnCode) -> Self {
         Self {
             mode,
             reader,
@@ -1134,7 +1134,7 @@ struct DecodedDistance {
 }
 
 #[inline(always)]
-fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
+const fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
     if output.is_full() {
         return false;
     }
@@ -1569,7 +1569,7 @@ impl State<'_> {
                             self.wbits = len;
                         }
 
-                        if len as i32 > MAX_WBITS || len > self.wbits {
+                        if i32::from(len) > MAX_WBITS || len > self.wbits {
                             mode = Mode::Bad;
                             break 'label self.bad("invalid window size\0");
                         }
@@ -1688,7 +1688,7 @@ impl State<'_> {
                                 // Checksum
                                 if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
                                     let extra_slice = &bit_reader.as_slice()[..extra_available];
-                                    self.checksum = crc32(self.checksum, extra_slice)
+                                    self.checksum = crc32(self.checksum, extra_slice);
                                 }
 
                                 bit_reader.advance(extra_available);
@@ -2563,7 +2563,7 @@ impl InflateAllocOffsets {
         }
     }
 
-    fn window_pos(&self) -> usize {
+    const fn window_pos(&self) -> usize {
         self.window_pos
             .expect("inflate allocation layout includes an owned window")
     }
@@ -2672,12 +2672,12 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     // allocator as the default, but `libz-rs-sys` configures the C allocator
     #[cfg(feature = "rust-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_rust_allocator()
+        stream.configure_default_rust_allocator();
     }
 
     #[cfg(feature = "c-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_c_allocator()
+        stream.configure_default_c_allocator();
     }
 
     if stream.zalloc.is_none() || stream.zfree.is_none() {
@@ -2763,7 +2763,7 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
 
     if state.wrap != 0 {
         // to support ill-conceived Java test suite
-        stream.adler = (state.wrap & 1) as _;
+        stream.adler = (state.wrap & 1).into();
     }
 
     state.mode = Mode::Head;
@@ -2868,7 +2868,7 @@ fn inflate_bound_io(
     stream.avail_out = output.remaining() as u32;
     stream.next_out = output.next_out() as *mut u8;
 
-    stream.adler = state.checksum as z_checksum;
+    stream.adler = z_checksum::from(state.checksum);
 
     let valid_mode = |mode| !matches!(mode, Mode::Bad | Mode::Mem | Mode::Sync);
     let not_done = |mode| {
@@ -2912,7 +2912,7 @@ fn inflate_bound_io(
     }
 }
 
-fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
+const fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
     let len = buf.len();
     let mut next = 0;
 
@@ -2933,7 +2933,7 @@ fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
 /// Find a recoverable full-flush marker in the caller's raw input.
 ///
 /// # Safety
-/// If avail_in is nonzero, next_in must point to that many readable bytes.
+/// If `avail_in` is nonzero, `next_in` must point to that many readable bytes.
 /// Buffers may be replaced between calls.
 pub unsafe fn sync(stream: &mut InflateStream) -> ReturnCode {
     let state = &mut *stream.state;
@@ -3260,7 +3260,7 @@ mod tests {
             &mut checksum,
             true,
         ));
-        assert!(first.as_slice().is_empty());
+        assert_eq!(first.as_slice(), []);
         assert_eq!(stored, 3);
 
         let mut second = BitReader::from_buffer(BitBuffer::default(), b"def\0trailing");
@@ -3386,7 +3386,7 @@ mod tests {
             uncompress2(&mut empty_dest, EMPTY_STREAM, InflateConfig::default());
         assert_eq!(code, ReturnCode::Ok);
         assert_eq!(consumed, EMPTY_STREAM.len());
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, []);
 
         let mut compressed = [0u8; 128];
         let (encoded, code) = crate::compress_slice(
@@ -3399,7 +3399,7 @@ mod tests {
             uncompress2(&mut empty_dest, encoded, InflateConfig::default());
         assert_eq!(code, ReturnCode::DataError);
         assert!(consumed <= encoded.len());
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, []);
     }
 
     #[test]

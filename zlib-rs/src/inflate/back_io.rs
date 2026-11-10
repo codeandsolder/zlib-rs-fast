@@ -48,17 +48,17 @@ impl BackInput {
     }
 
     #[inline(always)]
-    pub(super) fn available(&self) -> usize {
+    pub(super) const fn available(&self) -> usize {
         self.remaining
     }
 
     #[inline(always)]
-    pub(super) fn next_ptr(&self) -> *const u8 {
+    pub(super) const fn next_ptr(&self) -> *const u8 {
         self.next
     }
 
     #[inline(always)]
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub(super) const fn as_slice(&self) -> &[u8] {
         if self.remaining == 0 {
             &[]
         } else {
@@ -70,42 +70,42 @@ impl BackInput {
     }
 
     #[inline(always)]
-    pub(super) fn bit_buffer(&self) -> BitBuffer {
+    pub(super) const fn bit_buffer(&self) -> BitBuffer {
         self.bits
     }
 
     #[inline(always)]
-    pub(super) fn set_bit_buffer(&mut self, bits: BitBuffer) {
+    pub(super) const fn set_bit_buffer(&mut self, bits: BitBuffer) {
         self.bits = bits;
     }
 
     #[inline(always)]
-    pub(super) fn bits_in_buffer(&self) -> u8 {
+    pub(super) const fn bits_in_buffer(&self) -> u8 {
         self.bits.bits_in_buffer()
     }
 
     #[inline(always)]
-    pub(super) fn bits(&self, count: usize) -> u64 {
+    pub(super) const fn bits(&self, count: usize) -> u64 {
         self.bits.bits(count)
     }
 
     #[inline(always)]
-    pub(super) fn hold(&self) -> u64 {
+    pub(super) const fn hold(&self) -> u64 {
         self.bits.hold()
     }
 
     #[inline(always)]
-    pub(super) fn drop_bits(&mut self, count: u8) {
+    pub(super) const fn drop_bits(&mut self, count: u8) {
         self.bits.drop_bits(count);
     }
 
     #[inline(always)]
-    pub(super) fn init_bits(&mut self) {
+    pub(super) const fn init_bits(&mut self) {
         self.bits.init_bits();
     }
 
     #[inline(always)]
-    pub(super) fn next_byte_boundary(&mut self) {
+    pub(super) const fn next_byte_boundary(&mut self) {
         self.bits.next_byte_boundary();
     }
 
@@ -152,7 +152,7 @@ impl BackInput {
         // SAFETY: `ensure_available` established one readable byte in the current callback span.
         let byte = unsafe { *self.next };
         self.advance(1);
-        self.bits.prime(8, byte as u64);
+        self.bits.prime(8, u64::from(byte));
         Ok(())
     }
 
@@ -193,17 +193,17 @@ impl BackOutput {
     }
 
     #[inline(always)]
-    pub(super) fn len(&self) -> usize {
+    pub(super) const fn len(&self) -> usize {
         self.filled
     }
 
     #[inline(always)]
-    pub(super) fn remaining(&self, window: &BackWindow<'_>) -> usize {
+    pub(super) const fn remaining(&self, window: &BackWindow<'_>) -> usize {
         window.buffer_size() - self.filled
     }
 
     #[inline(always)]
-    pub(super) fn history_available(&self, window: &BackWindow<'_>) -> usize {
+    pub(super) const fn history_available(&self, window: &BackWindow<'_>) -> usize {
         if window.history_len() == 0 {
             self.filled
         } else {

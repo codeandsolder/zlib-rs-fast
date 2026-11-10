@@ -66,15 +66,15 @@ pub enum MatchSearchWork {
 }
 
 impl MatchSearchWork {
-    pub(crate) fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
+    pub(crate) const fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
         Self::HashChain { cur_match, kind }
     }
 
-    pub(crate) fn external() -> Self {
+    pub(crate) const fn external() -> Self {
         Self::External
     }
 
-    pub(crate) fn is_external(self) -> bool {
+    pub(crate) const fn is_external(self) -> bool {
         matches!(self, Self::External)
     }
 
@@ -128,7 +128,7 @@ pub struct MatchSearchRequest<'a> {
 
 impl MatchSearchParams {
     #[inline(always)]
-    fn update_hash(self, hash: u32, value: u32) -> u32 {
+    const fn update_hash(self, hash: u32, value: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(hash, value),
             HashCalcVariant::Roll => RollHashCalc::update_hash(hash, value),
@@ -224,7 +224,7 @@ pub(super) struct ScopedThreadMatchSearchBackend {
 
 #[cfg(feature = "std")]
 impl ScopedThreadMatchSearchBackend {
-    pub(super) fn new(workers: usize) -> Self {
+    pub(super) const fn new(workers: usize) -> Self {
         Self { workers }
     }
 }
