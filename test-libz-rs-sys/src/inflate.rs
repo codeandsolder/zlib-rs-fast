@@ -3043,44 +3043,81 @@ fn issue_232() {
 
     let mut stream = z_stream::default();
 
+    // SAFETY: initialized writable z_stream and valid ABI version/size.
     let err = unsafe {
         inflateInit2_(
             &raw mut stream,
             15 + 32,
             zlibVersion(),
-            core::mem::size_of::<z_stream>() as _,
+            test_c_stream_size::<z_stream>(),
         )
     };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
     let mut output = vec![0; INPUT.len()];
-    let input_len: u64 = INPUT.len().try_into().unwrap();
     stream.next_out = output.as_mut_ptr();
-    stream.avail_out = output.len().try_into().unwrap();
+    stream.avail_out = test_c_uint_len(output.len());
     stream.next_in = INPUT.as_ptr();
-    stream.avail_in = INPUT.len().try_into().unwrap();
+    stream.avail_in = test_c_uint_len(INPUT.len());
 
-    while input_len.checked_sub(stream.total_in as _).unwrap() > 0 {
+    // This fuzz reproducer need not contain a complete gzip stream. It
+    // exercises the decoder until the data is consumed or a stream ends.
+    loop {
+        let input_before = stream.avail_in;
+        let output_before = stream.total_out;
+        // SAFETY: both C byte spans are live, disjoint, and bounded by
+        // their stated avail_in/avail_out counts.
         let err = unsafe { inflate(&raw mut stream, InflateFlush::Finish as _) };
-        match ReturnCode::from(err) {
-            ReturnCode::StreamEnd => {
-                break;
-            }
-            ReturnCode::BufError | ReturnCode::Ok => {
-                let add_space: u32 = Ord::max(1024, output.len().try_into().unwrap());
-                output.resize(output.len() + add_space as usize, 0);
-
-                // If extend() reallocates, it may have moved in memory.
-                stream.next_out = output.as_mut_ptr();
-                stream.avail_out += add_space;
-            }
-            err => {
-                panic!("{err:?}");
-            }
+        assert!(
+            matches!(
+                ReturnCode::from(err),
+                ReturnCode::StreamEnd | ReturnCode::BufError | ReturnCode::Ok
+            ),
+            "unexpected inflate result: {err}"
+        );
+        let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(
+            produced <= output.len(),
+            "inflate output exceeds the vector"
+        );
+        if err == Z_STREAM_END {
+            break;
         }
+
+        // A full output buffer must grow, but the C pointer must advance
+        // to the *unwritten suffix* after Vec::resize, not its beginning.
+        if stream.avail_out == 0 {
+            let old_len = output.len();
+            let new_len = old_len.checked_mul(2).unwrap_or(old_len);
+            assert!(new_len > old_len, "inflate output buffer size overflow");
+            output.resize(new_len, 0);
+            stream.next_out = output[produced..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(new_len - produced);
+            continue;
+        }
+        if stream.avail_in == 0 {
+            break; // Truncated fixture may not produce Z_STREAM_END.
+        }
+        assert!(
+            stream.avail_in < input_before || stream.total_out > output_before,
+            "inflate stalled with input and output space remaining"
+        );
     }
 
-    unsafe { inflateEnd(&raw mut stream) };
+    // The reproducer contains no complete gzip trailer. zlib nevertheless
+    // produces this 35,001-byte prefix, independently checked against zlib.
+    // Verify its contents as well as its size: previously, resetting
+    // next_out to the Vec start on growth could silently overwrite bytes.
+    let decoded_len = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert_eq!(decoded_len, 35_001);
+    assert_eq!(
+        zlib_rs::crc32::crc32(0, &output[..decoded_len]),
+        0x0cf8_f315,
+        "issue_232 decoded output was overwritten or corrupted"
+    );
+
+    // SAFETY: the initialized inflate stream is ended exactly once.
+    assert_eq!(unsafe { inflateEnd(&raw mut stream) }, Z_OK);
 }
 
 #[test]
@@ -3145,49 +3182,99 @@ fn codes_used() {
             .as_slice(),
     ];
 
+    let mut reference_output: Option<Vec<u8>> = None;
     for input in inputs {
-        assert_eq_rs_ng!(unsafe {
-            let mut output: Vec<u8> = vec![0u8; 1 << 15];
-            let mut codes_used = Vec::new();
+        let (decoded, _) = assert_eq_rs_ng!({
+            let mut output = vec![0u8; 1 << 15];
+            let mut code_counts = Vec::new();
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
 
-            let mut stream = MaybeUninit::<z_stream>::zeroed();
-
-            let err = {
+            // SAFETY: initialize an ABI-compatible, writable z_stream.
+            let err = unsafe {
                 inflateInit2_(
-                    stream.as_mut_ptr(),
+                    raw.as_mut_ptr(),
                     16 + 15,
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as c_int,
+                    test_c_stream_size::<z_stream>(),
                 )
             };
             assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-            let stream = { stream.assume_init_mut() };
-            codes_used.push(inflateCodesUsed(stream));
+            // SAFETY: inflateInit2_ initialized the entire stream on success.
+            let stream = unsafe { raw.assume_init_mut() };
+            // SAFETY: the initialized C stream contains a live inflate state.
+            code_counts.push(unsafe { inflateCodesUsed(stream) });
 
             stream.next_out = output.as_mut_ptr();
-            stream.avail_out = output.len() as _;
+            stream.avail_out = test_c_uint_len(output.len());
 
+            let mut completed = false;
             for chunk in input.chunks(16) {
                 stream.next_in = chunk.as_ptr().cast_mut();
-                stream.avail_in = chunk.len() as _;
+                stream.avail_in = test_c_uint_len(chunk.len());
 
-                let err = { inflate(stream, InflateFlush::NoFlush as _) };
-                codes_used.push(inflateCodesUsed(stream));
+                // Do not discard an unconsumed suffix when another chunk
+                // arrives. Zlib may consume only part of the supplied input.
+                while stream.avail_in != 0 {
+                    if stream.avail_out == 0 {
+                        let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+                        assert!(used <= output.len(), "inflate output count exceeds buffer");
+                        let old_len = output.len();
+                        let new_len = old_len.checked_mul(2).unwrap_or(old_len);
+                        assert!(new_len > old_len, "inflate output length overflow");
+                        output.resize(new_len, 0);
+                        stream.next_out = output[used..].as_mut_ptr();
+                        stream.avail_out = test_c_uint_len(new_len - used);
+                    }
 
-                if err == ReturnCode::StreamEnd as i32 {
+                    let input_before = stream.avail_in;
+                    let output_before = stream.total_out;
+                    // SAFETY: C input points into the current live chunk, and
+                    // output points into the live, disjoint output vector.
+                    let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+                    // SAFETY: the successful initialization remains active.
+                    code_counts.push(unsafe { inflateCodesUsed(stream) });
+                    assert!(
+                        matches!(err, Z_OK | Z_STREAM_END),
+                        "invalid gzip fixture or decoder status: {err}"
+                    );
+                    assert!(
+                        stream.avail_in < input_before || stream.total_out > output_before,
+                        "inflate made no progress with unconsumed compressed input"
+                    );
+                    if err == Z_STREAM_END {
+                        completed = true;
+                        break;
+                    }
+                }
+                if completed {
                     break;
                 }
-
-                assert_eq!(err, ReturnCode::Ok as i32);
             }
 
-            let err = inflateEnd(stream);
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+            assert!(completed, "gzip fixture ended without Z_STREAM_END");
+            assert_eq!(
+                usize::try_from(stream.total_in),
+                Ok(input.len()),
+                "gzip fixture was not fully consumed"
+            );
+            let decoded_len = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(decoded_len <= output.len(), "inflate output exceeds buffer");
+            output.truncate(decoded_len);
 
-            output.truncate(stream.total_out as usize);
-            (output, codes_used)
+            // SAFETY: this initialized inflate stream is closed exactly once.
+            assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+            (output, code_counts)
         });
+
+        assert!(
+            !decoded.is_empty(),
+            "gzip fixture unexpectedly decoded empty"
+        );
+        if let Some(ref baseline) = reference_output {
+            assert_eq!(&decoded, baseline, "gzip compression variants disagree");
+        } else {
+            reference_output = Some(decoded);
+        }
     }
 }
 
