@@ -31,17 +31,29 @@ struct MemZone {
 unsafe extern "C" fn mem_alloc(mem: *mut c_void, count: u32, size: u32) -> *mut c_void {
     let count = count as usize;
     let size = size as usize;
-    let len = count * size;
+    // C allocator inputs are untrusted. Overflow must report allocation
+    // failure rather than unwind across the extern "C" callback boundary.
+    let Some(len) = count.checked_mul(size) else {
+        return std::ptr::null_mut();
+    };
 
     // induced allocation failure
     if mem.is_null() {
         return std::ptr::null_mut();
     }
 
-    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(mem as *mut MemZone) });
+    // SAFETY: opaque is the live MemZone originally allocated by mem_setup;
+    // ManuallyDrop keeps ownership with the stream until mem_done.
+    // SAFETY: opaque is the live MemZone owned by mem_setup; the callback
+    // does not transfer ownership, so ManuallyDrop prevents double-free.
+    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(mem.cast::<MemZone>()) });
 
-    // induced allocation failure
-    if zone.limit != 0 && zone.total + len > zone.limit {
+    // Check the accounting even without a configured memory limit: the
+    // callback must never allocate a smaller buffer than it advertises.
+    let Some(new_total) = zone.total.checked_add(len) else {
+        return std::ptr::null_mut();
+    };
+    if zone.limit != 0 && new_total > zone.limit {
         return std::ptr::null_mut();
     }
 
@@ -49,23 +61,23 @@ unsafe extern "C" fn mem_alloc(mem: *mut c_void, count: u32, size: u32) -> *mut 
         fn malloc(size: usize) -> *mut c_void;
     }
 
-    // perform the allocation
+    // SAFETY: libc malloc accepts any usize request and returns either a
+    // fresh allocation of at least len bytes or null on failure.
     let ptr = unsafe { malloc(len) };
     if ptr.is_null() {
         return std::ptr::null_mut();
     }
 
-    // fill the memory to make sure that the code does not depend on zeros
+    // SAFETY: non-null malloc returned writable storage of at least len
+    // bytes; this initializes exactly the allocated range.
     unsafe { std::ptr::write_bytes(ptr, 0xa5, len) };
 
     // create a new item for the list
     let item = MemItem { ptr, size: len };
 
     // update the statistics
-    zone.total += item.size;
-    if zone.total > zone.highwater {
-        zone.highwater = zone.total;
-    }
+    zone.total = new_total;
+    zone.highwater = zone.highwater.max(new_total);
 
     // insert item
     zone.items.push(item);
@@ -80,11 +92,13 @@ unsafe extern "C" fn mem_free(mem: *mut c_void, ptr: *mut c_void) {
     }
 
     if mem.is_null() {
+        // SAFETY: the C allocator callback contract passes only pointers
+        // previously allocated using the compatible libc allocator.
         unsafe { free(ptr) };
         return;
     }
 
-    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(mem as *mut MemZone) });
+    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(mem.cast::<MemZone>()) });
 
     let last = zone.items.pop();
     let mut found = None;
@@ -112,6 +126,8 @@ unsafe extern "C" fn mem_free(mem: *mut c_void, ptr: *mut c_void) {
         zone.rogue += 1;
     }
 
+    // SAFETY: the C free callback requires a live pointer allocated by
+    // the corresponding libc allocator; null is also accepted by free.
     unsafe { free(ptr) }
 }
 
@@ -137,7 +153,7 @@ fn mem_setup() -> libz_rs_sys::z_stream {
         state: std::ptr::null_mut(),
         zalloc: Some(mem_alloc),
         zfree: Some(mem_free),
-        opaque: Box::leak(zone) as *mut _ as *mut c_void,
+        opaque: Box::into_raw(zone).cast::<c_void>(),
         data_type: 0,
         adler: 0,
         reserved: 0,
@@ -149,13 +165,17 @@ fn mem_setup() -> libz_rs_sys::z_stream {
 fn mem_limit(stream: &mut libz_rs_sys::z_stream, limit: usize) {
     assert!(!stream.opaque.is_null());
 
-    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(stream.opaque as *mut MemZone) });
+    // SAFETY: stream.opaque holds the owned, live MemZone; borrowing it
+    // temporarily does not relinquish stream ownership.
+    let mut zone = ManuallyDrop::new(unsafe { Box::from_raw(stream.opaque.cast::<MemZone>()) });
     zone.limit = limit;
 }
 
 fn mem_highwater(stream: &libz_rs_sys::z_stream) -> usize {
     assert!(!stream.opaque.is_null());
-    unsafe { (*(stream.opaque as *const MemZone)).highwater }
+    // SAFETY: stream.opaque owns the initialized MemZone for the whole
+    // lifetime of this stream until mem_done.
+    unsafe { (*(stream.opaque.cast_const().cast::<MemZone>())).highwater }
 }
 
 fn mem_done(stream: &mut libz_rs_sys::z_stream) {
@@ -166,11 +186,15 @@ fn mem_done(stream: &mut libz_rs_sys::z_stream) {
     }
 
     // zone not wrapped in ManuallyDrop so it is free'd
-    let mut zone = unsafe { Box::from_raw(stream.opaque as *mut MemZone) };
+    // SAFETY: this is the only transfer of ownership back from the raw
+    // pointer created by Box::into_raw in mem_setup.
+    let mut zone = unsafe { Box::from_raw(stream.opaque.cast::<MemZone>()) };
 
     let count = zone.items.len();
 
     for item in zone.items.drain(..) {
+        // SAFETY: every tracked item came from libc malloc in mem_alloc
+        // and has not yet been released by the matching free callback.
         unsafe { free(item.ptr) };
     }
 
@@ -186,6 +210,35 @@ fn mem_done(stream: &mut libz_rs_sys::z_stream) {
     stream.opaque = std::ptr::null_mut();
     stream.zalloc = None;
     stream.zfree = None;
+}
+
+#[test]
+fn mem_allocator_rejects_overflow_without_unwinding_through_ffi() {
+    let mut stream = mem_setup();
+
+    // A u32 count * size exceeds usize on 32-bit targets. On 64-bit
+    // targets the limit prevents an impractically large allocation.
+    mem_limit(&mut stream, 1);
+    assert!(unsafe { mem_alloc(stream.opaque, u32::MAX, u32::MAX) }.is_null());
+
+    // The running total can overflow even when the new request fits
+    // usize. The deliberately forged accounting is restored before cleanup.
+    // SAFETY: opaque owns a live, exclusively accessed MemZone, and no
+    // allocator callback runs concurrently with this test.
+    {
+        // SAFETY: opaque is our live allocation, and no allocator callback
+        // runs while the mutable reference is held.
+        let zone = unsafe { &mut *stream.opaque.cast::<MemZone>() };
+        zone.limit = 0;
+        zone.total = usize::MAX;
+    }
+    // SAFETY: opaque remains a live MemZone; no memory was allocated and
+    // the deliberately overflowed accounting prevents any access to malloc.
+    assert!(unsafe { mem_alloc(stream.opaque, 1, 1) }.is_null());
+    // SAFETY: the callback completed and the same owned zone is still live.
+    unsafe { (*stream.opaque.cast::<MemZone>()).total = 0 };
+
+    mem_done(&mut stream);
 }
 
 /// Stateful callback fixture for the actual C ABI, exercising both the
@@ -267,7 +320,15 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
         let mut stream = mem_setup();
         let mut window = vec![0xa5; 32768];
         assert_eq!(
-            unsafe { inflateBackInit_(&mut stream, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE) },
+            unsafe {
+                inflateBackInit_(
+                    &raw mut stream,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION,
+                    STREAM_SIZE,
+                )
+            },
             Z_OK
         );
         let count = chunk_size.min(fixture.input.len());
@@ -277,7 +338,7 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
         let descriptor = (&raw mut fixture).cast::<c_void>();
         let result = unsafe {
             inflateBack(
-                &mut stream,
+                &raw mut stream,
                 Some(read_back_round_trip),
                 descriptor,
                 Some(write_back_round_trip),
@@ -287,7 +348,7 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
         assert_eq!(result, Z_STREAM_END, "input chunk {chunk_size}");
         assert_eq!(fixture.output, original, "input chunk {chunk_size}");
         assert_eq!(fixture.output_calls, 4, "input chunk {chunk_size}");
-        assert_eq!(unsafe { inflateBackEnd(&mut stream) }, Z_OK);
+        assert_eq!(unsafe { inflateBackEnd(&raw mut stream) }, Z_OK);
         mem_done(&mut stream);
     }
 }
@@ -298,21 +359,21 @@ fn inflate_back_init_allocates_state_only() {
 
     let mut regular = mem_setup();
     assert_eq!(
-        unsafe { inflateInit_(&mut regular, VERSION, STREAM_SIZE) },
+        unsafe { inflateInit_(&raw mut regular, VERSION, STREAM_SIZE) },
         Z_OK
     );
     let regular_highwater = mem_highwater(&regular);
-    assert_eq!(unsafe { inflateEnd(&mut regular) }, Z_OK);
+    assert_eq!(unsafe { inflateEnd(&raw mut regular) }, Z_OK);
     mem_done(&mut regular);
 
     let mut back = mem_setup();
     let mut window = vec![0u8; 1 << 15];
     assert_eq!(
-        unsafe { inflateBackInit_(&mut back, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE) },
+        unsafe { inflateBackInit_(&raw mut back, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE) },
         Z_OK
     );
     let back_highwater = mem_highwater(&back);
-    assert_eq!(unsafe { inflateBackEnd(&mut back) }, Z_OK);
+    assert_eq!(unsafe { inflateBackEnd(&raw mut back) }, Z_OK);
     mem_done(&mut back);
 
     assert!(
@@ -340,7 +401,7 @@ fn gzip_header_check() {
     let err = Some(err);
     let mut stream = mem_setup();
 
-    let init_err = unsafe { inflateInit2_(&mut stream, 47, VERSION, STREAM_SIZE) };
+    let init_err = unsafe { inflateInit2_(&raw mut stream, 47, VERSION, STREAM_SIZE) };
     if init_err != Z_OK {
         mem_done(&mut stream);
         return;
@@ -369,19 +430,19 @@ fn gzip_header_check() {
         done: 0,
     };
 
-    let ret = unsafe { inflateGetHeader(&mut stream, &mut header) };
+    let ret = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
     assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
     let have = input.len();
     let step = if step == 0 || step > have { have } else { step };
 
     stream.avail_in = step as _;
-    stream.next_in = input.as_ptr() as *mut _;
+    stream.next_in = input.as_ptr().cast_mut();
 
     stream.avail_out = len as _;
     stream.next_out = out.as_mut_ptr();
 
-    let ret = unsafe { inflate(&mut stream, InflateFlush::NoFlush as _) };
+    let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
 
     if let Some(err) = err {
         if err != 9 {
@@ -413,10 +474,10 @@ fn gzip_header_check() {
     let extra_bytes = [84, 71, 10, 0, 69, 88, 84, 82, 65, 32, 68, 65, 84, 65];
     assert_eq!(extra_bytes, extra);
 
-    let ret = unsafe { inflateReset2(&mut stream, -8) };
+    let ret = unsafe { inflateReset2(&raw mut stream, -8) };
     assert_eq!(ret, Z_OK);
 
-    let ret = unsafe { inflateEnd(&mut stream) };
+    let ret = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(ret, Z_OK);
 
     mem_done(&mut stream);
@@ -429,7 +490,7 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
 
     let mut stream = mem_setup();
 
-    let init_err = unsafe { inflateInit2_(&mut stream, win, VERSION, STREAM_SIZE) };
+    let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
     if init_err != Z_OK {
         mem_done(&mut stream);
         return;
@@ -460,7 +521,7 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
     };
 
     if win == 47 {
-        let err = unsafe { inflateGetHeader(&mut stream, &mut header) };
+        let err = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
     }
 
@@ -469,13 +530,13 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
 
     stream.avail_in = step as _;
     have -= step;
-    stream.next_in = input.as_ptr() as *mut _;
+    stream.next_in = input.as_ptr().cast_mut();
 
     loop {
         stream.avail_out = len as _;
         stream.next_out = out.as_mut_ptr();
 
-        let ret = unsafe { inflate(&mut stream, InflateFlush::NoFlush as _) };
+        let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
 
         if let Some(err) = err {
             assert_eq!(ret, err)
@@ -486,22 +547,22 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
         }
 
         if matches!(ret, Z_NEED_DICT) {
-            let ret = unsafe { inflateSetDictionary(&mut stream, input.as_ptr(), 1) };
+            let ret = unsafe { inflateSetDictionary(&raw mut stream, input.as_ptr(), 1) };
             assert_eq!(ret, Z_DATA_ERROR);
 
             unsafe { set_mode_dict(&mut stream) }
-            let ret = unsafe { inflateSetDictionary(&mut stream, out.as_ptr(), 0) };
+            let ret = unsafe { inflateSetDictionary(&raw mut stream, out.as_ptr(), 0) };
             assert_eq!(ret, Z_OK);
 
-            let ret = unsafe { inflate(&mut stream, InflateFlush::NoFlush as _) };
+            let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
             assert_eq!(ret, Z_BUF_ERROR);
         }
 
         let mut copy = z_stream::default();
-        let ret = unsafe { inflateCopy(&mut copy, &stream) };
+        let ret = unsafe { inflateCopy(&raw mut copy, &raw const stream) };
         assert_eq!(ret, Z_OK);
 
-        let ret = unsafe { inflateEnd(&mut copy) };
+        let ret = unsafe { inflateEnd(&raw mut copy) };
         assert_eq!(ret, Z_OK);
 
         // only care about this error on the first iteration
@@ -516,10 +577,10 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
         }
     }
 
-    let ret = unsafe { inflateReset2(&mut stream, -8) };
+    let ret = unsafe { inflateReset2(&raw mut stream, -8) };
     assert_eq!(ret, Z_OK);
 
-    let ret = unsafe { inflateEnd(&mut stream) };
+    let ret = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(ret, Z_OK);
 
     mem_done(&mut stream);
@@ -533,17 +594,17 @@ fn support() {
 
     let ret = unsafe {
         inflateInit_(
-            &mut stream,
+            &raw mut stream,
             zlibVersion(),
             core::mem::size_of::<z_stream>() as i32,
         )
     };
     assert_eq!(ret, Z_OK);
 
-    let ret = unsafe { inflateSetDictionary(&mut stream, std::ptr::null(), 0) };
+    let ret = unsafe { inflateSetDictionary(&raw mut stream, std::ptr::null(), 0) };
     assert_eq!(ret, Z_STREAM_ERROR);
 
-    let ret = unsafe { inflateEnd(&mut stream) };
+    let ret = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(ret, Z_OK);
 
     mem_done(&mut stream);
@@ -571,7 +632,7 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     let mut length_before = 0;
     // SAFETY: the initialized stream and length output are valid; NULL dictionary means query.
     assert_eq!(
-        unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &mut length_before) },
+        unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &raw mut length_before) },
         Z_OK,
     );
     assert_eq!(length_before, 0);
@@ -584,7 +645,7 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     let mut length_after = 0;
     // SAFETY: initialized stream and length output remain valid.
     assert_eq!(
-        unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &mut length_after) },
+        unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &raw mut length_after) },
         Z_OK,
     );
     assert_eq!(length_after, length_before);
@@ -608,7 +669,7 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     let mut recovered = [0u8; 64];
     // SAFETY: a valid output span is provided; recovered is sufficiently large.
     assert_eq!(
-        unsafe { inflateGetDictionary(stream, recovered.as_mut_ptr(), &mut length_after) },
+        unsafe { inflateGetDictionary(stream, recovered.as_mut_ptr(), &raw mut length_after) },
         Z_OK,
     );
     assert_eq!(usize::try_from(length_after).ok(), Some(valid.len()));
@@ -666,15 +727,15 @@ fn cover_wrap() {
     let mut strm = mem_setup();
     strm.avail_in = 0;
     strm.next_in = std::ptr::null_mut();
-    let mut ret = unsafe { inflateInit2_(&mut strm, -8, VERSION, STREAM_SIZE) };
+    let mut ret = unsafe { inflateInit2_(&raw mut strm, -8, VERSION, STREAM_SIZE) };
     let mut input = [0x63u8, 0x00];
     strm.avail_in = input.len() as _;
     strm.next_in = input.as_mut_ptr().cast();
     strm.avail_out = 1;
-    strm.next_out = (&mut ret) as *mut _ as *mut u8;
+    strm.next_out = (&raw mut ret).cast::<u8>();
 
     let dict = [0u8; 257];
-    ret = unsafe { inflateSetDictionary(&mut strm, dict.as_ptr(), 257) };
+    ret = unsafe { inflateSetDictionary(&raw mut strm, dict.as_ptr(), 257) };
     assert_eq!(ret, Z_OK);
 
     // ------------------------------
@@ -682,35 +743,35 @@ fn cover_wrap() {
     let size = 2 * INFLATE_STATE_SIZE + 256;
     mem_limit(&mut strm, size);
 
-    ret = unsafe { inflatePrime(&mut strm, 16, 0) };
+    ret = unsafe { inflatePrime(&raw mut strm, 16, 0) };
     assert_eq!(ret, Z_OK);
 
     let mut input = [0x80u8, 0x00];
     strm.avail_in = input.len() as _;
     strm.next_in = input.as_mut_ptr();
-    ret = unsafe { inflateSync(&mut strm) };
+    ret = unsafe { inflateSync(&raw mut strm) };
     assert_eq!(ret, Z_DATA_ERROR);
 
-    ret = unsafe { inflate(&mut strm, InflateFlush::NoFlush as _) };
+    ret = unsafe { inflate(&raw mut strm, InflateFlush::NoFlush as _) };
     assert_eq!(ret, Z_STREAM_ERROR);
 
     let mut input = [0u8, 0, 0xFF, 0xFF];
     strm.avail_in = input.len() as _;
     strm.next_in = input.as_mut_ptr();
-    ret = unsafe { inflateSync(&mut strm) };
+    ret = unsafe { inflateSync(&raw mut strm) };
     assert_eq!(ret, Z_OK);
-    let _ = unsafe { inflateSyncPoint(&mut strm) };
+    let _ = unsafe { inflateSyncPoint(&raw mut strm) };
 
     let mut copy = z_stream::default();
-    ret = unsafe { inflateCopy(&mut copy, &strm) };
+    ret = unsafe { inflateCopy(&raw mut copy, &raw const strm) };
     assert_eq!(ret, Z_MEM_ERROR);
 
     mem_limit(&mut strm, 0);
-    ret = unsafe { inflateUndermine(&mut strm, 1) };
+    ret = unsafe { inflateUndermine(&raw mut strm, 1) };
     assert_eq!(ret, Z_OK);
 
-    let _ = unsafe { inflateMark(&strm) };
-    ret = unsafe { inflateEnd(&mut strm) };
+    let _ = unsafe { inflateMark(&raw const strm) };
+    ret = unsafe { inflateEnd(&raw mut strm) };
     assert_eq!(ret, Z_OK);
     mem_done(&mut strm);
 }
@@ -734,10 +795,10 @@ fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
             source.extend(core::iter::repeat_n(0u8, trailing));
             let mut stream = mem_setup();
             assert_eq!(
-                unsafe { inflateInit2_(&mut stream, -15, VERSION, STREAM_SIZE) },
+                unsafe { inflateInit2_(&raw mut stream, -15, VERSION, STREAM_SIZE) },
                 Z_OK,
             );
-            assert_eq!(unsafe { inflateUndermine(&mut stream, subvert) }, Z_OK);
+            assert_eq!(unsafe { inflateUndermine(&raw mut stream, subvert) }, Z_OK);
             stream.next_in = source.as_mut_ptr();
             stream.avail_in =
                 u32::try_from(source.len()).map_err(|_| "test input exceeds C width")?;
@@ -750,7 +811,7 @@ fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
                 stream.avail_out =
                     u32::try_from(output_chunk).map_err(|_| "test output exceeds C width")?;
                 let before_in = stream.avail_in;
-                let code = unsafe { inflate(&mut stream, InflateFlush::NoFlush as i32) };
+                let code = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as i32) };
                 let written = output_chunk - stream.avail_out as usize;
                 result.extend_from_slice(&output[..written]);
                 if code == Z_STREAM_END {
@@ -772,7 +833,7 @@ fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
                 result.iter().all(|&b| b == 0),
                 "only synthesized zero history is allowed"
             );
-            assert_eq!(unsafe { inflateEnd(&mut stream) }, Z_OK);
+            assert_eq!(unsafe { inflateEnd(&raw mut stream) }, Z_OK);
             mem_done(&mut stream);
             observed.push(result);
         }
@@ -792,20 +853,20 @@ fn undermine_zero_restores_strict_history_validation() -> Result<(), &'static st
     let mut output = [0xa5u8; 32];
     let mut stream = mem_setup();
     assert_eq!(
-        unsafe { inflateInit2_(&mut stream, -15, VERSION, STREAM_SIZE) },
+        unsafe { inflateInit2_(&raw mut stream, -15, VERSION, STREAM_SIZE) },
         Z_OK
     );
-    assert_eq!(unsafe { inflateUndermine(&mut stream, 1) }, Z_OK);
-    assert_eq!(unsafe { inflateUndermine(&mut stream, 0) }, Z_OK);
+    assert_eq!(unsafe { inflateUndermine(&raw mut stream, 1) }, Z_OK);
+    assert_eq!(unsafe { inflateUndermine(&raw mut stream, 0) }, Z_OK);
     stream.next_in = input.as_mut_ptr();
     stream.avail_in = u32::try_from(input.len()).map_err(|_| "test input exceeds C width")?;
     stream.next_out = output.as_mut_ptr();
     stream.avail_out = u32::try_from(output.len()).map_err(|_| "test output exceeds C width")?;
     assert_eq!(
-        unsafe { inflate(&mut stream, InflateFlush::NoFlush as i32) },
+        unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as i32) },
         Z_DATA_ERROR,
     );
-    assert_eq!(unsafe { inflateEnd(&mut stream) }, Z_OK);
+    assert_eq!(unsafe { inflateEnd(&raw mut stream) }, Z_OK);
     mem_done(&mut stream);
     Ok(())
 }
@@ -1049,7 +1110,7 @@ fn try_inflate(input: &[u8], expected_err: c_int) -> c_int {
 
     let mut ret = unsafe {
         inflateInit2_(
-            &mut strm,
+            &raw mut strm,
             if expected_err < 0 { 47 } else { -15 },
             VERSION,
             STREAM_SIZE,
@@ -1057,13 +1118,13 @@ fn try_inflate(input: &[u8], expected_err: c_int) -> c_int {
     };
     assert_eq!(ret, Z_OK);
     strm.avail_in = len as _;
-    strm.next_in = input.as_ptr() as *mut u8;
+    strm.next_in = input.as_ptr().cast_mut();
 
     loop {
         strm.avail_out = size as _;
         strm.next_out = out.as_mut_ptr();
 
-        ret = unsafe { inflate(&mut strm, InflateFlush::Trees as _) };
+        ret = unsafe { inflate(&raw mut strm, InflateFlush::Trees as _) };
         assert!(!matches!(ret, Z_STREAM_ERROR | Z_MEM_ERROR));
 
         if matches!(ret, Z_DATA_ERROR | Z_NEED_DICT) {
@@ -1079,7 +1140,7 @@ fn try_inflate(input: &[u8], expected_err: c_int) -> c_int {
         assert_eq!(ret, Z_DATA_ERROR);
     }
 
-    unsafe { inflateEnd(&mut strm) };
+    unsafe { inflateEnd(&raw mut strm) };
     mem_done(&mut strm);
 
     /* then with inflateBack */
@@ -1102,16 +1163,16 @@ fn try_inflate_back(input: &[u8], expected_err: c_int) -> c_int {
     let mut strm = mem_setup();
 
     let mut ret =
-        unsafe { inflateBackInit_(&mut strm, 15, win.as_mut_ptr(), VERSION, STREAM_SIZE) };
+        unsafe { inflateBackInit_(&raw mut strm, 15, win.as_mut_ptr(), VERSION, STREAM_SIZE) };
     assert_eq!(ret, Z_OK);
 
     strm.avail_in = len as _;
-    strm.next_in = input.as_ptr() as *mut u8;
+    strm.next_in = input.as_ptr().cast_mut();
 
     // assumes you have `pull` and `push` extern "C" functions defined
     ret = unsafe {
         inflateBack(
-            &mut strm,
+            &raw mut strm,
             Some(pull),
             std::ptr::null_mut(),
             Some(push),
@@ -1124,7 +1185,7 @@ fn try_inflate_back(input: &[u8], expected_err: c_int) -> c_int {
         assert_eq!(ret, Z_DATA_ERROR);
     }
 
-    unsafe { inflateBackEnd(&mut strm) };
+    unsafe { inflateBackEnd(&raw mut strm) };
     mem_done(&mut strm);
 
     ret
@@ -1442,7 +1503,7 @@ fn uncompress_help(input: &[u8]) -> Vec<u8> {
     let source = input.as_ptr();
     let source_len = input.len() as _;
 
-    let err = unsafe { uncompress(dest, &mut dest_len, source, source_len) };
+    let err = unsafe { uncompress(dest, &raw mut dest_len, source, source_len) };
 
     if err != 0 {
         panic!("error {:?}", ReturnCode::from(err));
@@ -1462,7 +1523,7 @@ fn hello_world_uncompressed() {
     ];
 
     let output = uncompress_help(&deflated);
-    assert_eq!(String::from_utf8(output).unwrap(), "Hello World!\n");
+    assert_eq!(output, b"Hello World!\n");
 }
 
 #[test]
@@ -1478,7 +1539,7 @@ fn copy_direct_from_next_in_to_next_out() {
         let source = input.as_ptr();
         let mut source_len = input.len() as c_ulong;
 
-        let err = unsafe { uncompress2(dest, &mut dest_len, source, &mut source_len) };
+        let err = unsafe { uncompress2(dest, &raw mut dest_len, source, &raw mut source_len) };
 
         if err != 0 {
             panic!("error {:?}", ReturnCode::from(err));
@@ -1510,7 +1571,7 @@ fn compress_uncompress_z() {
         assert_eq!(
             compress_z(
                 compr_z.as_mut_ptr(),
-                &mut compr_z_len,
+                &raw mut compr_z_len,
                 source.as_ptr(),
                 source.len(),
             ),
@@ -1519,7 +1580,7 @@ fn compress_uncompress_z() {
         assert_eq!(
             compress(
                 compr.as_mut_ptr(),
-                &mut compr_len,
+                &raw mut compr_len,
                 source.as_ptr(),
                 source.len() as c_ulong,
             ),
@@ -1540,7 +1601,7 @@ fn compress_uncompress_z() {
         assert_eq!(
             libz_rs_sys::compress2_z(
                 compr2_z.as_mut_ptr(),
-                &mut compr2_z_len,
+                &raw mut compr2_z_len,
                 source.as_ptr(),
                 source.len(),
                 9,
@@ -1550,7 +1611,7 @@ fn compress_uncompress_z() {
         assert_eq!(
             libz_rs_sys::compress2(
                 compr2.as_mut_ptr(),
-                &mut compr2_len,
+                &raw mut compr2_len,
                 source.as_ptr(),
                 source.len() as c_ulong,
                 9,
@@ -1572,14 +1633,19 @@ fn compress_uncompress_z() {
         assert_eq!(
             uncompress_z(
                 dest_z.as_mut_ptr(),
-                &mut dest_z_len,
+                &raw mut dest_z_len,
                 compr_z.as_ptr(),
                 compr_z_len,
             ),
             Z_OK,
         );
         assert_eq!(
-            uncompress(dest.as_mut_ptr(), &mut dest_len, compr.as_ptr(), compr_len),
+            uncompress(
+                dest.as_mut_ptr(),
+                &raw mut dest_len,
+                compr.as_ptr(),
+                compr_len
+            ),
             Z_OK,
         );
 
@@ -1589,9 +1655,9 @@ fn compress_uncompress_z() {
         assert_eq!(
             libz_rs_sys::uncompress2_z(
                 dest2.as_mut_ptr(),
-                &mut dest2_len,
+                &raw mut dest2_len,
                 compr_z.as_ptr(),
-                &mut source2_len,
+                &raw mut source2_len,
             ),
             Z_OK,
         );
@@ -1613,7 +1679,7 @@ fn hello_world_fixed() {
         0x02, 0x00, 0x20, 0x91, 0x04, 0x48,
     ];
     let output = uncompress_help(&deflated);
-    assert_eq!(String::from_utf8(output).unwrap(), "Hello World!\n");
+    assert_eq!(output, b"Hello World!\n");
 }
 
 #[test]
@@ -1626,7 +1692,7 @@ fn hello_world_dynamic() {
     ];
 
     let output = uncompress_help(&deflated);
-    assert_eq!(String::from_utf8(output).unwrap(), input);
+    assert_eq!(output, input.as_bytes());
 }
 
 #[test]
@@ -1659,22 +1725,22 @@ fn inflate_adler() {
         reserved: 0,
     };
 
-    let err = unsafe { inflateInit2_(&mut stream, 32 + MAX_WBITS, VERSION, STREAM_SIZE) };
+    let err = unsafe { inflateInit2_(&raw mut stream, 32 + MAX_WBITS, VERSION, STREAM_SIZE) };
     assert_eq!(err, Z_OK);
 
     let mut uncompressed = [0u8; 1024];
 
-    stream.next_in = COMPRESSED.as_ptr() as *mut u8;
+    stream.next_in = COMPRESSED.as_ptr().cast_mut();
     stream.avail_in = COMPRESSED.len() as _;
     stream.next_out = uncompressed.as_mut_ptr();
     stream.avail_out = uncompressed.len() as _;
 
-    let err = unsafe { inflate(&mut stream, Z_NO_FLUSH) };
+    let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
     assert_eq!(err, Z_STREAM_END);
 
     assert_eq!(stream.adler, 0x6b931030);
 
-    let err = unsafe { inflateEnd(&mut stream) };
+    let err = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(err, Z_OK);
 
     let length = Ord::min(stream.total_out as usize, ORIGINAL.len());
@@ -1688,7 +1754,7 @@ fn inflate_get_header_non_gzip_stream() {
     let mut stream = mem_setup();
 
     let win = 15; // i.e. zlib compression (and not gzip)
-    let init_err = unsafe { inflateInit2_(&mut stream, win, VERSION, STREAM_SIZE) };
+    let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
     if init_err != Z_OK {
         mem_done(&mut stream);
         return;
@@ -1697,11 +1763,11 @@ fn inflate_get_header_non_gzip_stream() {
     let mut header = gz_header::default();
 
     assert_eq!(
-        unsafe { inflateGetHeader(&mut stream, &mut header) },
+        unsafe { inflateGetHeader(&raw mut stream, &raw mut header) },
         ReturnCode::StreamError as i32
     );
 
-    let ret = unsafe { inflateEnd(&mut stream) };
+    let ret = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(ret, Z_OK);
 
     mem_done(&mut stream);
@@ -1928,18 +1994,18 @@ fn gzip_header_fields_insufficient_space() {
         time: 0,
         xflags: 0,
         os: 0,
-        extra: extra.as_ptr() as *mut _,
+        extra: extra.as_ptr().cast_mut(),
         extra_len: extra.len() as _,
         extra_max: 0,
-        name: name.as_ptr() as *mut _,
+        name: name.as_ptr().cast_mut(),
         name_max: 0,
-        comment: comment.as_ptr() as *mut _,
+        comment: comment.as_ptr().cast_mut(),
         comm_max: 0,
         hcrc: 1,
         done: 0,
     };
 
-    let err = unsafe { libz_rs_sys::deflateSetHeader(stream, &mut header) };
+    let err = unsafe { libz_rs_sys::deflateSetHeader(stream, &raw mut header) };
     assert_eq!(err, 0);
 
     let mut output_rs = [0u8; 512];
@@ -1947,7 +2013,7 @@ fn gzip_header_fields_insufficient_space() {
     stream.avail_out = output_rs.len() as _;
 
     for chunk in input.chunks(chunk_size) {
-        stream.next_in = chunk.as_ptr() as *mut u8;
+        stream.next_in = chunk.as_ptr().cast_mut();
         stream.avail_in = chunk.len() as _;
 
         let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::NoFlush as _) };
@@ -2008,7 +2074,7 @@ fn gzip_header_fields_insufficient_space() {
             done: 0,
         };
 
-        let err = unsafe { inflateGetHeader(stream, &mut header) };
+        let err = unsafe { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
         for chunk in output_rs.chunks_mut(chunk_size) {
@@ -2139,18 +2205,18 @@ fn gzip_chunked(chunk_size: usize) {
         time: 0,
         xflags: 0,
         os: 0,
-        extra: extra.as_ptr() as *mut _,
+        extra: extra.as_ptr().cast_mut(),
         extra_len: extra.len() as _,
         extra_max: 0,
-        name: name.as_ptr() as *mut _,
+        name: name.as_ptr().cast_mut(),
         name_max: 0,
-        comment: comment.as_ptr() as *mut _,
+        comment: comment.as_ptr().cast_mut(),
         comm_max: 0,
         hcrc: 1,
         done: 0,
     };
 
-    let err = unsafe { libz_rs_sys::deflateSetHeader(stream, &mut header) };
+    let err = unsafe { libz_rs_sys::deflateSetHeader(stream, &raw mut header) };
     assert_eq!(err, 0);
 
     let mut output_rs = [0u8; 512];
@@ -2158,7 +2224,7 @@ fn gzip_chunked(chunk_size: usize) {
     stream.avail_out = output_rs.len() as _;
 
     for chunk in input.chunks(chunk_size) {
-        stream.next_in = chunk.as_ptr() as *mut u8;
+        stream.next_in = chunk.as_ptr().cast_mut();
         stream.avail_in = chunk.len() as _;
 
         let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::NoFlush as _) };
@@ -2220,7 +2286,7 @@ fn gzip_chunked(chunk_size: usize) {
             done: 0,
         };
 
-        let err = unsafe { inflateGetHeader(stream, &mut header) };
+        let err = unsafe { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
         for chunk in output_rs.chunks_mut(chunk_size) {
@@ -2274,7 +2340,7 @@ fn chunked_output_rs() {
 
     let stream = unsafe { stream.assume_init_mut() };
 
-    stream.next_in = input.as_ptr() as *mut u8;
+    stream.next_in = input.as_ptr().cast_mut();
     stream.avail_in = input.len() as _;
 
     let mut output = [0; 33];
@@ -2377,7 +2443,7 @@ fn issue_109() {
 
         let stream = { stream.assume_init_mut() };
 
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         while stream.avail_in != 0 {
@@ -2426,7 +2492,7 @@ fn window_match_bug() {
 
         let stream = { stream.assume_init_mut() };
 
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         loop {
@@ -2479,7 +2545,7 @@ fn op_len_edge_case() {
 
         let stream = { stream.assume_init_mut() };
 
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         while stream.avail_in != 0 {
@@ -2553,7 +2619,7 @@ fn test_inflate_flush_block() {
 
         let mut output = vec![0u8; CHUNK * 2];
         let stream = unsafe { stream.assume_init_mut() };
-        stream.next_in = compressed_data.as_ptr() as *mut u8;
+        stream.next_in = compressed_data.as_ptr().cast_mut();
         stream.avail_in = compressed_data.len() as _;
         loop {
             stream.next_out = output.as_mut_ptr();
@@ -2595,7 +2661,7 @@ fn test_inflate_flush_block() {
 
         let mut output = vec![0u8; CHUNK * 2];
         let stream = unsafe { stream.assume_init_mut() };
-        stream.next_in = compressed_data.as_ptr() as *mut u8;
+        stream.next_in = compressed_data.as_ptr().cast_mut();
         stream.avail_in = compressed_data.len() as _;
         loop {
             stream.next_out = output.as_mut_ptr();
@@ -2643,7 +2709,7 @@ fn issue_172() {
             let strm = strm.assume_init_mut();
 
             strm.avail_out = out.len() as _;
-            strm.next_in = BUF.as_ptr() as *mut u8;
+            strm.next_in = BUF.as_ptr().cast_mut();
             strm.next_out = out.as_mut_ptr();
             while ret == Z_OK && strm.total_in < BUF.len() as _ {
                 strm.avail_in = if chunk as c_ulong > (BUF.len() as c_ulong - strm.total_in) {
@@ -2701,11 +2767,11 @@ fn header_configured_but_no_gzip() {
             done: 123,
         };
 
-        let ret = { inflateGetHeader(stream, &mut header) };
+        let ret = { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
         stream.avail_in = input.len() as _;
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
 
         let mut out = [0u8; 32];
         stream.avail_out = out.len() as _;
@@ -2804,7 +2870,7 @@ fn issue_232() {
 
     let err = unsafe {
         inflateInit2_(
-            &mut stream,
+            &raw mut stream,
             15 + 32,
             zlibVersion(),
             core::mem::size_of::<z_stream>() as _,
@@ -2820,7 +2886,7 @@ fn issue_232() {
     stream.avail_in = INPUT.len().try_into().unwrap();
 
     while input_len.checked_sub(stream.total_in as _).unwrap() > 0 {
-        let err = unsafe { inflate(&mut stream, InflateFlush::Finish as _) };
+        let err = unsafe { inflate(&raw mut stream, InflateFlush::Finish as _) };
         match ReturnCode::from(err) {
             ReturnCode::StreamEnd => {
                 break;
@@ -2839,7 +2905,7 @@ fn issue_232() {
         }
     }
 
-    unsafe { inflateEnd(&mut stream) };
+    unsafe { inflateEnd(&raw mut stream) };
 }
 
 #[test]
@@ -3045,8 +3111,13 @@ fn test_dict_inflate() {
         }
 
         let mut check_dictionary_len = 0;
-        let err =
-            { inflateGetDictionary(d_stream, core::ptr::null_mut(), &mut check_dictionary_len) };
+        let err = {
+            inflateGetDictionary(
+                d_stream,
+                core::ptr::null_mut(),
+                &raw mut check_dictionary_len,
+            )
+        };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         if (check_dictionary_len as usize) < dictionary.len() {
@@ -3057,7 +3128,7 @@ fn test_dict_inflate() {
             inflateGetDictionary(
                 d_stream,
                 check_dictionary.as_mut_ptr().cast(),
-                &mut check_dictionary_len,
+                &raw mut check_dictionary_len,
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
@@ -3319,7 +3390,13 @@ fn cover_back() {
         use libz_rs_sys::*;
 
         let mut stream = mem_setup();
-        let ret = inflateBackInit_(&mut stream, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE);
+        let ret = inflateBackInit_(
+            &raw mut stream,
+            15,
+            window.as_mut_ptr(),
+            VERSION,
+            STREAM_SIZE,
+        );
         assert_eq!(ret, Z_OK);
 
         let mut input = *b"\x03\0";
@@ -3327,7 +3404,7 @@ fn cover_back() {
         stream.next_in = input.as_mut_ptr();
 
         let ret = libz_rs_sys::inflateBack(
-            &mut stream,
+            &raw mut stream,
             Some(pull),
             core::ptr::null_mut(),
             Some(push),
@@ -3368,13 +3445,19 @@ fn cover_back() {
             assert_eq!(ret, Z_STREAM_ERROR);
         }
 
-        let ret = { inflateBackEnd(&mut stream) };
+        let ret = { inflateBackEnd(&raw mut stream) };
         assert_eq!(ret, Z_OK);
         mem_done(&mut stream);
 
-        let ret = inflateBackInit_(&mut stream, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE);
+        let ret = inflateBackInit_(
+            &raw mut stream,
+            15,
+            window.as_mut_ptr(),
+            VERSION,
+            STREAM_SIZE,
+        );
         assert_eq!(ret, Z_OK);
-        let ret = { inflateBackEnd(&mut stream) };
+        let ret = { inflateBackEnd(&raw mut stream) };
         assert_eq!(ret, Z_OK);
     }
 }
@@ -3479,7 +3562,7 @@ fn inflate_copy_after_half_input() {
         // First, decompress only the first half of the compressed input.
         let half = input.len() / 2;
 
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = half as _;
         stream.next_out = out.as_mut_ptr();
         stream.avail_out = out.len() as _;
@@ -3527,7 +3610,7 @@ fn inflate_copy_after_half_input() {
         // Now feed the *remainder* of the compressed input to both streams.
         let remaining = input.len() - half;
         if remaining > 0 {
-            stream.next_in = input.as_ptr().add(half) as *mut _;
+            stream.next_in = input.as_ptr().add(half).cast_mut();
             stream.avail_in = remaining as _;
 
             copy.next_in = stream.next_in;
@@ -3604,7 +3687,7 @@ fn inflate_validate_toggles_checksum_update() {
             let ret = inflateValidate(stream, 1);
             assert_eq!(ret, Z_OK);
 
-            stream.next_in = input.as_ptr() as *mut _;
+            stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = input.len() as _;
             stream.next_out = out1.as_mut_ptr();
             stream.avail_out = out1.len() as _;
@@ -3642,7 +3725,7 @@ fn inflate_validate_toggles_checksum_update() {
             let ret = inflateValidate(stream, 0);
             assert_eq!(ret, Z_OK);
 
-            stream.next_in = input.as_ptr() as *mut _;
+            stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = input.len() as _;
             stream.next_out = out2.as_mut_ptr();
             stream.avail_out = out2.len() as _;
@@ -3690,7 +3773,7 @@ fn inflate_validate_toggles_checksum_update() {
             let ret = inflateValidate(stream, 1);
             assert_eq!(ret, Z_OK);
 
-            stream.next_in = input.as_ptr() as *mut _;
+            stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = input.len() as _;
             stream.next_out = out3.as_mut_ptr();
             stream.avail_out = out3.len() as _;
