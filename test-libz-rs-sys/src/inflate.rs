@@ -547,6 +547,8 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
 
     let mut stream = mem_setup();
 
+    // SAFETY: mem_setup provided writable ABI stream storage and valid
+    // allocation callbacks; invalid win values are tested intentionally.
     let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
     if init_err != Z_OK {
         mem_done(&mut stream);
@@ -573,16 +575,18 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
         os: 0,
         extra: extra.as_mut_ptr(),
         extra_len: 0,
-        extra_max: 1024,
+        extra_max: test_c_uint_len(extra.len()),
         name: name.as_mut_ptr(),
-        name_max: 64, // How / where should this be set?
+        name_max: test_c_uint_len(name.len()),
         comment: comment.as_mut_ptr(),
-        comm_max: 64,
+        comm_max: test_c_uint_len(comment.len()),
         hcrc: 0,
         done: 0,
     };
 
     if win == 47 {
+        // SAFETY: header points to live writable fields with capacities
+        // equal to the actual allocated test arrays.
         let err = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
     }
@@ -590,18 +594,28 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
     let mut have = input.len();
     let step = if step == 0 || step > have { have } else { step };
 
-    stream.avail_in = step as _;
+    stream.avail_in = test_c_uint_len(step);
     have -= step;
     stream.next_in = input.as_ptr().cast_mut();
 
     loop {
-        stream.avail_out = len as _;
+        // These deliberately tiny buffers are scratch output for testing
+        // status transitions, not a cumulative decoded-output allocation.
+        stream.avail_out = test_c_uint_len(out.len());
         stream.next_out = out.as_mut_ptr();
+        let available_before = stream.avail_in;
+        let total_out_before = stream.total_out;
 
+        // SAFETY: the offered input is a live prefix of the remaining input
+        // slice; the scratch buffer is live and disjoint, including len == 0.
         let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
+        assert!(
+            stream.avail_in <= available_before,
+            "inflate reported more input than the helper provided"
+        );
 
-        if let Some(err) = err {
-            assert_eq!(ret, err)
+        if let Some(expected) = err {
+            assert_eq!(ret, expected, "unexpected first result in {_what}");
         }
 
         if !matches!(ret, Z_OK | Z_BUF_ERROR | Z_NEED_DICT) {
@@ -609,39 +623,77 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
         }
 
         if matches!(ret, Z_NEED_DICT) {
+            // SAFETY: the one-byte candidate dictionary resides inside
+            // the live input fixture. Rejection is required by this test.
             let ret = unsafe { inflateSetDictionary(&raw mut stream, input.as_ptr(), 1) };
             assert_eq!(ret, Z_DATA_ERROR);
 
+            // SAFETY: this intentional test-only state mutation restores
+            // the dictionary-request state before trying a zero-byte span.
             unsafe { set_mode_dict(&mut stream) }
+            // SAFETY: zero-length dictionary requires no dereference of out.
             let ret = unsafe { inflateSetDictionary(&raw mut stream, out.as_ptr(), 0) };
             assert_eq!(ret, Z_OK);
 
+            // SAFETY: the initialized stream and caller-owned spans remain
+            // live through this expected no-progress dictionary probe.
             let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
             assert_eq!(ret, Z_BUF_ERROR);
         }
 
+        let inflate_result = ret;
         let mut copy = z_stream::default();
+        // SAFETY: source is an initialized live decoder, and copy is
+        // writable C ABI storage with a separate destination address.
         let ret = unsafe { inflateCopy(&raw mut copy, &raw const stream) };
         assert_eq!(ret, Z_OK);
+        assert_ne!(copy.state, stream.state, "inflateCopy shared state storage");
 
+        // SAFETY: successful inflateCopy initialized an independent state
+        // which is closed here exactly once.
         let ret = unsafe { inflateEnd(&raw mut copy) };
         assert_eq!(ret, Z_OK);
 
-        // only care about this error on the first iteration
+        // This intentionally tiny scratch buffer can cause Z_BUF_ERROR
+        // without consuming input or producing output. Repeating that same
+        // call forever cannot change the result, so end the coverage probe.
+        if inflate_result == Z_BUF_ERROR
+            && stream.avail_in == available_before
+            && stream.total_out == total_out_before
+        {
+            break;
+        }
+        assert!(
+            inflate_result == Z_NEED_DICT
+                || stream.avail_in < available_before
+                || stream.total_out > total_out_before,
+            "inflate coverage probe stalled in {_what}"
+        );
+
+        // Only the initial return code is a fixed fixture expectation.
         err = None;
 
-        have += stream.avail_in as usize;
-        stream.avail_in = if step > have { have } else { step } as _;
-        have -= stream.avail_in as usize;
+        // Existing next_in advanced by the number of consumed bytes;
+        // re-advertise up to step contiguous bytes including any unconsumed
+        // suffix, bounded by the complete remaining fixture.
+        let still_offered = usize::try_from(stream.avail_in).unwrap_or(usize::MAX);
+        assert!(still_offered <= step);
+        assert!(have <= input.len().saturating_sub(still_offered));
+        have += still_offered;
+        stream.avail_in = test_c_uint_len(step.min(have));
+        have -= usize::try_from(stream.avail_in).unwrap_or(usize::MAX);
 
         if stream.avail_in == 0 {
             break;
         }
     }
 
+    // SAFETY: the coverage probe has an initialized stream; reset before
+    // closing to exercise the alternate window configuration.
     let ret = unsafe { inflateReset2(&raw mut stream, -8) };
     assert_eq!(ret, Z_OK);
 
+    // SAFETY: this stream was initialized and is ended exactly once.
     let ret = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(ret, Z_OK);
 
@@ -789,15 +841,25 @@ fn cover_wrap() {
     let mut strm = mem_setup();
     strm.avail_in = 0;
     strm.next_in = std::ptr::null_mut();
+    // SAFETY: stream has an allocator and correct ABI version/size; the
+    // -8 window size is a valid raw DEFLATE initialization.
     let mut ret = unsafe { inflateInit2_(&raw mut strm, -8, VERSION, STREAM_SIZE) };
+    assert_eq!(ret, Z_OK, "cover_wrap failed to initialize the stream");
     let mut input = [0x63u8, 0x00];
-    strm.avail_in = input.len() as _;
-    strm.next_in = input.as_mut_ptr().cast();
-    strm.avail_out = 1;
-    strm.next_out = (&raw mut ret).cast::<u8>();
+    strm.avail_in = test_c_uint_len(input.len());
+    strm.next_in = input.as_mut_ptr();
+
+    // Keep decoder output separate from the variable holding its C return
+    // codes. Writing decoded bytes through the latter pointer can silently
+    // corrupt the test's assertions and is not a real output allocation.
+    let mut scratch = [0u8; 1];
+    strm.avail_out = test_c_uint_len(scratch.len());
+    strm.next_out = scratch.as_mut_ptr();
 
     let dict = [0u8; 257];
-    ret = unsafe { inflateSetDictionary(&raw mut strm, dict.as_ptr(), 257) };
+    // SAFETY: initialized stream and a live 257-byte dictionary fixture.
+    ret =
+        unsafe { inflateSetDictionary(&raw mut strm, dict.as_ptr(), test_c_uint_len(dict.len())) };
     assert_eq!(ret, Z_OK);
 
     // ------------------------------
@@ -805,34 +867,47 @@ fn cover_wrap() {
     let size = 2 * INFLATE_STATE_SIZE + 256;
     mem_limit(&mut strm, size);
 
+    // SAFETY: the initialized stream remains live; the bit pattern is
+    // supplied as a value, not a pointer.
     ret = unsafe { inflatePrime(&raw mut strm, 16, 0) };
     assert_eq!(ret, Z_OK);
 
     let mut input = [0x80u8, 0x00];
-    strm.avail_in = input.len() as _;
+    strm.avail_in = test_c_uint_len(input.len());
     strm.next_in = input.as_mut_ptr();
+    // SAFETY: next_in points to the currently live, bounded input fixture.
     ret = unsafe { inflateSync(&raw mut strm) };
     assert_eq!(ret, Z_DATA_ERROR);
 
+    // SAFETY: the input buffer and one-byte output scratch are disjoint
+    // live allocations, with capacities described in the z_stream fields.
     ret = unsafe { inflate(&raw mut strm, InflateFlush::NoFlush as _) };
     assert_eq!(ret, Z_STREAM_ERROR);
 
     let mut input = [0u8, 0, 0xFF, 0xFF];
-    strm.avail_in = input.len() as _;
+    strm.avail_in = test_c_uint_len(input.len());
     strm.next_in = input.as_mut_ptr();
+    // SAFETY: next_in points to the currently live, bounded input fixture.
     ret = unsafe { inflateSync(&raw mut strm) };
     assert_eq!(ret, Z_OK);
+    // SAFETY: query a live initialized stream; the result is incidental
+    // to this allocation-failure regression.
     let _ = unsafe { inflateSyncPoint(&raw mut strm) };
 
     let mut copy = z_stream::default();
+    // SAFETY: source has valid live decoder state, destination is writable
+    // C stream storage. The active allocator limit forces Z_MEM_ERROR.
     ret = unsafe { inflateCopy(&raw mut copy, &raw const strm) };
     assert_eq!(ret, Z_MEM_ERROR);
 
     mem_limit(&mut strm, 0);
+    // SAFETY: no memory limit remains and the decoder state is live.
     ret = unsafe { inflateUndermine(&raw mut strm, 1) };
     assert_eq!(ret, Z_OK);
 
+    // SAFETY: read-only query on a live initialized decoder state.
     let _ = unsafe { inflateMark(&raw const strm) };
+    // SAFETY: the initialized stream is closed exactly once.
     ret = unsafe { inflateEnd(&raw mut strm) };
     assert_eq!(ret, Z_OK);
     mem_done(&mut strm);
@@ -4126,157 +4201,107 @@ fn inflate_copy_after_half_input() {
 fn inflate_validate_toggles_checksum_update() {
     let input = include_bytes!("test-data/compression-corpus/The fastest WASM zlib.md.gzip-9.gz");
 
-    // Check that `inflateValidate` toggles checksum updating.
-    //
-    // - decompress normally, the checksum should update
-    // - toggle, the checksum should not update
-    // - toggle again, the checksum should update
-    assert_eq_rs_ng!(unsafe {
-        let mut stream = MaybeUninit::<z_stream>::zeroed();
-        let ret = inflateInit2_(
-            stream.as_mut_ptr(),
-            16 + 15, // gzip + max window
-            zlibVersion(),
-            core::mem::size_of::<z_stream>() as c_int,
-        );
+    // The three passes must decode exactly the same complete gzip stream:
+    // checksum enabled, disabled, then explicitly toggled off and on again.
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable z_stream storage with matching ABI version/size.
+        let ret = unsafe {
+            inflateInit2_(
+                raw.as_mut_ptr(),
+                16 + 15,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
         assert_eq!(ret, Z_OK);
+        // SAFETY: successful initialization populated every stream field.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        let stream = stream.assume_init_mut();
+        let mut checks = Vec::new();
+        let mut reference_output: Option<Vec<u8>> = None;
+        for pass in 0..3 {
+            if pass != 0 {
+                // SAFETY: inflateReset reuses the existing initialized stream
+                // after the preceding run completed successfully.
+                assert_eq!(unsafe { inflateReset(stream) }, Z_OK);
+            }
+            let validate = if pass == 1 { 0 } else { 1 };
+            if pass == 2 {
+                // This third run exercises the *transition* back to enabled,
+                // not just starting with validation already enabled.
+                // SAFETY: the initialized decoder has no pending input.
+                assert_eq!(unsafe { inflateValidate(stream, 0) }, Z_OK);
+            }
+            // SAFETY: control call on a live initialized inflate stream.
+            assert_eq!(unsafe { inflateValidate(stream, validate) }, Z_OK);
 
-        let mut out1 = vec![0u8; 16 * 1024];
-        let mut out2 = vec![0u8; 16 * 1024];
-        let mut out3 = vec![0u8; 16 * 1024];
-
-        let check1 = {
-            let ret = inflateValidate(stream, 1);
-            assert_eq!(ret, Z_OK);
-
+            let mut out = vec![0u8; 1024];
             stream.next_in = input.as_ptr().cast_mut();
-            stream.avail_in = input.len() as _;
-            stream.next_out = out1.as_mut_ptr();
-            stream.avail_out = out1.len() as _;
+            stream.avail_in = test_c_uint_len(input.len());
+            stream.next_out = out.as_mut_ptr();
+            stream.avail_out = test_c_uint_len(out.len());
 
-            let ret = loop {
-                let ret = inflate(stream, InflateFlush::NoFlush as _);
-
+            loop {
+                let before_in = stream.avail_in;
+                let before_out = stream.total_out;
+                // SAFETY: the compressed input is live and immutable, and
+                // next_out points into a disjoint writable output allocation.
+                let ret = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
                 assert!(
                     matches!(ret, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
-                    "unexpected inflate return (run 1): {}",
-                    ret
+                    "unexpected inflate return on validation pass {pass}: {ret}"
                 );
-
-                if matches!(ret, Z_STREAM_END) {
-                    break ret;
-                }
-
-                if stream.avail_in == 0 {
-                    break ret;
+                if ret == Z_STREAM_END {
+                    break;
                 }
 
                 if stream.avail_out == 0 {
-                    unreachable!("run 1: not enough output space");
+                    let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+                    assert_eq!(produced, out.len(), "invalid output position");
+                    let old_len = out.len();
+                    let new_len = old_len.checked_mul(2).unwrap_or(old_len);
+                    assert!(new_len > old_len, "output capacity overflow");
+                    out.resize(new_len, 0);
+                    stream.next_out = out[produced..].as_mut_ptr();
+                    stream.avail_out = test_c_uint_len(new_len - produced);
+                } else {
+                    assert!(
+                        stream.avail_in < before_in || stream.total_out > before_out,
+                        "decoder stalled during validation pass {pass}"
+                    );
                 }
-            };
-
-            assert_eq!(ret, Z_STREAM_END);
-            out1.truncate(stream.total_out as usize);
-            stream.adler
-        };
-
-        assert_eq!(inflateReset(stream), Z_OK);
-
-        let check2 = {
-            let ret = inflateValidate(stream, 0);
-            assert_eq!(ret, Z_OK);
-
-            stream.next_in = input.as_ptr().cast_mut();
-            stream.avail_in = input.len() as _;
-            stream.next_out = out2.as_mut_ptr();
-            stream.avail_out = out2.len() as _;
-
-            let ret = loop {
-                let ret = inflate(stream, InflateFlush::NoFlush as _);
-
                 assert!(
-                    matches!(ret, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
-                    "unexpected inflate return (run 2): {}",
-                    ret
+                    stream.avail_in != 0 || stream.avail_out != 0,
+                    "decoder exhausted input without reaching stream end on pass {pass}"
                 );
+            }
 
-                if matches!(ret, Z_STREAM_END) {
-                    break ret;
-                }
+            assert_eq!(stream.avail_in, 0, "gzip trailer not fully consumed");
+            assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+            let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(produced <= out.len(), "inflate wrote beyond output");
+            out.truncate(produced);
 
-                if stream.avail_in == 0 {
-                    break ret;
-                }
+            // Fixed external reference generated with the system zlib gzip
+            // decoder. Even with checksum validation disabled, output bytes
+            // must remain exactly correct.
+            assert_eq!(out.len(), 5929);
+            assert_eq!(zlib_rs::crc32::crc32(0, &out), 0xefc2_9986);
+            if let Some(previous) = &reference_output {
+                assert_eq!(&out, previous, "validation toggle altered plaintext");
+            } else {
+                reference_output = Some(out);
+            }
+            checks.push(stream.adler);
+        }
 
-                if stream.avail_out == 0 {
-                    unreachable!("run 2: not enough output space");
-                }
-            };
-
-            assert_eq!(ret, Z_STREAM_END);
-            out2.truncate(stream.total_out as usize);
-            stream.adler
-        };
-
-        // Output must be identical, regardless of validation.
-        assert_eq!(out1, out2);
-
-        assert_ne!(
-            check1, check2,
-            "checksum with validation disabled unexpectedly matches the validated checksum",
-        );
-
-        assert_eq!(inflateReset(stream), Z_OK);
-
-        let check3 = {
-            let ret = inflateValidate(stream, 0);
-            assert_eq!(ret, Z_OK);
-            let ret = inflateValidate(stream, 1);
-            assert_eq!(ret, Z_OK);
-
-            stream.next_in = input.as_ptr().cast_mut();
-            stream.avail_in = input.len() as _;
-            stream.next_out = out3.as_mut_ptr();
-            stream.avail_out = out3.len() as _;
-
-            let ret = loop {
-                let ret = inflate(stream, InflateFlush::NoFlush as _);
-
-                assert!(
-                    matches!(ret, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
-                    "unexpected inflate return (run 3): {}",
-                    ret
-                );
-
-                if matches!(ret, Z_STREAM_END) {
-                    break ret;
-                }
-
-                if stream.avail_in == 0 {
-                    break ret;
-                }
-
-                if stream.avail_out == 0 {
-                    unreachable!("run 3: not enough output space");
-                }
-            };
-
-            assert_eq!(ret, Z_STREAM_END);
-            out3.truncate(stream.total_out as usize);
-            stream.adler
-        };
-
-        assert_eq!(out1, out3);
-
-        // With validation back on, checksum should again match the first run
-        assert_eq!(
-            check1, check3,
-            "checksum with validation re-enabled does not match validated run"
-        );
-
-        assert_eq!(inflateEnd(stream), Z_OK);
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0], 0xefc2_9986, "validated gzip CRC mismatch");
+        assert_ne!(checks[0], checks[1], "disabling validation had no effect");
+        assert_eq!(checks[0], checks[2], "re-enabling validation changed CRC");
+        // SAFETY: all three complete runs used the same live stream, closed
+        // exactly once after the last pass.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
     });
 }
