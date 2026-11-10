@@ -1693,23 +1693,30 @@ fn cover_cve_2022_37434() {
 fn uncompress_help(input: &[u8]) -> Vec<u8> {
     use libz_rs_sys::*;
 
-    let mut dest_vec = vec![0u8; 1 << 16];
+    let mut decoded = vec![0u8; 1 << 16];
+    let mut decoded_len = test_c_ulong_len(decoded.len());
 
-    let mut dest_len = dest_vec.len() as c_ulong;
-    let dest = dest_vec.as_mut_ptr();
-
-    let source = input.as_ptr();
-    let source_len = input.len() as _;
-
-    let err = unsafe { uncompress(dest, &raw mut dest_len, source, source_len) };
-
-    if err != 0 {
-        panic!("error {:?}", ReturnCode::from(err));
-    }
-
-    dest_vec.truncate(dest_len as usize);
-
-    dest_vec
+    // SAFETY: the compressed input and writable output allocations are
+    // disjoint and live through this synchronous C call, and their actual
+    // capacities are represented without narrowing in c_ulong.
+    let status = unsafe {
+        uncompress(
+            decoded.as_mut_ptr(),
+            &raw mut decoded_len,
+            input.as_ptr(),
+            test_c_ulong_len(input.len()),
+        )
+    };
+    assert_eq!(
+        status,
+        Z_OK,
+        "uncompress failed: {:?}",
+        ReturnCode::from(status)
+    );
+    let size = usize::try_from(decoded_len).unwrap_or(usize::MAX);
+    assert!(size <= decoded.len(), "uncompress exceeded output capacity");
+    decoded.truncate(size);
+    decoded
 }
 
 #[test]
@@ -1727,28 +1734,31 @@ fn hello_world_uncompressed() {
 #[test]
 fn copy_direct_from_next_in_to_next_out() {
     assert_eq_rs_ng!({
+        // Stored block: precisely two decoded bytes, with no trailing
+        // compressed input ignored by the uncompress2 API.
         let input = [120, 1, 1, 2, 0, 253, 255, 6, 10, 0, 24, 0, 17];
-        let output = [6u8, 10];
-        let mut dest_vec = vec![0u8; 1 << 16];
+        let expected = [6u8, 10];
+        let mut output = vec![0u8; 1 << 16];
+        let mut output_len = test_c_ulong_len(output.len());
+        let mut input_len = test_c_ulong_len(input.len());
 
-        let mut dest_len = dest_vec.len() as c_ulong;
-        let dest = dest_vec.as_mut_ptr();
-
-        let source = input.as_ptr();
-        let mut source_len = input.len() as c_ulong;
-
-        let err = unsafe { uncompress2(dest, &raw mut dest_len, source, &raw mut source_len) };
-
-        if err != 0 {
-            panic!("error {:?}", ReturnCode::from(err));
-        }
-
-        assert_eq!(dest_len as usize, output.len());
-        assert_eq!(source_len as usize, input.len());
-
-        dest_vec.truncate(dest_len as usize);
-
-        assert_eq!(dest_vec, output);
+        // SAFETY: the source is a live immutable compressed fixture and
+        // destination is a distinct live writable allocation. Each C length
+        // pointer refers to independently owned writable local storage.
+        let status = unsafe {
+            uncompress2(
+                output.as_mut_ptr(),
+                &raw mut output_len,
+                input.as_ptr(),
+                &raw mut input_len,
+            )
+        };
+        assert_eq!(status, Z_OK, "stored block uncompress failed");
+        assert_eq!(usize::try_from(input_len), Ok(input.len()));
+        assert_eq!(usize::try_from(output_len), Ok(expected.len()));
+        assert_eq!(&output[..expected.len()], &expected);
+        output.truncate(expected.len());
+        output
     });
 }
 
@@ -3216,15 +3226,26 @@ fn issue_172() {
 }
 #[test]
 fn header_configured_but_no_gzip() {
+    // This is raw DEFLATE rather than a gzip member. Registering a gzip
+    // header receiver must not trick automatic wrapper detection into
+    // accepting the input or writing unexpected output bytes.
     let input: &[u8] = &[0x63, 0x18, 0x68, 0x30, 0xd0, 0x0, 0x0];
 
-    assert_eq_rs_ng!(unsafe {
-        let mut stream = MaybeUninit::<z_stream>::zeroed();
-
-        let init_err = { inflateInit2_(stream.as_mut_ptr(), 47, VERSION, STREAM_SIZE) };
-        assert_eq!(init_err, Z_OK);
-
-        let stream = stream.assume_init_mut();
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable C stream storage, valid auto-wrapper mode,
+        // correct version and checked structure size.
+        let status = unsafe {
+            inflateInit2_(
+                raw.as_mut_ptr(),
+                47,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(status, Z_OK);
+        // SAFETY: successful inflateInit2_ initialized the whole C stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
         let mut header = gz_header {
             text: 0,
@@ -3242,25 +3263,33 @@ fn header_configured_but_no_gzip() {
             done: 123,
         };
 
-        let ret = { inflateGetHeader(stream, &raw mut header) };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+        // SAFETY: the live C stream and writable header struct remain
+        // valid throughout header registration and the following decode.
+        let status = unsafe { inflateGetHeader(stream, &raw mut header) };
+        assert_eq!(status, Z_OK);
 
-        stream.avail_in = input.len() as _;
+        stream.avail_in = test_c_uint_len(input.len());
         stream.next_in = input.as_ptr().cast_mut();
 
-        let mut out = [0u8; 32];
-        stream.avail_out = out.len() as _;
-        stream.next_out = out.as_mut_ptr();
+        let mut output = [0xa5u8; 32];
+        stream.avail_out = test_c_uint_len(output.len());
+        stream.next_out = output.as_mut_ptr();
 
-        let ret = { inflate(stream, InflateFlush::NoFlush as _) };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::DataError);
+        // SAFETY: the bounded input bytes and writable output array are
+        // disjoint and live for this synchronous inflate call.
+        let status = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+        assert_eq!(status, Z_DATA_ERROR);
+        assert_eq!(stream.total_out, 0);
+        assert_eq!(output, [0xa5u8; 32]);
+        assert!(usize::try_from(stream.total_in).unwrap_or(usize::MAX) <= input.len());
 
-        let ret = { inflateEnd(stream) };
-        assert_eq!(ret, Z_OK);
-
-        // we did set a gzip header, but the data is not gzip.
+        // The requested header was not a gzip header; its done flag must
+        // report that, instead of silently retaining the caller's 123.
         assert_eq!(header.done, -1);
-    })
+        // SAFETY: the successfully initialized C stream is ended once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+        (status, header.done)
+    });
 }
 
 #[test]
@@ -3759,7 +3788,7 @@ fn test_dict_inflate() {
 mod stable_api {
     use zlib_rs::{
         deflate::{compress_slice, DeflateConfig},
-        InflateError, ReturnCode,
+        InflateError, ReturnCode, Status,
     };
 
     fn with_window_bits(n: i32) {
@@ -3768,23 +3797,23 @@ mod stable_api {
             ..DeflateConfig::default()
         };
 
-        let mut output = [0u8; 64];
-        let input = "Hello World!";
-        let (compressed, ret) = compress_slice(&mut output, input.as_bytes(), config);
+        let mut compressed_buffer = [0u8; 64];
+        let input = b"Hello World!";
+        let (compressed, ret) = compress_slice(&mut compressed_buffer, input, config);
         assert_eq!(ret, ReturnCode::Ok);
 
         let mut decompressed = [0u8; 64];
-        let mut inflate = zlib_rs::Inflate::new(n >= 0, n.unsigned_abs() as u8);
-        inflate
-            .decompress(compressed, &mut decompressed, zlib_rs::InflateFlush::Finish)
-            .unwrap();
-
-        assert_eq!(inflate.total_in() as usize, compressed.len());
-
+        let window_bits = u8::try_from(n.unsigned_abs()).unwrap_or(0);
+        assert_ne!(window_bits, 0, "invalid test window bits");
+        let mut decoder = zlib_rs::Inflate::new(n >= 0, window_bits);
         assert_eq!(
-            &decompressed[..inflate.total_out() as usize],
-            input.as_bytes()
+            decoder.decompress(compressed, &mut decompressed, zlib_rs::InflateFlush::Finish),
+            Ok(Status::StreamEnd),
+            "decoder did not complete the compressed member"
         );
+        assert_eq!(usize::try_from(decoder.total_in()), Ok(compressed.len()));
+        assert_eq!(usize::try_from(decoder.total_out()), Ok(input.len()));
+        assert_eq!(&decompressed[..input.len()], input);
     }
 
     #[test]
@@ -3843,61 +3872,69 @@ mod stable_api {
 
     #[test]
     fn reset_reuse() {
-        let input1 = "Hello World!";
-        let input2 = "Goodbye World!";
+        let first = b"Hello World!";
+        let second = b"Goodbye World!";
 
-        let mut output1 = [0u8; 64];
-        let config1 = DeflateConfig {
-            window_bits: 15,
-            ..DeflateConfig::default()
-        };
-        let (compressed1, ret) = compress_slice(&mut output1, input1.as_bytes(), config1);
-        assert_eq!(ret, ReturnCode::Ok);
-
-        let mut output2 = [0u8; 64];
-        let config2 = DeflateConfig {
-            window_bits: -15,
-            ..DeflateConfig::default()
-        };
-        let (compressed2, ret) = compress_slice(&mut output2, input2.as_bytes(), config2);
-        assert_eq!(ret, ReturnCode::Ok);
-
-        // Start with header enabled.
-        let zlib_header_first = true;
-        let mut inflate = zlib_rs::Inflate::new(zlib_header_first, 15);
-
-        let mut decompressed1 = [0u8; 64];
-        inflate
-            .decompress(
-                compressed1,
-                &mut decompressed1,
-                zlib_rs::InflateFlush::Finish,
-            )
-            .unwrap();
-
-        assert_eq!(inflate.total_in() as usize, compressed1.len());
-        assert_eq!(
-            &decompressed1[..inflate.total_out() as usize],
-            input1.as_bytes()
+        let mut first_compressed = [0u8; 64];
+        let (first_stream, status) = compress_slice(
+            &mut first_compressed,
+            first,
+            DeflateConfig {
+                window_bits: 15,
+                ..DeflateConfig::default()
+            },
         );
+        assert_eq!(status, ReturnCode::Ok);
 
-        // Reset for a *raw* stream: swap the zlib_header flag.
-        inflate.reset(!zlib_header_first);
-
-        let mut decompressed2 = [0u8; 64];
-        inflate
-            .decompress(
-                compressed2,
-                &mut decompressed2,
-                zlib_rs::InflateFlush::Finish,
-            )
-            .unwrap();
-
-        assert_eq!(inflate.total_in() as usize, compressed2.len());
-        assert_eq!(
-            &decompressed2[..inflate.total_out() as usize],
-            input2.as_bytes()
+        let mut second_compressed = [0u8; 64];
+        let (second_stream, status) = compress_slice(
+            &mut second_compressed,
+            second,
+            DeflateConfig {
+                window_bits: -15,
+                ..DeflateConfig::default()
+            },
         );
+        assert_eq!(status, ReturnCode::Ok);
+
+        // First complete a wrapped zlib stream.
+        let mut decoder = zlib_rs::Inflate::new(true, 15);
+        let mut decoded = [0xa5u8; 64];
+        assert_eq!(
+            decoder.decompress(first_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        assert_eq!(usize::try_from(decoder.total_in()), Ok(first_stream.len()));
+        assert_eq!(usize::try_from(decoder.total_out()), Ok(first.len()));
+        assert_eq!(&decoded[..first.len()], first);
+
+        // Reuse the very same decoder for a raw DEFLATE stream. Reset
+        // must clear counters and old wrapper state before the new call.
+        decoder.reset(false);
+        assert_eq!(decoder.total_in(), 0);
+        assert_eq!(decoder.total_out(), 0);
+        decoded.fill(0xa5);
+        assert_eq!(
+            decoder.decompress(second_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        assert_eq!(usize::try_from(decoder.total_in()), Ok(second_stream.len()));
+        assert_eq!(usize::try_from(decoder.total_out()), Ok(second.len()));
+        assert_eq!(&decoded[..second.len()], second);
+
+        // Switching the same decoder back to wrapped mode catches stale
+        // raw-state history which a one-way reset cannot reveal.
+        decoder.reset(true);
+        assert_eq!(decoder.total_in(), 0);
+        assert_eq!(decoder.total_out(), 0);
+        decoded.fill(0xa5);
+        assert_eq!(
+            decoder.decompress(first_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        assert_eq!(usize::try_from(decoder.total_in()), Ok(first_stream.len()));
+        assert_eq!(usize::try_from(decoder.total_out()), Ok(first.len()));
+        assert_eq!(&decoded[..first.len()], first);
     }
 
     #[test]
