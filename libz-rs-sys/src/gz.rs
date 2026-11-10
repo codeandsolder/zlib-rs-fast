@@ -23,10 +23,6 @@ use zlib_rs::MAX_WBITS;
 // For ABI compatibility with zlib and zlib-ng, the first fields in [`GzState`] match
 // what would be in the C version of [`gzFile_s`]. But we don't want new users to rely
 // on this internal implementation, so the Rust [`gzFile_s`] is intentionally opaque.
-#[expect(
-    non_camel_case_types,
-    reason = "gzFile_s preserves the opaque zlib handle ABI name"
-)]
 #[repr(C)]
 pub struct gzFile_s {
     _private: [u8; 0],
