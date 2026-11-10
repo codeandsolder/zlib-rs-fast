@@ -3921,147 +3921,203 @@ fn done_state_returns_stream_end() {
 
 #[test]
 fn inflate_copy_does_not_require_live_io_pointers() {
-    let result = assert_eq_rs_ng!(unsafe {
-        let mut source = MaybeUninit::<z_stream>::zeroed();
-        let ret = inflateInit_(
-            source.as_mut_ptr(),
-            zlibVersion(),
-            core::mem::size_of::<z_stream>() as c_int,
-        );
+    assert_eq_rs_ng!({
+        let mut raw_source = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable stream storage and matching C ABI metadata.
+        let ret = unsafe {
+            inflateInit_(
+                raw_source.as_mut_ptr(),
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
         assert_eq!(ret, Z_OK);
+        // SAFETY: inflateInit_ successfully initialized the whole stream.
+        let source = unsafe { raw_source.assume_init_mut() };
 
-        let source = source.assume_init_mut();
+        // inflateCopy must copy stream metadata without dereferencing I/O
+        // pointers: this intentionally has a NULL input with avail_in > 0.
         source.next_in = core::ptr::null_mut();
         source.avail_in = 7;
         source.next_out = core::ptr::null_mut();
         source.avail_out = 0;
 
-        let mut copy = MaybeUninit::<z_stream>::zeroed();
-        let ret = inflateCopy(copy.as_mut_ptr(), source);
-        if ret == Z_OK {
-            let _ = inflateEnd(copy.as_mut_ptr());
-        }
-        let _ = inflateEnd(source);
-        ret
-    });
+        let mut raw_copy = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: source owns live inflate state; copying the state does not
+        // require dereferencing its intentionally absent I/O buffers.
+        let ret = unsafe { inflateCopy(raw_copy.as_mut_ptr(), source) };
+        assert_eq!(ret, Z_OK);
+        // SAFETY: successful inflateCopy initialized the entire destination.
+        let copy = unsafe { raw_copy.assume_init_mut() };
 
-    assert_eq!(result, libz_rs_sys::Z_OK);
+        assert!(copy.next_in.is_null());
+        assert!(copy.next_out.is_null());
+        assert_eq!(copy.avail_in, source.avail_in);
+        assert_eq!(copy.avail_out, source.avail_out);
+        assert_eq!(copy.total_in, source.total_in);
+        assert_eq!(copy.total_out, source.total_out);
+        assert_ne!(
+            copy.state, source.state,
+            "inflateCopy must own distinct state"
+        );
+
+        // SAFETY: each initialized decoder owns distinct state; close both
+        // exactly once without ever trying to decode through NULL I/O spans.
+        assert_eq!(unsafe { inflateEnd(copy) }, Z_OK);
+        // SAFETY: the live original decoder has not yet been closed.
+        assert_eq!(unsafe { inflateEnd(source) }, Z_OK);
+    });
 }
 
 #[test]
 fn inflate_copy_after_half_input() {
     let input = include_bytes!("test-data/compression-corpus/The fastest WASM zlib.md.gzip-9.gz");
 
-    let _ = assert_eq_rs_ng!(unsafe {
-        let mut stream = MaybeUninit::<z_stream>::zeroed();
-        let ret = {
+    assert_eq_rs_ng!({
+        // Preserve the prefix already written when the output Vec grows.
+        // A small initial buffer exercises reallocation on this fixture.
+        fn grow_output(stream: &mut z_stream, output: &mut Vec<u8>) {
+            assert_eq!(stream.avail_out, 0, "grow only after exhausting output");
+            let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert_eq!(used, output.len(), "output pointer and count disagree");
+            let old_len = output.len();
+            let new_len = old_len.checked_mul(2).unwrap_or(old_len);
+            assert!(new_len > old_len, "inflate output size overflow");
+            output.resize(new_len, 0);
+            stream.next_out = output[used..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(new_len - used);
+        }
+
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable C stream storage and matching version/structure size.
+        let ret = unsafe {
             inflateInit2_(
-                stream.as_mut_ptr(),
+                raw.as_mut_ptr(),
                 16 + 15,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as i32,
+                test_c_stream_size::<z_stream>(),
             )
         };
-        let stream = stream.assume_init_mut();
         assert_eq!(ret, Z_OK);
+        // SAFETY: successful inflateInit2_ initialized the entire C stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        let mut out = vec![0u8; 16 * 1024];
-
-        // First, decompress only the first half of the compressed input.
+        let mut out = vec![0u8; 1024];
         let half = input.len() / 2;
-
+        assert!(half > 0 && half < input.len());
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = half as _;
+        stream.avail_in = test_c_uint_len(half);
         stream.next_out = out.as_mut_ptr();
-        stream.avail_out = out.len() as _;
+        stream.avail_out = test_c_uint_len(out.len());
+
+        // Decode the entire first offered half, without assuming every call
+        // consumes all input or has enough available output space.
+        loop {
+            let input_before = stream.avail_in;
+            let output_before = stream.total_out;
+            // SAFETY: input is a live slice of the fixture and output points
+            // to the disjoint, live writable suffix of out.
+            let ret = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+            assert!(
+                matches!(ret, Z_OK | Z_BUF_ERROR),
+                "first half unexpectedly ended or failed: {ret}"
+            );
+            if stream.avail_out == 0 {
+                grow_output(stream, &mut out);
+            }
+            if stream.avail_in == 0 {
+                break;
+            }
+            assert!(
+                stream.avail_in < input_before || stream.total_out > output_before,
+                "inflate stalled before consuming the first half"
+            );
+        }
+        assert_eq!(usize::try_from(stream.total_in), Ok(half));
+
+        let prefix_len = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(prefix_len <= out.len());
+
+        // Make an independent decoder copy only after the source init and
+        // the state-copy call have both returned success.
+        let mut raw_copy = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: inflateCopy receives a fully initialized source stream and
+        // writable destination; source internal state is valid and live.
+        let ret = unsafe { inflateCopy(raw_copy.as_mut_ptr(), stream) };
+        assert_eq!(ret, Z_OK);
+        // SAFETY: successful inflateCopy initialized the copy's full ABI state.
+        let copy = unsafe { raw_copy.assume_init_mut() };
+        assert_eq!(copy.total_in, stream.total_in);
+        assert_eq!(copy.total_out, stream.total_out);
+
+        // Copy the already-decoded prefix and redirect the copied stream's
+        // output pointer to its own allocation, not the original allocation.
+        let mut out_copy = out.clone();
+        copy.next_out = out_copy[prefix_len..].as_mut_ptr();
+        copy.avail_out = test_c_uint_len(out_copy.len() - prefix_len);
+
+        let remainder = &input[half..];
+        stream.next_in = remainder.as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(remainder.len());
+        copy.next_in = stream.next_in;
+        copy.avail_in = stream.avail_in;
 
         loop {
-            let ret = { inflate(stream, InflateFlush::NoFlush as _) };
+            let input_before = stream.avail_in;
+            let output_before = stream.total_out;
 
+            // SAFETY: each independent initialized decoder reads the same
+            // live compressed suffix, but writes into its own output Vec.
+            let ret1 = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
+            // SAFETY: the cloned decoder owns its own internal state and its
+            // next_out pointer refers to its distinct output allocation.
+            let ret2 = unsafe { inflate(copy, InflateFlush::NoFlush as _) };
+
+            assert_eq!(ret1, ret2, "copied decoder returned a different status");
             assert!(
-                matches!(ret, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
-                "unexpected inflate return: {}",
-                ret
+                matches!(ret1, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
+                "unexpected inflate status after state copy: {ret1}"
             );
+            assert_eq!(stream.total_in, copy.total_in);
+            assert_eq!(stream.total_out, copy.total_out);
+            assert_eq!(stream.avail_in, copy.avail_in);
+            assert_eq!(stream.avail_out, copy.avail_out);
 
-            if matches!(ret, Z_STREAM_END) {
-                unreachable!("we only provide half of the input")
-            }
-
-            if stream.avail_in == 0 {
+            if ret1 == Z_STREAM_END {
                 break;
             }
 
             if stream.avail_out == 0 {
-                unreachable!("there is enough output space")
+                grow_output(stream, &mut out);
+                grow_output(copy, &mut out_copy);
+            } else {
+                assert!(
+                    stream.avail_in < input_before || stream.total_out > output_before,
+                    "copied inflate streams stalled before reaching Z_STREAM_END"
+                );
             }
         }
 
-        // At this point, we’ve decompressed part (or possibly all) of the stream.
-        let prefix_len = stream.total_out as usize;
+        assert_eq!(stream.avail_in, 0, "gzip trailer left unconsumed");
+        assert_eq!(copy.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+        assert_eq!(stream.total_out, copy.total_out);
 
-        // Make a copy of the inflate state *after* half the input has been processed.
-        let mut copy = MaybeUninit::<z_stream>::zeroed();
-        let ret = { inflateCopy(copy.as_mut_ptr(), stream) };
-        let copy = copy.assume_init_mut();
-        assert_eq!(ret, Z_OK);
-
-        // Prepare a separate output buffer for the copy, and copy the already-produced prefix
-        let mut out_copy = vec![0u8; 16 * 1024];
-        out_copy[..prefix_len].copy_from_slice(&out[..prefix_len]);
-
-        // The original stream already has next_out pointing at out[prefix_len].
-        // For the copy, we need to point it at the corresponding location in out_copy.
-        copy.next_out = out_copy.as_mut_ptr().add(prefix_len);
-        copy.avail_out = (out_copy.len() - prefix_len) as _;
-
-        // Now feed the *remainder* of the compressed input to both streams.
-        let remaining = input.len() - half;
-        if remaining > 0 {
-            stream.next_in = input.as_ptr().add(half).cast_mut();
-            stream.avail_in = remaining as _;
-
-            copy.next_in = stream.next_in;
-            copy.avail_in = stream.avail_in;
-        }
-
-        // Decompress the remainder in lockstep on both the original and the copy.
-        loop {
-            let ret1 = { inflate(stream, InflateFlush::NoFlush as _) };
-            let ret2 = { inflate(copy, InflateFlush::NoFlush as _) };
-
-            // Both streams should behave identically
-            assert_eq!(ret1, ret2);
-            assert!(
-                matches!(ret1, Z_OK | Z_BUF_ERROR | Z_STREAM_END),
-                "unexpected inflate return: {ret}",
-            );
-
-            // Their accounting should remain in sync at all times
-            assert_eq!(stream.total_out, copy.total_out);
-            assert_eq!(stream.total_in, copy.total_in);
-
-            if matches!(ret1, Z_STREAM_END) {
-                break;
-            }
-
-            // If we somehow run out of input or output space, bail
-            if stream.avail_in == 0 && copy.avail_in == 0 {
-                break;
-            }
-            if stream.avail_out == 0 || copy.avail_out == 0 {
-                break;
-            }
-        }
-
-        assert_eq!({ inflateEnd(stream) }, Z_OK);
-        assert_eq!({ inflateEnd(copy) }, Z_OK);
-
-        let total = stream.total_out as usize;
-        assert_eq!(total, copy.total_out as usize);
-
+        let total = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(total <= out.len() && total <= out_copy.len());
         assert_eq!(&out[..total], &out_copy[..total]);
+        // Independently measured with the reference zlib gzip decoder.
+        assert_eq!(
+            total, 5929,
+            "copied streams did not decode the entire fixture"
+        );
+        assert_eq!(zlib_rs::crc32::crc32(0, &out[..total]), 0xefc2_9986);
 
+        // SAFETY: source and copied streams are distinct, successfully
+        // initialized states and each is ended exactly once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+        // SAFETY: the copied stream has not yet been ended.
+        assert_eq!(unsafe { inflateEnd(copy) }, Z_OK);
         out[..total].to_vec()
     });
 }
