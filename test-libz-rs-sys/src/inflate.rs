@@ -477,6 +477,8 @@ fn gzip_header_check() {
 
     // A gzip-header parsing test must fail if decoder initialization fails,
     // rather than silently skipping all assertions after the error.
+    // SAFETY: mem_setup supplies the correct allocator callbacks and
+    // live writable C stream storage for the gzip-wrapper decoder.
     let init_err = unsafe { inflateInit2_(&raw mut stream, 47, VERSION, STREAM_SIZE) };
     assert_eq!(init_err, Z_OK, "gzip header decoder initialization failed");
 
@@ -494,30 +496,38 @@ fn gzip_header_check() {
         os: 0,
         extra: extra.as_mut_ptr(),
         extra_len: 0,
-        extra_max: 14,
+        extra_max: test_c_uint_len(extra.len()),
         name: name.as_mut_ptr(),
-        name_max: 9,
+        name_max: test_c_uint_len(name.len()),
         comment: comment.as_mut_ptr(),
-        comm_max: 10,
+        comm_max: test_c_uint_len(comment.len()),
         hcrc: 0,
         done: 0,
     };
 
+    // SAFETY: initialized stream and valid writable gzip header whose
+    // metadata pointers refer to the live caller-owned arrays.
     let ret = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
     assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
-    stream.avail_in = u32::try_from(input.len()).unwrap_or(u32::MAX);
+    stream.avail_in = test_c_uint_len(input.len());
     stream.next_in = input.as_ptr().cast_mut();
 
-    stream.avail_out = len as _;
+    stream.avail_out = test_c_uint_len(out.len());
     stream.next_out = out.as_mut_ptr();
 
+    // SAFETY: all input bytes and one writable output byte remain live,
+    // with accurate advertised C byte counts.
     let ret = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) };
 
     assert_eq!(ret, Z_OK);
+    assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+    assert_eq!(stream.avail_in, 0, "gzip header input was not consumed");
+    assert_eq!(stream.total_out, 0, "header-only gzip emitted payload");
+    assert_eq!(out, [0u8; 1], "gzip header unexpectedly wrote output");
 
     assert_eq!(header.text, 1);
-    assert_eq!(header.time, 1699023428);
+    assert_eq!(header.time, 1_699_023_428);
     assert_eq!(header.os, 3);
     assert_eq!(header.hcrc, 1);
     assert_eq!(header.done, 1);
@@ -531,9 +541,12 @@ fn gzip_header_check() {
     let extra_bytes = [84, 71, 10, 0, 69, 88, 84, 82, 65, 32, 68, 65, 84, 65];
     assert_eq!(extra_bytes, extra);
 
+    // SAFETY: the decoder remains initialized; test raw-mode reset after
+    // successfully processing the complete gzip metadata.
     let ret = unsafe { inflateReset2(&raw mut stream, -8) };
     assert_eq!(ret, Z_OK);
 
+    // SAFETY: the initialized stream is closed exactly once.
     let ret = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(ret, Z_OK);
 
@@ -736,7 +749,7 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
                 raw.as_mut_ptr(),
                 -15,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                test_c_stream_size::<z_stream>(),
             )
         },
         Z_OK,
@@ -771,13 +784,7 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     let valid = b"raw dictionary history";
     // SAFETY: valid is readable and remains live for the duration of the call.
     assert_eq!(
-        unsafe {
-            inflateSetDictionary(
-                stream,
-                valid.as_ptr(),
-                c_uint::try_from(valid.len()).unwrap_or(c_uint::MAX),
-            )
-        },
+        unsafe { inflateSetDictionary(stream, valid.as_ptr(), test_c_uint_len(valid.len()),) },
         Z_OK,
     );
     let mut recovered = [0u8; 64];
@@ -788,6 +795,25 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     );
     assert_eq!(usize::try_from(length_after).ok(), Some(valid.len()));
     assert_eq!(&recovered[..valid.len()], valid);
+
+    // Rejecting a NULL nonzero dictionary must leave existing window bytes
+    // untouched too, not just an initially empty dictionary's length.
+    // SAFETY: NULL with nonzero length is deliberately rejected before any
+    // read; the stream already contains a valid dictionary.
+    assert_eq!(
+        unsafe { inflateSetDictionary(stream, core::ptr::null(), 1) },
+        Z_STREAM_ERROR
+    );
+    recovered.fill(0xa5);
+    // SAFETY: the destination spans the complete live 64-byte buffer and
+    // the stream remains initialized with its original valid history.
+    assert_eq!(
+        unsafe { inflateGetDictionary(stream, recovered.as_mut_ptr(), &raw mut length_after) },
+        Z_OK
+    );
+    assert_eq!(usize::try_from(length_after), Ok(valid.len()));
+    assert_eq!(&recovered[..valid.len()], valid);
+
     // SAFETY: end the initialized stream exactly once.
     assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
 }
@@ -2776,56 +2802,75 @@ fn issue_109() {
 
 #[test]
 fn window_match_bug() {
-    // this hit some invalid logic in the inflate `match_` function where invalid bytes were copied
-    // to the current output position.
-    let input = &include_bytes!("test-data/window-match-bug.zraw");
+    // Regression for a match-copy error that wrote incorrect bytes at the
+    // current output cursor. The expected full output was independently
+    // decoded using reference zlib with raw DEFLATE window_bits=-10.
+    let input = include_bytes!("test-data/window-match-bug.zraw");
+    let output = assert_eq_rs_ng!({
+        let mut decoded = Vec::with_capacity(1 << 15);
+        let mut scratch = [0u8; 402];
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
 
-    let window_bits = -10;
-
-    assert_eq_rs_ng!(unsafe {
-        let mut output: Vec<u8> = Vec::with_capacity(1 << 15);
-        let mut buf = [0; 402];
-
-        let mut stream = MaybeUninit::<z_stream>::zeroed();
-
-        let err = {
+        // SAFETY: writable C stream storage, raw-DEFLATE window mode,
+        // matching ABI version and checked stream structure size.
+        let err = unsafe {
             inflateInit2_(
-                stream.as_mut_ptr(),
-                window_bits,
+                raw.as_mut_ptr(),
+                -10,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let stream = { stream.assume_init_mut() };
-
+        // SAFETY: successful inflateInit2_ initialized every stream field.
+        let stream = unsafe { raw.assume_init_mut() };
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
+        stream.avail_in = test_c_uint_len(input.len());
 
         loop {
-            stream.next_out = buf.as_mut_ptr();
-            stream.avail_out = buf.len() as _;
+            stream.next_out = scratch.as_mut_ptr();
+            stream.avail_out = test_c_uint_len(scratch.len());
+            let remaining_before = stream.avail_in;
 
-            let err = { inflate(stream, InflateFlush::Finish as _) };
-
-            output.extend(&buf[..buf.len() - stream.avail_out as usize]);
+            // SAFETY: input and independent writable scratch remain live
+            // throughout each synchronous decoder invocation.
+            let err = unsafe { inflate(stream, InflateFlush::Finish as _) };
+            let remaining_out = usize::try_from(stream.avail_out).unwrap_or(usize::MAX);
+            assert!(remaining_out <= scratch.len(), "invalid output capacity");
+            let produced = scratch.len() - remaining_out;
+            decoded.extend_from_slice(&scratch[..produced]);
 
             match ReturnCode::from(err) {
                 ReturnCode::BufError => {
-                    assert_eq!(stream.avail_out, 0);
-                    stream.avail_out = buf.len() as _;
+                    assert_eq!(remaining_out, 0, "buffer error without full output");
+                    assert!(
+                        produced > 0 || stream.avail_in < remaining_before,
+                        "decoder stalled with input remaining"
+                    );
                 }
                 ReturnCode::StreamEnd => break,
-                other => panic!("unexpected {other:?}"),
+                other => panic!("unexpected raw DEFLATE decoder status: {other:?}"),
             }
         }
 
-        let err = inflateEnd(stream);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        output
+        assert_eq!(stream.avail_in, 0, "trailing raw DEFLATE bytes ignored");
+        assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+        assert_eq!(usize::try_from(stream.total_out), Ok(decoded.len()));
+        // SAFETY: successfully initialized decoder is closed exactly once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+        decoded
     });
+
+    assert_eq!(
+        output.len(),
+        1284,
+        "window-match regression output length changed"
+    );
+    assert_eq!(
+        zlib_rs::crc32::crc32(0, &output),
+        0x336c_0bf1,
+        "window-match regression output differs from reference zlib"
+    );
 }
 
 #[test]
@@ -4075,50 +4120,65 @@ fn cover_back() {
 
 #[test]
 fn done_state_returns_stream_end() {
-    use std::mem::size_of;
-
     let input = [
         31u8, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 87, 40, 207, 47, 202, 73, 81,
         200, 0, 179, 33, 36, 68, 4, 89, 28, 137, 13, 0, 181, 147, 9, 162, 53, 0, 0, 0,
     ];
+    const PLAIN: &[u8] = b"hello world hello hello world world hello world hello";
 
-    assert_eq_rs_ng!(unsafe {
-        let mut out: [u8; 64] = [0; 64];
+    assert_eq_rs_ng!({
+        let mut output = [0u8; 64];
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
 
-        let mut stream = MaybeUninit::<z_stream>::zeroed();
-
-        let ret = {
+        // SAFETY: writable uninitialized C stream storage with the
+        // correct gzip window mode, ABI version and checked size.
+        let ret = unsafe {
             inflateInit2_(
-                stream.as_mut_ptr(),
+                raw.as_mut_ptr(),
                 15 + 16,
                 zlibVersion(),
-                size_of::<z_stream>() as _,
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(ret, Z_OK);
+        // SAFETY: successful initialization populated every C stream field.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        let stream = stream.assume_init_mut();
-
-        // The first call returns Z_STREAM_END
-        stream.avail_in = input.len() as _;
+        stream.avail_in = test_c_uint_len(input.len());
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_out = out.len() as _;
-        stream.next_out = out.as_mut_ptr();
+        stream.avail_out = test_c_uint_len(output.len());
+        stream.next_out = output.as_mut_ptr();
 
-        // The mode will be Mode::Done at this point.
-        assert_eq!({ inflate(stream, Z_NO_FLUSH) }, Z_STREAM_END);
+        // SAFETY: decoder reads the complete live compressed fixture and
+        // writes into the disjoint writable output array.
+        assert_eq!(unsafe { inflate(stream, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+        assert_eq!(usize::try_from(stream.total_out), Ok(PLAIN.len()));
+        assert_eq!(&output[..PLAIN.len()], PLAIN);
 
-        // A second call to inflate returns StreamEnd
-        stream.avail_in = input.len() as _;
-        stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_out = out.len() as _;
-        stream.next_out = out.as_mut_ptr();
+        let consumed = stream.total_in;
+        let produced = stream.total_out;
+        // Even new valid input offered to the completed stream must remain
+        // unconsumed, and no additional output bytes may be produced.
+        let sentinel_input = *b"extra";
+        let mut sentinel_output = [0xa5u8; 8];
+        stream.avail_in = test_c_uint_len(sentinel_input.len());
+        stream.next_in = sentinel_input.as_ptr().cast_mut();
+        stream.avail_out = test_c_uint_len(sentinel_output.len());
+        stream.next_out = sentinel_output.as_mut_ptr();
 
-        assert_eq!({ inflate(stream, Z_FINISH) }, Z_STREAM_END);
+        // SAFETY: the complete decoder retains its live internal state;
+        // both new caller-owned spans remain valid and disjoint.
+        assert_eq!(unsafe { inflate(stream, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(stream.total_in, consumed);
+        assert_eq!(stream.total_out, produced);
+        assert_eq!(stream.avail_in, test_c_uint_len(sentinel_input.len()));
+        assert_eq!(stream.avail_out, test_c_uint_len(sentinel_output.len()));
+        assert_eq!(sentinel_output, [0xa5u8; 8]);
 
-        {
-            inflateEnd(stream)
-        }
+        // SAFETY: the successfully initialized decoder is ended once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
     });
 }
 
