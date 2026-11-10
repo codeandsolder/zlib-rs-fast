@@ -476,68 +476,109 @@ pub mod quick {
 
 #[test]
 fn test_deflate_tune() {
-    let mut compr = [0; 128];
+    let input = b"Hello, World!\n";
+    let mut raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
 
-    let good_length = 3;
-    let max_lazy = 5;
-    let nice_length = 18;
-    let max_chain = 6;
+    // SAFETY: the uninitialized decoder must reject scalar tuning without
+    // reading any stream fields beyond its valid zeroed C storage.
+    assert_eq!(
+        // SAFETY: zeroed C stream state is rejected without dereference.
+        unsafe { libz_rs_sys::deflateTune(raw.as_mut_ptr(), 3, 5, 18, 6) },
+        libz_rs_sys::Z_STREAM_ERROR
+    );
 
-    let mut c_stream = MaybeUninit::zeroed();
+    // SAFETY: this writable stream is initialized using the matching ABI
+    // version and stream size with an ordinary zlib wrapper.
+    assert_eq!(
+        // SAFETY: correct ABI version/size and live writable stream.
+        unsafe {
+            libz_rs_sys::deflateInit_(
+                raw.as_mut_ptr(),
+                libz_rs_sys::Z_BEST_COMPRESSION,
+                VERSION,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
+            )
+        },
+        libz_rs_sys::Z_OK
+    );
+    // SAFETY: successful initialization populated the C stream.
+    let stream = unsafe { raw.assume_init_mut() };
 
-    let err = unsafe {
-        libz_rs_sys::deflateTune(
-            c_stream.as_mut_ptr(),
-            good_length,
-            max_lazy,
-            nice_length,
-            max_chain,
-        )
-    };
-    assert_eq!(err, libz_rs_sys::Z_STREAM_ERROR);
+    // SAFETY: deflateTune reads a live initialized encoder and scalar
+    // settings. No output/input spans are required for this call.
+    assert_eq!(
+        // SAFETY: fully initialized C stream and scalar settings.
+        unsafe { libz_rs_sys::deflateTune(stream, 3, 5, 18, 6) },
+        libz_rs_sys::Z_OK
+    );
 
-    let err = unsafe {
-        libz_rs_sys::deflateInit_(
-            c_stream.as_mut_ptr(),
-            libz_rs_sys::Z_BEST_COMPRESSION,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        )
-    };
-    assert_eq!(err, libz_rs_sys::Z_OK);
-
-    let c_stream = unsafe { c_stream.assume_init_mut() };
-
-    let err = unsafe {
-        libz_rs_sys::deflateTune(c_stream, good_length, max_lazy, nice_length, max_chain)
-    };
-    assert_eq!(err, libz_rs_sys::Z_OK);
-
-    let input = "Hello, World!\n";
-
-    c_stream.next_in = input.as_ptr().cast_mut();
-    c_stream.next_out = compr.as_mut_ptr();
-
-    while c_stream.total_in as usize != input.len() && (c_stream.total_out as usize) < compr.len() {
-        c_stream.avail_in = 1;
-        c_stream.avail_out = 1; /* force small buffers */
-
-        let err = unsafe { libz_rs_sys::deflate(c_stream, Z_NO_FLUSH) };
-        assert_eq!(err, libz_rs_sys::Z_OK);
-    }
-
-    /* Finish the stream, still forcing small buffers: */
+    let mut compressed = vec![0xa5u8; 128];
+    let mut finishing = false;
     loop {
-        c_stream.avail_out = 1;
-        let err = unsafe { libz_rs_sys::deflate(c_stream, libz_ng_sys::Z_FINISH) };
-        if err == libz_ng_sys::Z_STREAM_END {
-            break;
+        let consumed = usize::try_from(stream.total_in).unwrap_or(usize::MAX);
+        let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(
+            consumed <= input.len(),
+            "tuned encoder consumed too much input"
+        );
+        assert!(
+            produced <= compressed.len(),
+            "tuned encoder wrote past output"
+        );
+        if produced == compressed.len() {
+            let expanded = compressed.len().checked_mul(2).unwrap_or(0);
+            assert!(expanded > compressed.len(), "tuned output size overflow");
+            compressed.resize(expanded, 0xa5);
+        }
+
+        // Always supply exactly one writable byte, but repoint that byte
+        // to the actual unwritten suffix rather than repeatedly offering
+        // an already-consumed output location.
+        stream.next_out = compressed[produced..].as_mut_ptr();
+        stream.avail_out = 1;
+        stream.next_in = input[consumed..].as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(input.len() - consumed);
+
+        finishing |= consumed == input.len();
+        let previous = (stream.total_in, stream.total_out);
+        let flush = if finishing {
+            DeflateFlush::Finish as c_int
+        } else {
+            Z_NO_FLUSH
         };
-        assert_eq!(err, libz_rs_sys::Z_OK);
+        // SAFETY: both current input and one-byte output spans are live,
+        // and the initialized encoder does not alias their allocations.
+        let status = unsafe { libz_rs_sys::deflate(stream, flush) };
+        if status == libz_rs_sys::Z_STREAM_END {
+            break;
+        }
+        assert_eq!(status, libz_rs_sys::Z_OK, "tuned compressor status");
+        assert_ne!(
+            (stream.total_in, stream.total_out),
+            previous,
+            "one-byte streaming encoder made no progress"
+        );
     }
 
-    let err = unsafe { libz_rs_sys::deflateEnd(c_stream) };
-    assert_eq!(err, libz_rs_sys::Z_OK);
+    assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+    let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert!(written <= compressed.len());
+    assert!(compressed[written..].iter().all(|&b| b == 0xa5));
+    // SAFETY: initialized encoder has reached Z_STREAM_END and is closed
+    // exactly once with the caller-owned output allocation still live.
+    assert_eq!(
+        // SAFETY: successful initialization paired with one final close.
+        unsafe { libz_rs_sys::deflateEnd(stream) },
+        libz_rs_sys::Z_OK
+    );
+    compressed.truncate(written);
+
+    let mut restored = [0xa5u8; 64];
+    let (decoded, status) =
+        zlib_rs::decompress_slice(&mut restored, &compressed, InflateConfig::default());
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, input);
+    assert!(restored[input.len()..].iter().all(|&b| b == 0xa5));
 }
 
 #[test]
@@ -3000,52 +3041,51 @@ fn issue_169() {
     });
 }
 
+// Exact original regression header bytes; this fixture must remain unchanged.
+const PENDING_HEADER_NAME: [u8; 510] = [
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x8b, 0x8b, 0x8b, 0x8b,
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
+    0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x8b,
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x97, 0x97, 0x97,
+    0x97, 0x97, 0x97, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97,
+    0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x99, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xbf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0x97, 0x97, 0x97, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97,
+    0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x97,
+    0x97, 0x97, 0x97, 0x97, 0x97, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
+    0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97,
+    0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
 #[test]
 fn flood_pending_buffer() {
     // this test configures a very small mem_level, resulting in a small `Pending` buffer. In
     // combination with large chunks of gzip header data, this exposed a logic error in the
     // `Pending` implementation, that resulted in out-of-bounds writes.
 
-    const NAME_BYTES: [u8; 510] = [
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97,
-        0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
-        0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x97, 0x97, 0x97, 0x97, 0x97,
-        0x97, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97,
-        0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x99, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xbf, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x97, 0x97, 0x97, 0x8b, 0x8b,
-        0x8b, 0x8b, 0x8b, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x97, 0x97, 0x97,
-        0x97, 0x97, 0x97, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b,
-        0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x8b, 0x97, 0x97,
-        0x97, 0x97, 0x97, 0x97, 0x97, 0x97, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    ];
-
-    let name = CString::new(NAME_BYTES).unwrap();
-
-    let comment = CString::new("").unwrap();
+    let name = CString::new(PENDING_HEADER_NAME).unwrap_or_default();
+    assert_eq!(name.as_bytes(), &PENDING_HEADER_NAME);
+    let comment = CString::default();
 
     let mut extra = [
         139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 151, 151, 151, 151, 151, 255,
@@ -3060,68 +3100,114 @@ fn flood_pending_buffer() {
     ]
     .to_vec();
 
-    assert_eq_rs_ng!({
+    let compressed = assert_eq_rs_ng!({
         let config = DeflateConfig {
             level: Z_DEFAULT_COMPRESSION,
             method: Method::Deflated,
             window_bits: 31,
-            mem_level: 1, // NOTE: this is extremely small
+            mem_level: 1, // Deliberately tiny pending buffer
             strategy: Strategy::HuffmanOnly,
         };
-
-        let mut stream = MaybeUninit::zeroed();
-
-        let err = unsafe {
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: valid gzip configuration with matching ABI version and
+        // checked size, writing into live uninitialized C stream storage.
+        let init = unsafe {
             deflateInit2_(
-                stream.as_mut_ptr(),
+                raw.as_mut_ptr(),
                 config.level,
-                config.method as i32,
+                config.method as c_int,
                 config.window_bits,
                 config.mem_level,
-                config.strategy as i32,
-                libz_rs_sys::zlibVersion(),
+                config.strategy as c_int,
+                zlibVersion(),
                 test_c_stream_size::<z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let stream = unsafe { stream.assume_init_mut() };
+        assert_eq!(init, Z_OK);
+        // SAFETY: initialization populated the C stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
         let mut header = gz_header {
             text: 0,
             time: 0,
             xflags: 0,
-            os: -1953789045,
+            os: -1_953_789_045,
             extra: extra.as_mut_ptr(),
             extra_len: test_c_uint_len(extra.len()),
-            extra_max: 0,                                // doesn't matter for writing.
-            name: name.as_ptr().cast_mut().cast::<u8>(), // deflate only reads header strings.
-            name_max: 0,                                 // doesn't matter for writing.
-            comment: comment.as_ptr().cast_mut().cast::<u8>(), // deflate only reads header strings.
-            comm_max: 0,                                 // doesn't matter for wr+iting.
+            extra_max: 0,
+            name: name.as_ptr().cast_mut().cast(),
+            name_max: 0,
+            comment: comment.as_ptr().cast_mut().cast(),
+            comm_max: 0,
             hcrc: 222,
-            done: 0, // doesn't matter for writing.
+            done: 0,
         };
+        // SAFETY: the gzip metadata buffers are live for the entire encoder
+        // lifetime, and this header is writable and disjoint from state.
+        assert_eq!(unsafe { deflateSetHeader(stream, &raw mut header) }, Z_OK);
 
-        let err = unsafe { deflateSetHeader(stream, &mut header as gz_headerp) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        // Include an actual payload: it tests that a large pending header
+        // does not corrupt bytes that are emitted after the header.
+        let payload = b"header spanning multiple pending-buffer flushes";
+        stream.next_in = payload.as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(payload.len());
 
-        let mut source: [u8; 0] = [];
+        // deflateBound is only an initial allocation hint here; a tiny
+        // pending buffer can need repeated output-buffer refills.
+        // SAFETY: the initialized stream is live and the requested bound is
+        // a valid checked C unsigned long.
+        let bound = unsafe { deflateBound(stream, test_c_ulong_len(payload.len())) };
+        let initial = usize::try_from(bound).unwrap_or(0);
+        assert!(initial > 0, "invalid initial gzip output bound");
+        let mut encoded = vec![0xa5u8; initial];
 
-        let bound = unsafe { deflateBound(stream, test_c_ulong_len(source.len())) };
-        let mut dest = vec![0; bound as usize];
+        loop {
+            let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(used <= encoded.len(), "encoder exceeded output storage");
+            if used == encoded.len() {
+                let expanded = encoded.len().checked_mul(2).unwrap_or(0);
+                assert!(expanded > encoded.len(), "output size overflow");
+                encoded.resize(expanded, 0xa5);
+            }
+            stream.next_out = encoded[used..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(encoded.len() - used);
+            let in_before = stream.total_in;
+            let out_before = stream.total_out;
+            // SAFETY: the remaining input pointer and each writable suffix
+            // are live, disjoint, and represented with exact C byte counts.
+            let status = unsafe { deflate(stream, Z_FINISH) };
+            if status == Z_STREAM_END {
+                break;
+            }
+            assert_eq!(status, Z_OK, "unexpected pending-buffer status");
+            assert!(
+                stream.total_in != in_before || stream.total_out != out_before,
+                "pending-buffer encoder stalled"
+            );
+        }
 
-        stream.next_in = source.as_mut_ptr().cast();
-        stream.avail_in = test_c_uint_len(source.len());
-        stream.next_out = dest.as_mut_ptr().cast();
-        stream.avail_out = test_c_uint_len(dest.len());
-
-        let err = unsafe { deflate(stream, DeflateFlush::NoFlush as _) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let err = unsafe { deflateEnd(stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::DataError);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(payload.len()));
+        let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(used <= encoded.len());
+        assert!(encoded[used..].iter().all(|&byte| byte == 0xa5));
+        // SAFETY: the finished encoder is ended once, before dropping the
+        // borrowed metadata buffers and compressed output.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        encoded.truncate(used);
+        encoded
     });
+
+    let payload = b"header spanning multiple pending-buffer flushes";
+    let mut restored = vec![0xa5u8; payload.len() + 16];
+    let (decoded, status) = zlib_rs::decompress_slice(
+        &mut restored,
+        &compressed,
+        InflateConfig { window_bits: 31 },
+    );
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, payload);
+    assert!(restored[payload.len()..].iter().all(|&byte| byte == 0xa5));
 }
 
 #[test]
@@ -3593,7 +3679,7 @@ fn test_gzip_deflate_config() {
 	    flush: DeflateFlush::Block,
 	    header: GzHeaderData {
 	        text: -120653576,
-	        time: 17940362863843014904u64 as _, // may truncate, that's fine.
+	        time: c_ulong::try_from(17_940_362_863_843_014_904u64 & u64::from(c_ulong::MAX)).unwrap_or(0), // may truncate, that's fine.
 	        os: -1,
 	        extra: vec![
 	            0,
@@ -3604,101 +3690,106 @@ fn test_gzip_deflate_config() {
 	    },
 	};
 
-    assert_eq_rs_ng!({
+    let compressed = assert_eq_rs_ng!({
         let Input {
             ref source,
             config,
             flush,
             ref header,
         } = input;
+        let mut metadata = header.clone();
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
 
-        let mut header = header.clone();
-
-        // Initialize stream.
-        let mut stream = core::mem::MaybeUninit::zeroed();
-        let err = unsafe {
+        // SAFETY: writable uninitialized C stream, valid gzip parameters,
+        // matching ABI version and checked stream size.
+        let init = unsafe {
             deflateInit2_(
-                stream.as_mut_ptr(),
+                raw.as_mut_ptr(),
                 config.level,
-                config.method as i32,
+                config.method as c_int,
                 config.window_bits,
                 config.mem_level,
-                config.strategy as i32,
+                config.strategy as c_int,
                 zlibVersion(),
                 test_c_stream_size::<z_stream>(),
             )
         };
+        assert_eq!(init, Z_OK);
+        // SAFETY: successful initialization populated the entire stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        assert_eq!(err, ReturnCode::Ok as i32);
+        let mut c_header: gz_header = metadata.as_gz_header();
+        // SAFETY: metadata and all nested vectors/CStrings stay allocated
+        // and unchanged for the entire C encoder lifetime.
+        let header_status = unsafe { deflateSetHeader(stream, &raw mut c_header) };
+        assert_eq!(header_status, Z_OK, "gzip metadata unexpectedly rejected");
 
-        let streamp = unsafe { stream.assume_init_mut() };
+        // SAFETY: deflateBound reads only this initialized stream and a
+        // checked input length. It is an allocation hint, not a proof that
+        // alternate flush sequences cannot exceed the bound.
+        let bound = unsafe { deflateBound(stream, test_c_ulong_len(source.len())) };
+        let initial = usize::try_from(bound).unwrap_or(0);
+        assert!(initial > 0, "invalid gzip initial capacity");
+        let mut output = vec![0xa5u8; initial];
 
-        // Build the C header explicitly rather than assuming two independent
-        // crate types have interchangeable memory layouts.
-        let mut header: gz_header = header.as_gz_header();
-        let err = unsafe { deflateSetHeader(streamp, &mut header as gz_headerp) };
-        if err != ReturnCode::Ok as i32 {
-            // Deallocate, so that we don't trigger ASAN leak detector.
-            let err = unsafe { deflateEnd(streamp) };
-            assert_eq!(err, ReturnCode::Ok as i32);
-            return;
-        }
-
-        let bound = unsafe { deflateBound(streamp, test_c_ulong_len(source.len())) };
-        let buf_size = match flush {
-            DeflateFlush::NoFlush | DeflateFlush::Finish => bound,
-            // Other flush options might require more than `bound` bytes, so add a safety margin. We
-            // _could_ catch Z_BUF_ERROR to allocate more memory, but that's not interesting right now.
-            // (In fact, it's more interesting if NoFlush/Finish triggers UB write if we're
-            // miscalculating)
-            DeflateFlush::PartialFlush
-            | DeflateFlush::SyncFlush
-            | DeflateFlush::FullFlush
-            | DeflateFlush::Block => bound * 2,
-        };
-
-        // We deliberately use uninitialized memory as the input buffer here, to simulate how these
-        // functions will likely be used from C, and to catch us ever reading uninitialized memory.
-        let mut dest: Vec<u8> = Vec::with_capacity(buf_size as usize);
-
-        let max = c_uint::MAX as usize;
-
-        let mut left = dest.capacity();
-        let mut source_len = source.len();
-
-        streamp.next_in = source.as_ptr().cast_mut().cast();
-        streamp.next_out = dest.as_mut_ptr().cast();
-
+        // Offer the entire input once; do not treat merely *offered* bytes
+        // as consumed. The decoder advances next_in and avail_in itself.
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(source.len());
         loop {
-            if streamp.avail_out == 0 {
-                streamp.avail_out = Ord::min(left, max) as _;
-                left -= streamp.avail_out as usize;
+            let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(used <= output.len(), "output exceeds allocated space");
+            if used == output.len() {
+                let expanded = output.len().checked_mul(2).unwrap_or(0);
+                assert!(expanded > output.len(), "gzip output growth overflow");
+                output.resize(expanded, 0xa5);
             }
+            stream.next_out = output[used..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(output.len() - used);
 
-            if streamp.avail_in == 0 {
-                streamp.avail_in = Ord::min(source_len, max) as _;
-                source_len -= streamp.avail_in as usize;
-            }
-
-            let flush = if source_len > 0 {
-                flush
-            } else {
+            let before_in = stream.total_in;
+            let before_out = stream.total_out;
+            let mode = if stream.avail_in == 0 {
                 DeflateFlush::Finish
+            } else {
+                flush
             };
-
-            let err = unsafe { deflate(streamp, flush as i32) };
-            if ReturnCode::from(err) != ReturnCode::Ok {
+            // SAFETY: input refers to source's live readable suffix, and
+            // output to the disjoint writable unwritten suffix of output.
+            let status = unsafe { deflate(stream, mode as c_int) };
+            if status == Z_STREAM_END {
                 break;
             }
+            assert_eq!(status, Z_OK, "gzip block/finish status");
+            assert!(
+                stream.total_in != before_in || stream.total_out != before_out,
+                "encoder stalled during gzip header/block flush"
+            );
         }
 
-        unsafe { dest.set_len(streamp.total_out as usize) }
-
-        let err = unsafe { deflateEnd(streamp) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        Some(dest)
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(source.len()));
+        let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(used <= output.len());
+        assert!(output[used..].iter().all(|&b| b == 0xa5));
+        // SAFETY: the finished stream is ended once while the gzip metadata
+        // and all original buffers remain live.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        output.truncate(used);
+        output
     });
+
+    let source = input.source.as_bytes();
+    let mut recovered = vec![0xa5u8; source.len().checked_add(16).unwrap_or(0)];
+    assert!(recovered.len() >= source.len());
+    let (decoded, status) = zlib_rs::decompress_slice(
+        &mut recovered,
+        &compressed,
+        InflateConfig { window_bits: 31 },
+    );
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, source);
+    assert!(recovered[source.len()..].iter().all(|&b| b == 0xa5));
 }
 
 #[test]
