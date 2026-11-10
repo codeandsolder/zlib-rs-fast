@@ -11,7 +11,6 @@ use zlib_rs::{InflateFlush, ReturnCode, MAX_WBITS};
 use crate::assert_eq_rs_ng;
 
 const VERSION: *const c_char = libz_rs_sys::zlibVersion();
-const STREAM_SIZE: c_int = core::mem::size_of::<libz_rs_sys::z_stream>() as c_int;
 
 #[derive(Clone, Copy)]
 struct MemItem {
@@ -334,17 +333,28 @@ unsafe extern "C" fn read_back_round_trip(
     descriptor: *mut c_void,
     next: *mut *const c_uchar,
 ) -> c_uint {
-    // SAFETY: descriptor is a uniquely borrowed BackRoundTrip fixture during
-    // each synchronous inflateBack callback.
+    if descriptor.is_null() || next.is_null() {
+        return 0;
+    }
+
+    // SAFETY: the synchronous inflateBack call passes a unique live
+    // BackRoundTrip descriptor that is not aliased by the decoder state.
     let context = unsafe { &mut *descriptor.cast::<BackRoundTrip>() };
-    let (len, count) = callback_chunk_size(context.chunk_size, context.input.len() - context.next);
+    // Do not assume the callback will never be called after EOF, and do
+    // not allow a corrupted cursor to underflow input.len() - next.
+    let Some(remaining) = context.input.len().checked_sub(context.next) else {
+        // SAFETY: next is a non-null writable callback output slot.
+        unsafe { *next = core::ptr::null() };
+        return 0;
+    };
+    let (len, count) = callback_chunk_size(context.chunk_size, remaining);
     if count == 0 {
-        // SAFETY: next is a valid output pointer supplied by inflateBack.
+        // SAFETY: next is a valid callback output slot; EOF has no input.
         unsafe { *next = core::ptr::null() };
         return 0;
     }
-    // SAFETY: len is bounded by the remaining input bytes, whose Vec
-    // remains unchanged for the duration of this inflateBack invocation.
+    // SAFETY: context.next <= input.len() and len <= remaining, so the
+    // returned pointer refers to a live slice of the owned compressed Vec.
     unsafe { *next = context.input.as_ptr().add(context.next) };
     context.next += len;
     count
@@ -355,12 +365,25 @@ unsafe extern "C" fn write_back_round_trip(
     bytes: *mut c_uchar,
     count: c_uint,
 ) -> c_int {
-    // SAFETY: descriptor points to the live fixture; the output pointer covers
-    // exactly count initialized bytes until this synchronous callback returns.
+    if descriptor.is_null() {
+        return 1;
+    }
+    let Ok(len) = usize::try_from(count) else {
+        return 1;
+    };
+    if len > 0 && bytes.is_null() {
+        return 1;
+    }
+    // SAFETY: the initialized decoder invokes this callback synchronously
+    // with a unique, caller-owned BackRoundTrip descriptor.
     let context = unsafe { &mut *descriptor.cast::<BackRoundTrip>() };
-    let bytes = unsafe { core::slice::from_raw_parts(bytes, count as usize) };
-    context.output.extend_from_slice(bytes);
-    context.output_calls += 1;
+    if len != 0 {
+        // SAFETY: with nonzero len, bytes is non-null and points to len
+        // initialized output bytes owned by the live inflateBack window.
+        let output = unsafe { core::slice::from_raw_parts(bytes, len) };
+        context.output.extend_from_slice(output);
+        context.output_calls += 1;
+    }
     0
 }
 
@@ -371,7 +394,8 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
     // Repeated medium-range patterns generate both dynamic Huffman symbols
     // and back-references, including those spanning callback output windows.
     let seed: Vec<u8> = (0..2048usize)
-        .map(|i| (i.wrapping_mul(73) ^ (i >> 3) ^ (i >> 8)) as u8)
+        // The generator intentionally retains only the low eight bits.
+        .map(|i| u8::try_from((i.wrapping_mul(73) ^ (i >> 3) ^ (i >> 8)) & 0xff).unwrap_or(0))
         .collect();
     let original: Vec<u8> = (0..100_123usize)
         .map(|i| seed[(i + i / 8192) % seed.len()])
@@ -398,6 +422,8 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
         };
         let mut stream = mem_setup();
         let mut window = vec![0xa5; 32768];
+        // SAFETY: the initialized allocator and full 32 KiB window
+        // remain live and disjoint throughout back-inflate.
         assert_eq!(
             unsafe {
                 inflateBackInit_(
@@ -405,7 +431,7 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
                     15,
                     window.as_mut_ptr(),
                     VERSION,
-                    STREAM_SIZE,
+                    test_c_stream_size::<libz_rs_sys::z_stream>(),
                 )
             },
             Z_OK
@@ -415,6 +441,8 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
         stream.avail_in = avail_in;
         fixture.next = count;
         let descriptor = (&raw mut fixture).cast::<c_void>();
+        // SAFETY: callbacks use a live, exclusive fixture descriptor;
+        // input and the writable output window remain valid.
         let result = unsafe {
             inflateBack(
                 &raw mut stream,
@@ -426,7 +454,17 @@ fn inflate_back_round_trip_crosses_multiple_windows_and_input_chunks() {
         };
         assert_eq!(result, Z_STREAM_END, "input chunk {chunk_size}");
         assert_eq!(fixture.output, original, "input chunk {chunk_size}");
+        assert_eq!(
+            fixture.next,
+            fixture.input.len(),
+            "input callback did not offer all compressed bytes"
+        );
+        assert_eq!(
+            stream.avail_in, 0,
+            "decoder left offered compressed bytes unread"
+        );
         assert_eq!(fixture.output_calls, 4, "input chunk {chunk_size}");
+        // SAFETY: the initialized stream has not yet been closed.
         assert_eq!(unsafe { inflateBackEnd(&raw mut stream) }, Z_OK);
         mem_done(&mut stream);
     }
@@ -438,7 +476,13 @@ fn inflate_back_init_allocates_state_only() {
 
     let mut regular = mem_setup();
     assert_eq!(
-        unsafe { inflateInit_(&raw mut regular, VERSION, STREAM_SIZE) },
+        unsafe {
+            inflateInit_(
+                &raw mut regular,
+                VERSION,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
+            )
+        },
         Z_OK
     );
     let regular_highwater = mem_highwater(&regular);
@@ -448,7 +492,15 @@ fn inflate_back_init_allocates_state_only() {
     let mut back = mem_setup();
     let mut window = vec![0u8; 1 << 15];
     assert_eq!(
-        unsafe { inflateBackInit_(&raw mut back, 15, window.as_mut_ptr(), VERSION, STREAM_SIZE) },
+        unsafe {
+            inflateBackInit_(
+                &raw mut back,
+                15,
+                window.as_mut_ptr(),
+                VERSION,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
+            )
+        },
         Z_OK
     );
     let back_highwater = mem_highwater(&back);
@@ -479,7 +531,14 @@ fn gzip_header_check() {
     // rather than silently skipping all assertions after the error.
     // SAFETY: mem_setup supplies the correct allocator callbacks and
     // live writable C stream storage for the gzip-wrapper decoder.
-    let init_err = unsafe { inflateInit2_(&raw mut stream, 47, VERSION, STREAM_SIZE) };
+    let init_err = unsafe {
+        inflateInit2_(
+            &raw mut stream,
+            47,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
     assert_eq!(init_err, Z_OK, "gzip header decoder initialization failed");
 
     let mut out = vec![0u8; len];
@@ -553,7 +612,7 @@ fn gzip_header_check() {
     mem_done(&mut stream);
 }
 
-fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int) {
+fn inf(input: &[u8], what: &str, step: usize, win: i32, len: usize, err: c_int) {
     use libz_rs_sys::*;
 
     let mut err = Some(err);
@@ -562,13 +621,20 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
 
     // SAFETY: mem_setup provided writable ABI stream storage and valid
     // allocation callbacks; invalid win values are tested intentionally.
-    let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
+    let init_err = unsafe {
+        inflateInit2_(
+            &raw mut stream,
+            win,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
     if init_err != Z_OK {
         mem_done(&mut stream);
         // The single intentionally invalid initialization uses window_bits=1.
         // Matching the final expected status is not enough: otherwise a
         // failed setup could accidentally pass a test targeting inflate().
-        assert_eq!(win, 1, "unexpected init failure in {_what}");
+        assert_eq!(win, 1, "unexpected init failure in {what}");
         assert_eq!(init_err, Z_STREAM_ERROR);
         return;
     }
@@ -628,7 +694,7 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
         );
 
         if let Some(expected) = err {
-            assert_eq!(ret, expected, "unexpected first result in {_what}");
+            assert_eq!(ret, expected, "unexpected first result in {what}");
         }
 
         if !matches!(ret, Z_OK | Z_BUF_ERROR | Z_NEED_DICT) {
@@ -680,7 +746,7 @@ fn inf(input: &[u8], _what: &str, step: usize, win: i32, len: usize, err: c_int)
             inflate_result == Z_NEED_DICT
                 || stream.avail_in < available_before
                 || stream.total_out > total_out_before,
-            "inflate coverage probe stalled in {_what}"
+            "inflate coverage probe stalled in {what}"
         );
 
         // Only the initial return code is a fixed fixture expectation.
@@ -744,6 +810,8 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     let mut raw = MaybeUninit::<z_stream>::zeroed();
     // SAFETY: this is the correct ABI version and stream size; -15 enables raw DEFLATE.
     assert_eq!(
+        // SAFETY: writable C stream storage, matching ABI version/size and
+        // valid raw-DEFLATE window configuration are supplied.
         unsafe {
             inflateInit2_(
                 raw.as_mut_ptr(),
@@ -759,6 +827,8 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     let mut length_before = 0;
     // SAFETY: the initialized stream and length output are valid; NULL dictionary means query.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &raw mut length_before) },
         Z_OK,
     );
@@ -766,30 +836,40 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     // SAFETY: NULL is a documented possible pointer, and the wrapper must reject
     // a nonzero length before attempting to materialize or dereference any slice.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateSetDictionary(stream, core::ptr::null(), 1) },
         Z_STREAM_ERROR,
     );
     let mut length_after = 0;
     // SAFETY: initialized stream and length output remain valid.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateGetDictionary(stream, core::ptr::null_mut(), &raw mut length_after) },
         Z_OK,
     );
     assert_eq!(length_after, length_before);
     // SAFETY: zero-length input does not require a backing dictionary buffer.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateSetDictionary(stream, core::ptr::null(), 0) },
         Z_OK,
     );
     let valid = b"raw dictionary history";
     // SAFETY: valid is readable and remains live for the duration of the call.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateSetDictionary(stream, valid.as_ptr(), test_c_uint_len(valid.len()),) },
         Z_OK,
     );
     let mut recovered = [0u8; 64];
     // SAFETY: a valid output span is provided; recovered is sufficiently large.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateGetDictionary(stream, recovered.as_mut_ptr(), &raw mut length_after) },
         Z_OK,
     );
@@ -801,6 +881,8 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     // SAFETY: NULL with nonzero length is deliberately rejected before any
     // read; the stream already contains a valid dictionary.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateSetDictionary(stream, core::ptr::null(), 1) },
         Z_STREAM_ERROR
     );
@@ -808,6 +890,8 @@ fn raw_inflate_dictionary_rejects_null_nonzero_length_without_state_change() {
     // SAFETY: the destination spans the complete live 64-byte buffer and
     // the stream remains initialized with its original valid history.
     assert_eq!(
+        // SAFETY: this call uses the live initialized decoder and the
+        // pointer/length contract described directly above.
         unsafe { inflateGetDictionary(stream, recovered.as_mut_ptr(), &raw mut length_after) },
         Z_OK
     );
@@ -869,7 +953,14 @@ fn cover_wrap() {
     strm.next_in = std::ptr::null_mut();
     // SAFETY: stream has an allocator and correct ABI version/size; the
     // -8 window size is a valid raw DEFLATE initialization.
-    let mut ret = unsafe { inflateInit2_(&raw mut strm, -8, VERSION, STREAM_SIZE) };
+    let mut ret = unsafe {
+        inflateInit2_(
+            &raw mut strm,
+            -8,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
     assert_eq!(ret, Z_OK, "cover_wrap failed to initialize the stream");
     let mut input = [0x63u8, 0x00];
     strm.avail_in = test_c_uint_len(input.len());
@@ -957,11 +1048,21 @@ fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
             let mut source = MALFORMED.to_vec();
             source.extend(core::iter::repeat_n(0u8, trailing));
             let mut stream = mem_setup();
-            assert_eq!(
-                unsafe { inflateInit2_(&raw mut stream, -15, VERSION, STREAM_SIZE) },
-                Z_OK,
-            );
-            assert_eq!(unsafe { inflateUndermine(&raw mut stream, subvert) }, Z_OK);
+            // SAFETY: mem_setup created a live allocator and writable C
+            // stream; -15 selects raw DEFLATE and VERSION/SIZE match its ABI.
+            let init_status = unsafe {
+                inflateInit2_(
+                    &raw mut stream,
+                    -15,
+                    VERSION,
+                    test_c_stream_size::<libz_rs_sys::z_stream>(),
+                )
+            };
+            assert_eq!(init_status, Z_OK);
+            // SAFETY: successful initialization created live decoder state;
+            // this control operation needs no caller-owned input/output spans.
+            let undermine_status = unsafe { inflateUndermine(&raw mut stream, subvert) };
+            assert_eq!(undermine_status, Z_OK);
             stream.next_in = source.as_mut_ptr();
             stream.avail_in =
                 u32::try_from(source.len()).map_err(|_| "test input exceeds C width")?;
@@ -974,8 +1075,16 @@ fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
                 stream.avail_out =
                     u32::try_from(output_chunk).map_err(|_| "test output exceeds C width")?;
                 let before_in = stream.avail_in;
+                // SAFETY: the supplied compressed span and each fresh output
+                // array remain live and non-overlapping throughout decode.
                 let code = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as i32) };
-                let written = output_chunk - stream.avail_out as usize;
+                let remaining = usize::try_from(stream.avail_out)
+                    .map_err(|_| "output capacity cannot fit usize")?;
+                assert!(
+                    remaining <= output_chunk,
+                    "decoder increased output capacity"
+                );
+                let written = output_chunk - remaining;
                 result.extend_from_slice(&output[..written]);
                 if code == Z_STREAM_END {
                     done = true;
@@ -991,12 +1100,18 @@ fn undermine_initializes_invalid_back_history_in_fragmented_and_fast_modes(
                 done,
                 "invalid-history recovery must finish for {output_chunk}"
             );
-            assert!(!result.is_empty());
-            assert!(
-                result.iter().all(|&b| b == 0),
-                "only synthesized zero history is allowed"
+            assert_eq!(
+                result, [0u8; 3],
+                "missing history must decode to exactly three zeros"
             );
-            assert_eq!(unsafe { inflateEnd(&raw mut stream) }, Z_OK);
+            assert_eq!(usize::try_from(stream.total_out), Ok(result.len()));
+            assert!(
+                usize::try_from(stream.total_in).unwrap_or(usize::MAX) <= source.len(),
+                "inflate claimed to consume more input than supplied"
+            );
+            // SAFETY: the initialized stream is closed once after decoding.
+            let end_status = unsafe { inflateEnd(&raw mut stream) };
+            assert_eq!(end_status, Z_OK);
             mem_done(&mut stream);
             observed.push(result);
         }
@@ -1015,21 +1130,43 @@ fn undermine_zero_restores_strict_history_validation() -> Result<(), &'static st
     let mut input = [0x03u8, 0x02, 0x00];
     let mut output = [0xa5u8; 32];
     let mut stream = mem_setup();
-    assert_eq!(
-        unsafe { inflateInit2_(&raw mut stream, -15, VERSION, STREAM_SIZE) },
-        Z_OK
-    );
-    assert_eq!(unsafe { inflateUndermine(&raw mut stream, 1) }, Z_OK);
-    assert_eq!(unsafe { inflateUndermine(&raw mut stream, 0) }, Z_OK);
+    // SAFETY: mem_setup supplies valid C stream storage and allocator
+    // callbacks, with raw DEFLATE mode and matching ABI metadata.
+    let init_status = unsafe {
+        inflateInit2_(
+            &raw mut stream,
+            -15,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
+    assert_eq!(init_status, Z_OK);
+    // SAFETY: both calls control a live decoder state without changing
+    // caller-owned input/output pointers.
+    let enabled = unsafe { inflateUndermine(&raw mut stream, 1) };
+    // SAFETY: the initialized decoder is still live between calls.
+    let disabled = unsafe { inflateUndermine(&raw mut stream, 0) };
+    assert_eq!(enabled, Z_OK);
+    assert_eq!(disabled, Z_OK);
     stream.next_in = input.as_mut_ptr();
     stream.avail_in = u32::try_from(input.len()).map_err(|_| "test input exceeds C width")?;
     stream.next_out = output.as_mut_ptr();
     stream.avail_out = u32::try_from(output.len()).map_err(|_| "test output exceeds C width")?;
+    // SAFETY: input and output are live disjoint arrays, with bounded
+    // availability counts and correctly initialized decoder state.
+    let decode_status = unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as i32) };
+    assert_eq!(decode_status, Z_DATA_ERROR);
     assert_eq!(
-        unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as i32) },
-        Z_DATA_ERROR,
+        stream.total_out, 0,
+        "invalid back-reference produced output"
     );
-    assert_eq!(unsafe { inflateEnd(&raw mut stream) }, Z_OK);
+    assert_eq!(
+        output, [0xa5u8; 32],
+        "invalid history overwrote the output array"
+    );
+    // SAFETY: successful initialization is matched with exactly one end.
+    let end_status = unsafe { inflateEnd(&raw mut stream) };
+    assert_eq!(end_status, Z_OK);
     mem_done(&mut stream);
     Ok(())
 }
@@ -1046,7 +1183,7 @@ fn inflate_mark_is_independent_of_unbound_io_buffers() {
                 inflateInit_(
                     raw.as_mut_ptr(),
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as c_int,
+                    test_c_stream_size::<z_stream>(),
                 )
             },
             Z_OK
@@ -1099,7 +1236,7 @@ fn inflate_mark_reports_unfinished_stored_block_without_io_buffers() {
                 inflateInit_(
                     raw.as_mut_ptr(),
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as c_int,
+                    test_c_stream_size::<z_stream>(),
                 )
             },
             Z_OK
@@ -1273,7 +1410,7 @@ fn try_inflate(input: &[u8], expected_err: c_int) -> c_int {
             &raw mut stream,
             if expected_err < 0 { 47 } else { -15 },
             VERSION,
-            STREAM_SIZE,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
         )
     };
     assert_eq!(result, Z_OK);
@@ -1359,7 +1496,7 @@ fn try_inflate_back(input: &[u8], expected_err: c_int) -> c_int {
             15,
             window.as_mut_ptr(),
             VERSION,
-            STREAM_SIZE,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
         )
     };
     assert_eq!(result, Z_OK);
@@ -1952,7 +2089,14 @@ fn inflate_adler() {
     // SAFETY: the caller owns writable, ABI-compatible stream storage;
     // the version/size match this C API and the selected window bits
     // enable zlib/gzip wrapper detection.
-    let err = unsafe { inflateInit2_(&raw mut stream, 32 + MAX_WBITS, VERSION, STREAM_SIZE) };
+    let err = unsafe {
+        inflateInit2_(
+            &raw mut stream,
+            32 + MAX_WBITS,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
     assert_eq!(err, Z_OK);
 
     let mut uncompressed = [0u8; 1024];
@@ -1985,21 +2129,53 @@ fn inflate_get_header_non_gzip_stream() {
     use libz_rs_sys::*;
 
     let mut stream = mem_setup();
-
-    let win = 15; // i.e. zlib compression (and not gzip)
-    let init_err = unsafe { inflateInit2_(&raw mut stream, win, VERSION, STREAM_SIZE) };
-    assert_eq!(init_err, Z_OK, "non-gzip decoder initialization failed");
+    // SAFETY: mem_setup owns a live allocation zone and stream storage;
+    // +15 selects the ordinary zlib wrapper, not a gzip member.
+    let init_status = unsafe {
+        inflateInit2_(
+            &raw mut stream,
+            15,
+            zlibVersion(),
+            test_c_stream_size::<z_stream>(),
+        )
+    };
+    assert_eq!(init_status, Z_OK, "non-gzip decoder initialization failed");
 
     let mut header = gz_header::default();
-
+    // SAFETY: the initialized decoder is live and header is writable C
+    // storage. This invalid operation must be rejected without using it.
+    let header_status = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
+    assert_eq!(header_status, Z_STREAM_ERROR);
     assert_eq!(
-        unsafe { inflateGetHeader(&raw mut stream, &raw mut header) },
-        ReturnCode::StreamError as i32
+        header.done, 0,
+        "invalid registration modified gzip metadata"
     );
 
-    let ret = unsafe { inflateEnd(&raw mut stream) };
-    assert_eq!(ret, Z_OK);
+    // A rejected gzip header registration must not poison the otherwise
+    // valid decoder. Feed a complete ordinary zlib stream afterwards.
+    let plain = b"zlib wrapper survives invalid gzip header registration";
+    let mut compressed_storage = [0u8; 128];
+    let (compressed, compress_status) =
+        compress_slice(&mut compressed_storage, plain, DeflateConfig::new(6));
+    assert_eq!(compress_status, ReturnCode::Ok);
 
+    let mut decoded = [0xa5u8; 128];
+    stream.next_in = compressed.as_ptr().cast_mut();
+    stream.avail_in = test_c_uint_len(compressed.len());
+    stream.next_out = decoded.as_mut_ptr();
+    stream.avail_out = test_c_uint_len(decoded.len());
+    // SAFETY: the live input and disjoint writable output have checked
+    // C lengths; the same valid initialized stream is reused directly.
+    let decode_status = unsafe { inflate(&raw mut stream, Z_FINISH) };
+    assert_eq!(decode_status, Z_STREAM_END);
+    assert_eq!(stream.avail_in, 0);
+    assert_eq!(usize::try_from(stream.total_in), Ok(compressed.len()));
+    assert_eq!(usize::try_from(stream.total_out), Ok(plain.len()));
+    assert_eq!(&decoded[..plain.len()], plain);
+
+    // SAFETY: the successfully initialized decoder is closed once.
+    let end_status = unsafe { inflateEnd(&raw mut stream) };
+    assert_eq!(end_status, Z_OK);
     mem_done(&mut stream);
 }
 
@@ -2039,7 +2215,7 @@ fn inflate_total_in_counter_wraps_as_c_unsigned_long() {
                 inflateInit_(
                     raw.as_mut_ptr(),
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as c_int,
+                    test_c_stream_size::<z_stream>(),
                 )
             },
             Z_OK,
@@ -2073,7 +2249,7 @@ fn inflate_sync_counter_wraps_as_c_unsigned_long() {
                 inflateInit_(
                     raw.as_mut_ptr(),
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as c_int,
+                    test_c_stream_size::<z_stream>(),
                 )
             },
             Z_OK,
@@ -2633,7 +2809,14 @@ fn chunked_output_rs() {
 
     // SAFETY: the zeroed stream pointer is writable and version/size
     // match the C ABI; -15 requests raw DEFLATE decoding.
-    let err = unsafe { inflateInit2_(stream.as_mut_ptr(), -15, VERSION, STREAM_SIZE) };
+    let err = unsafe {
+        inflateInit2_(
+            stream.as_mut_ptr(),
+            -15,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
     // SAFETY: a successful initialization wrote the full C stream.
@@ -2755,7 +2938,7 @@ fn issue_109() {
                 stream.as_mut_ptr(),
                 window_bits,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
@@ -2901,7 +3084,7 @@ fn op_len_edge_case() {
                 stream.as_mut_ptr(),
                 window_bits,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
@@ -4002,31 +4185,41 @@ unsafe extern "C" fn pull(desc: *mut c_void, buf: *mut *const c_uchar) -> c_uint
 
 /// Cover `inflateBack` edge cases.
 #[test]
-fn cover_back() {
+fn cover_back_invalid_api_calls() {
     let mut window = [0u8; 32768];
 
-    let ret = assert_eq_rs_ng!(unsafe {
-        inflateBackInit_(
-            core::ptr::null_mut(),
-            0,
-            window.as_mut_ptr(),
-            core::ptr::null(),
-            0,
-        )
+    let ret = assert_eq_rs_ng!({
+        // SAFETY: this negative C ABI case deliberately supplies an
+        // invalid stream/version and must be rejected before dereference.
+        unsafe {
+            inflateBackInit_(
+                core::ptr::null_mut(),
+                0,
+                window.as_mut_ptr(),
+                core::ptr::null(),
+                0,
+            )
+        }
     });
     assert_eq!(ret, Z_VERSION_ERROR);
 
-    let ret = assert_eq_rs_ng!(unsafe {
-        inflateBackInit_(
-            core::ptr::null_mut(),
-            0,
-            window.as_mut_ptr(),
-            VERSION,
-            STREAM_SIZE,
-        )
+    let ret = assert_eq_rs_ng!({
+        // SAFETY: this negative C ABI case deliberately supplies an
+        // invalid stream/version and must be rejected before dereference.
+        unsafe {
+            inflateBackInit_(
+                core::ptr::null_mut(),
+                0,
+                window.as_mut_ptr(),
+                VERSION,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
+            )
+        }
     });
     assert_eq!(ret, Z_STREAM_ERROR);
 
+    // SAFETY: a NULL decoder must report StreamError without accessing
+    // missing callbacks or their descriptors.
     let ret = unsafe {
         libz_rs_sys::inflateBack(
             core::ptr::null_mut(),
@@ -4038,10 +4231,17 @@ fn cover_back() {
     };
     assert_eq!(ret, Z_STREAM_ERROR);
 
-    let ret = assert_eq_rs_ng!(unsafe { inflateBackEnd(core::ptr::null_mut(),) });
+    let ret = assert_eq_rs_ng!({
+        // SAFETY: the NULL decoder is rejected by the C API before cleanup.
+        unsafe { inflateBackEnd(core::ptr::null_mut()) }
+    });
     assert_eq!(ret, Z_STREAM_ERROR);
+}
 
+#[test]
+fn cover_back() {
     use libz_rs_sys::*;
+    let mut window = [0u8; 32768];
 
     let mut stream = mem_setup();
     // SAFETY: the custom allocator, C stream and full 32 KiB output window
@@ -4053,7 +4253,7 @@ fn cover_back() {
                 15,
                 window.as_mut_ptr(),
                 VERSION,
-                STREAM_SIZE,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
             )
         },
         Z_OK
@@ -4145,7 +4345,7 @@ fn cover_back() {
                 15,
                 window.as_mut_ptr(),
                 VERSION,
-                STREAM_SIZE,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
             )
         },
         Z_OK
