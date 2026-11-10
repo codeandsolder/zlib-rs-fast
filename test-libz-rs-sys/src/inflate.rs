@@ -2777,88 +2777,156 @@ fn test_inflate_flush_block() {
     let (compressed_data, return_code) = compress_slice(&mut output, &data, config);
     assert_eq!(return_code, ReturnCode::Ok);
 
-    // Log the stream positions and data_type output from libz
-    let mut zlib_log = Vec::new();
+    // Capture not just the Z_BLOCK state transitions but the bytes produced
+    // at each transition. Matching counters alone could hide bad output.
+    let mut zlib_trace = Vec::new();
+    let mut zlib_decoded = Vec::with_capacity(data.len());
     {
         let mut stream = MaybeUninit::<libz_sys::z_stream>::zeroed();
 
+        // SAFETY: stream storage, version, and structure size match the
+        // installed reference zlib C ABI.
         let ret = unsafe {
             libz_sys::inflateInit2_(
                 stream.as_mut_ptr(),
                 window_bits,
                 libz_sys::zlibVersion(),
-                core::mem::size_of::<libz_sys::z_stream>() as c_int,
+                test_c_stream_size::<libz_sys::z_stream>(),
             )
         };
         assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
-        let mut output = vec![0u8; CHUNK * 2];
+        // SAFETY: successful inflateInit2_ initialized every stream field.
         let stream = unsafe { stream.assume_init_mut() };
+        let mut scratch = vec![0u8; CHUNK * 2];
         stream.next_in = compressed_data.as_ptr().cast_mut();
-        stream.avail_in = compressed_data.len() as _;
+        stream.avail_in = test_c_uint_len(compressed_data.len());
         loop {
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out = output.len() as _;
+            stream.next_out = scratch.as_mut_ptr();
+            stream.avail_out = test_c_uint_len(scratch.len());
+            let input_before = stream.avail_in;
+            let output_before = stream.total_out;
+            let data_type_before = stream.data_type;
 
+            // SAFETY: the compressed input and the disjoint writable scratch
+            // buffer stay live for the synchronous reference decoder call.
             let ret = unsafe { libz_sys::inflate(stream, InflateFlush::Block as i32) };
-
-            let log = format!(
-                "In:{} Out:{} DT:{}",
-                stream.avail_in, stream.avail_out, stream.data_type
-            );
-            zlib_log.push(log);
-
             assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+            let remaining = usize::try_from(stream.avail_out).unwrap_or(usize::MAX);
+            assert!(
+                remaining <= scratch.len(),
+                "reference output capacity invalid"
+            );
+            let produced = scratch.len() - remaining;
+            zlib_decoded.extend_from_slice(&scratch[..produced]);
+            zlib_trace.push((
+                stream.avail_in,
+                stream.avail_out,
+                stream.data_type,
+                scratch[..produced].to_vec(),
+            ));
 
             if stream.avail_in == 0 {
                 break;
             }
+            assert!(
+                stream.avail_in < input_before
+                    || stream.total_out > output_before
+                    || stream.data_type != data_type_before,
+                "reference Z_BLOCK decoder stalled"
+            );
         }
 
-        unsafe { libz_sys::inflateEnd(stream) };
+        assert_eq!(usize::try_from(stream.total_in), Ok(compressed_data.len()));
+        assert_eq!(usize::try_from(stream.total_out), Ok(data.len()));
+        // SAFETY: reference stream initialization succeeded and is ended once.
+        assert_eq!(unsafe { libz_sys::inflateEnd(stream) }, Z_OK);
     }
+    assert_eq!(zlib_decoded, data, "reference Z_BLOCK decode lost data");
 
-    // Log the stream positions and data_type output from libz_rs and compare
+    // Compare *every* reference transition and output chunk with zlib-rs;
+    // also require the same number of calls (no unverified extra/missing
+    // transitions).
     {
         use libz_rs_sys::*;
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
+        // SAFETY: writable stream storage and the matching zlib-rs ABI.
         let ret = unsafe {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 window_bits,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
-        let mut output = vec![0u8; CHUNK * 2];
+        // SAFETY: the successful initialization wrote the complete C stream.
         let stream = unsafe { stream.assume_init_mut() };
+        let mut scratch = vec![0u8; CHUNK * 2];
+        let mut decoded = Vec::with_capacity(data.len());
+        let mut reference_index = 0;
         stream.next_in = compressed_data.as_ptr().cast_mut();
-        stream.avail_in = compressed_data.len() as _;
+        stream.avail_in = test_c_uint_len(compressed_data.len());
         loop {
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out = output.len() as _;
+            stream.next_out = scratch.as_mut_ptr();
+            stream.avail_out = test_c_uint_len(scratch.len());
+            let input_before = stream.avail_in;
+            let output_before = stream.total_out;
+            let data_type_before = stream.data_type;
 
+            // SAFETY: compressed_data and scratch are live non-overlapping
+            // byte spans with accurate C ABI availability counts.
             let ret = unsafe { inflate(stream, InflateFlush::Block as i32) };
-
-            let log = format!(
-                "In:{} Out:{} DT:{}",
-                stream.avail_in, stream.avail_out, stream.data_type
-            );
-            // Compare log entries
-            assert_eq!(zlib_log.remove(0), log);
-
             assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+            let remaining = usize::try_from(stream.avail_out).unwrap_or(usize::MAX);
+            assert!(
+                remaining <= scratch.len(),
+                "zlib-rs output capacity invalid"
+            );
+            let produced = scratch.len() - remaining;
+            assert!(
+                reference_index < zlib_trace.len(),
+                "zlib-rs produced an extra Z_BLOCK transition"
+            );
+            let (expected_in, expected_out, expected_type, expected_chunk) =
+                &zlib_trace[reference_index];
+            reference_index += 1;
+            assert_eq!(
+                (stream.avail_in, stream.avail_out, stream.data_type),
+                (*expected_in, *expected_out, *expected_type),
+                "Z_BLOCK state transition differs from reference"
+            );
+            assert_eq!(
+                &scratch[..produced],
+                expected_chunk,
+                "Z_BLOCK output differs"
+            );
+            decoded.extend_from_slice(&scratch[..produced]);
 
             if stream.avail_in == 0 {
                 break;
             }
+            assert!(
+                stream.avail_in < input_before
+                    || stream.total_out > output_before
+                    || stream.data_type != data_type_before,
+                "zlib-rs Z_BLOCK decoder stalled"
+            );
         }
 
-        unsafe { inflateEnd(stream) };
+        assert_eq!(
+            reference_index,
+            zlib_trace.len(),
+            "zlib-rs skipped Z_BLOCK transitions"
+        );
+        assert_eq!(usize::try_from(stream.total_in), Ok(compressed_data.len()));
+        assert_eq!(usize::try_from(stream.total_out), Ok(data.len()));
+        assert_eq!(decoded, data, "zlib-rs Z_BLOCK decode lost data");
+        // SAFETY: initialized zlib-rs stream is ended exactly once.
+        assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
     }
 }
 
@@ -2869,51 +2937,80 @@ fn issue_172() {
         45, 1, 0, 176, 1, 57, 179, 15, 0, 0, 0,
     ];
 
-    assert_eq_rs_ng!(unsafe {
-        let mut exitcode = 0;
-        for chunk in 1..BUF.len() {
-            let mut ret;
-            let mut out = [0u8; 32];
+    // Every chunk size from a single compressed byte through the full
+    // fixture must decode exactly the same output.
+    assert_eq_rs_ng!({
+        let mut completed_sizes = Vec::new();
+        for chunk_size in 1..=BUF.len() {
+            let mut output = [0u8; 32];
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
 
-            let mut strm = MaybeUninit::zeroed();
-
-            // first validate the config
-            ret = inflateInit2_(strm.as_mut_ptr(), 31, VERSION, STREAM_SIZE);
+            // SAFETY: writable stream storage and a matching C ABI version
+            // and structure size are supplied for initialization.
+            let ret = unsafe {
+                inflateInit2_(
+                    raw.as_mut_ptr(),
+                    31,
+                    zlibVersion(),
+                    test_c_stream_size::<z_stream>(),
+                )
+            };
             assert_eq!(ret, Z_OK);
+            // SAFETY: successful initialization populated the entire stream.
+            let stream = unsafe { raw.assume_init_mut() };
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = test_c_uint_len(output.len());
 
-            let strm = strm.assume_init_mut();
+            let mut offered = 0;
+            loop {
+                // Only supply a new chunk after the previous one was fully
+                // consumed. Never replace a still-live next_in/avail_in span.
+                if stream.avail_in == 0 && offered < BUF.len() {
+                    let end = offered.saturating_add(chunk_size).min(BUF.len());
+                    let pending = &BUF[offered..end];
+                    stream.next_in = pending.as_ptr().cast_mut();
+                    stream.avail_in = test_c_uint_len(pending.len());
+                    offered = end;
+                }
 
-            strm.avail_out = out.len() as _;
-            strm.next_in = BUF.as_ptr().cast_mut();
-            strm.next_out = out.as_mut_ptr();
-            while ret == Z_OK && strm.total_in < BUF.len() as _ {
-                strm.avail_in = if chunk as c_ulong > (BUF.len() as c_ulong - strm.total_in) {
-                    (BUF.len() as c_ulong - strm.total_in) as c_uint
-                } else {
-                    chunk as c_uint
-                };
-                ret = inflate(strm, Z_NO_FLUSH);
+                let input_before = stream.avail_in;
+                let output_before = stream.total_out;
+                // SAFETY: next_in refers to an allocated portion of BUF;
+                // next_out refers into the disjoint, writable output buffer.
+                let ret = unsafe { inflate(stream, Z_NO_FLUSH) };
+                assert!(
+                    matches!(ret, Z_OK | Z_STREAM_END),
+                    "chunk size {chunk_size}: unexpected inflate status {ret}"
+                );
+                if ret == Z_STREAM_END {
+                    break;
+                }
+                assert!(
+                    stream.avail_in < input_before || stream.total_out > output_before,
+                    "chunk size {chunk_size}: decoder made no progress"
+                );
+                assert!(
+                    stream.avail_in != 0 || offered != BUF.len(),
+                    "chunk size {chunk_size}: compressed input ended without Z_STREAM_END"
+                );
             }
-            if ret != Z_STREAM_END {
-                eprintln!("Finished with {ret} at chunk size {chunk}\n");
-                exitcode = 1;
-            }
 
-            if &out[..strm.total_out as usize] != b"expected output" {
-                eprintln!("Output did not match at chunk size {chunk}\n");
-                exitcode = 1;
-            }
+            assert_eq!(offered, BUF.len(), "did not supply the full gzip fixture");
+            assert_eq!(stream.avail_in, 0, "gzip trailer left unconsumed");
+            assert_eq!(usize::try_from(stream.total_in), Ok(BUF.len()));
+            assert_eq!(
+                usize::try_from(stream.total_out),
+                Ok(b"expected output".len())
+            );
+            assert_eq!(&output[..b"expected output".len()], b"expected output");
 
-            let err = inflateEnd(strm);
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+            // SAFETY: the successfully initialized stream is ended once.
+            assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
+            completed_sizes.push(chunk_size);
         }
-
-        assert!(exitcode == 0);
-
-        exitcode
+        completed_sizes
     });
 }
-
 #[test]
 fn header_configured_but_no_gzip() {
     let input: &[u8] = &[0x63, 0x18, 0x68, 0x30, 0xd0, 0x0, 0x0];
