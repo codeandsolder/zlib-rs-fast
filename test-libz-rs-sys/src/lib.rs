@@ -121,6 +121,7 @@ macro_rules! assert_eq_rs_ng {
 fn zlib_rs_is_not_zlib_ng() {
     use std::ffi::CStr;
 
+    // SAFETY: zlibVersion returns a valid static NUL-terminated version string from each ABI.
     unsafe {
         let rs = CStr::from_ptr(libz_rs_sys::zlibVersion());
         assert!(rs.to_str().unwrap().contains("zlib-rs"));
@@ -135,6 +136,7 @@ fn zlib_rs_is_not_zlib_ng() {
 #[cfg(test)]
 #[test]
 fn flags() {
+    // SAFETY: both zero-argument C ABI functions return scalar compile flags only.
     unsafe {
         let rs = libz_rs_sys::zlibCompileFlags();
         let ng = libz_sys::zlibCompileFlags();
@@ -167,19 +169,25 @@ mod null {
 
     #[test]
     fn adler() {
+        // SAFETY: adler32 permits a null buffer and treats it as an initialization query.
         assert_eq_rs_ng!(unsafe { adler32(0, core::ptr::null(), 0) });
+        // SAFETY: adler32 permits null even with a nonzero size, returning the initial checksum.
         assert_eq_rs_ng!(unsafe { adler32(1, core::ptr::null(), 0) });
+        // SAFETY: this intentionally checks the null-input ABI; no buffer may be read.
         assert_eq_rs_ng!(unsafe { adler32(2, core::ptr::null(), 32) });
     }
 
     #[test]
     fn adler32_combine_negative() {
+        // SAFETY: checksum combine consumes only scalar values, without dereferencing pointers.
         assert_eq_rs_ng!(unsafe { adler32_combine(0, 123, 16) }, {
             adler32_combine(0, 123, 16)
         });
+        // SAFETY: these checksum inputs are plain integer parameters to the C ABI.
         assert_eq_rs_ng!(unsafe { adler32_combine(1, 123, 16) }, {
             adler32_combine(1, 123, 16)
         });
+        // SAFETY: negative input is passed as a scalar; the implementation validates its semantics.
         assert_eq_rs_ng!(unsafe { adler32_combine(2, 123, -16) }, {
             adler32_combine(2, 123, -16)
         });
@@ -187,16 +195,21 @@ mod null {
 
     #[test]
     fn crc32() {
+        // SAFETY: crc32 permits null input as a checksum initialization operation.
         assert_eq_rs_ng!(unsafe { crc32(0, core::ptr::null(), 0) });
+        // SAFETY: crc32 checks a null buffer before inspecting the nonzero length.
         assert_eq_rs_ng!(unsafe { crc32(1, core::ptr::null(), 0) });
+        // SAFETY: this intentionally exercises null-input handling, not a readable byte span.
         assert_eq_rs_ng!(unsafe { crc32(2, core::ptr::null(), 32) });
     }
 
     #[test]
     fn crc32_combine_negative() {
+        // SAFETY: checksum combine operates on scalar arguments without memory access.
         assert_eq_rs_ng!(unsafe { crc32_combine(0, 123, 16) }, {
             crc32_combine(0, 123, 16)
         });
+        // SAFETY: the C checksum combination API takes scalar values only.
         assert_eq_rs_ng!(unsafe { crc32_combine(1, 123, 16) }, {
             crc32_combine(1, 123, 16)
         });
@@ -219,6 +232,7 @@ mod null {
 
             let buf_size = Ord::max(buf_len, 1) as usize;
 
+            // SAFETY: every CRC input pointer refers to a live borrowed slice for its declared length.
             assert_eq_rs_ng!(unsafe {
                 let crc0 = 0;
                 let mut crc1 = crc0;
@@ -262,6 +276,7 @@ mod null {
         let mut dest = [0; 64];
         let source = [1, 2, 3];
 
+        // SAFETY: destination is a writable array and the malformed source remains live for this call.
         assert_eq_rs_ng!(unsafe {
             uncompress(
                 dest.as_mut_ptr(),
@@ -273,6 +288,7 @@ mod null {
 
         // this makes stock zlib segfault
         assert_eq!(
+            // SAFETY: this intentionally tests rejection of a null length pointer before dereference.
             unsafe {
                 libz_rs_sys::uncompress(
                     dest.as_mut_ptr(),
@@ -284,6 +300,7 @@ mod null {
             libz_rs_sys::Z_STREAM_ERROR
         );
 
+        // SAFETY: the null destination is an intentional ABI error case; the source buffer is valid.
         assert_eq_rs_ng!(unsafe {
             uncompress(
                 core::ptr::null_mut(),
@@ -293,6 +310,7 @@ mod null {
             )
         });
 
+        // SAFETY: the source pointer is intentionally null; the decoder must reject it before reading.
         assert_eq_rs_ng!(unsafe {
             uncompress(
                 dest.as_mut_ptr(),
@@ -302,6 +320,7 @@ mod null {
             )
         });
 
+        // SAFETY: both null buffers are invalid ABI inputs that must be rejected before access.
         assert_eq_rs_ng!(unsafe {
             uncompress(
                 core::ptr::null_mut(),
@@ -319,6 +338,7 @@ mod null {
 
         // this makes stock zlib segfault
         assert_eq!(
+            // SAFETY: this invokes the Rust C ABI with an invalid null length pointer to verify rejection.
             unsafe {
                 libz_rs_sys::compress(
                     dest.as_mut_ptr(),
@@ -336,6 +356,7 @@ mod null {
         let dest = [0; 64];
         let source = [1, 2, 3];
 
+        // SAFETY: the null output buffer is an intentional compression error case, not writable memory.
         assert_eq_rs_ng!(unsafe {
             compress(
                 core::ptr::null_mut(),
@@ -351,6 +372,7 @@ mod null {
         let mut dest = [0; 64];
         let source = [1, 2, 3];
 
+        // SAFETY: the source is intentionally null; the compression API must return an error before read.
         assert_eq_rs_ng!(unsafe {
             compress(
                 dest.as_mut_ptr(),
@@ -366,6 +388,7 @@ mod null {
         let dest = [0; 64];
         let source = [1, 2, 3];
 
+        // SAFETY: null input and output pointers are exercised solely as a rejected ABI configuration.
         assert_eq_rs_ng!(unsafe {
             compress(
                 core::ptr::null_mut(),
@@ -378,6 +401,7 @@ mod null {
 
     #[test]
     fn inflate_init() {
+        // SAFETY: a null stream is an invalid initialization argument that must be rejected.
         assert_eq_rs_ng!(unsafe {
             inflateInit_(
                 core::ptr::null_mut(),
@@ -386,6 +410,7 @@ mod null {
             )
         });
 
+        // SAFETY: the zeroed stream is writable, while the null version deliberately tests validation.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateInit_(
@@ -398,6 +423,7 @@ mod null {
 
     #[test]
     fn inflate_init2() {
+        // SAFETY: a null stream must produce a stream error without dereferencing it.
         assert_eq_rs_ng!(unsafe {
             inflateInit2_(
                 core::ptr::null_mut(),
@@ -407,6 +433,7 @@ mod null {
             )
         });
 
+        // SAFETY: the stream storage is valid; the null version is rejected before use.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateInit2_(
@@ -420,12 +447,15 @@ mod null {
 
     #[test]
     fn inflate() {
+        // SAFETY: this tests that inflate rejects a null stream pointer before accessing it.
         assert_eq_rs_ng!(unsafe { inflate(core::ptr::null_mut(), Z_NO_FLUSH) });
     }
 
     #[test]
     fn inflate_end() {
+        // SAFETY: this tests that inflateEnd rejects a null stream without dereferencing it.
         assert_eq_rs_ng!(unsafe { inflateEnd(core::ptr::null_mut()) });
+        // SAFETY: zeroed stream storage is live; the end API checks that no state was initialized.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateEnd(strm.as_mut_ptr())
@@ -436,6 +466,7 @@ mod null {
     fn inflate_end_after_inflate() {
         use libz_rs_sys::*;
 
+        // SAFETY: the initialized stream, compressed input and writable output stay live until inflateEnd.
         unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
@@ -451,7 +482,7 @@ mod null {
             {
                 let mut dest = vec![0u8; 100];
 
-                strm.next_in = FERRIS_BYTES.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -471,10 +502,12 @@ mod null {
 
     #[test]
     fn inflate_copy() {
+        // SAFETY: the null copy destination is rejected; the zeroed source storage is addressable.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateCopy(core::ptr::null_mut(), strm.as_mut_ptr())
         });
+        // SAFETY: the null copy source is rejected before dereference; output storage is live.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             inflateCopy(strm.as_mut_ptr(), core::ptr::null_mut())
@@ -483,6 +516,7 @@ mod null {
 
     #[test]
     fn inflate_get_header() {
+        // SAFETY: the initialized stream/header allocations outlive these invalid-header API probes.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
             let mut head = MaybeUninit::<gz_header>::zeroed();
@@ -560,12 +594,12 @@ mod null {
                 done: 0,
             };
 
-            deflateSetHeader(strm, &mut header);
-            assert_eq!(err, Z_OK);
+            let header_status = deflateSetHeader(strm, &raw mut header);
+            assert_eq!(header_status, Z_OK);
 
             buf.fill(0);
 
-            strm.next_in = input.as_ptr() as *mut u8;
+            strm.next_in = input.as_ptr().cast_mut();
             strm.avail_in = input.len() as _;
 
             strm.next_out = buf.as_mut_ptr();
@@ -626,7 +660,7 @@ mod null {
                     );
                     core::ptr::write(
                         core::ptr::addr_of_mut!((*head.as_mut_ptr()).name_max),
-                        extra.len() as _,
+                        name.len() as _,
                     );
                     core::ptr::write(
                         core::ptr::addr_of_mut!((*head.as_mut_ptr()).comment),
@@ -634,7 +668,7 @@ mod null {
                     );
                     core::ptr::write(
                         core::ptr::addr_of_mut!((*head.as_mut_ptr()).comm_max),
-                        extra.len() as _,
+                        comment.len() as _,
                     );
                 }
 
@@ -659,7 +693,7 @@ mod null {
 
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES_GZ_NO_HEADER.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES_GZ_NO_HEADER.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES_GZ_NO_HEADER.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -690,7 +724,7 @@ mod null {
 
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES_GZ_NO_HEADER.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES_GZ_NO_HEADER.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES_GZ_NO_HEADER.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -721,7 +755,7 @@ mod null {
 
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES_GZ_WITH_HEADER.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES_GZ_WITH_HEADER.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES_GZ_WITH_HEADER.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -741,9 +775,11 @@ mod null {
             inflateReset(strm);
 
             {
-                let mut name_buf = [0u8; 3];
-                let mut extra_buf = [0u8; 3];
-                let mut comment_buf = [0u8; 3];
+                // Deliberately use different capacities. The C API must not
+                // reuse extra_max for the independent name/comment buffers.
+                let mut name_buf = [0u8; 7];
+                let mut extra_buf = [0u8; 2];
+                let mut comment_buf = [0u8; 6];
                 let mut head =
                     initialize_header_buffers(&mut extra_buf, &mut name_buf, &mut comment_buf);
 
@@ -752,7 +788,7 @@ mod null {
 
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES_GZ_WITH_HEADER.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES_GZ_WITH_HEADER.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES_GZ_WITH_HEADER.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -763,9 +799,9 @@ mod null {
 
                 assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
 
-                assert_eq!(&extra_buf, b"ban");
-                assert_eq!(&name_buf, b"app");
-                assert_eq!(&comment_buf, b"pea");
+                assert_eq!(&extra_buf, b"ba");
+                assert_eq!(&name_buf, b"apple\0\0");
+                assert_eq!(&comment_buf, b"pear\0\0");
 
                 // zlib-rs will properly initialize this struct, zlib-ng does not!
                 if cfg!(miri) {
@@ -803,9 +839,9 @@ mod null {
             let mut input_len = core::ffi::c_ulong::try_from(input.len()).unwrap_or(0);
             let status = uncompress2(
                 output.as_mut_ptr(),
-                &mut output_len,
+                &raw mut output_len,
                 input.as_ptr(),
-                &mut input_len,
+                &raw mut input_len,
             );
             assert_eq!(status, Z_OK);
             assert_eq!(input_len as usize, compressed_len);
@@ -833,9 +869,9 @@ mod null {
                 let mut input_len = core::ffi::c_ulong::try_from(compressed.len()).unwrap_or(0);
                 let code = uncompress2(
                     core::ptr::null_mut(),
-                    &mut output_len,
+                    &raw mut output_len,
                     compressed.as_ptr(),
-                    &mut input_len,
+                    &raw mut input_len,
                 );
                 (code, output_len, input_len)
             });
@@ -859,9 +895,9 @@ mod null {
             let direct = unsafe {
                 libz_rs_sys::uncompress2_z(
                     core::ptr::null_mut(),
-                    &mut output_len,
+                    &raw mut output_len,
                     compressed.as_ptr(),
-                    &mut input_len,
+                    &raw mut input_len,
                 )
             };
             assert_eq!(direct, result);
@@ -876,9 +912,9 @@ mod null {
                 unsafe {
                     libz_rs_sys::uncompress2_z(
                         core::ptr::null_mut(),
-                        &mut invalid_capacity,
+                        &raw mut invalid_capacity,
                         compressed.as_ptr(),
-                        &mut invalid_source_len,
+                        &raw mut invalid_source_len,
                     )
                 },
                 libz_rs_sys::Z_STREAM_ERROR
@@ -904,9 +940,9 @@ mod null {
                 let mut input_len: core::ffi::c_ulong = 0;
                 let code = uncompress2(
                     output_ptr,
-                    &mut output_len,
+                    &raw mut output_len,
                     core::ptr::null(),
-                    &mut input_len,
+                    &raw mut input_len,
                 );
                 (code, output_len, input_len)
             });
@@ -923,9 +959,9 @@ mod null {
                 unsafe {
                     libz_rs_sys::uncompress2_z(
                         output.as_mut_ptr(),
-                        &mut output_len,
+                        &raw mut output_len,
                         core::ptr::null(),
-                        &mut invalid_input_len,
+                        &raw mut invalid_input_len,
                     )
                 },
                 libz_rs_sys::Z_STREAM_ERROR
@@ -943,7 +979,7 @@ mod null {
             let mut output_len = core::ffi::c_ulong::try_from(output.len()).unwrap_or(0);
             let status = compress2(
                 output.as_mut_ptr(),
-                &mut output_len,
+                &raw mut output_len,
                 core::ptr::null(),
                 0,
                 6,
@@ -968,7 +1004,7 @@ mod null {
         let direct = unsafe {
             libz_rs_sys::compress2_z(
                 output.as_mut_ptr(),
-                &mut output_len,
+                &raw mut output_len,
                 core::ptr::null(),
                 0,
                 6,
@@ -984,7 +1020,7 @@ mod null {
             unsafe {
                 libz_rs_sys::compress2_z(
                     invalid_output.as_mut_ptr(),
-                    &mut invalid_capacity,
+                    &raw mut invalid_capacity,
                     core::ptr::null(),
                     1,
                     6,
@@ -1273,6 +1309,29 @@ mod null {
     }
 
     #[test]
+    fn deflate_set_header_rejects_non_gzip_stream() {
+        // SAFETY: the stream/header are initialized C-compatible objects.
+        // The ordinary zlib encoder is not configured for gzip headers,
+        // and the header must be rejected before any state is consumed.
+        assert_eq_rs_ng!(unsafe {
+            let mut stream = MaybeUninit::<z_stream>::zeroed();
+            let init = deflateInit_(
+                stream.as_mut_ptr(),
+                Z_DEFAULT_COMPRESSION,
+                zlibVersion(),
+                core::mem::size_of::<z_stream>() as _,
+            );
+            assert_eq!(init, Z_OK);
+
+            let mut header = MaybeUninit::<gz_header>::zeroed();
+            let header_status = deflateSetHeader(stream.as_mut_ptr(), header.as_mut_ptr());
+            let end_status = deflateEnd(stream.as_mut_ptr());
+            assert_eq!(end_status, Z_OK);
+            header_status
+        });
+    }
+
+    #[test]
     fn deflate_set_header() {
         assert_eq_rs_ng!(unsafe {
             let mut head = MaybeUninit::<gz_header>::zeroed();
@@ -1395,7 +1454,7 @@ mod null {
 
             buf.fill(0);
 
-            strm.next_in = input.as_ptr() as *mut u8;
+            strm.next_in = input.as_ptr().cast_mut();
             strm.avail_in = input.len() as _;
 
             strm.next_out = buf.as_mut_ptr();
@@ -1428,7 +1487,7 @@ mod null {
             {
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -1446,7 +1505,7 @@ mod null {
             {
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -1482,7 +1541,7 @@ mod null {
             {
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -1500,7 +1559,7 @@ mod null {
             {
                 let mut dest = [0u8; 100];
 
-                strm.next_in = FERRIS_BYTES.as_ptr() as *mut u8;
+                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
                 strm.avail_in = FERRIS_BYTES.len() as _;
 
                 strm.next_out = dest.as_mut_ptr();
@@ -1765,8 +1824,8 @@ mod coverage {
             buf.fill(0);
             let err = compress2(
                 buf.as_mut_ptr() as *mut u8,
-                &mut dest_len,
-                input.as_ptr() as *mut u8,
+                &raw mut dest_len,
+                input.as_ptr().cast_mut(),
                 input.len() as _,
                 6,
             );
@@ -1793,7 +1852,7 @@ mod coverage {
 
             let strm = strm.assume_init_mut();
 
-            strm.next_in = input.as_ptr() as *mut u8;
+            strm.next_in = input.as_ptr().cast_mut();
             strm.avail_in = input.len() as _;
 
             strm.next_out = buf.as_mut_ptr();
@@ -1826,7 +1885,7 @@ mod coverage {
 
             let strm = strm.assume_init_mut();
 
-            strm.next_in = input.as_ptr() as *mut u8;
+            strm.next_in = input.as_ptr().cast_mut();
             strm.avail_in = input.len() as _;
 
             strm.next_out = buf.as_mut_ptr();
@@ -1863,7 +1922,7 @@ mod coverage {
             {
                 let mut buf = [0; 64];
 
-                strm.next_in = input.as_ptr() as *mut u8;
+                strm.next_in = input.as_ptr().cast_mut();
                 strm.avail_in = input.len() as _;
 
                 strm.next_out = buf.as_mut_ptr();
@@ -1881,7 +1940,7 @@ mod coverage {
             {
                 let mut buf = [0; 64];
 
-                strm.next_in = input.as_ptr() as *mut u8;
+                strm.next_in = input.as_ptr().cast_mut();
                 strm.avail_in = input.len() as _;
 
                 strm.next_out = buf.as_mut_ptr();
@@ -2091,7 +2150,7 @@ fn inflate_strict_is_off() {
         let err = unsafe {
             uncompress(
                 dest.as_mut_ptr(),
-                &mut dest_len,
+                &raw mut dest_len,
                 source.as_ptr(),
                 source.len() as _,
             )
