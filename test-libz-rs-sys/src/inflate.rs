@@ -254,7 +254,7 @@ fn mem_allocator_rejects_unknown_and_duplicate_free_without_touching_memory() {
 fn mem_allocator_rejects_overflow_without_unwinding_through_ffi() {
     let mut stream = mem_setup();
 
-    // A \`u32\` count * size exceeds \`usize\` on 32-bit targets. On 64-bit
+    // A '+chr(96)+'u32'+chr(96)+' count times the item size exceeds '+chr(96)+'usize'+chr(96)+' on 32-bit targets. On 64-bit
     // targets the limit prevents an impractically large allocation.
     mem_limit(&mut stream, 1);
     // SAFETY: the live and exclusively owned MemZone rejects an allocation
@@ -299,7 +299,7 @@ struct BackRoundTrip {
 ///
 /// Returning both representations from one checked conversion ensures that
 /// advancing the input cursor and reporting the C byte count cannot diverge
-/// when the host usize can represent more than c_uint.
+/// when the host `usize` can represent more than `c_uint`.
 fn callback_chunk_size(requested: usize, remaining: usize) -> (usize, c_uint) {
     let max_count = usize::try_from(c_uint::MAX).unwrap_or(usize::MAX);
     let len = requested.min(remaining).min(max_count);
@@ -2436,7 +2436,7 @@ fn uncompress_edge_cases() {
 
 /// Convert a test's real buffer extent to the C ABI byte-count type.
 /// Passing a wrapped length would silently make the test exercise less data.
-fn test_c_uint_len(len: usize) -> c_uint {
+pub fn test_c_uint_len(len: usize) -> c_uint {
     let count = c_uint::try_from(len);
     assert!(count.is_ok(), "C ABI test span exceeds unsigned-int limit");
     count.unwrap_or_default()
@@ -2444,7 +2444,7 @@ fn test_c_uint_len(len: usize) -> c_uint {
 
 /// An API taking C unsigned long must not silently compress or decompress a
 /// truncated caller-supplied input/output capacity.
-fn test_c_ulong_len(len: usize) -> c_ulong {
+pub fn test_c_ulong_len(len: usize) -> c_ulong {
     let result = c_ulong::try_from(len);
     assert!(
         result.is_ok(),
@@ -2455,7 +2455,7 @@ fn test_c_ulong_len(len: usize) -> c_ulong {
 
 /// Check the actual C stream structure size rather than passing a cast that
 /// could wrap. Both the fork and the system zlib use this in differential tests.
-fn test_c_stream_size<T>() -> c_int {
+pub fn test_c_stream_size<T>() -> c_int {
     let size = c_int::try_from(core::mem::size_of::<T>());
     assert!(size.is_ok(), "C ABI stream structure exceeds int limit");
     size.unwrap_or_default()
@@ -3174,7 +3174,7 @@ fn prng_bytes(seed: u64, bytes: &mut [u8], step: usize) {
     }
 }
 
-/// Capture reference-zlib Z_BLOCK state transitions and complete emitted
+/// Capture reference-zlib `Z_BLOCK` state transitions and complete emitted
 /// bytes, so the fork can compare each boundary rather than just counters.
 fn reference_zblock_trace(
     compressed_data: &[u8],
@@ -4145,9 +4145,13 @@ mod stable_api {
 
         // First complete a wrapped zlib stream.
         let mut decoder = zlib_rs::Inflate::new(true, 15);
-        let mut decoded = [0xa5u8; 64];
+        let mut plaintext_buffer = [0xa5u8; 64];
         assert_eq!(
-            decoder.decompress(zlib_encoded, &mut decoded, zlib_rs::InflateFlush::Finish),
+            decoder.decompress(
+                zlib_encoded,
+                &mut plaintext_buffer,
+                zlib_rs::InflateFlush::Finish
+            ),
             Ok(Status::StreamEnd)
         );
         assert_eq!(usize::try_from(decoder.total_in()), Ok(zlib_encoded.len()));
@@ -4155,16 +4159,23 @@ mod stable_api {
             usize::try_from(decoder.total_out()),
             Ok(wrapped_plaintext.len())
         );
-        assert_eq!(&decoded[..wrapped_plaintext.len()], wrapped_plaintext);
+        assert_eq!(
+            &plaintext_buffer[..wrapped_plaintext.len()],
+            wrapped_plaintext
+        );
 
         // Reuse the very same decoder for a raw DEFLATE stream. Reset
         // must clear counters and old wrapper state before the new call.
         decoder.reset(false);
         assert_eq!(decoder.total_in(), 0);
         assert_eq!(decoder.total_out(), 0);
-        decoded.fill(0xa5);
+        plaintext_buffer.fill(0xa5);
         assert_eq!(
-            decoder.decompress(deflate_encoded, &mut decoded, zlib_rs::InflateFlush::Finish),
+            decoder.decompress(
+                deflate_encoded,
+                &mut plaintext_buffer,
+                zlib_rs::InflateFlush::Finish
+            ),
             Ok(Status::StreamEnd)
         );
         assert_eq!(
@@ -4175,16 +4186,20 @@ mod stable_api {
             usize::try_from(decoder.total_out()),
             Ok(raw_plaintext.len())
         );
-        assert_eq!(&decoded[..raw_plaintext.len()], raw_plaintext);
+        assert_eq!(&plaintext_buffer[..raw_plaintext.len()], raw_plaintext);
 
         // Switching the same decoder back to wrapped mode catches stale
         // raw-state history which a one-way reset cannot reveal.
         decoder.reset(true);
         assert_eq!(decoder.total_in(), 0);
         assert_eq!(decoder.total_out(), 0);
-        decoded.fill(0xa5);
+        plaintext_buffer.fill(0xa5);
         assert_eq!(
-            decoder.decompress(zlib_encoded, &mut decoded, zlib_rs::InflateFlush::Finish),
+            decoder.decompress(
+                zlib_encoded,
+                &mut plaintext_buffer,
+                zlib_rs::InflateFlush::Finish
+            ),
             Ok(Status::StreamEnd)
         );
         assert_eq!(usize::try_from(decoder.total_in()), Ok(zlib_encoded.len()));
@@ -4192,7 +4207,10 @@ mod stable_api {
             usize::try_from(decoder.total_out()),
             Ok(wrapped_plaintext.len())
         );
-        assert_eq!(&decoded[..wrapped_plaintext.len()], wrapped_plaintext);
+        assert_eq!(
+            &plaintext_buffer[..wrapped_plaintext.len()],
+            wrapped_plaintext
+        );
     }
 
     #[test]
