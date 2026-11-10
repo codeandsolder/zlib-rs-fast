@@ -1952,18 +1952,23 @@ fn test_sync(compr: &[u8]) {
 #[test]
 fn test_deflate_hash_head_0() {
     use libz_rs_sys::{
-        deflate, deflateEnd, deflateInit2_, deflateParams, Z_DEFLATED, Z_FINISH, Z_FULL_FLUSH,
-        Z_HUFFMAN_ONLY, Z_SYNC_FLUSH,
+        deflate, deflateEnd, deflateInit2_, deflateParams, Z_DEFLATED, Z_FILTERED, Z_FINISH,
+        Z_FULL_FLUSH, Z_HUFFMAN_ONLY, Z_OK, Z_STREAM_END, Z_SYNC_FLUSH,
     };
 
-    const MAX_WBITS: i32 = 15;
+    let mut original = [0x30u8; 9_698];
+    original[8_193] = 0;
+    original[8_194] = 0;
+    original[8_195] = 0;
+    original[8_199] = 0x8a;
+    let mut compressed = vec![0xa5u8; 21_572];
 
-    let mut strm = MaybeUninit::zeroed();
-    let mut err;
-
-    err = unsafe {
+    let mut raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: initialized storage and matching C ABI metadata, with
+    // supported raw-DEFLATE, Huffman-only settings.
+    let init = unsafe {
         deflateInit2_(
-            strm.as_mut_ptr(),
+            raw.as_mut_ptr(),
             1,
             Z_DEFLATED,
             -15,
@@ -1973,277 +1978,261 @@ fn test_deflate_hash_head_0() {
             test_c_stream_size::<libz_rs_sys::z_stream>(),
         )
     };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(init, Z_OK);
+    // SAFETY: successful initialization populated the C stream.
+    let stream = unsafe { raw.assume_init_mut() };
+    stream.next_in = original.as_mut_ptr();
+    stream.next_out = compressed.as_mut_ptr();
 
-    let strm = unsafe { strm.assume_init_mut() };
+    stream.avail_in = 0;
+    stream.avail_out = 1_348;
+    // SAFETY: compressor state is live and a writable output suffix
+    // with 1348 bytes is actually allocated.
+    assert_eq!(unsafe { deflateParams(stream, 3, Z_FILTERED) }, Z_OK);
 
-    let mut next_in = [0x30; 9698];
+    stream.avail_in = 6_728;
+    stream.avail_out = 2_696;
+    // SAFETY: both source and destination are live arrays; their remaining
+    // spans are sufficient for these explicitly bounded byte counts.
+    assert_eq!(unsafe { deflate(stream, Z_SYNC_FLUSH) }, Z_OK);
 
-    next_in[8193] = 0x00;
-    next_in[8194] = 0x00;
-    next_in[8195] = 0x00;
-    next_in[8199] = 0x8a;
+    stream.avail_in = 15;
+    stream.avail_out = 1_348;
+    // SAFETY: the prior call left valid byte cursors inside both arrays.
+    assert_eq!(unsafe { deflateParams(stream, 9, Z_FILTERED) }, Z_OK);
 
-    strm.next_in = next_in.as_mut_ptr();
-    let mut next_out = [0u8; 21572];
-    strm.next_out = next_out.as_mut_ptr();
+    stream.avail_in = 1_453;
+    stream.avail_out = 1_348;
+    // SAFETY: the previous compressor input/output cursors stay live.
+    assert_eq!(unsafe { deflate(stream, Z_FULL_FLUSH) }, Z_OK);
 
-    strm.avail_in = 0;
-    strm.avail_out = 1348;
-    err = unsafe { deflateParams(strm, 3, Z_FILTERED) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    // C cursors must stay inside the actual arrays. Never derive a fresh
+    // avail count from unchecked pointer subtraction or assume all the
+    // previously offered bytes were consumed by a successful call.
+    let input_offset = (stream.next_in as usize)
+        .checked_sub(original.as_ptr() as usize)
+        .unwrap_or(usize::MAX);
+    let output_offset = (stream.next_out as usize)
+        .checked_sub(compressed.as_ptr() as usize)
+        .unwrap_or(usize::MAX);
+    assert!(input_offset <= original.len());
+    assert!(output_offset <= compressed.len());
+    stream.avail_in = test_c_uint_len(original.len() - input_offset);
+    stream.avail_out = test_c_uint_len(compressed.len() - output_offset);
+    // SAFETY: after the cursor checks, each C field describes exactly
+    // the valid unread input and writable unfilled output suffix.
+    assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
+    assert_eq!(stream.avail_in, 0);
+    assert_eq!(usize::try_from(stream.total_in), Ok(original.len()));
+    let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert!(produced <= compressed.len());
+    assert!(compressed[produced..].iter().all(|&byte| byte == 0xa5));
+    // SAFETY: this initialized and finished encoder is closed exactly once.
+    assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
 
-    strm.avail_in = 6728;
-    strm.avail_out = 2696;
-    err = unsafe { deflate(strm, Z_SYNC_FLUSH) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-    strm.avail_in = 15;
-    strm.avail_out = 1348;
-    err = unsafe { deflateParams(strm, 9, Z_FILTERED) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-    strm.avail_in = 1453;
-    strm.avail_out = 1348;
-    err = unsafe { deflate(strm, Z_FULL_FLUSH) };
-
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-    strm.avail_in = (next_in.as_mut_ptr() as usize + next_in.len() - strm.next_in as usize) as _;
-    strm.avail_out = (next_out.as_ptr() as usize + next_out.len() - strm.next_out as usize) as _;
-    err = unsafe { deflate(strm, Z_FINISH) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-    let compressed_size = strm.next_out as usize - next_out.as_ptr() as usize;
-
-    err = unsafe { deflateEnd(strm) };
-
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-    let mut strm = MaybeUninit::zeroed();
-
-    err = unsafe {
-        inflateInit2_(
-            strm.as_mut_ptr(),
-            -MAX_WBITS,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        )
-    };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-    let strm = unsafe { strm.assume_init_mut() };
-
-    strm.next_in = next_out.as_mut_ptr();
-    strm.avail_in = compressed_size as _;
-    let mut uncompressed = [0; 9698];
-    assert_eq!(next_in.len(), uncompressed.len());
-
-    strm.next_out = uncompressed.as_mut_ptr();
-    strm.avail_out = test_c_uint_len(uncompressed.len());
-
-    err = unsafe { inflate(strm, Z_NO_FLUSH) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-    err = unsafe { inflateEnd(strm) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-    assert_eq!(uncompressed, next_in);
+    let mut inflate_raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: a separate writable C stream is initialized in raw mode
+    // with the exact size and valid version for this implementation.
+    assert_eq!(
+        // SAFETY: the allocated C stream is writable and this raw inflate
+        // mode uses the correct ABI version and checked structure size.
+        unsafe {
+            inflateInit2_(
+                inflate_raw.as_mut_ptr(),
+                -15,
+                VERSION,
+                test_c_stream_size::<libz_rs_sys::z_stream>(),
+            )
+        },
+        Z_OK
+    );
+    // SAFETY: initialization successfully populated the decoder C stream.
+    let decoder = unsafe { inflate_raw.assume_init_mut() };
+    decoder.next_in = compressed.as_mut_ptr();
+    decoder.avail_in = test_c_uint_len(produced);
+    let mut restored = vec![0xa5u8; original.len() + 16];
+    decoder.next_out = restored.as_mut_ptr();
+    decoder.avail_out = test_c_uint_len(restored.len());
+    // SAFETY: decoder input is a live compressed prefix and its writable
+    // output buffer is distinct and offered with its exact C byte length.
+    assert_eq!(unsafe { inflate(decoder, Z_NO_FLUSH) }, Z_STREAM_END);
+    assert_eq!(decoder.avail_in, 0);
+    assert_eq!(usize::try_from(decoder.total_in), Ok(produced));
+    assert_eq!(usize::try_from(decoder.total_out), Ok(original.len()));
+    assert_eq!(&restored[..original.len()], &original);
+    assert!(restored[original.len()..].iter().all(|&byte| byte == 0xa5));
+    // SAFETY: the initialized decoder is closed exactly once.
+    assert_eq!(unsafe { inflateEnd(decoder) }, Z_OK);
 }
 
 #[test]
 fn test_deflate_copy_small() {
-    test_deflate_copy_help(b"hello, hello!\0")
+    test_deflate_copy_help(b"hello, hello!\0");
 }
 
 #[test]
 #[cfg_attr(miri, ignore = "too slow")]
 fn test_deflate_copy_large() {
-    test_deflate_copy_help(LCET10.as_bytes())
+    test_deflate_copy_help(LCET10.as_bytes());
 }
 
-/// This test
-///
-/// - compresses half of the input, flushes, then compresses the remainder
-/// - compresses half of the input, flushes, copies the state, then compresses
-///   the remainder using the copy
-///
-/// It then asserts that the output is the same, testing that the copy was succesful.
+/// A copied encoder must yield the same complete compressed bytes as the
+/// original encoder and both streams must decode to the original plaintext.
+/// The copy is made after half the data and a sync flush.
 fn test_deflate_copy_help(input: &[u8]) {
     let config = DeflateConfig::default();
-
-    let _ = assert_eq_rs_ng!(unsafe {
-        let mut strm_full = MaybeUninit::zeroed();
-
-        let err = deflateInit2_(
-            strm_full.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
-
-        let strm_full = strm_full.assume_init_mut();
-
-        let mut full_out = vec![0u8; input.len() * 2 + 64];
-
-        strm_full.next_out = full_out.as_mut_ptr();
-        strm_full.avail_out = test_c_uint_len(full_out.len());
-
-        let half_full = input.len() / 2;
-        let mut pos_full = 0;
-
-        while pos_full < half_full {
-            strm_full.next_in = input.as_ptr().add(pos_full).cast_mut();
-            let before_in = strm_full.total_in;
-            strm_full.avail_in = (half_full - pos_full) as u32;
-
-            let err = deflate(strm_full, DeflateFlush::NoFlush as i32);
-            assert_eq!(err, 0);
-            assert_ne!(strm_full.avail_out, 0);
-
-            let used = (strm_full.total_in - before_in) as usize;
-            assert!(used > 0);
-            pos_full += used;
-        }
-
-        strm_full.next_in = core::ptr::null_mut();
-        strm_full.avail_in = 0;
-        let err = deflate(strm_full, DeflateFlush::SyncFlush as i32);
-        assert_eq!(err, 0);
-        assert_ne!(strm_full.avail_out, 0);
-
-        while pos_full < input.len() {
-            strm_full.next_in = input.as_ptr().add(pos_full).cast_mut();
-            let before_in = strm_full.total_in;
-            strm_full.avail_in = (input.len() - pos_full) as u32;
-
-            let err = deflate(strm_full, DeflateFlush::NoFlush as i32);
-            assert_eq!(err, 0);
-            assert_ne!(strm_full.avail_out, 0);
-
-            let used = (strm_full.total_in - before_in) as usize;
-            assert!(used > 0);
-            pos_full += used;
-        }
-
-        strm_full.next_in = core::ptr::null_mut();
-        strm_full.avail_in = 0;
-        let err = deflate(strm_full, DeflateFlush::SyncFlush as i32);
-        assert_eq!(err, 0);
-        assert_ne!(strm_full.avail_out, 0);
-
-        loop {
-            let err = deflate(strm_full, DeflateFlush::Finish as i32);
-            if ReturnCode::from(err) == ReturnCode::StreamEnd {
-                break;
+    let compressed = assert_eq_rs_ng!({
+        // This function is instantiated independently for the two C ABIs
+        // by the differential test macro.
+        fn feed_until(stream: &mut z_stream, input: &[u8], position: &mut usize, stop: usize) {
+            assert!(stop <= input.len());
+            while *position < stop {
+                stream.next_in = input[*position..stop].as_ptr().cast_mut();
+                stream.avail_in = test_c_uint_len(stop - *position);
+                let before = stream.total_in;
+                // SAFETY: this is a live initialized C deflater. Its input is
+                // the readable suffix and the caller keeps writable output
+                // allocated and correctly advertised for the whole call.
+                let status = unsafe { deflate(stream, Z_NO_FLUSH) };
+                assert_eq!(status, Z_OK);
+                assert_ne!(stream.avail_out, 0, "output exhausted during input");
+                let consumed = usize::try_from(stream.total_in - before).unwrap_or(usize::MAX);
+                assert!(
+                    (1..=stop - *position).contains(&consumed),
+                    "input did not advance within the offered span"
+                );
+                *position += consumed;
             }
-            assert_eq!(err, 0);
-            assert_ne!(strm_full.avail_out, 0);
+            assert_eq!(stream.avail_in, 0);
         }
 
-        let full_total_out = strm_full.total_out as usize;
-        let err = deflateEnd(strm_full);
-        assert_eq!(err, 0);
+        fn flush_sync(stream: &mut z_stream) {
+            stream.next_in = core::ptr::null_mut();
+            stream.avail_in = 0;
+            // SAFETY: an initialized deflater has live state and the
+            // remaining output suffix is writable and within its allocation.
+            assert_eq!(unsafe { deflate(stream, Z_SYNC_FLUSH) }, Z_OK);
+            assert_ne!(stream.avail_out, 0, "sync flush exhausted output");
+        }
 
-        full_out.truncate(full_total_out);
+        fn finish(stream: &mut z_stream) -> usize {
+            loop {
+                // SAFETY: no input remains, the encoder and its output
+                // allocation stay alive and the output suffix is writable.
+                let status = unsafe { deflate(stream, Z_FINISH) };
+                if status == Z_STREAM_END {
+                    break;
+                }
+                assert_eq!(status, Z_OK, "unexpected finish status");
+                assert_ne!(stream.avail_out, 0, "finish exhausted output");
+            }
+            usize::try_from(stream.total_out).unwrap_or(usize::MAX)
+        }
 
-        let mut strm_half = MaybeUninit::zeroed();
-
-        let err = deflateInit2_(
-            strm_half.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
-
-        let strm_half = strm_half.assume_init_mut();
-
-        let mut copy_out = vec![0u8; input.len() * 2 + 64];
-
-        strm_half.next_out = copy_out.as_mut_ptr();
-        strm_half.avail_out = test_c_uint_len(copy_out.len());
-
+        let capacity = input
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(64))
+            .unwrap_or(0);
+        assert!(capacity >= input.len());
         let half = input.len() / 2;
-        let mut pos = 0;
 
-        while pos < half {
-            strm_half.next_in = input.as_ptr().add(pos).cast_mut();
-            let before_in = strm_half.total_in;
-            strm_half.avail_in = (half - pos) as u32;
+        let mut first_raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable stream storage and checked ABI metadata are
+        // passed with a valid standard compressor configuration.
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    first_raw.as_mut_ptr(),
+                    config.level,
+                    config.method as c_int,
+                    config.window_bits,
+                    config.mem_level,
+                    config.strategy as c_int,
+                    zlibVersion(),
+                    test_c_stream_size::<z_stream>(),
+                )
+            },
+            Z_OK
+        );
+        // SAFETY: successful initialization populated the whole C stream.
+        let first = unsafe { first_raw.assume_init_mut() };
+        let mut full_output = vec![0xa5u8; capacity];
+        first.next_out = full_output.as_mut_ptr();
+        first.avail_out = test_c_uint_len(full_output.len());
+        let mut position = 0;
+        feed_until(first, input, &mut position, half);
+        flush_sync(first);
+        feed_until(first, input, &mut position, input.len());
+        flush_sync(first);
+        let full_size = finish(first);
+        assert_eq!(usize::try_from(first.total_in), Ok(input.len()));
+        assert!(full_size <= full_output.len());
+        assert!(full_output[full_size..].iter().all(|&byte| byte == 0xa5));
+        // SAFETY: the fully finished stream is ended exactly once.
+        assert_eq!(unsafe { deflateEnd(first) }, Z_OK);
+        full_output.truncate(full_size);
 
-            let err = deflate(strm_half, DeflateFlush::NoFlush as i32);
-            assert_eq!(err, 0);
-            assert_ne!(strm_half.avail_out, 0);
+        let mut source_raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: a separate writable C stream and same valid configuration.
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    source_raw.as_mut_ptr(),
+                    config.level,
+                    config.method as c_int,
+                    config.window_bits,
+                    config.mem_level,
+                    config.strategy as c_int,
+                    zlibVersion(),
+                    test_c_stream_size::<z_stream>(),
+                )
+            },
+            Z_OK
+        );
+        // SAFETY: successful initialization populated the source stream.
+        let source = unsafe { source_raw.assume_init_mut() };
+        let mut copy_output = vec![0xa5u8; capacity];
+        source.next_out = copy_output.as_mut_ptr();
+        source.avail_out = test_c_uint_len(copy_output.len());
+        position = 0;
+        feed_until(source, input, &mut position, half);
+        flush_sync(source);
 
-            let used = (strm_half.total_in - before_in) as usize;
-            assert!(used > 0);
-            pos += used;
-        }
+        let mut copy_raw = MaybeUninit::<z_stream>::uninit();
+        // SAFETY: source is initialized; destination is distinct writable
+        // uninitialized stream storage. The output pointer refers to the
+        // shared, still-live copied stream's output allocation.
+        assert_eq!(unsafe { deflateCopy(copy_raw.as_mut_ptr(), source) }, Z_OK);
+        // SAFETY: the source stream is no longer needed after deflateCopy;
+        // zlib reports DataError when ending this unfinished stream.
+        assert_eq!(unsafe { deflateEnd(source) }, Z_DATA_ERROR);
+        // SAFETY: a successful deflateCopy initialized the entire copy.
+        let copy = unsafe { copy_raw.assume_init_mut() };
 
-        strm_half.next_in = core::ptr::null_mut();
-        strm_half.avail_in = 0;
-        let err = deflate(strm_half, DeflateFlush::SyncFlush as i32);
-        assert_eq!(err, 0);
-        assert_ne!(strm_half.avail_out, 0);
-
-        let mut copy = MaybeUninit::uninit();
-        let err = deflateCopy(copy.as_mut_ptr(), strm_half);
-        assert_eq!(err, 0);
-
-        let err = deflateEnd(strm_half);
-        assert_eq!(err, -3); // still partway through according to your original expectation
-
-        let copy = copy.assume_init_mut();
-
-        while pos < input.len() {
-            copy.next_in = input.as_ptr().add(pos).cast_mut();
-            let before_in = copy.total_in;
-            copy.avail_in = (input.len() - pos) as u32;
-
-            let err = deflate(copy, DeflateFlush::NoFlush as i32);
-            assert_eq!(err, 0);
-            assert_ne!(copy.avail_out, 0);
-
-            let used = (copy.total_in - before_in) as usize;
-            assert!(used > 0);
-            pos += used;
-        }
-
-        copy.next_in = core::ptr::null_mut();
-        copy.avail_in = 0;
-        let err = deflate(copy, DeflateFlush::SyncFlush as i32);
-        assert_eq!(err, 0);
-        assert_ne!(copy.avail_out, 0);
-
-        loop {
-            let err = deflate(copy, DeflateFlush::Finish as i32);
-            if ReturnCode::from(err) == ReturnCode::StreamEnd {
-                break;
-            }
-            assert_eq!(err, 0);
-            assert_ne!(copy.avail_out, 0);
-        }
-
-        let copy_total_out = copy.total_out as usize;
-        let err = deflateEnd(copy);
-        assert_eq!(err, 0);
-
-        copy_out.truncate(copy_total_out);
-
-        assert_eq!(full_out, copy_out);
-
-        full_out
+        feed_until(copy, input, &mut position, input.len());
+        flush_sync(copy);
+        let copy_size = finish(copy);
+        assert_eq!(usize::try_from(copy.total_in), Ok(input.len()));
+        assert!(copy_size <= copy_output.len());
+        assert!(copy_output[copy_size..].iter().all(|&byte| byte == 0xa5));
+        // SAFETY: only the source was ended; the copied stream still owns
+        // its state and is independently ended once after StreamEnd.
+        assert_eq!(unsafe { deflateEnd(copy) }, Z_OK);
+        copy_output.truncate(copy_size);
+        assert_eq!(full_output, copy_output, "copied encoder output diverged");
+        full_output
     });
+
+    // Identical outputs alone are not an independent correctness oracle:
+    // verify exact round-trip bytes, including the end of the input.
+    let mut decoded = vec![0xa5u8; input.len().checked_add(32).unwrap_or(0)];
+    assert!(decoded.len() >= input.len());
+    let (plain, status) =
+        zlib_rs::decompress_slice(&mut decoded, &compressed, InflateConfig::default());
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(plain, input);
+    assert!(decoded[input.len()..].iter().all(|&byte| byte == 0xa5));
 }
 
 #[test]
