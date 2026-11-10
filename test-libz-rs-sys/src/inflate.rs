@@ -1737,8 +1737,10 @@ fn compress_uncompress_z() {
     let mut compr_z_len = compr_z.len();
 
     let mut compr = vec![0u8; 128];
-    let mut compr_len = compr.len() as c_ulong;
+    let mut compr_len = test_c_ulong_len(compr.len());
 
+    // SAFETY: the live source and distinct compressor output spans
+    // are valid for the declared checked C buffer lengths.
     unsafe {
         assert_eq!(
             compress_z(
@@ -1754,21 +1756,24 @@ fn compress_uncompress_z() {
                 compr.as_mut_ptr(),
                 &raw mut compr_len,
                 source.as_ptr(),
-                source.len() as c_ulong,
+                test_c_ulong_len(source.len()),
             ),
             Z_OK,
         );
     }
 
-    assert_eq!(compr_z_len, compr_len as usize);
-    assert_eq!(&compr_z[..compr_z_len], &compr[..compr_len as usize]);
+    assert_eq!(usize::try_from(compr_len), Ok(compr_z_len));
+    assert!(compr_z_len <= compr_z.len() && compr_z_len <= compr.len());
+    assert_eq!(&compr_z[..compr_z_len], &compr[..compr_z_len]);
 
     let mut compr2_z = vec![0u8; 128];
     let mut compr2_z_len = compr2_z.len();
 
     let mut compr2 = vec![0u8; 128];
-    let mut compr2_len = compr2.len() as c_ulong;
+    let mut compr2_len = test_c_ulong_len(compr2.len());
 
+    // SAFETY: both level-9 encoders read the same live input and write
+    // to separate output buffers with correctly described capacities.
     unsafe {
         assert_eq!(
             libz_rs_sys::compress2_z(
@@ -1785,22 +1790,28 @@ fn compress_uncompress_z() {
                 compr2.as_mut_ptr(),
                 &raw mut compr2_len,
                 source.as_ptr(),
-                source.len() as c_ulong,
+                test_c_ulong_len(source.len()),
                 9,
             ),
             Z_OK,
         );
     }
 
-    assert_eq!(compr2_z_len, compr2_len as usize);
-    assert_eq!(&compr2_z[..compr2_z_len], &compr2[..compr2_len as usize]);
+    assert_eq!(usize::try_from(compr2_len), Ok(compr2_z_len));
+    assert!(compr2_z_len <= compr2_z.len() && compr2_z_len <= compr2.len());
+    assert_eq!(&compr2_z[..compr2_z_len], &compr2[..compr2_z_len]);
+
+    assert!(compr_z_len <= compr_z.len());
+    assert!(compr2_z_len <= compr2_z.len());
 
     let mut dest_z = vec![0u8; source.len()];
     let mut dest_z_len = dest_z.len();
 
     let mut dest = vec![0u8; source.len()];
-    let mut dest_len = dest.len() as c_ulong;
+    let mut dest_len = test_c_ulong_len(dest.len());
 
+    // SAFETY: all three decompressors have live, disjoint input/output
+    // spans and the reported compressed lengths were bounded above.
     unsafe {
         assert_eq!(
             uncompress_z(
@@ -1835,12 +1846,14 @@ fn compress_uncompress_z() {
         );
 
         assert_eq!(source2_len, compr_z_len);
+        assert_eq!(dest2_len, source.len());
         assert_eq!(&dest2[..dest2_len], source);
     }
 
-    assert_eq!(dest_z_len, dest_len as usize);
+    assert_eq!(usize::try_from(dest_len), Ok(dest_z_len));
+    assert_eq!(dest_z_len, source.len());
     assert_eq!(&dest_z[..dest_z_len], source);
-    assert_eq!(&dest[..dest_len as usize], source);
+    assert_eq!(&dest[..dest_z_len], source);
 }
 
 #[test]
@@ -1871,7 +1884,10 @@ fn hello_world_dynamic() {
 fn inflate_adler() {
     use libz_rs_sys::*;
 
-    const ORIGINAL: &str = "The quick brown fox jumped over the lazy dog\0";
+    // The compressed fixture contains the 44 text bytes, not the NUL
+    // terminator in the old expected string. A prefix-only comparison
+    // previously hid that disagreement.
+    const ORIGINAL: &[u8] = b"The quick brown fox jumped over the lazy dog";
 
     const COMPRESSED: [u8; 52] = [
         0x78, 0x9c, 0x0b, 0xc9, 0x48, 0x55, 0x28, 0x2c, 0xcd, 0x4c, 0xce, 0x56, 0x48, 0x2a, 0xca,
@@ -1897,26 +1913,35 @@ fn inflate_adler() {
         reserved: 0,
     };
 
+    // SAFETY: the caller owns writable, ABI-compatible stream storage;
+    // the version/size match this C API and the selected window bits
+    // enable zlib/gzip wrapper detection.
     let err = unsafe { inflateInit2_(&raw mut stream, 32 + MAX_WBITS, VERSION, STREAM_SIZE) };
     assert_eq!(err, Z_OK);
 
     let mut uncompressed = [0u8; 1024];
 
     stream.next_in = COMPRESSED.as_ptr().cast_mut();
-    stream.avail_in = COMPRESSED.len() as _;
+    stream.avail_in = test_c_uint_len(COMPRESSED.len());
     stream.next_out = uncompressed.as_mut_ptr();
-    stream.avail_out = uncompressed.len() as _;
+    stream.avail_out = test_c_uint_len(uncompressed.len());
 
+    // SAFETY: compressed input and writable output are live and disjoint,
+    // with correct C availability counts.
     let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
     assert_eq!(err, Z_STREAM_END);
+    assert_eq!(
+        stream.avail_in, 0,
+        "trailing compressed bytes were not read"
+    );
+    assert_eq!(usize::try_from(stream.total_in), Ok(COMPRESSED.len()));
+    assert_eq!(usize::try_from(stream.total_out), Ok(ORIGINAL.len()));
+    assert_eq!(&uncompressed[..ORIGINAL.len()], ORIGINAL);
+    assert_eq!(stream.adler, 0x6b93_1030);
 
-    assert_eq!(stream.adler, 0x6b931030);
-
+    // SAFETY: the initialized decoder is closed exactly once.
     let err = unsafe { inflateEnd(&raw mut stream) };
     assert_eq!(err, Z_OK);
-
-    let length = Ord::min(stream.total_out as usize, ORIGINAL.len());
-    assert_eq!(&uncompressed[..length], &ORIGINAL.as_bytes()[..length])
 }
 
 #[test]
@@ -2127,6 +2152,17 @@ fn test_c_uint_len(len: usize) -> c_uint {
     count.unwrap_or_default()
 }
 
+/// An API taking C unsigned long must not silently compress or decompress a
+/// truncated caller-supplied input/output capacity.
+fn test_c_ulong_len(len: usize) -> c_ulong {
+    let result = c_ulong::try_from(len);
+    assert!(
+        result.is_ok(),
+        "C unsigned long is too narrow for test buffer"
+    );
+    result.unwrap_or_default()
+}
+
 /// Check the actual C stream structure size rather than passing a cast that
 /// could wrap. Both the fork and the system zlib use this in differential tests.
 fn test_c_stream_size<T>() -> c_int {
@@ -2155,9 +2191,8 @@ fn gzip_header_fields_insufficient_space() {
 
     let mut stream = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
 
-    const VERSION: *const c_char = libz_rs_sys::zlibVersion();
-    const STREAM_SIZE: c_int = core::mem::size_of::<libz_rs_sys::z_stream>() as c_int;
-
+    // SAFETY: writable C stream storage, valid gzip settings and
+    // the matching ABI version and checked C structure size.
     let err = unsafe {
         libz_rs_sys::deflateInit2_(
             stream.as_mut_ptr(),
@@ -2166,12 +2201,13 @@ fn gzip_header_fields_insufficient_space() {
             config.window_bits,
             config.mem_level,
             config.strategy as i32,
-            VERSION,
-            STREAM_SIZE,
+            libz_rs_sys::zlibVersion(),
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
         )
     };
     assert_eq!(err, 0);
 
+    // SAFETY: successful deflateInit2_ initialized the entire C stream.
     let stream = unsafe { stream.assume_init_mut() };
 
     let mut header = libz_rs_sys::gz_header {
@@ -2190,6 +2226,8 @@ fn gzip_header_fields_insufficient_space() {
         done: 0,
     };
 
+    // SAFETY: header and its metadata buffers are live and readable
+    // until compression is finished.
     let err = unsafe { libz_rs_sys::deflateSetHeader(stream, &raw mut header) };
     assert_eq!(err, 0);
 
@@ -2209,6 +2247,8 @@ fn gzip_header_fields_insufficient_space() {
         assert_eq!(stream.avail_in, 0, "deflate dropped an input chunk");
     }
 
+    // SAFETY: input was fully consumed and next_out refers to the
+    // remaining writable suffix of the compressed output buffer.
     let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::Finish as _) };
     assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
@@ -2231,19 +2271,19 @@ fn gzip_header_fields_insufficient_space() {
     assert_eq_rs_ng!({
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        const VERSION: *const c_char = libz_rs_sys::zlibVersion();
-        const STREAM_SIZE: c_int = core::mem::size_of::<z_stream>() as c_int;
-
+        // SAFETY: writable C stream storage and valid gzip configuration,
+        // version and checked ABI structure size.
         let err = unsafe {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 config.window_bits,
-                VERSION,
-                STREAM_SIZE,
+                libz_rs_sys::zlibVersion(),
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(err, 0);
 
+        // SAFETY: successful inflateInit2_ initialized every C stream field.
         let stream = unsafe { stream.assume_init_mut() };
 
         let mut output = [0u8; 64];
@@ -2273,6 +2313,8 @@ fn gzip_header_fields_insufficient_space() {
             done: 0,
         };
 
+        // SAFETY: the header's live writable buffers are described by
+        // their checked actual C capacities.
         let err = unsafe { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
@@ -2372,9 +2414,8 @@ fn gzip_chunked(chunk_size: usize) {
 
     let mut stream = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
 
-    const VERSION: *const c_char = libz_rs_sys::zlibVersion();
-    const STREAM_SIZE: c_int = core::mem::size_of::<libz_rs_sys::z_stream>() as c_int;
-
+    // SAFETY: writable C stream storage, valid gzip settings and
+    // the matching ABI version and checked C structure size.
     let err = unsafe {
         libz_rs_sys::deflateInit2_(
             stream.as_mut_ptr(),
@@ -2383,12 +2424,13 @@ fn gzip_chunked(chunk_size: usize) {
             config.window_bits,
             config.mem_level,
             config.strategy as i32,
-            VERSION,
-            STREAM_SIZE,
+            libz_rs_sys::zlibVersion(),
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
         )
     };
     assert_eq!(err, 0);
 
+    // SAFETY: successful deflateInit2_ initialized the entire C stream.
     let stream = unsafe { stream.assume_init_mut() };
 
     let mut header = libz_rs_sys::gz_header {
@@ -2407,6 +2449,8 @@ fn gzip_chunked(chunk_size: usize) {
         done: 0,
     };
 
+    // SAFETY: header and its metadata buffers are live and readable
+    // until compression is finished.
     let err = unsafe { libz_rs_sys::deflateSetHeader(stream, &raw mut header) };
     assert_eq!(err, 0);
 
@@ -2426,6 +2470,8 @@ fn gzip_chunked(chunk_size: usize) {
         assert_eq!(stream.avail_in, 0, "deflate dropped an input chunk");
     }
 
+    // SAFETY: input was fully consumed and next_out refers to the
+    // remaining writable suffix of the compressed output buffer.
     let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::Finish as _) };
     assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
@@ -2452,19 +2498,19 @@ fn gzip_chunked(chunk_size: usize) {
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        const VERSION: *const c_char = libz_rs_sys::zlibVersion();
-        const STREAM_SIZE: c_int = core::mem::size_of::<z_stream>() as c_int;
-
+        // SAFETY: writable C stream storage and valid gzip configuration,
+        // version and checked ABI structure size.
         let err = unsafe {
             inflateInit2_(
                 stream.as_mut_ptr(),
                 config.window_bits,
-                VERSION,
-                STREAM_SIZE,
+                libz_rs_sys::zlibVersion(),
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(err, 0);
 
+        // SAFETY: successful inflateInit2_ initialized every C stream field.
         let stream = unsafe { stream.assume_init_mut() };
 
         let mut output = [0u8; 64];
@@ -2491,6 +2537,8 @@ fn gzip_chunked(chunk_size: usize) {
             done: 0,
         };
 
+        // SAFETY: the header's live writable buffers are described by
+        // their checked actual C capacities.
         let err = unsafe { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
