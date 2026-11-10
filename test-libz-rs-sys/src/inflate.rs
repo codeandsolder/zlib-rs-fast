@@ -658,7 +658,7 @@ fn support() {
         inflateInit_(
             &raw mut stream,
             zlibVersion(),
-            core::mem::size_of::<z_stream>() as i32,
+            test_c_stream_size::<z_stream>(),
         )
     };
     assert_eq!(ret, Z_OK);
@@ -2009,14 +2009,20 @@ fn uncompress_edge_cases() {
     assert!(result.is_empty());
 }
 
-/// A gzip test buffer must fit the zlib C ABI's unsigned-byte count.
-///
-/// Do not silently truncate fixture sizes: an incorrect C length makes a
-/// test pass against an input/output span different from the one intended.
-fn gzip_test_c_len(len: usize) -> c_uint {
+/// Convert a test's real buffer extent to the C ABI byte-count type.
+/// Passing a wrapped length would silently make the test exercise less data.
+fn test_c_uint_len(len: usize) -> c_uint {
     let count = c_uint::try_from(len);
-    assert!(count.is_ok(), "gzip test span exceeds C unsigned-int limit");
+    assert!(count.is_ok(), "C ABI test span exceeds unsigned-int limit");
     count.unwrap_or_default()
+}
+
+/// Check the actual C stream structure size rather than passing a cast that
+/// could wrap. Both the fork and the system zlib use this in differential tests.
+fn test_c_stream_size<T>() -> c_int {
+    let size = c_int::try_from(core::mem::size_of::<T>());
+    assert!(size.is_ok(), "C ABI stream structure exceeds int limit");
+    size.unwrap_or_default()
 }
 
 #[test]
@@ -2064,7 +2070,7 @@ fn gzip_header_fields_insufficient_space() {
         xflags: 0,
         os: 0,
         extra: extra.as_ptr().cast_mut(),
-        extra_len: gzip_test_c_len(extra.len()),
+        extra_len: test_c_uint_len(extra.len()),
         extra_max: 0,
         name: name.as_ptr().cast_mut(),
         name_max: 0,
@@ -2079,11 +2085,11 @@ fn gzip_header_fields_insufficient_space() {
 
     let mut output_rs = [0u8; 512];
     stream.next_out = output_rs.as_mut_ptr();
-    stream.avail_out = gzip_test_c_len(output_rs.len());
+    stream.avail_out = test_c_uint_len(output_rs.len());
 
     for chunk in input.chunks(chunk_size) {
         stream.next_in = chunk.as_ptr().cast_mut();
-        stream.avail_in = gzip_test_c_len(chunk.len());
+        stream.avail_in = test_c_uint_len(chunk.len());
 
         // SAFETY: the chunk is a live input span, and output_rs remains a
         // writable destination until the stream is ended.
@@ -2132,7 +2138,7 @@ fn gzip_header_fields_insufficient_space() {
 
         let mut output = [0u8; 64];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = gzip_test_c_len(output.len());
+        stream.avail_out = test_c_uint_len(output.len());
 
         let mut extra_buf = [0u8; 64];
         assert!(extra_buf.len() < extra.len());
@@ -2148,11 +2154,11 @@ fn gzip_header_fields_insufficient_space() {
             os: 0,
             extra: extra_buf.as_mut_ptr(),
             extra_len: 0,
-            extra_max: gzip_test_c_len(extra_buf.len()),
+            extra_max: test_c_uint_len(extra_buf.len()),
             name: name_buf.as_mut_ptr(),
-            name_max: gzip_test_c_len(name_buf.len()),
+            name_max: test_c_uint_len(name_buf.len()),
             comment: comment_buf.as_mut_ptr(),
-            comm_max: gzip_test_c_len(comment_buf.len()),
+            comm_max: test_c_uint_len(comment_buf.len()),
             hcrc: 0,
             done: 0,
         };
@@ -2163,7 +2169,7 @@ fn gzip_header_fields_insufficient_space() {
         let mut completed = false;
         for chunk in output_rs.chunks_mut(chunk_size) {
             stream.next_in = chunk.as_mut_ptr();
-            stream.avail_in = gzip_test_c_len(chunk.len());
+            stream.avail_in = test_c_uint_len(chunk.len());
 
             // SAFETY: the initialized inflate stream reads the supplied
             // compressed bytes and writes into the live output allocation.
@@ -2184,7 +2190,7 @@ fn gzip_header_fields_insufficient_space() {
         assert_eq!(usize::try_from(stream.total_out), Ok(input.len()));
         assert_eq!(&output[..input.len()], input);
         assert_eq!(header.done, 1, "gzip header parsing never completed");
-        assert_eq!(header.extra_len, gzip_test_c_len(extra.len()));
+        assert_eq!(header.extra_len, test_c_uint_len(extra.len()));
 
         // SAFETY: the initialized inflate stream is closed exactly once.
         let err = unsafe { inflateEnd(stream) };
@@ -2281,7 +2287,7 @@ fn gzip_chunked(chunk_size: usize) {
         xflags: 0,
         os: 0,
         extra: extra.as_ptr().cast_mut(),
-        extra_len: gzip_test_c_len(extra.len()),
+        extra_len: test_c_uint_len(extra.len()),
         extra_max: 0,
         name: name.as_ptr().cast_mut(),
         name_max: 0,
@@ -2296,11 +2302,11 @@ fn gzip_chunked(chunk_size: usize) {
 
     let mut output_rs = [0u8; 512];
     stream.next_out = output_rs.as_mut_ptr();
-    stream.avail_out = gzip_test_c_len(output_rs.len());
+    stream.avail_out = test_c_uint_len(output_rs.len());
 
     for chunk in input.chunks(chunk_size) {
         stream.next_in = chunk.as_ptr().cast_mut();
-        stream.avail_in = gzip_test_c_len(chunk.len());
+        stream.avail_in = test_c_uint_len(chunk.len());
 
         // SAFETY: the chunk is a live input span, and output_rs remains a
         // writable destination until the stream is ended.
@@ -2353,7 +2359,7 @@ fn gzip_chunked(chunk_size: usize) {
 
         let mut output = [0u8; 64];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = gzip_test_c_len(output.len());
+        stream.avail_out = test_c_uint_len(output.len());
 
         let mut extra_buf = [0u8; 64];
         let mut name_buf = [0u8; 64];
@@ -2366,11 +2372,11 @@ fn gzip_chunked(chunk_size: usize) {
             os: 0,
             extra: extra_buf.as_mut_ptr(),
             extra_len: 0,
-            extra_max: gzip_test_c_len(extra_buf.len()),
+            extra_max: test_c_uint_len(extra_buf.len()),
             name: name_buf.as_mut_ptr(),
-            name_max: gzip_test_c_len(name_buf.len()),
+            name_max: test_c_uint_len(name_buf.len()),
             comment: comment_buf.as_mut_ptr(),
-            comm_max: gzip_test_c_len(comment_buf.len()),
+            comm_max: test_c_uint_len(comment_buf.len()),
             hcrc: 0,
             done: 0,
         };
@@ -2381,7 +2387,7 @@ fn gzip_chunked(chunk_size: usize) {
         let mut completed = false;
         for chunk in output_rs.chunks_mut(chunk_size) {
             stream.next_in = chunk.as_mut_ptr();
-            stream.avail_in = gzip_test_c_len(chunk.len());
+            stream.avail_in = test_c_uint_len(chunk.len());
 
             // SAFETY: the initialized inflate stream reads the supplied
             // compressed bytes and writes into the live output allocation.
@@ -2402,7 +2408,7 @@ fn gzip_chunked(chunk_size: usize) {
         assert_eq!(usize::try_from(stream.total_out), Ok(input.len()));
         assert_eq!(&output[..input.len()], input);
         assert_eq!(header.done, 1, "gzip header parsing never completed");
-        assert_eq!(header.extra_len, gzip_test_c_len(extra.len()));
+        assert_eq!(header.extra_len, test_c_uint_len(extra.len()));
 
         // SAFETY: the initialized inflate stream is closed exactly once.
         let err = unsafe { inflateEnd(stream) };
@@ -2431,19 +2437,24 @@ fn chunked_output_rs() {
 
     let mut stream = MaybeUninit::<z_stream>::zeroed();
 
+    // SAFETY: the zeroed stream pointer is writable and version/size
+    // match the C ABI; -15 requests raw DEFLATE decoding.
     let err = unsafe { inflateInit2_(stream.as_mut_ptr(), -15, VERSION, STREAM_SIZE) };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
+    // SAFETY: a successful initialization wrote the full C stream.
     let stream = unsafe { stream.assume_init_mut() };
 
     stream.next_in = input.as_ptr().cast_mut();
-    stream.avail_in = input.len() as _;
+    stream.avail_in = test_c_uint_len(input.len());
 
     let mut output = [0; 33];
 
     stream.next_out = output.as_mut_ptr();
     stream.avail_out = 32;
 
+    // SAFETY: the 7-byte compressed input and first 32 bytes of output
+    // remain live and non-overlapping during the decode call.
     let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
@@ -2452,10 +2463,14 @@ fn chunked_output_rs() {
 
     stream.avail_out = 1;
 
+    // SAFETY: the stream has advanced its output pointer to the final
+    // writable byte, and avail_out is limited to that remaining byte.
     let err = unsafe { inflate(stream, InflateFlush::Finish as _) };
     assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-    unsafe { inflateEnd(stream) };
+    // SAFETY: the successful inflateInit2_ call initialized this stream
+    // and it has not yet been closed.
+    assert_eq!(unsafe { inflateEnd(stream) }, Z_OK);
 
     assert_eq!(stream.total_out, 33);
 }
@@ -2466,49 +2481,63 @@ fn version_error() {
 
     let mut stream = core::mem::MaybeUninit::zeroed();
 
+    // SAFETY: a writable ABI stream pointer is supplied for each init
+    // attempt. Negative cases intentionally provide invalid version data,
+    // which the API must reject before it accesses any stream state.
     let ret = unsafe {
         inflateInit_(
             stream.as_mut_ptr(),
             zlibVersion(),
-            core::mem::size_of::<z_stream>() as i32,
+            test_c_stream_size::<z_stream>(),
         )
     };
     assert_eq!(ret, Z_OK);
 
+    // SAFETY: the first initialization succeeded, and the stream is live.
     let ret = unsafe { inflateEnd(stream.as_mut_ptr()) };
     assert_eq!(ret, Z_OK);
 
     // invalid stream size
+    // SAFETY: the version is valid and the deliberately incorrect
+    // structure-size argument must be rejected before initialization.
     let ret = unsafe { inflateInit_(stream.as_mut_ptr(), zlibVersion(), 1) };
     assert_eq!(ret, Z_VERSION_ERROR);
 
     // version is null
+    // SAFETY: a writable ABI stream pointer is supplied for each init
+    // attempt. Negative cases intentionally provide invalid version data,
+    // which the API must reject before it accesses any stream state.
     let ret = unsafe {
         inflateInit_(
             stream.as_mut_ptr(),
             core::ptr::null(),
-            core::mem::size_of::<z_stream>() as i32,
+            test_c_stream_size::<z_stream>(),
         )
     };
     assert_eq!(ret, Z_VERSION_ERROR);
 
     // version is invalid
+    // SAFETY: a writable ABI stream pointer is supplied for each init
+    // attempt. Negative cases intentionally provide invalid version data,
+    // which the API must reject before it accesses any stream state.
     let ret = unsafe {
         inflateInit_(
             stream.as_mut_ptr(),
-            b"!\0".as_ptr() as *const c_char,
-            core::mem::size_of::<z_stream>() as i32,
+            c"!".as_ptr(),
+            test_c_stream_size::<z_stream>(),
         )
     };
     assert_eq!(ret, Z_VERSION_ERROR);
 
     // version is invalid, inflateInit2_
+    // SAFETY: the version buffer is NUL-terminated and lives throughout
+    // the call; the invalid version is intentionally rejected by the API.
     let ret = unsafe {
         inflateInit2_(
             stream.as_mut_ptr(),
             1,
-            b"!\0".as_ptr() as *const c_char,
-            core::mem::size_of::<z_stream>() as i32,
+            c"!".as_ptr(),
+            test_c_stream_size::<z_stream>(),
         )
     };
     assert_eq!(ret, Z_VERSION_ERROR);
@@ -3170,7 +3199,7 @@ fn test_dict_inflate() {
     let mut dictionary = *b"hello\0";
     let mut hello = *b"hello\0";
 
-    let (compr, dict_id) = assert_eq_rs_ng!({
+    let (compr, dict_id, compressed_len) = assert_eq_rs_ng!({
         let mut compr = [0u8; 1024];
 
         let mut strm = MaybeUninit::zeroed();
@@ -3180,84 +3209,134 @@ fn test_dict_inflate() {
                 strm.as_mut_ptr(),
                 Z_BEST_COMPRESSION,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as _,
+                test_c_stream_size::<z_stream>(),
             )
         };
 
+        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+        // SAFETY: deflateInit_ successfully initialized the complete stream.
         let c_stream = unsafe { strm.assume_init_mut() };
 
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
-
-        let err =
-            unsafe { deflateSetDictionary(c_stream, dictionary.as_ptr(), dictionary.len() as _) };
+        // SAFETY: the initialized encoder borrows the live dictionary only
+        // during the synchronous deflateSetDictionary call.
+        let err = unsafe {
+            deflateSetDictionary(
+                c_stream,
+                dictionary.as_ptr(),
+                test_c_uint_len(dictionary.len()),
+            )
+        };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         let dict_id = c_stream.adler;
-        c_stream.avail_out = compr.len() as _;
+        c_stream.avail_out = test_c_uint_len(compr.len());
         c_stream.next_out = compr.as_mut_ptr();
 
-        c_stream.avail_in = hello.len() as _;
+        c_stream.avail_in = test_c_uint_len(hello.len());
         c_stream.next_in = hello.as_mut_ptr();
 
+        // SAFETY: both input and output buffers remain live, writable as
+        // required, and disjoint for the entire encoder call.
         let err = unsafe { deflate(c_stream, Z_FINISH) };
         assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
+        // deflateSetDictionary contributes the preset dictionary bytes to
+        // total_in before the actual payload is presented to deflate().
+        assert_eq!(
+            usize::try_from(c_stream.total_in),
+            Ok(dictionary.len() + hello.len())
+        );
+        let compressed_len = usize::try_from(c_stream.total_out).unwrap_or(usize::MAX);
+        assert!(
+            compressed_len <= compr.len(),
+            "deflate wrote outside its buffer"
+        );
 
-        if err != Z_STREAM_END {
-            panic!("deflate should report Z_STREAM_END\n");
-        }
+        // SAFETY: this initialized deflate stream is ended exactly once.
         let err = unsafe { deflateEnd(c_stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        (compr, dict_id)
+        (compr, dict_id, compressed_len)
     });
 
-    assert_eq_rs_ng!(unsafe {
+    assert_eq_rs_ng!({
         let mut compr = compr;
         let mut uncompr = *b"garbage garbage garbage\0";
 
         let mut stream = MaybeUninit::<z_stream>::zeroed();
 
-        let err = {
+        // SAFETY: the destination is a writable C stream, and the supplied
+        // version and stream size match this ABI.
+        let err = unsafe {
             inflateInit_(
                 stream.as_mut_ptr(),
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                test_c_stream_size::<z_stream>(),
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let d_stream = stream.assume_init_mut();
+        // SAFETY: inflateInit_ initialized every C stream field.
+        let d_stream = unsafe { stream.assume_init_mut() };
 
         d_stream.adler = 0;
-        d_stream.avail_in = compr.len() as _;
+        // The encoder may use only a prefix of the 1024-byte scratch array.
+        // Never offer the uninitialized-as-compressed trailing padding.
+        d_stream.avail_in = test_c_uint_len(compressed_len);
         d_stream.next_in = compr.as_mut_ptr();
 
-        d_stream.avail_out = uncompr.len() as _;
+        d_stream.avail_out = test_c_uint_len(uncompr.len());
         d_stream.next_out = uncompr.as_mut_ptr();
 
-        let mut check_dictionary = [0i8; MAX_DICTIONARY_SIZE];
+        let mut check_dictionary = [0u8; MAX_DICTIONARY_SIZE];
+        let mut supplied_dictionary = false;
 
         loop {
-            let mut err = { inflate(d_stream, Z_NO_FLUSH) };
+            let previous_input = d_stream.avail_in;
+            let previous_output = d_stream.total_out;
+            // SAFETY: the stream is initialized and its input/output spans
+            // refer to separate, live allocations with the stated capacities.
+            let mut err = unsafe { inflate(d_stream, Z_NO_FLUSH) };
 
             if err == Z_STREAM_END {
                 break;
             }
 
             if err == Z_NEED_DICT {
-                if d_stream.adler != dict_id {
-                    panic!("unexpected dictionary");
-                }
-                err = {
-                    inflateSetDictionary(d_stream, dictionary.as_mut_ptr(), dictionary.len() as _)
+                assert!(
+                    !supplied_dictionary,
+                    "inflate requested the dictionary twice"
+                );
+                assert_eq!(d_stream.adler, dict_id, "incorrect dictionary identifier");
+                // SAFETY: the borrowed dictionary bytes remain live until this
+                // synchronous inflateSetDictionary call returns.
+                err = unsafe {
+                    inflateSetDictionary(
+                        d_stream,
+                        dictionary.as_mut_ptr(),
+                        test_c_uint_len(dictionary.len()),
+                    )
                 };
+                supplied_dictionary = true;
+            } else {
+                assert!(
+                    d_stream.avail_in < previous_input || d_stream.total_out > previous_output,
+                    "inflate stalled without consuming input or producing output"
+                );
             }
-
             assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
         }
+        assert!(
+            supplied_dictionary,
+            "decode never requested its preset dictionary"
+        );
+        // Preset-dictionary setup may reset the decoder's total_in
+        // counter. avail_in directly verifies that every supplied byte
+        // from the actual compressed span was consumed.
+        assert_eq!(d_stream.avail_in, 0, "compressed payload left unread");
+        assert_eq!(usize::try_from(d_stream.total_out), Ok(hello.len()));
 
         let mut check_dictionary_len = 0;
-        let err = {
+        // SAFETY: a null dictionary pointer requests only its current size.
+        let err = unsafe {
             inflateGetDictionary(
                 d_stream,
                 core::ptr::null_mut(),
@@ -3265,26 +3344,25 @@ fn test_dict_inflate() {
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert!(usize::try_from(check_dictionary_len).unwrap_or(0) >= dictionary.len());
+        assert!(
+            usize::try_from(check_dictionary_len).unwrap_or(usize::MAX) <= check_dictionary.len()
+        );
 
-        if (check_dictionary_len as usize) < dictionary.len() {
-            panic!("bad dictionary length");
-        }
-
-        let err = {
+        // SAFETY: the returned size was checked against the writable
+        // dictionary buffer and the stream is still initialized.
+        let err = unsafe {
             inflateGetDictionary(
                 d_stream,
-                check_dictionary.as_mut_ptr().cast(),
+                check_dictionary.as_mut_ptr(),
                 &raw mut check_dictionary_len,
             )
         };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(&check_dictionary[..dictionary.len()], dictionary);
 
-        assert_eq!(
-            dictionary,
-            &check_dictionary.map(|c| c as u8)[..dictionary.len()]
-        );
-
-        let err = { inflateEnd(d_stream) };
+        // SAFETY: the initialized inflate stream is ended exactly once.
+        let err = unsafe { inflateEnd(d_stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         assert_eq!(uncompr[..hello.len()], hello);
