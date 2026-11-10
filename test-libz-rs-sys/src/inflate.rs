@@ -2009,6 +2009,16 @@ fn uncompress_edge_cases() {
     assert!(result.is_empty());
 }
 
+/// A gzip test buffer must fit the zlib C ABI's unsigned-byte count.
+///
+/// Do not silently truncate fixture sizes: an incorrect C length makes a
+/// test pass against an input/output span different from the one intended.
+fn gzip_test_c_len(len: usize) -> c_uint {
+    let count = c_uint::try_from(len);
+    assert!(count.is_ok(), "gzip test span exceeds C unsigned-int limit");
+    count.unwrap_or_default()
+}
+
 #[test]
 fn gzip_header_fields_insufficient_space() {
     let chunk_size = 16;
@@ -2054,7 +2064,7 @@ fn gzip_header_fields_insufficient_space() {
         xflags: 0,
         os: 0,
         extra: extra.as_ptr().cast_mut(),
-        extra_len: extra.len() as _,
+        extra_len: gzip_test_c_len(extra.len()),
         extra_max: 0,
         name: name.as_ptr().cast_mut(),
         name_max: 0,
@@ -2069,22 +2079,36 @@ fn gzip_header_fields_insufficient_space() {
 
     let mut output_rs = [0u8; 512];
     stream.next_out = output_rs.as_mut_ptr();
-    stream.avail_out = output_rs.len() as _;
+    stream.avail_out = gzip_test_c_len(output_rs.len());
 
     for chunk in input.chunks(chunk_size) {
         stream.next_in = chunk.as_ptr().cast_mut();
-        stream.avail_in = chunk.len() as _;
+        stream.avail_in = gzip_test_c_len(chunk.len());
 
+        // SAFETY: the chunk is a live input span, and output_rs remains a
+        // writable destination until the stream is ended.
         let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::NoFlush as _) };
 
         assert_eq!(err, ReturnCode::Ok as i32, "{:?}", stream.msg);
+        assert_eq!(stream.avail_in, 0, "deflate dropped an input chunk");
     }
 
     let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::Finish as _) };
     assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-    let output_rs = &mut output_rs[..stream.total_out as usize];
+    assert_eq!(
+        usize::try_from(stream.total_in),
+        Ok(input.len()),
+        "deflate did not consume the complete payload"
+    );
+    let compressed_len = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert!(
+        compressed_len <= output_rs.len(),
+        "deflate output exceeds its buffer"
+    );
+    let output_rs = &mut output_rs[..compressed_len];
 
+    // SAFETY: deflateInit2_ succeeded and this is the only stream end.
     let err = unsafe { libz_rs_sys::deflateEnd(stream) };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
@@ -2108,7 +2132,7 @@ fn gzip_header_fields_insufficient_space() {
 
         let mut output = [0u8; 64];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out = gzip_test_c_len(output.len());
 
         let mut extra_buf = [0u8; 64];
         assert!(extra_buf.len() < extra.len());
@@ -2124,11 +2148,11 @@ fn gzip_header_fields_insufficient_space() {
             os: 0,
             extra: extra_buf.as_mut_ptr(),
             extra_len: 0,
-            extra_max: extra_buf.len() as _,
+            extra_max: gzip_test_c_len(extra_buf.len()),
             name: name_buf.as_mut_ptr(),
-            name_max: name_buf.len() as _,
+            name_max: gzip_test_c_len(name_buf.len()),
             comment: comment_buf.as_mut_ptr(),
-            comm_max: comment_buf.len() as _,
+            comm_max: gzip_test_c_len(comment_buf.len()),
             hcrc: 0,
             done: 0,
         };
@@ -2136,19 +2160,33 @@ fn gzip_header_fields_insufficient_space() {
         let err = unsafe { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
+        let mut completed = false;
         for chunk in output_rs.chunks_mut(chunk_size) {
             stream.next_in = chunk.as_mut_ptr();
-            stream.avail_in = chunk.len() as _;
+            stream.avail_in = gzip_test_c_len(chunk.len());
 
+            // SAFETY: the initialized inflate stream reads the supplied
+            // compressed bytes and writes into the live output allocation.
             let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
-
-            if err == ReturnCode::StreamEnd as i32 {
+            assert!(
+                matches!(err, Z_OK | Z_STREAM_END),
+                "gzip inflate failed while parsing a chunk: {err}"
+            );
+            assert_eq!(stream.avail_in, 0, "inflate left unconsumed gzip bytes");
+            if err == Z_STREAM_END {
+                completed = true;
                 break;
             }
-
-            assert_eq!(err, ReturnCode::Ok as i32);
         }
 
+        assert!(completed, "gzip input ended without reaching Z_STREAM_END");
+        assert_eq!(usize::try_from(stream.total_in), Ok(output_rs.len()));
+        assert_eq!(usize::try_from(stream.total_out), Ok(input.len()));
+        assert_eq!(&output[..input.len()], input);
+        assert_eq!(header.done, 1, "gzip header parsing never completed");
+        assert_eq!(header.extra_len, gzip_test_c_len(extra.len()));
+
+        // SAFETY: the initialized inflate stream is closed exactly once.
         let err = unsafe { inflateEnd(stream) };
         assert_eq!(err, ReturnCode::Ok as i32);
 
@@ -2243,7 +2281,7 @@ fn gzip_chunked(chunk_size: usize) {
         xflags: 0,
         os: 0,
         extra: extra.as_ptr().cast_mut(),
-        extra_len: extra.len() as _,
+        extra_len: gzip_test_c_len(extra.len()),
         extra_max: 0,
         name: name.as_ptr().cast_mut(),
         name_max: 0,
@@ -2258,22 +2296,36 @@ fn gzip_chunked(chunk_size: usize) {
 
     let mut output_rs = [0u8; 512];
     stream.next_out = output_rs.as_mut_ptr();
-    stream.avail_out = output_rs.len() as _;
+    stream.avail_out = gzip_test_c_len(output_rs.len());
 
     for chunk in input.chunks(chunk_size) {
         stream.next_in = chunk.as_ptr().cast_mut();
-        stream.avail_in = chunk.len() as _;
+        stream.avail_in = gzip_test_c_len(chunk.len());
 
+        // SAFETY: the chunk is a live input span, and output_rs remains a
+        // writable destination until the stream is ended.
         let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::NoFlush as _) };
 
         assert_eq!(err, ReturnCode::Ok as i32, "{:?}", stream.msg);
+        assert_eq!(stream.avail_in, 0, "deflate dropped an input chunk");
     }
 
     let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::Finish as _) };
     assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-    let output_rs = &mut output_rs[..stream.total_out as usize];
+    assert_eq!(
+        usize::try_from(stream.total_in),
+        Ok(input.len()),
+        "deflate did not consume the complete payload"
+    );
+    let compressed_len = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert!(
+        compressed_len <= output_rs.len(),
+        "deflate output exceeds its buffer"
+    );
+    let output_rs = &mut output_rs[..compressed_len];
 
+    // SAFETY: deflateInit2_ succeeded and this is the only stream end.
     let err = unsafe { libz_rs_sys::deflateEnd(stream) };
     assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
@@ -2301,7 +2353,7 @@ fn gzip_chunked(chunk_size: usize) {
 
         let mut output = [0u8; 64];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out = gzip_test_c_len(output.len());
 
         let mut extra_buf = [0u8; 64];
         let mut name_buf = [0u8; 64];
@@ -2314,11 +2366,11 @@ fn gzip_chunked(chunk_size: usize) {
             os: 0,
             extra: extra_buf.as_mut_ptr(),
             extra_len: 0,
-            extra_max: extra_buf.len() as _,
+            extra_max: gzip_test_c_len(extra_buf.len()),
             name: name_buf.as_mut_ptr(),
-            name_max: name_buf.len() as _,
+            name_max: gzip_test_c_len(name_buf.len()),
             comment: comment_buf.as_mut_ptr(),
-            comm_max: comment_buf.len() as _,
+            comm_max: gzip_test_c_len(comment_buf.len()),
             hcrc: 0,
             done: 0,
         };
@@ -2326,19 +2378,33 @@ fn gzip_chunked(chunk_size: usize) {
         let err = unsafe { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
+        let mut completed = false;
         for chunk in output_rs.chunks_mut(chunk_size) {
             stream.next_in = chunk.as_mut_ptr();
-            stream.avail_in = chunk.len() as _;
+            stream.avail_in = gzip_test_c_len(chunk.len());
 
+            // SAFETY: the initialized inflate stream reads the supplied
+            // compressed bytes and writes into the live output allocation.
             let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
-
-            if err == ReturnCode::StreamEnd as i32 {
+            assert!(
+                matches!(err, Z_OK | Z_STREAM_END),
+                "gzip inflate failed while parsing a chunk: {err}"
+            );
+            assert_eq!(stream.avail_in, 0, "inflate left unconsumed gzip bytes");
+            if err == Z_STREAM_END {
+                completed = true;
                 break;
             }
-
-            assert_eq!(err, ReturnCode::Ok as i32);
         }
 
+        assert!(completed, "gzip input ended without reaching Z_STREAM_END");
+        assert_eq!(usize::try_from(stream.total_in), Ok(output_rs.len()));
+        assert_eq!(usize::try_from(stream.total_out), Ok(input.len()));
+        assert_eq!(&output[..input.len()], input);
+        assert_eq!(header.done, 1, "gzip header parsing never completed");
+        assert_eq!(header.extra_len, gzip_test_c_len(extra.len()));
+
+        // SAFETY: the initialized inflate stream is closed exactly once.
         let err = unsafe { inflateEnd(stream) };
         assert_eq!(err, ReturnCode::Ok as i32);
 
