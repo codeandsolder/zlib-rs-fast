@@ -1985,11 +1985,26 @@ fn write_all_with(
 
 fn write_all_to_fd(fd: c_int, input: &[u8]) -> Result<(), ()> {
     write_all_with(input, |remaining| {
-        // On some platforms write(2) cannot accept lengths exceeding SSIZE_MAX.
+        // On Unix, the count must fit in ssize_t. On Windows, the CRT
+        // _write count is an unsigned int but the result is a signed int.
+        #[cfg(not(windows))]
         let len = remaining.len().min(isize::MAX as usize);
+        #[cfg(windows)]
+        let len = remaining
+            .len()
+            .min(usize::try_from(c_int::MAX).map_err(|_| IoAttemptError::Failed)?);
         // SAFETY: the initialized input slice stays live across this syscall
         // and the request cannot exceed its size.
+        #[cfg(not(windows))]
         let written = unsafe { libc::write(fd, remaining.as_ptr().cast::<c_void>(), len) };
+        #[cfg(windows)]
+        let written = unsafe {
+            libc::write(
+                fd,
+                remaining.as_ptr().cast::<c_void>(),
+                c_uint::try_from(len).map_err(|_| IoAttemptError::Failed)?,
+            )
+        };
         usize::try_from(written).map_err(|_| last_io_attempt_error())
     })
 }
@@ -2014,10 +2029,24 @@ fn read_with(
 
 fn load_from_fd(fd: c_int, output: &mut [MaybeUninit<u8>]) -> Result<(usize, bool), ()> {
     read_with(output, |remaining| {
+        #[cfg(not(windows))]
         let len = remaining.len().min(isize::MAX as usize);
+        #[cfg(windows)]
+        let len = remaining
+            .len()
+            .min(usize::try_from(c_int::MAX).map_err(|_| IoAttemptError::Failed)?);
         // SAFETY: the output is writable uninitialized storage for len
         // bytes, and stays live across this syscall.
+        #[cfg(not(windows))]
         let got = unsafe { libc::read(fd, remaining.as_mut_ptr().cast::<c_void>(), len) };
+        #[cfg(windows)]
+        let got = unsafe {
+            libc::read(
+                fd,
+                remaining.as_mut_ptr().cast::<c_void>(),
+                c_uint::try_from(len).map_err(|_| IoAttemptError::Failed)?,
+            )
+        };
         usize::try_from(got).map_err(|_| last_io_attempt_error())
     })
 }
