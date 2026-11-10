@@ -13,6 +13,8 @@ use libc::{O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_CUR, SEE
 use zlib_rs::deflate::Strategy;
 use zlib_rs::MAX_WBITS;
 
+/// Opaque gzip file handle compatible with the zlib C API.
+///
 /// In the zlib C API, this structure exposes just enough of the internal state
 /// of an open [`gzFile`] to support the `gzgetc` C macro. Since Rust code won't be
 /// using that C macro, we define [`gzFile_s`] as an empty structure.
@@ -78,7 +80,7 @@ impl GzCString {
         Some(Self { ptr, len_with_nul })
     }
 
-    fn as_ptr(&self) -> *const c_char {
+    const fn as_ptr(&self) -> *const c_char {
         self.ptr.as_ptr()
     }
 
@@ -132,7 +134,7 @@ impl GzBuffer {
         })
     }
 
-    fn as_ptr(&self) -> *mut u8 {
+    const fn as_ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
     }
 
@@ -165,7 +167,7 @@ impl GzBuffer {
         self.checked_range_within(cursor, len, self.capacity)
     }
 
-    fn usable(&self) -> usize {
+    const fn usable(&self) -> usize {
         self.usable
     }
 
@@ -206,22 +208,22 @@ impl GzWriteInput {
         }
     }
 
-    fn from_slice(input: &[u8]) -> Self {
+    const fn from_slice(input: &[u8]) -> Self {
         Self {
             next: input.as_ptr(),
             remaining: input.len(),
         }
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.remaining
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.remaining == 0
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    const fn as_ptr(&self) -> *const u8 {
         self.next
     }
 
@@ -697,12 +699,12 @@ impl GzStateOwner {
         Some(Self { ptr })
     }
 
-    fn as_mut(&mut self) -> &mut GzState {
+    const fn as_mut(&mut self) -> &mut GzState {
         // Safety: the owner uniquely owns a live, fully initialized `GzState`.
         unsafe { self.ptr.as_mut() }
     }
 
-    fn into_raw(self) -> NonNull<GzState> {
+    const fn into_raw(self) -> NonNull<GzState> {
         let ptr = self.ptr;
         core::mem::forget(self);
         ptr
@@ -713,7 +715,7 @@ impl GzStateOwner {
     /// # Safety
     /// `ptr` must identify a live `GzState` allocation produced by `into_raw`, and
     /// ownership of that allocation must be transferred exclusively to the returned owner.
-    unsafe fn reclaim(ptr: NonNull<GzState>) -> Self {
+    const unsafe fn reclaim(ptr: NonNull<GzState>) -> Self {
         Self { ptr }
     }
 }
@@ -788,6 +790,7 @@ impl Source {
 ///
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen64))]
+#[must_use]
 pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> gzFile {
     if path.is_null() {
         return ptr::null_mut();
@@ -821,6 +824,7 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 ///
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen))]
+#[must_use]
 pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzFile {
     if path.is_null() {
         return ptr::null_mut();
@@ -860,6 +864,7 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
 ///
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzdopen))]
+#[must_use]
 pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
     if mode.is_null() {
         return ptr::null_mut();
@@ -998,6 +1003,7 @@ fn fd_path(buf: &mut [u8; 27], fd: c_int) -> &CStr {
 
     write!(w, "<fd:{fd}>\0").unwrap();
 
+    // SAFETY: The stack formatter wrote a trailing NUL within the local byte buffer; the pointer remains valid for this borrowed C string.
     unsafe { CStr::from_ptr(w.buf[..w.len].as_ptr().cast()) }
 }
 
@@ -1094,12 +1100,15 @@ fn free_buffers(state: &mut GzState) {
 /// been deallocated.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzclose))]
 pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
+    // SAFETY: The caller supplies either null or a live, correctly aligned gzip handle; as_ref returns None for null and only borrows it.
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return Z_STREAM_ERROR;
     };
 
     match state.mode {
+        // SAFETY: The live handle was inspected above and has read mode; gzclose_r consumes that read handle.
         GzMode::Read => unsafe { gzclose_r(file) },
+        // SAFETY: The live handle was inspected above and is not in read mode; gzclose_w handles the remaining states and consumes it.
         GzMode::Write | GzMode::Append | GzMode::None => unsafe { gzclose_w(file) },
     }
 }
@@ -1139,7 +1148,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
     // Process any buffered input.
     if state.input.is_some() {
         // Safety: state.stream was properly initialized as a z_stream during gzip open.
-        unsafe { inflateEnd(&mut state.stream as *mut z_stream) };
+        unsafe { inflateEnd(&raw mut state.stream) };
     }
 
     let err = match state.err {
@@ -1147,6 +1156,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
         _ => Z_OK,
     };
 
+    // SAFETY: The state owns the integer file descriptor; close accepts any descriptor value and reports an invalid one with -1.
     let ret = match unsafe { libc::close(state.fd) } {
         0 => err,
         _ => Z_ERRNO,
@@ -1204,8 +1214,9 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     }
     if state.input.is_some() && !state.direct {
         // Safety: state.stream was properly initialized as a z_stream during gzip open.
-        unsafe { deflateEnd(&mut state.stream as *mut z_stream) };
+        unsafe { deflateEnd(&raw mut state.stream) };
     }
+    // SAFETY: The state owns this descriptor until close; libc::close returns an error for invalid descriptors rather than dereferencing them.
     if unsafe { libc::close(state.fd) } == -1 {
         ret = Z_ERRNO;
     }
@@ -1214,6 +1225,8 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     ret
 }
 
+/// Configure the buffer capacity of an open gzip file.
+///
 /// Set the internal buffer size used by this library's functions for `file` to
 /// `size`.  The default buffer size is 128 KB.  This function must be called
 /// after [`gzopen`] or [`gzdopen`], but before any other calls that read or write
@@ -1238,6 +1251,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
 /// - A null pointer.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzbuffer))]
 pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
+    // SAFETY: The gzip handle contract gives exclusive access to a live, aligned state, or null; as_mut handles null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -1296,6 +1310,7 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzerror))]
 pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_char {
     // Get internal structure and check integrity
+    // SAFETY: The gzip handle contract gives a valid, aligned live state for non-null file; as_ref does not take ownership.
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return ptr::null();
     };
@@ -1332,6 +1347,7 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzclearerr))]
 pub unsafe extern "C" fn gzclearerr(file: gzFile) {
     // Get internal structure and check integrity
+    // SAFETY: The gzip handle contract gives exclusive access to a valid state for non-null file; as_mut handles null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return;
     };
@@ -1368,6 +1384,7 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzeof))]
 pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
     // Get internal structure and check integrity
+    // SAFETY: The gzip handle contract gives a valid, aligned live state for non-null file; as_ref handles null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return 0;
     };
@@ -1407,6 +1424,7 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
 /// `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzdirect))]
 pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
+    // SAFETY: The gzip handle contract provides a live and uniquely borrowed GzState for non-null file.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return 0;
     };
@@ -1466,6 +1484,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
 /// - The caller must ensure that `buf` points to at least `len` writable bytes.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzread))]
 pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> c_int {
+    // SAFETY: The caller guarantees an exclusive live gzip handle; as_mut rejects null without dereferencing it.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -1565,6 +1584,7 @@ pub unsafe extern "C" fn gzfread(
         return 0;
     }
 
+    // SAFETY: The enclosing gzip entry point receives an exclusive live handle or null, so as_mut is valid for non-null file.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return 0;
     };
@@ -1760,7 +1780,7 @@ fn gz_look(state: &mut GzState) -> Result<(), ()> {
         // `opaque` fields as needed by `inflateInit2`.
         if unsafe {
             inflateInit2_(
-                &mut state.stream as *mut z_stream,
+                &raw mut state.stream,
                 MAX_WBITS + 16,
                 zlibVersion(),
                 core::mem::size_of::<z_stream>() as i32,
@@ -1796,7 +1816,7 @@ fn gz_look(state: &mut GzState) -> Result<(), ()> {
     };
     if input.len() > 1 && input[0] == 31 && input[1] == 139 {
         // Safety: We initialized `state.stream` with `inflateInit2` above.
-        unsafe { inflateReset(&mut state.stream as *mut z_stream) };
+        unsafe { inflateReset(&raw mut state.stream) };
         state.how = How::Gzip;
         state.direct = false;
         return Ok(());
@@ -2080,7 +2100,8 @@ fn gz_decomp_into(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> Result
                 break;
             }
 
-            match unsafe { inflate(&mut state.stream, Z_NO_FLUSH) } {
+            // SAFETY: The gzip stream was initialized for decompression and its input/output pointers refer to the live owned buffers during this call.
+            match unsafe { inflate(&raw mut state.stream, Z_NO_FLUSH) } {
                 Z_STREAM_ERROR | Z_NEED_DICT => {
                     const MSG: &str = "internal error: inflate stream corrupt";
                     gz_error(state, Some((Z_STREAM_ERROR, MSG)));
@@ -2130,6 +2151,7 @@ fn gz_decomp_into(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> Result
 /// - `buf` must point to at least `len` bytes of readable memory.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzwrite))]
 pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) -> c_int {
+    // SAFETY: The writer receives an exclusive valid gzip handle or null, and as_mut only dereferences non-null handles.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return 0;
     };
@@ -2186,6 +2208,7 @@ pub unsafe extern "C" fn gzfwrite(
         return 0;
     }
 
+    // SAFETY: The enclosing gzip entry point provides an exclusive live handle or null, checked by as_mut.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return 0;
     };
@@ -2322,6 +2345,7 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
         if first {
             // `gz_comp` lazily initializes the owned input buffer when needed, and `n`
             // is bounded by its usable compression prefix.
+            // SAFETY: gz_comp initialized the owned writable buffer, and n is bounded by its usable prefix, so this zero fill stays inside it.
             unsafe { state.input_ptr().write_bytes(0u8, n) };
             first = false;
         }
@@ -2371,9 +2395,10 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
         state.stream.zfree = Some(ALLOCATOR.zfree);
         state.stream.opaque = ALLOCATOR.opaque;
         const DEF_MEM_LEVEL: c_int = 8;
+        // SAFETY: The embedded z_stream has its allocator and opaque state set, and the initialization call receives a valid writable stream structure.
         if unsafe {
             deflateInit2_(
-                &mut state.stream,
+                &raw mut state.stream,
                 state.level as _,
                 Z_DEFLATED,
                 MAX_WBITS + 16,
@@ -2445,7 +2470,7 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
         }
         // Safety: `state.reset` is set only in `gz_comp`, which first initializes
         // `state.stream` using `deflateInit2_`.
-        let _ = unsafe { deflateReset(&mut state.stream) };
+        let _ = unsafe { deflateReset(&raw mut state.stream) };
         state.reset = false;
     }
 
@@ -2479,7 +2504,8 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
 
         // Compress.
         let mut have = state.stream.avail_out;
-        ret = unsafe { deflate(&mut state.stream, flush) };
+        // SAFETY: The deflate stream is initialized; the input and output cursors point within owned live gzip buffers at this call.
+        ret = unsafe { deflate(&raw mut state.stream, flush) };
         if ret == Z_STREAM_ERROR {
             const MSG: &str = "internal error: deflate stream corrupt";
             gz_error(state, Some((Z_STREAM_ERROR, MSG)));
@@ -2500,6 +2526,8 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
     Ok(())
 }
 
+/// Flush pending compressed output from a gzip file.
+///
 /// Flush all pending output buffered in `file`. The parameter `flush` is interpreted
 /// the same way as in the [`deflate`] function. The return value is the zlib error
 /// number (see [`gzerror`]). `gzflush` is permitted only when writing.
@@ -2514,6 +2542,7 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzflush))]
 pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
+    // SAFETY: The flush call receives an exclusive live gzip state when file is non-null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return Z_STREAM_ERROR;
     };
@@ -2541,6 +2570,8 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
     state.err
 }
 
+/// Get the uncompressed stream position for the next operation.
+///
 /// Return the starting position for the next [`gzread`] or [`gzwrite`] on `file`.
 /// This position represents a number of bytes in the uncompressed data stream,
 /// and is zero when starting, even if appending or reading a gzip stream from
@@ -2557,6 +2588,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gztell64))]
 pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
+    // SAFETY: The tell operation borrows a live aligned gzip state for non-null file; as_ref checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return -1;
     };
@@ -2576,6 +2608,8 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
     }
 }
 
+/// Get the uncompressed stream position for the next operation.
+///
 /// Return the starting position for the next [`gzread`] or [`gzwrite`] on `file`.
 /// This position represents a number of bytes in the uncompressed data stream,
 /// and is zero when starting, even if appending or reading a gzip stream from
@@ -2592,9 +2626,12 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gztell))]
 pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
+    // SAFETY: The public gztell wrapper inherits the same live-handle precondition as gztell64 and forwards it unchanged.
     z_off_t::try_from(unsafe { gztell64(file) }).unwrap_or(-1)
 }
 
+/// Get the compressed byte offset of an open gzip file.
+///
 /// Return the current compressed (actual) read or write offset of `file`.  This
 /// offset includes the count of bytes that precede the gzip stream, for example
 /// when appending or when using [`gzdopen`] for reading. When reading, the
@@ -2612,6 +2649,7 @@ pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzoffset64))]
 pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
+    // SAFETY: The offset getter shares a valid aligned live gzip state for non-null file; as_ref checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_ref() }) else {
         return -1;
     };
@@ -2635,6 +2673,8 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
     }
 }
 
+/// Get the compressed byte offset of an open gzip file.
+///
 /// Return the current compressed (actual) read or write offset of `file`.  This
 /// offset includes the count of bytes that precede the gzip stream, for example
 /// when appending or when using [`gzdopen`] for reading. When reading, the
@@ -2652,6 +2692,7 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzoffset))]
 pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
+    // SAFETY: The public gzoffset wrapper inherits the same handle precondition as gzoffset64 and forwards it unchanged.
     z_off_t::try_from(unsafe { gzoffset64(file) }).unwrap_or(-1)
 }
 
@@ -2667,6 +2708,7 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzputc))]
 pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
+    // SAFETY: The caller supplies a uniquely borrowed live gzip handle or null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -2738,6 +2780,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
 /// - `s` must point to a null-terminated C string.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzputs))]
 pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
+    // SAFETY: The caller supplies a uniquely borrowed live gzip handle or null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -2752,6 +2795,7 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
     }
 
     // Write string.
+    // SAFETY: The gzputs C API requires s to point to a valid NUL-terminated string; strlen reads through that terminator.
     let len = unsafe { libc::strlen(s) };
     if c_int::try_from(len).is_err() {
         const MSG: &str = "string length does not fit in int";
@@ -2782,6 +2826,7 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzgetc))]
 pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
+    // SAFETY: The caller supplies an exclusive live gzip handle or null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -2810,6 +2855,7 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
     // Nothing there -- try the typed read core.
     let mut c = [MaybeUninit::<u8>::uninit()];
     match gz_read(state, &mut c) {
+        // SAFETY: gz_read returned exactly one byte, so it initialized the first MaybeUninit entry before we read it.
         1 => c_int::from(unsafe { c[0].assume_init() }),
         _ => -1,
     }
@@ -2851,6 +2897,7 @@ pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzungetc))]
 pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
+    // SAFETY: The caller supplies an exclusive live gzip handle or null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -2901,6 +2948,8 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     c
 }
 
+/// Read a NUL-terminated line of decompressed text.
+///
 /// Read decompressed bytes from `file` into `buf`, until `len-1` characters are
 /// read, or until a newline character is read and transferred to `buf`, or an
 /// end-of-file condition is encountered.  If any characters are read or if `len`
@@ -2929,6 +2978,7 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
         return ptr::null_mut();
     }
 
+    // SAFETY: The enclosing gzip operation holds the live handle exclusively, or receives null, which as_mut rejects.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return ptr::null_mut();
     };
@@ -3001,6 +3051,8 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
     }
 }
 
+/// Change the compression level and strategy of an open gzip file.
+///
 /// Dynamically update the compression level and strategy for `file`. See the
 /// description of [`deflateInit2_`] for the meaning of these parameters. Previously
 /// provided data is flushed before applying the parameter changes.
@@ -3024,6 +3076,7 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
     let Ok(strategy) = Strategy::try_from(strategy) else {
         return Z_STREAM_ERROR;
     };
+    // SAFETY: The enclosing gzip operation holds the live handle exclusively, or receives null, which as_mut rejects.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return Z_STREAM_ERROR;
     };
@@ -3054,13 +3107,15 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
         }
         // Safety: Because `state` is in write mode and owns an input buffer, `state.stream`
         // was initialized using `deflateInit2` in `gz_init`.
-        unsafe { super::deflateParams(&mut state.stream, level, strategy as c_int) };
+        unsafe { super::deflateParams(&raw mut state.stream, level, strategy as c_int) };
     }
     state.level = level as _;
     state.strategy = strategy;
     Z_OK
 }
 
+/// Seek to an uncompressed byte offset of a gzip stream.
+///
 /// Set the starting position to `offset` relative to `whence` for the next [`gzread`]
 /// or [`gzwrite`] on `file`. The `offset` represents a number of bytes in the
 /// uncompressed data stream. The `whence` parameter is defined as in `lseek(2)`,
@@ -3084,6 +3139,7 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzseek64))]
 pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int) -> z_off64_t {
+    // SAFETY: The seek call receives an exclusive valid gzip handle or null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -3195,6 +3251,8 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
     target
 }
 
+/// Seek to an uncompressed byte offset of a gzip stream.
+///
 /// Set the starting position to `offset` relative to `whence` for the next [`gzread`]
 /// or [`gzwrite`] on `file`. The `offset` represents a number of bytes in the
 /// uncompressed data stream. The `whence` parameter is defined as in `lseek(2)`,
@@ -3218,6 +3276,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzseek))]
 pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) -> z_off_t {
+    // SAFETY: The public gzseek wrapper forwards the live handle and seek arguments to gzseek64 under its matching caller contract.
     z_off_t::try_from(unsafe { gzseek64(file, offset as z_off64_t, whence) }).unwrap_or(-1)
 }
 
@@ -3235,6 +3294,7 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
 /// - `file`, if non-null, must be an open file handle obtained from [`gzopen`] or [`gzdopen`].
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzrewind))]
 pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
+    // SAFETY: The rewind operation receives an exclusive valid gzip state or null; as_mut checks null.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return -1;
     };
@@ -3401,6 +3461,7 @@ pub unsafe extern "C" fn gzvprintf(
 fn lseek64(fd: c_int, offset: z_off64_t, origin: c_int) -> z_off64_t {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     {
+        // SAFETY: lseek64 accepts a file-descriptor integer and offset; invalid descriptors or origins are returned as errors by libc.
         return unsafe { libc::lseek64(fd, offset as _, origin) as z_off64_t };
     }
 
@@ -4078,7 +4139,7 @@ mod tests {
 
         // Safety: `gz_init` initialized the deflate stream above. Ending without
         // `Z_FINISH` reports `Z_DATA_ERROR`, but still releases the deflate state.
-        assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_DATA_ERROR);
+        assert_eq!(unsafe { deflateEnd(&raw mut state.stream) }, Z_DATA_ERROR);
     }
 
     #[test]
@@ -4100,7 +4161,7 @@ mod tests {
             assert_eq!(gz_write(&mut state, &mut source), 0);
             assert_eq!(state.err, Z_STREAM_ERROR);
             // SAFETY: gz_init initialized the compression stream.
-            assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_OK);
+            assert_eq!(unsafe { deflateEnd(&raw mut state.stream) }, Z_OK);
         }
         Ok(())
     }
@@ -4123,7 +4184,7 @@ mod tests {
             assert_eq!(gz_comp(&mut state, Z_NO_FLUSH), Err(()));
             assert_eq!(state.err, Z_STREAM_ERROR);
             // SAFETY: gz_init initialized the compression stream.
-            assert_eq!(unsafe { deflateEnd(&mut state.stream) }, Z_OK);
+            assert_eq!(unsafe { deflateEnd(&raw mut state.stream) }, Z_OK);
         }
         Ok(())
     }
@@ -4245,7 +4306,7 @@ mod tests {
         assert_eq!(state.err, Z_OK);
         assert!(state.msg.is_none());
         let mut err = Z_ERRNO;
-        let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+        let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
         assert_eq!(err, Z_OK);
 
@@ -4258,7 +4319,7 @@ mod tests {
             b"<fd:-2>: example error\0"
         );
         let mut err = Z_OK;
-        let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+        let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(
             unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(),
             b"<fd:-2>: example error\0"
@@ -4271,7 +4332,7 @@ mod tests {
         assert_eq!(state.err, Z_OK);
         assert!(state.msg.is_none());
         let mut err = Z_ERRNO;
-        let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+        let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
         assert_eq!(err, Z_OK);
 
@@ -4283,7 +4344,7 @@ mod tests {
         assert_eq!(state.err, Z_MEM_ERROR);
         assert!(state.msg.is_none());
         let mut err = Z_OK;
-        let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+        let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(
             unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(),
             b"out of memory\0"
@@ -4339,7 +4400,7 @@ mod tests {
             )
         };
         let mut err = Z_OK;
-        let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+        let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(err, Z_STREAM_ERROR);
         assert_eq!(
             unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(),
@@ -4348,7 +4409,7 @@ mod tests {
 
         // gzclearerr should clear the error flag and message.
         unsafe { gzclearerr(handle) };
-        let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+        let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(err, Z_OK);
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
 
@@ -4379,7 +4440,7 @@ mod tests {
 
             // gzclearerr should clear the error flag and message.
             unsafe { gzclearerr(handle) };
-            let msg = unsafe { gzerror(handle, &mut err as *mut c_int) };
+            let msg = unsafe { gzerror(handle, &raw mut err) };
             assert_eq!(err, Z_OK);
             assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
 
