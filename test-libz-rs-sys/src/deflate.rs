@@ -87,7 +87,7 @@ pub mod quick {
 
         let err = unsafe {
             deflateInit2_(
-                &mut stream,
+                &raw mut stream,
                 1,
                 Z_DEFLATED,
                 31,
@@ -100,22 +100,22 @@ pub mod quick {
 
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        stream.next_in = &BI_VALID_INPUT as *const u8 as *mut u8;
+        stream.next_in = BI_VALID_INPUT.as_ptr().cast_mut();
         let mut next_out = [0u8; 1236];
         stream.next_out = next_out.as_mut_ptr();
 
         stream.avail_in = 554;
         stream.avail_out = 31;
 
-        let err = unsafe { deflate(&mut stream, DeflateFlush::Finish as i32) };
+        let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         stream.avail_in = 0;
         stream.avail_out = 498;
-        let err = unsafe { deflate(&mut stream, DeflateFlush::Finish as i32) };
+        let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
         assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-        let err = unsafe { deflateEnd(&mut stream) };
+        let err = unsafe { deflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
     }
 
@@ -177,7 +177,7 @@ pub mod quick {
 
         let err = unsafe {
             deflateInit2_(
-                &mut stream,
+                &raw mut stream,
                 1,
                 Z_DEFLATED,
                 -MAX_WBITS,
@@ -190,7 +190,7 @@ pub mod quick {
 
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        stream.next_in = &BLOCK_OPEN_INPUT as *const u8 as *mut u8;
+        stream.next_in = BLOCK_OPEN_INPUT.as_ptr().cast_mut();
         let mut next_out = [0u8; 1116];
         let next_out_start = next_out.as_ptr() as usize;
         stream.next_out = next_out.as_mut_ptr();
@@ -204,7 +204,7 @@ pub mod quick {
                 stream.avail_out = 38;
             }
 
-            let err = unsafe { deflate(&mut stream, DeflateFlush::Finish as i32) };
+            let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
             if ReturnCode::from(err) == ReturnCode::StreamEnd {
                 break;
             }
@@ -214,7 +214,7 @@ pub mod quick {
 
         let compressed_size = stream.next_out as usize - next_out.as_mut_ptr() as usize;
 
-        let err = unsafe { deflateEnd(&mut stream) };
+        let err = unsafe { deflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         let mut stream = libz_rs_sys::z_stream {
@@ -234,7 +234,7 @@ pub mod quick {
             reserved: 0,
         };
 
-        let err = unsafe { inflateInit2_(&mut stream, -MAX_WBITS, VERSION, STREAM_SIZE) };
+        let err = unsafe { inflateInit2_(&raw mut stream, -MAX_WBITS, VERSION, STREAM_SIZE) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         stream.next_in = next_out.as_mut_ptr();
@@ -244,10 +244,10 @@ pub mod quick {
         stream.next_out = uncompressed.as_mut_ptr();
         stream.avail_out = uncompressed.len() as _;
 
-        let err = unsafe { inflate(&mut stream, Z_NO_FLUSH) };
+        let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
         assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-        let err = unsafe { inflateEnd(&mut stream) };
+        let err = unsafe { inflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         assert_eq!(uncompressed, BLOCK_OPEN_INPUT);
@@ -276,7 +276,7 @@ pub mod quick {
 
         let err = unsafe {
             deflateInit2_(
-                &mut stream,
+                &raw mut stream,
                 2, // fast
                 Z_DEFLATED,
                 -MAX_WBITS,
@@ -289,7 +289,7 @@ pub mod quick {
 
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        stream.next_in = &BLOCK_OPEN_INPUT as *const u8 as *mut u8;
+        stream.next_in = BLOCK_OPEN_INPUT.as_ptr().cast_mut();
         let mut next_out = [0u8; 1116];
         let next_out_start = next_out.as_ptr() as usize;
         stream.next_out = next_out.as_mut_ptr();
@@ -303,7 +303,7 @@ pub mod quick {
                 stream.avail_out = 38;
             }
 
-            let err = unsafe { deflate(&mut stream, DeflateFlush::Finish as i32) };
+            let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
             if ReturnCode::from(err) == ReturnCode::StreamEnd {
                 break;
             }
@@ -313,7 +313,7 @@ pub mod quick {
 
         let compressed_size = stream.next_out as usize - next_out_start;
 
-        let err = unsafe { deflateEnd(&mut stream) };
+        let err = unsafe { deflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         let mut stream = libz_rs_sys::z_stream {
@@ -333,7 +333,7 @@ pub mod quick {
             reserved: 0,
         };
 
-        let err = unsafe { inflateInit2_(&mut stream, -MAX_WBITS, VERSION, STREAM_SIZE) };
+        let err = unsafe { inflateInit2_(&raw mut stream, -MAX_WBITS, VERSION, STREAM_SIZE) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         stream.next_in = next_out.as_mut_ptr();
@@ -343,10 +343,10 @@ pub mod quick {
         stream.next_out = uncompressed.as_mut_ptr();
         stream.avail_out = uncompressed.len() as _;
 
-        let err = unsafe { inflate(&mut stream, Z_NO_FLUSH) };
+        let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
         assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-        let err = unsafe { inflateEnd(&mut stream) };
+        let err = unsafe { inflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         assert_eq!(uncompressed, BLOCK_OPEN_INPUT);
@@ -375,7 +375,7 @@ pub mod quick {
 
         let err = unsafe {
             deflateInit2_(
-                &mut stream,
+                &raw mut stream,
                 9, // fast
                 Z_DEFLATED,
                 -MAX_WBITS,
@@ -388,7 +388,7 @@ pub mod quick {
 
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        stream.next_in = &BLOCK_OPEN_INPUT as *const u8 as *mut u8;
+        stream.next_in = BLOCK_OPEN_INPUT.as_ptr().cast_mut();
         let mut next_out = [0u8; 1116];
         let next_out_start = next_out.as_ptr() as usize;
         stream.next_out = next_out.as_mut_ptr();
@@ -402,7 +402,7 @@ pub mod quick {
                 stream.avail_out = 38;
             }
 
-            let err = unsafe { deflate(&mut stream, DeflateFlush::Finish as i32) };
+            let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
             if ReturnCode::from(err) == ReturnCode::StreamEnd {
                 break;
             }
@@ -412,7 +412,7 @@ pub mod quick {
 
         let compressed_size = stream.next_out as usize - next_out_start;
 
-        let err = unsafe { deflateEnd(&mut stream) };
+        let err = unsafe { deflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         let mut stream = libz_rs_sys::z_stream {
@@ -432,7 +432,7 @@ pub mod quick {
             reserved: 0,
         };
 
-        let err = unsafe { inflateInit2_(&mut stream, -MAX_WBITS, VERSION, STREAM_SIZE) };
+        let err = unsafe { inflateInit2_(&raw mut stream, -MAX_WBITS, VERSION, STREAM_SIZE) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         stream.next_in = next_out.as_mut_ptr();
@@ -442,10 +442,10 @@ pub mod quick {
         stream.next_out = uncompressed.as_mut_ptr();
         stream.avail_out = uncompressed.len() as _;
 
-        let err = unsafe { inflate(&mut stream, Z_NO_FLUSH) };
+        let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
         assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
 
-        let err = unsafe { inflateEnd(&mut stream) };
+        let err = unsafe { inflateEnd(&raw mut stream) };
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
         assert_eq!(uncompressed, BLOCK_OPEN_INPUT);
@@ -493,7 +493,7 @@ fn test_deflate_tune() {
 
     let input = "Hello, World!\n";
 
-    c_stream.next_in = input.as_ptr() as *mut u8;
+    c_stream.next_in = input.as_ptr().cast_mut();
     c_stream.next_out = compr.as_mut_ptr();
 
     while c_stream.total_in as usize != input.len() && (c_stream.total_out as usize) < compr.len() {
@@ -916,7 +916,7 @@ fn deflate_bound_gzip_header_help(
         };
 
         // this may fail if the config is not set up for gzip
-        let _ = deflateSetHeader(strm.as_mut_ptr(), &mut header);
+        let _ = deflateSetHeader(strm.as_mut_ptr(), &raw mut header);
 
         let bound = deflateBound(strm.as_mut_ptr(), source_len);
 
@@ -966,8 +966,8 @@ fn gz_header_text_and_hcrc_check() {
             os: 0,
             extra: core::ptr::null_mut(),
             extra_len: 0,
-            name: empty_c_string.as_ptr() as *mut _,
-            comment: empty_c_string.as_ptr() as *mut _,
+            name: empty_c_string.as_ptr().cast_mut(),
+            comment: empty_c_string.as_ptr().cast_mut(),
             hcrc: -42,
             //
             xflags: 0,
@@ -978,7 +978,7 @@ fn gz_header_text_and_hcrc_check() {
         };
 
         // this may fail if the config is not set up for gzip
-        let _ = deflateSetHeader(strm, &mut header);
+        let _ = deflateSetHeader(strm, &raw mut header);
 
         let input = "\0\u{2}\0\0\0\0\0\0\0\u{10}";
         let mut output = [0u8; 32];
@@ -1009,9 +1009,9 @@ fn deflate_bound_gzip_header_basic() {
     deflate_bound_gzip_header_help((
         DeflateConfig::default(),
         1234,
-        CString::from_vec_with_nul("extra\0".as_bytes().to_vec()).unwrap(),
-        CString::from_vec_with_nul("name\0".as_bytes().to_vec()).unwrap(),
-        CString::from_vec_with_nul("comment\0".as_bytes().to_vec()).unwrap(),
+        CString::from_vec_with_nul(b"extra\0".to_vec()).unwrap(),
+        CString::from_vec_with_nul(b"name\0".to_vec()).unwrap(),
+        CString::from_vec_with_nul(b"comment\0".to_vec()).unwrap(),
     ));
 }
 
@@ -1149,7 +1149,7 @@ fn test_compress_param() {
 
         let offset = input.len() / 2;
 
-        stream.next_in = input.as_ptr() as *mut u8;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = offset as _;
 
         let err = deflate(stream, DeflateFlush::NoFlush as i32);
@@ -1210,7 +1210,7 @@ fn test_dict_deflate() {
         strm.next_out = compr.as_mut_ptr();
         strm.avail_out = compr.len() as _;
 
-        strm.next_in = HELLO.as_ptr() as *mut u8;
+        strm.next_in = HELLO.as_ptr().cast_mut();
         strm.avail_in = HELLO.len() as _;
 
         let err = deflate(strm, DeflateFlush::Finish as i32);
@@ -1365,7 +1365,7 @@ fn test_deflate_prime() {
 
         const HELLO: &str = "hello, hello!\0";
 
-        strm.next_in = HELLO.as_ptr() as *mut u8;
+        strm.next_in = HELLO.as_ptr().cast_mut();
         strm.avail_in = HELLO.len() as _;
 
         let mut compr = [0xAA; 64];
@@ -1445,7 +1445,7 @@ fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
             let total_in = strm.total_in;
             let adler = strm.adler;
             let mut dictionary_len = 0;
-            let get = deflateGetDictionary(strm, core::ptr::null_mut(), &mut dictionary_len);
+            let get = deflateGetDictionary(strm, core::ptr::null_mut(), &raw mut dictionary_len);
             let end = deflateEnd(strm);
 
             (init, set, total_in, adler, get, dictionary_len, end)
@@ -1501,7 +1501,7 @@ fn small_window() {
         let err = deflateSetDictionary(strm, plain.as_ptr(), plain.len() as _);
         assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        strm.next_in = plain.as_ptr() as *mut u8;
+        strm.next_in = plain.as_ptr().cast_mut();
         strm.avail_in = plain.len() as _;
 
         let mut compr = [0; 32];
@@ -1575,7 +1575,7 @@ fn test_deflate_pending() {
         let strm = strm.assume_init_mut();
 
         let mut compr = [0; 32];
-        strm.next_in = HELLO.as_ptr() as *mut u8;
+        strm.next_in = HELLO.as_ptr().cast_mut();
         strm.next_out = compr.as_mut_ptr();
 
         let it_in = HELLO.as_bytes().chunks(1);
@@ -1594,13 +1594,13 @@ fn test_deflate_pending() {
         let err = libz_rs_sys::deflatePending(strm, std::ptr::null_mut(), std::ptr::null_mut());
         assert_eq!(err, 0);
 
-        let err = libz_rs_sys::deflatePending(strm, &mut ped, std::ptr::null_mut());
+        let err = libz_rs_sys::deflatePending(strm, &raw mut ped, std::ptr::null_mut());
         assert_eq!(err, 0);
 
-        let err = libz_rs_sys::deflatePending(strm, std::ptr::null_mut(), &mut bits);
+        let err = libz_rs_sys::deflatePending(strm, std::ptr::null_mut(), &raw mut bits);
         assert_eq!(err, 0);
 
-        let err = libz_rs_sys::deflatePending(strm, &mut ped, &mut bits);
+        let err = libz_rs_sys::deflatePending(strm, &raw mut ped, &raw mut bits);
         assert_eq!(err, 0);
 
         assert!(bits >= 0);
@@ -1656,12 +1656,12 @@ fn test_deflate_used() {
 
         // Before any flush to a byte boundary, the value is 0
         let mut bits = -1;
-        let err = libz_rs_sys::deflateUsed(strm, &mut bits);
+        let err = libz_rs_sys::deflateUsed(strm, &raw mut bits);
         assert_eq!(err, 0);
         assert_eq!(bits, 0);
 
         let mut compr = [0; 32];
-        strm.next_in = HELLO.as_ptr() as *mut u8;
+        strm.next_in = HELLO.as_ptr().cast_mut();
         strm.next_out = compr.as_mut_ptr();
         strm.avail_in = HELLO.len() as _;
         strm.avail_out = compr.len() as _;
@@ -1672,7 +1672,7 @@ fn test_deflate_used() {
         // after flushing the final block to a byte boundary, the number of bits
         // used in the last byte is in 1..=8.
         let mut bits = -1;
-        let err = libz_rs_sys::deflateUsed(strm, &mut bits);
+        let err = libz_rs_sys::deflateUsed(strm, &raw mut bits);
         assert_eq!(err, 0);
 
         // 7 bits is what stock zlib reports.
@@ -1769,7 +1769,7 @@ fn test_deflate_used_stored() {
 
         let input = b"a stored block carries raw bytes\0";
         let mut compr = [0; 128];
-        strm.next_in = input.as_ptr() as *mut u8;
+        strm.next_in = input.as_ptr().cast_mut();
         strm.next_out = compr.as_mut_ptr();
         strm.avail_in = input.len() as _;
         strm.avail_out = compr.len() as _;
@@ -1778,7 +1778,7 @@ fn test_deflate_used_stored() {
         assert_eq!(err, libz_rs_sys::Z_STREAM_END);
 
         let mut bits = -1;
-        let err = libz_rs_sys::deflateUsed(strm, &mut bits);
+        let err = libz_rs_sys::deflateUsed(strm, &raw mut bits);
         assert_eq!(err, 0);
 
         // Always a full byte.
@@ -1812,7 +1812,7 @@ fn test_deflate_used_copy() {
 
         let input = b"just some string...\0";
         let mut compr = [0; 128];
-        source.next_in = input.as_ptr() as *mut u8;
+        source.next_in = input.as_ptr().cast_mut();
         source.next_out = compr.as_mut_ptr();
         source.avail_in = input.len() as _;
         source.avail_out = compr.len() as _;
@@ -1821,7 +1821,7 @@ fn test_deflate_used_copy() {
         assert_eq!(err, libz_rs_sys::Z_STREAM_END);
 
         let mut src_bits = -1;
-        assert_eq!(libz_rs_sys::deflateUsed(source, &mut src_bits), Z_OK);
+        assert_eq!(libz_rs_sys::deflateUsed(source, &raw mut src_bits), Z_OK);
         assert!((1..=8).contains(&src_bits));
 
         let mut dest = MaybeUninit::zeroed();
@@ -1830,7 +1830,7 @@ fn test_deflate_used_copy() {
         let dest = dest.assume_init_mut();
 
         let mut dst_bits = -1;
-        assert_eq!(libz_rs_sys::deflateUsed(dest, &mut dst_bits), Z_OK);
+        assert_eq!(libz_rs_sys::deflateUsed(dest, &raw mut dst_bits), Z_OK);
         assert_eq!(dst_bits, src_bits);
 
         assert_eq!(deflateEnd(source), 0);
@@ -1864,7 +1864,7 @@ fn test_flush() {
 
         let stream = strm.assume_init_mut();
 
-        stream.next_in = HELLO.as_ptr() as *mut u8;
+        stream.next_in = HELLO.as_ptr().cast_mut();
         stream.next_out = compr.as_mut_ptr();
 
         stream.avail_in = 3;
@@ -1906,7 +1906,7 @@ fn test_sync(compr: &[u8]) {
 
         let stream = stream.assume_init_mut();
 
-        stream.next_in = compr.as_ptr() as *mut u8;
+        stream.next_in = compr.as_ptr().cast_mut();
         stream.avail_in = 2; // read just the zlib header
 
         stream.next_out = uncompr.as_mut_ptr();
@@ -2024,7 +2024,7 @@ fn test_deflate_hash_head_0() {
 
 #[test]
 fn test_deflate_copy_small() {
-    test_deflate_copy_help("hello, hello!\0".as_bytes())
+    test_deflate_copy_help(b"hello, hello!\0")
 }
 
 #[test]
@@ -2069,7 +2069,7 @@ fn test_deflate_copy_help(input: &[u8]) {
         let mut pos_full = 0;
 
         while pos_full < half_full {
-            strm_full.next_in = input.as_ptr().add(pos_full) as *mut u8;
+            strm_full.next_in = input.as_ptr().add(pos_full).cast_mut();
             let before_in = strm_full.total_in;
             strm_full.avail_in = (half_full - pos_full) as u32;
 
@@ -2089,7 +2089,7 @@ fn test_deflate_copy_help(input: &[u8]) {
         assert_ne!(strm_full.avail_out, 0);
 
         while pos_full < input.len() {
-            strm_full.next_in = input.as_ptr().add(pos_full) as *mut u8;
+            strm_full.next_in = input.as_ptr().add(pos_full).cast_mut();
             let before_in = strm_full.total_in;
             strm_full.avail_in = (input.len() - pos_full) as u32;
 
@@ -2148,7 +2148,7 @@ fn test_deflate_copy_help(input: &[u8]) {
         let mut pos = 0;
 
         while pos < half {
-            strm_half.next_in = input.as_ptr().add(pos) as *mut u8;
+            strm_half.next_in = input.as_ptr().add(pos).cast_mut();
             let before_in = strm_half.total_in;
             strm_half.avail_in = (half - pos) as u32;
 
@@ -2177,7 +2177,7 @@ fn test_deflate_copy_help(input: &[u8]) {
         let copy = copy.assume_init_mut();
 
         while pos < input.len() {
-            copy.next_in = input.as_ptr().add(pos) as *mut u8;
+            copy.next_in = input.as_ptr().add(pos).cast_mut();
             let before_in = copy.total_in;
             copy.avail_in = (input.len() - pos) as u32;
 
@@ -2312,7 +2312,7 @@ fn gzip_header_survives_deflate_resets_like_zlib_ng() {
                 hcrc: 1,
                 done: 0,
             };
-            assert_eq!(deflateSetHeader(stream, &mut header), Z_OK);
+            assert_eq!(deflateSetHeader(stream, &raw mut header), Z_OK);
 
             let reset = if reset_keep {
                 deflateResetKeep(stream)
@@ -2323,7 +2323,7 @@ fn gzip_header_survives_deflate_resets_like_zlib_ng() {
 
             let input = b"payload after reset";
             let mut output = [0u8; 256];
-            stream.next_in = input.as_ptr() as *mut u8;
+            stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = input.len() as _;
             stream.next_out = output.as_mut_ptr();
             stream.avail_out = output.len() as _;
@@ -2372,22 +2372,22 @@ fn gzip_with_header() {
             time: 0,
             xflags: 0,
             os: 0,
-            extra: extra.as_ptr() as *mut _,
+            extra: extra.as_ptr().cast_mut(),
             extra_len: extra.len() as _,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
         };
 
-        let err = unsafe { deflateSetHeader(stream, &mut header) };
+        let err = unsafe { deflateSetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut _;
+        stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = input.len() as _;
 
         let mut output = [0u8; 256];
@@ -2452,7 +2452,7 @@ fn gzip_with_header() {
             done: 0,
         };
 
-        let err = { inflateGetHeader(stream, &mut header) };
+        let err = { inflateGetHeader(stream, &raw mut header) };
         assert_eq!(err, 0);
 
         let err = { inflate(stream, DeflateFlush::NoFlush as _) };
@@ -2561,7 +2561,7 @@ mod fuzz_based_tests {
     #[test]
     fn simple_rle() {
         fuzz_based_test(
-            "\0\0\0\0\u{6}".as_bytes(),
+            b"\0\0\0\0\x06",
             DeflateConfig {
                 level: -1,
                 method: Method::Deflated,
@@ -2927,7 +2927,7 @@ fn issue_169() {
 
         strm.avail_in = 2048;
         strm.avail_out = 1053;
-        strm.next_in = buf.as_ptr() as *mut u8;
+        strm.next_in = buf.as_ptr().cast_mut();
         strm.next_out = out.as_mut_ptr();
         ret = deflate(strm, Z_NO_FLUSH);
         assert_eq!(ret, Z_OK);
@@ -3065,11 +3065,11 @@ fn flood_pending_buffer() {
             os: -1953789045,
             extra: extra.as_mut_ptr(),
             extra_len: extra.len().try_into().unwrap(),
-            extra_max: 0,                         // doesn't matter for writing.
-            name: name.as_ptr() as *mut u8, // hack: UB if written to, but we shouldn't write during deflate.
-            name_max: 0,                    // doesn't matter for writing.
-            comment: comment.as_ptr() as *mut u8, // hack: UB if written to, but we shouldn't write during deflate.
-            comm_max: 0,                          // doesn't matter for wr+iting.
+            extra_max: 0,                                // doesn't matter for writing.
+            name: name.as_ptr().cast_mut().cast::<u8>(), // deflate only reads header strings.
+            name_max: 0,                                 // doesn't matter for writing.
+            comment: comment.as_ptr().cast_mut().cast::<u8>(), // deflate only reads header strings.
+            comm_max: 0,                                 // doesn't matter for wr+iting.
             hcrc: 222,
             done: 0, // doesn't matter for writing.
         };
@@ -3448,7 +3448,8 @@ fn test_deflate_get_dict() {
         let mut dict_new = vec![0; 256];
         let mut dict_len = dict_new.len() as c_uint;
 
-        let ret = unsafe { deflateGetDictionary(c_stream, dict_new.as_mut_ptr(), &mut dict_len) };
+        let ret =
+            unsafe { deflateGetDictionary(c_stream, dict_new.as_mut_ptr(), &raw mut dict_len) };
         assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
 
         let dictionary = unsafe { CStr::from_ptr(dict_new.as_ptr().cast()) }.to_owned();
@@ -3652,7 +3653,7 @@ fn test_issue_455() {
             let mut length = 32;
             compress(
                 output.as_mut_ptr(),
-                &mut length,
+                &raw mut length,
                 data.as_ptr(),
                 data.len() as _,
             )
@@ -3698,7 +3699,7 @@ mod deflate_reset_deterministic {
             let mut a_stream = MaybeUninit::<z_stream>::zeroed().assume_init();
 
             let err = deflateInit2_(
-                &mut a_stream,
+                &raw mut a_stream,
                 compression_level,
                 Z_DEFLATED,
                 window_bits,
@@ -3711,14 +3712,14 @@ mod deflate_reset_deterministic {
 
             let a_compressed = compress_data(DATA_A, &mut a_stream);
 
-            let err = deflateEnd(&mut a_stream);
+            let err = deflateEnd(&raw mut a_stream);
             assert_eq!(err, Z_OK);
 
             // ---- Compress b with newly created z_stream. ----
             let mut b_stream = MaybeUninit::<z_stream>::zeroed().assume_init();
 
             let err = deflateInit2_(
-                &mut b_stream,
+                &raw mut b_stream,
                 compression_level,
                 Z_DEFLATED,
                 window_bits,
@@ -3732,12 +3733,12 @@ mod deflate_reset_deterministic {
             let _b_compressed = compress_data(DATA_B, &mut b_stream);
 
             // ---- Reset the stream. ----
-            let err = deflateReset(&mut b_stream);
+            let err = deflateReset(&raw mut b_stream);
             assert_eq!(err, Z_OK);
 
             let a_compressed2 = compress_data(DATA_A, &mut b_stream);
 
-            let err = deflateEnd(&mut b_stream);
+            let err = deflateEnd(&raw mut b_stream);
             assert_eq!(err, Z_OK);
 
             assert_eq!(a_compressed, a_compressed2);
