@@ -1,8 +1,10 @@
 use zlib_rs::c_api::*;
 
+#[cfg(feature = "export-symbols")]
+use crate::prefix;
 use crate::{
     deflate, deflateEnd, deflateInit2_, deflateReset, inflate, inflateEnd, inflateInit2_,
-    inflateReset, prefix, z_off64_t, z_off_t, zlibVersion,
+    inflateReset, z_off64_t, z_off_t, zlibVersion,
 };
 use core::cmp::Ordering;
 use core::ffi::{c_char, c_int, c_uint, c_void, CStr};
@@ -25,7 +27,10 @@ use zlib_rs::MAX_WBITS;
     non_camel_case_types,
     reason = "gzFile_s preserves the opaque zlib handle ABI name"
 )]
-pub enum gzFile_s {}
+#[repr(C)]
+pub struct gzFile_s {
+    _private: [u8; 0],
+}
 
 /// File handle for an open gzip file.
 #[expect(
@@ -327,7 +332,7 @@ impl GzState {
             start: 0,
             eof: false,
             past: false,
-            level: crate::Z_DEFAULT_COMPRESSION as i8,
+            level: -1, // The C API default compression level.
             strategy: Strategy::Default,
             reset: false,
             skip: 0,
@@ -344,7 +349,7 @@ impl GzState {
 
         for &ch in mode {
             if ch.is_ascii_digit() {
-                self.level = (ch - b'0') as i8;
+                self.level = i8::try_from(ch - b'0').map_err(|_| ())?;
             } else {
                 match ch {
                     b'r' => self.mode = GzMode::Read,
@@ -805,9 +810,9 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
     }
     // Safety: guaranteed by this public function's caller contract.
     let mode = unsafe { CStr::from_ptr(mode) };
-    gzopen_bound(source, mode)
-        .map(|owner| owner.into_raw().as_ptr().cast::<gzFile_s>())
-        .unwrap_or(ptr::null_mut())
+    gzopen_bound(source, mode).map_or(ptr::null_mut(), |owner| {
+        owner.into_raw().as_ptr().cast::<gzFile_s>()
+    })
 }
 
 /// Open a gzip file for reading or writing.
@@ -839,9 +844,9 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
     }
     // Safety: guaranteed by this public function's caller contract.
     let mode = unsafe { CStr::from_ptr(mode) };
-    gzopen_bound(source, mode)
-        .map(|owner| owner.into_raw().as_ptr().cast::<gzFile_s>())
-        .unwrap_or(ptr::null_mut())
+    gzopen_bound(source, mode).map_or(ptr::null_mut(), |owner| {
+        owner.into_raw().as_ptr().cast::<gzFile_s>()
+    })
 }
 
 /// Given an open file descriptor, prepare to read or write a gzip file.
@@ -871,9 +876,9 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
     }
     // Safety: guaranteed by this public function's caller contract.
     let mode = unsafe { CStr::from_ptr(mode) };
-    gzopen_bound(Source::Fd(fd), mode)
-        .map(|owner| owner.into_raw().as_ptr().cast::<gzFile_s>())
-        .unwrap_or(ptr::null_mut())
+    gzopen_bound(Source::Fd(fd), mode).map_or(ptr::null_mut(), |owner| {
+        owner.into_raw().as_ptr().cast::<gzFile_s>()
+    })
 }
 
 /// Safe construction core shared by the raw gzip-open FFI shims.
@@ -1203,7 +1208,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     // Check for a pending seek request
     if state.seek {
         state.seek = false;
-        if gz_zero(state, state.skip as _).is_err() {
+        if gz_zero_pending(state).is_err() {
             ret = state.err;
         }
     }
@@ -1516,7 +1521,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
     if got == 0 && state.err != Z_OK && state.err != Z_BUF_ERROR {
         -1
     } else {
-        got as _
+        c_int::try_from(got).unwrap_or(-1)
     }
 }
 
@@ -2178,7 +2183,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
 
     // Safety: the public contract guarantees a readable caller span of `len` bytes.
     let mut input = unsafe { GzWriteInput::from_raw(buf, len) };
-    gz_write(state, &mut input) as c_int
+    c_int::try_from(gz_write(state, &mut input)).unwrap_or(0)
 }
 
 /// Compress and write `nitems` items of size `size` from `buf` to `file`, duplicating
@@ -2252,7 +2257,7 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
 
     if state.seek {
         state.seek = false;
-        if gz_zero(state, state.skip as _).is_err() {
+        if gz_zero_pending(state).is_err() {
             return 0;
         }
     }
@@ -2328,6 +2333,29 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
 //
 // - `Ok` on success.
 // - `Err` on error.
+// Pending write seeks are signed 64-bit positions, even on 32-bit targets.
+// Consume them in representable chunks rather than truncating an i64 offset to usize.
+fn gz_zero_pending(state: &mut GzState) -> Result<(), ()> {
+    let Ok(mut remaining) = u64::try_from(state.skip) else {
+        state.fail_position_overflow();
+        return Err(());
+    };
+    if remaining == 0 {
+        return gz_zero(state, 0);
+    }
+
+    while remaining != 0 {
+        let count = usize::try_from(remaining).unwrap_or(usize::MAX);
+        gz_zero(state, count)?;
+        let Ok(consumed) = u64::try_from(count) else {
+            state.fail_position_overflow();
+            return Err(());
+        };
+        remaining -= consumed;
+    }
+    Ok(())
+}
+
 fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
     if state.ensure_position_room(len).is_err() {
         return Err(());
@@ -2560,7 +2588,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
     // Check for seek request.
     if state.seek {
         state.seek = false;
-        if gz_zero(state, state.skip as _).is_err() {
+        if gz_zero_pending(state).is_err() {
             return state.err;
         }
     }
@@ -2724,7 +2752,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     // Check for seek request.
     if state.seek {
         state.seek = false;
-        if gz_zero(state, state.skip as _).is_err() {
+        if gz_zero_pending(state).is_err() {
             return -1;
         }
     }
@@ -2747,7 +2775,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
                 .as_mut()
                 .expect("write input must remain allocated")
                 .usable_uninit_mut()[have]
-                .write(c as u8);
+                .write(c.to_le_bytes()[0]);
             if state.advance_position(1).is_err() {
                 return -1;
             }
@@ -2757,7 +2785,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     }
 
     // No room in buffer or not initialized, use gz_write.
-    let buf = [c as u8];
+    let buf = [c.to_le_bytes()[0]];
     // Safety: We have confirmed that `state` is valid, and `buf` contains 1 readable byte of data.
     let mut input = GzWriteInput::from_slice(&buf);
     match gz_write(state, &mut input) {
@@ -2797,17 +2825,17 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
     // Write string.
     // SAFETY: The gzputs C API requires s to point to a valid NUL-terminated string; strlen reads through that terminator.
     let len = unsafe { libc::strlen(s) };
-    if c_int::try_from(len).is_err() {
+    let Ok(len_abi) = c_int::try_from(len) else {
         const MSG: &str = "string length does not fit in int";
         gz_error(state, Some((Z_STREAM_ERROR, MSG)));
         return -1;
-    }
+    };
     // Safety: `s` was validated above as a C string containing at least `len` bytes.
     let mut input = unsafe { GzWriteInput::from_raw(s.cast::<c_void>(), len) };
     let put = gz_write(state, &mut input);
     match put.cmp(&len) {
         Ordering::Less => -1,
-        Ordering::Equal | Ordering::Greater => len as _,
+        Ordering::Equal | Ordering::Greater => len_abi,
     }
 }
 
@@ -3086,6 +3114,15 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
         return Z_STREAM_ERROR;
     }
 
+    // zlib-compatible behavior: ignore an invalid level without mutating the
+    // stream. Valid levels are the default sentinel -1 and levels 0 through 9.
+    let Ok(level_storage) = i8::try_from(level) else {
+        return Z_OK;
+    };
+    if level_storage != -1 && !(0..=9).contains(&level_storage) {
+        return Z_OK;
+    }
+
     // If no change is requested, then do nothing.
     if level == c_int::from(state.level) && strategy == state.strategy {
         return Z_OK;
@@ -3094,7 +3131,7 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
     // Check for seek request.
     if state.seek {
         state.seek = false;
-        if gz_zero(state, state.skip as _).is_err() {
+        if gz_zero_pending(state).is_err() {
             return state.err;
         }
     }
@@ -3107,9 +3144,14 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
         }
         // Safety: Because `state` is in write mode and owns an input buffer, `state.stream`
         // was initialized using `deflateInit2` in `gz_init`.
-        unsafe { super::deflateParams(&raw mut state.stream, level, strategy as c_int) };
+        // SAFETY: gz_init initialized this live stream; the state holds its
+        // compression input/output buffers throughout the parameter change.
+        let ret = unsafe { super::deflateParams(&raw mut state.stream, level, strategy as c_int) };
+        if ret != Z_OK {
+            return ret;
+        }
     }
-    state.level = level as _;
+    state.level = level_storage;
     state.strategy = strategy;
     Z_OK
 }
@@ -3378,7 +3420,7 @@ pub unsafe extern "C" fn gzvprintf(
     // Check for seek request.
     if state.seek {
         state.seek = false;
-        if gz_zero(state, state.skip as _).is_err() {
+        if gz_zero_pending(state).is_err() {
             return state.err;
         }
     }
@@ -3553,7 +3595,7 @@ mod tests {
     fn path(prefix: &Path, file: &str) -> String {
         let mut path_buf = prefix.to_path_buf();
         path_buf.push(file);
-        path_buf.as_path().to_str().unwrap().to_owned()
+        path_buf.to_string_lossy().into_owned()
     }
 
     #[test]
@@ -3640,63 +3682,118 @@ mod tests {
     }
 
     #[test]
-    fn test_configure() {
+    fn test_configure() -> Result<(), ()> {
         let mut state = GzState::new();
 
-        state.configure(b"r").unwrap();
+        state.configure(b"r")?;
         assert_eq!(state.mode, GzMode::Read);
-        state.configure(b"rw").unwrap();
+        state.configure(b"rw")?;
         assert_eq!(state.mode, GzMode::Write);
-        state.configure(b"wr").unwrap();
+        state.configure(b"wr")?;
         assert_eq!(state.mode, GzMode::Read);
 
-        state.configure(b"4").unwrap();
+        state.configure(b"4")?;
         assert_eq!(state.level, 4);
-        state.configure(b"64").unwrap();
+        state.configure(b"64")?;
         assert_eq!(state.level, 4);
 
-        state.configure(b"f").unwrap();
+        state.configure(b"f")?;
         assert_eq!(state.strategy, Strategy::Filtered);
-        state.configure(b"h").unwrap();
+        state.configure(b"h")?;
         assert_eq!(state.strategy, Strategy::HuffmanOnly);
-        state.configure(b"R").unwrap();
+        state.configure(b"R")?;
         assert_eq!(state.strategy, Strategy::Rle);
-        state.configure(b"F").unwrap();
+        state.configure(b"F")?;
         assert_eq!(state.strategy, Strategy::Fixed);
 
         // Unknown characters are ignored.
-        state.configure(b"xqz").unwrap();
+        state.configure(b"xqz")?;
 
         // Plus errors (read + write mode is not supported)
-        state.configure(b"123+").unwrap_err();
+        assert!(state.configure(b"123+").is_err());
 
         assert_eq!(state.configure(b""), Ok((false, false)));
         assert_eq!(state.configure(b"x"), Ok((true, false)));
         assert_eq!(state.configure(b"e"), Ok((false, true)));
         assert_eq!(state.configure(b"xe"), Ok((true, true)));
+        Ok(())
     }
 
     #[test]
-    fn owned_buffers_encode_mode_specific_geometry() {
+    fn pending_write_seek_rejects_negative_offset_without_compression() {
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        state.seek = true;
+        state.skip = -1;
+        assert_eq!(gz_zero_pending(&mut state), Err(()));
+        assert_eq!(state.err, Z_STREAM_ERROR);
+        assert_eq!(state.pos, 0);
+        assert!(state.input.is_none());
+
+        state.err = Z_OK;
+        state.seek = true;
+        state.skip = 0;
+        assert_eq!(gz_zero_pending(&mut state), Ok(()));
+        assert_eq!(state.pos, 0);
+        assert_eq!(state.err, Z_OK);
+    }
+
+    #[test]
+    fn invalid_gzip_level_is_ignored_without_mutating_state() {
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        let pointer: gzFile = core::ptr::from_mut(&mut state).cast();
+        let strategy = Strategy::Default as c_int;
+
+        assert_eq!(
+            // SAFETY: gzsetparams checks a null handle and returns before accessing state,
+            // even when the supplied compression level is invalid.
+            unsafe { gzsetparams(ptr::null_mut(), c_int::MAX, strategy) },
+            Z_STREAM_ERROR
+        );
+
+        // SAFETY: state is a live, aligned, exclusively borrowed gzip handle,
+        // and it does not own any compression buffer yet.
+        assert_eq!(unsafe { gzsetparams(pointer, c_int::MAX, strategy) }, Z_OK);
+        assert_eq!(state.level, -1);
+        // SAFETY: the same state remains live and has not been consumed.
+        assert_eq!(unsafe { gzsetparams(pointer, 10, strategy) }, Z_OK);
+        assert_eq!(state.level, -1);
+        assert_eq!(
+            // SAFETY: invalid strategy is checked before inspecting the live state
+            // exclusively owned by this test.
+            unsafe { gzsetparams(pointer, 9, c_int::MAX) },
+            Z_STREAM_ERROR
+        );
+        assert_eq!(state.level, -1);
+        // SAFETY: the handle is still live and uninitialized, so this only
+        // updates the configuration, without attempting compression.
+        assert_eq!(unsafe { gzsetparams(pointer, 9, strategy) }, Z_OK);
+        assert_eq!(state.level, 9);
+    }
+
+    #[test]
+    fn owned_buffers_encode_mode_specific_geometry() -> Result<(), ()> {
         let mut state = GzState::new();
         state.want = 64;
 
         state.mode = GzMode::Read;
-        state.input = Some(state.allocate_input_buffer().unwrap());
-        state.output = Some(state.allocate_output_buffer().unwrap());
+        state.input = Some(state.allocate_input_buffer().ok_or(())?);
+        state.output = Some(state.allocate_output_buffer().ok_or(())?);
         assert_eq!(state.in_size(), 64);
-        assert_eq!(state.input.as_ref().unwrap().capacity, 64);
+        assert_eq!(state.input.as_ref().ok_or(())?.capacity, 64);
         assert_eq!(state.output.as_ref().map_or(0, GzBuffer::usable), 128);
         free_buffers(&mut state);
         assert!(state.input.is_none());
         assert!(state.output.is_none());
 
         state.mode = GzMode::Write;
-        state.input = Some(state.allocate_input_buffer().unwrap());
-        state.output = Some(state.allocate_output_buffer().unwrap());
+        state.input = Some(state.allocate_input_buffer().ok_or(())?);
+        state.output = Some(state.allocate_output_buffer().ok_or(())?);
         assert_eq!(state.in_size(), 64);
-        assert_eq!(state.input.as_ref().unwrap().capacity, 128);
+        assert_eq!(state.input.as_ref().ok_or(())?.capacity, 128);
         assert_eq!(state.output.as_ref().map_or(0, GzBuffer::usable), 64);
+        Ok(())
     }
 
     #[test]
@@ -4074,38 +4171,45 @@ mod tests {
     }
 
     #[test]
-    fn large_gzip_read_keeps_abi_cursor_in_owned_output() {
+    fn large_gzip_read_keeps_abi_cursor_in_owned_output() -> Result<(), ()> {
         let path = std::env::temp_dir().join(format!(
             "zlib-rs-fast-read-cursor-{}.gz",
             std::process::id()
         ));
-        let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| ())?;
         let input = vec![b'A'; 8192];
 
-        let write_mode = CString::new("w").unwrap();
+        let write_mode = CString::new("w").map_err(|_| ())?;
+        // SAFETY: the supplied path/mode are either valid NUL-terminated C strings or intentionally null as accepted and checked by gzopen.
         let writer = unsafe { gzopen(path_c.as_ptr(), write_mode.as_ptr()) };
         assert!(!writer.is_null());
         assert_eq!(
+            // SAFETY: writer was successfully opened, and input is an initialized readable slice with exactly the length passed to gzwrite.
             unsafe { gzwrite(writer, input.as_ptr().cast(), input.len() as c_uint) },
             input.len() as c_int
         );
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(writer) }, Z_OK);
 
-        let read_mode = CString::new("r").unwrap();
+        let read_mode = CString::new("r").map_err(|_| ())?;
+        // SAFETY: the supplied path/mode are either valid NUL-terminated C strings or intentionally null as accepted and checked by gzopen.
         let reader = unsafe { gzopen(path_c.as_ptr(), read_mode.as_ptr()) };
         assert!(!reader.is_null());
+        // SAFETY: the gzip handle is live and exclusively held when non-null; the C API explicitly accepts null and reports an error.
         assert_eq!(unsafe { gzbuffer(reader, 64) }, 0);
 
         let mut output = vec![0u8; 4096];
         assert_eq!(
+            // SAFETY: reader was successfully opened, and output is a writable slice covering all bytes offered to gzread.
             unsafe { gzread(reader, output.as_mut_ptr().cast(), output.len() as c_uint) },
             output.len() as c_int
         );
         assert!(output.iter().all(|&byte| byte == b'A'));
 
-        let state = unsafe { reader.cast::<GzState>().as_ref() }.unwrap();
+        // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+        let state = unsafe { reader.cast::<GzState>().as_ref() }.ok_or(())?;
         assert_eq!(state.have, 0);
-        let owned = state.output.as_ref().unwrap();
+        let owned = state.output.as_ref().ok_or(())?;
         let owned_start = owned.as_ptr() as usize;
         let owned_end = owned_start + owned.usable();
         let next = state.next as usize;
@@ -4115,8 +4219,10 @@ mod tests {
         let caller_end = caller_start + output.len();
         assert!(!(caller_start..caller_end).contains(&next));
 
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(reader) }, Z_OK);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(path).map_err(|_| ())?;
+        Ok(())
     }
 
     #[test]
@@ -4231,12 +4337,14 @@ mod tests {
 
     #[test]
     fn gzdopen_invalid_fd() {
+        // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
         assert_eq!(unsafe { gzdopen(-1, c!(b"r\0")) }, core::ptr::null_mut())
     }
 
     #[test]
     fn gzopen_path_null() {
         assert_eq!(
+            // SAFETY: gzopen rejects a null path or mode without reading through that null pointer.
             unsafe { gzopen(core::ptr::null(), c!(b"r\0")) },
             core::ptr::null_mut()
         )
@@ -4245,35 +4353,38 @@ mod tests {
     #[test]
     fn gzopen_mode_null() {
         assert_eq!(
+            // SAFETY: gzopen rejects a null path or mode without reading through that null pointer.
             unsafe { gzopen(c!(b"/foo/bar\0"), core::ptr::null(),) },
             core::ptr::null_mut()
         )
     }
 
     #[test]
-    fn owned_c_string_clones_and_concatenates_bytes() {
-        let empty = GzCString::clone_from_c_str(c"").unwrap();
+    fn owned_c_string_clones_and_concatenates_bytes() -> Result<(), ()> {
+        let empty = GzCString::clone_from_c_str(c"").ok_or(())?;
         assert_eq!(empty.as_c_str().to_bytes_with_nul(), b"\0");
 
-        let example = GzCString::clone_from_c_str(c"example").unwrap();
+        let example = GzCString::clone_from_c_str(c"example").ok_or(())?;
         assert_eq!(example.as_c_str().to_bytes_with_nul(), b"example\0");
 
-        let joined = GzCString::concat(&[b"hello", b"", b",", b"world"]).unwrap();
+        let joined = GzCString::concat(&[b"hello", b"", b",", b"world"]).ok_or(())?;
         assert_eq!(joined.as_c_str().to_bytes_with_nul(), b"hello,world\0");
+        Ok(())
     }
 
     #[test]
-    fn owned_c_string_preserves_non_utf8_bytes() {
-        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").unwrap();
-        let owned = GzCString::clone_from_c_str(path).unwrap();
+    fn owned_c_string_preserves_non_utf8_bytes() -> Result<(), ()> {
+        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").map_err(|_| ())?;
+        let owned = GzCString::clone_from_c_str(path).ok_or(())?;
         assert_eq!(owned.as_c_str().to_bytes_with_nul(), b"bad-\xff-path\0");
 
         let message =
-            GzCString::concat(&[owned.as_c_str().to_bytes(), b": ", b"read error"]).unwrap();
+            GzCString::concat(&[owned.as_c_str().to_bytes(), b": ", b"read error"]).ok_or(())?;
         assert_eq!(
             message.as_c_str().to_bytes_with_nul(),
             b"bad-\xff-path: read error\0"
         );
+        Ok(())
     }
 
     #[test]
@@ -4293,82 +4404,99 @@ mod tests {
         not(any(target_os = "linux", target_os = "macos")),
         ignore = "lseek is not implemented"
     )]
-    fn test_gz_error() {
+    fn test_gz_error() -> Result<(), ()> {
         // gzerror(null) should return null.
+        // SAFETY: gzerror explicitly checks null file and errnum pointers and returns null.
         assert!(unsafe { gzerror(ptr::null_mut(), ptr::null_mut()) }.is_null());
 
         // Open a gzip stream with an invalid file handle. Initially, no error
         // status should be set.
+        // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
         let handle = unsafe { gzdopen(-2, c!(b"r\0")) };
         assert!(!handle.is_null());
 
-        let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        let state = (unsafe { handle.cast::<GzState>().as_mut() }).ok_or(())?;
         assert_eq!(state.err, Z_OK);
         assert!(state.msg.is_none());
         let mut err = Z_ERRNO;
+        // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
         let msg = unsafe { gzerror(handle, &raw mut err) };
+        // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
         assert_eq!(err, Z_OK);
 
         // When an error is set, the path should be prepended to the error message automatically.
-        let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        let state = (unsafe { handle.cast::<GzState>().as_mut() }).ok_or(())?;
         gz_error(state, Some((Z_ERRNO, "example error")));
         assert_eq!(state.err, Z_ERRNO);
         assert_eq!(
-            state.msg.as_ref().unwrap().as_c_str().to_bytes_with_nul(),
+            state.msg.as_ref().ok_or(())?.as_c_str().to_bytes_with_nul(),
             b"<fd:-2>: example error\0"
         );
         let mut err = Z_OK;
+        // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
         let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(
+            // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
             unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(),
             b"<fd:-2>: example error\0"
         );
         assert_eq!(err, Z_ERRNO);
 
         // Setting the error message to null should clear the old error message.
-        let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        let state = (unsafe { handle.cast::<GzState>().as_mut() }).ok_or(())?;
         gz_error(state, None);
         assert_eq!(state.err, Z_OK);
         assert!(state.msg.is_none());
         let mut err = Z_ERRNO;
+        // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
         let msg = unsafe { gzerror(handle, &raw mut err) };
+        // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
         assert_eq!(err, Z_OK);
 
         // Setting the error code to Z_MEM_ERROR should clear the internal error message
         // (because gz_error doesn't try to allocate space for a copy of the message if
         // the reason for the error is that allocations are failing).
-        let state = (unsafe { handle.cast::<GzState>().as_mut() }).unwrap();
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        let state = (unsafe { handle.cast::<GzState>().as_mut() }).ok_or(())?;
         gz_error(state, Some((Z_MEM_ERROR, "should be ignored")));
         assert_eq!(state.err, Z_MEM_ERROR);
         assert!(state.msg.is_none());
         let mut err = Z_OK;
+        // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
         let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(
+            // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
             unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(),
             b"out of memory\0"
         );
         assert_eq!(err, Z_MEM_ERROR);
 
         // gzclose should return an error because the fd is invalid.
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(handle) }, Z_ERRNO);
+        Ok(())
     }
 
     #[test]
-    fn gz_error_preserves_non_utf8_path_bytes() {
-        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").unwrap();
+    fn gz_error_preserves_non_utf8_path_bytes() -> Result<(), ()> {
+        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").map_err(|_| ())?;
         let mut state = GzState::new();
         state.mode = GzMode::Read;
-        state.source = Some(Source::Path(GzCString::clone_from_c_str(path).unwrap()));
+        state.source = Some(Source::Path(GzCString::clone_from_c_str(path).ok_or(())?));
 
         gz_error(&mut state, Some((Z_ERRNO, "read error")));
 
         assert_eq!(state.err, Z_ERRNO);
         assert_eq!(
-            state.msg.as_ref().unwrap().as_c_str().to_bytes_with_nul(),
+            state.msg.as_ref().ok_or(())?.as_c_str().to_bytes_with_nul(),
             b"bad-\xff-path: read error\0"
         );
+        Ok(())
     }
 
     #[test]
@@ -4376,77 +4504,104 @@ mod tests {
         not(any(target_os = "linux", target_os = "macos")),
         ignore = "lseek is not implemented"
     )]
-    fn test_gzclearerr() {
+    fn test_gzclearerr() -> Result<(), ()> {
         // gzclearerr on a null file handle should return quietly.
+        // SAFETY: gzclearerr explicitly accepts a null handle and performs no dereference.
         unsafe { gzclearerr(ptr::null_mut()) };
 
         // Open a gzip stream with an invalid file handle. Initially, no error
         // status should be set.
+        // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
         let handle = unsafe { gzdopen(-2, c!(b"r\0")) };
         assert!(!handle.is_null());
 
         // gzclearerr should reset the eof and past flags.
-        unsafe { handle.cast::<GzState>().as_mut().unwrap().eof = true };
-        unsafe { handle.cast::<GzState>().as_mut().unwrap().past = true };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.eof = true };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.past = true };
+        // SAFETY: gzclearerr accepts null, or a live gzip state allocated by gzdopen and held exclusively for this call.
         unsafe { gzclearerr(handle) };
-        assert!(!unsafe { handle.cast::<GzState>().as_ref().unwrap().eof });
-        assert!(!unsafe { handle.cast::<GzState>().as_ref().unwrap().past });
+        // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+        assert!(!unsafe { handle.cast::<GzState>().as_ref().ok_or(())?.eof });
+        // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+        assert!(!unsafe { handle.cast::<GzState>().as_ref().ok_or(())?.past });
 
         // Set an error flag and message.
+        // SAFETY: the handle is live and uniquely borrowed as GzState for gz_error; the checked pointer conversion rejects null.
         unsafe {
             gz_error(
-                handle.cast::<GzState>().as_mut().unwrap(),
+                handle.cast::<GzState>().as_mut().ok_or(())?,
                 Some((Z_STREAM_ERROR, "example error")),
             )
         };
         let mut err = Z_OK;
+        // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
         let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(err, Z_STREAM_ERROR);
         assert_eq!(
+            // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
             unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(),
             b"<fd:-2>: example error\0"
         );
 
         // gzclearerr should clear the error flag and message.
+        // SAFETY: gzclearerr accepts null, or a live gzip state allocated by gzdopen and held exclusively for this call.
         unsafe { gzclearerr(handle) };
+        // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
         let msg = unsafe { gzerror(handle, &raw mut err) };
         assert_eq!(err, Z_OK);
+        // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
         assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
 
         // gzclose should return an error because the fd is invalid.
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(handle) }, Z_ERRNO);
 
         // Test the write and append modes, where gzclearerr should not clear eof or past.
         for mode in [c!(b"w\0"), c!(b"a\0")] {
             // Open a gzip stream for write with an invalid file handle. gzeof should return 0.
+            // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
             let handle = unsafe { gzdopen(-2, mode) };
             assert!(!handle.is_null());
+            // SAFETY: gzeof accepts null, or inspects a live handle allocated by gzdopen and not yet closed.
             assert_eq!(unsafe { gzeof(handle) }, 0);
 
             // gzclearerr should not reset the eof and past flags in write or append mode.
-            unsafe { handle.cast::<GzState>().as_mut().unwrap().eof = true };
-            unsafe { handle.cast::<GzState>().as_mut().unwrap().past = true };
+            // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+            unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.eof = true };
+            // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+            unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.past = true };
+            // SAFETY: gzclearerr accepts null, or a live gzip state allocated by gzdopen and held exclusively for this call.
             unsafe { gzclearerr(handle) };
-            assert!(unsafe { handle.cast::<GzState>().as_ref().unwrap().eof });
-            assert!(unsafe { handle.cast::<GzState>().as_ref().unwrap().past });
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            assert!(unsafe { handle.cast::<GzState>().as_ref().ok_or(())?.eof });
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            assert!(unsafe { handle.cast::<GzState>().as_ref().ok_or(())?.past });
 
             // Set an error flag and message.
+            // SAFETY: the handle is live and uniquely borrowed as GzState for gz_error; the checked pointer conversion rejects null.
             unsafe {
                 gz_error(
-                    handle.cast::<GzState>().as_mut().unwrap(),
+                    handle.cast::<GzState>().as_mut().ok_or(())?,
                     Some((Z_STREAM_ERROR, "example error")),
                 )
             };
 
             // gzclearerr should clear the error flag and message.
+            // SAFETY: gzclearerr accepts null, or a live gzip state allocated by gzdopen and held exclusively for this call.
             unsafe { gzclearerr(handle) };
+            // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
             let msg = unsafe { gzerror(handle, &raw mut err) };
             assert_eq!(err, Z_OK);
+            // SAFETY: gzerror returned a borrowed pointer to a live, NUL-terminated state or static error message; the handle has not been closed.
             assert_eq!(unsafe { CStr::from_ptr(msg) }.to_bytes_with_nul(), b"\0");
 
             // gzclose should return an error because the fd is invalid.
+            // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
             assert_eq!(unsafe { gzclose(handle) }, Z_ERRNO);
         }
+        Ok(())
     }
 
     #[test]
@@ -4454,38 +4609,52 @@ mod tests {
         not(any(target_os = "linux", target_os = "macos")),
         ignore = "lseek is not implemented"
     )]
-    fn test_gzeof() {
+    fn test_gzeof() -> Result<(), ()> {
         // gzeof on a null file handle should return false.
+        // SAFETY: gzeof explicitly checks a null handle and returns 0 without dereferencing it.
         assert_eq!(unsafe { gzeof(ptr::null_mut()) }, 0);
 
         // Open a gzip stream for read with an invalid file handle. gzeof should return 0.
+        // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
         let handle = unsafe { gzdopen(-2, c!(b"r\0")) };
         assert!(!handle.is_null());
+        // SAFETY: gzeof accepts null, or inspects a live handle allocated by gzdopen and not yet closed.
         assert_eq!(unsafe { gzeof(handle) }, 0);
 
         // gzeof should return 1 only if there was a read attempt past the end of the stream.
-        unsafe { handle.cast::<GzState>().as_mut().unwrap().eof = true };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.eof = true };
+        // SAFETY: gzeof accepts null, or inspects a live handle allocated by gzdopen and not yet closed.
         assert_eq!(unsafe { gzeof(handle) }, 0);
-        unsafe { handle.cast::<GzState>().as_mut().unwrap().past = true };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.past = true };
+        // SAFETY: gzeof accepts null, or inspects a live handle allocated by gzdopen and not yet closed.
         assert_eq!(unsafe { gzeof(handle) }, 1);
 
         // gzclose should return an error because the fd is invalid.
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(handle) }, Z_ERRNO);
 
         // Test the write and append modes, where gzeof should always return 0.
         for mode in [c!(b"w\0"), c!(b"a\0")] {
             // Open a gzip stream for write with an invalid file handle. gzeof should return 0.
+            // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
             let handle = unsafe { gzdopen(-2, mode) };
             assert!(!handle.is_null());
+            // SAFETY: gzeof accepts null, or inspects a live handle allocated by gzdopen and not yet closed.
             assert_eq!(unsafe { gzeof(handle) }, 0);
 
             // Even with the past flag set, gzeof should still return 0 in write or append mode.
-            unsafe { handle.cast::<GzState>().as_mut().unwrap().past = true };
+            // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+            unsafe { handle.cast::<GzState>().as_mut().ok_or(())?.past = true };
+            // SAFETY: gzeof accepts null, or inspects a live handle allocated by gzdopen and not yet closed.
             assert_eq!(unsafe { gzeof(handle) }, 0);
 
             // gzclose should return an error because the fd is invalid.
+            // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
             assert_eq!(unsafe { gzclose(handle) }, Z_ERRNO);
         }
+        Ok(())
     }
 
     #[test]
@@ -4495,30 +4664,39 @@ mod tests {
     )]
     // Open a gzip file for reading. gzdirect should return 0.
     fn test_gzdirect_gzip_file() -> Result<(), ()> {
+        // SAFETY: both path and mode are NUL-terminated CString buffers that remain alive during this gzopen call.
         let file = unsafe {
             gzopen(
                 CString::new(crate_path("src/test-data/example.gz"))
-                    .unwrap()
+                    .map_err(|_| ())?
                     .as_ptr(),
-                CString::new("r").unwrap().as_ptr(),
+                CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
         assert!(!file.is_null());
         // Set a smaller read batch size to exercise the buffer management code paths.
         const FILE_SIZE: usize = 48; // size of test-data/example.gz
         const BLOCK_SIZE: usize = 40;
-        unsafe { file.cast::<GzState>().as_mut().unwrap().want = BLOCK_SIZE };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { file.cast::<GzState>().as_mut().ok_or(())?.want = BLOCK_SIZE };
+        // SAFETY: gzdirect receives the live gzip handle opened immediately above, including its owned buffer state.
         assert_eq!(unsafe { gzdirect(file) }, 0);
         // gzdirect should have pulled the first `BLOCK_SIZE` bytes of the file into `file`'s internal input buffer.
-        assert_eq!(unsafe { file.cast::<GzState>().as_ref().unwrap().have }, 0);
         assert_eq!(
-            unsafe { file.cast::<GzState>().as_ref().unwrap().stream.avail_in },
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.have },
+            0
+        );
+        assert_eq!(
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.stream.avail_in },
             BLOCK_SIZE as uInt
         );
         // Consume some of the buffered input and call gz_avail. It should move the remaining
         // input to the front of the input buffer.
+        // SAFETY: file points to the live owned GzState, and the buffered suffix is checked before advancing its input cursor within the allocated span.
         unsafe {
-            let state = file.cast::<GzState>().as_mut().unwrap();
+            let state = file.cast::<GzState>().as_mut().ok_or(())?;
             const CONSUME: usize = 10;
             let buffered = state.buffered_read_input().ok_or(())?;
             let expected_suffix = buffered[CONSUME..].to_vec();
@@ -4536,6 +4714,7 @@ mod tests {
             let buffered = state.buffered_read_input().ok_or(())?;
             assert_eq!(&buffered[..expected_suffix.len()], expected_suffix);
         };
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
         Ok(())
     }
@@ -4546,62 +4725,87 @@ mod tests {
         not(any(target_os = "linux", target_os = "macos")),
         ignore = "lseek is not implemented"
     )]
-    fn test_gzdirect_non_gzip_file() {
+    fn test_gzdirect_non_gzip_file() -> Result<(), ()> {
+        // SAFETY: both path and mode are NUL-terminated CString buffers that remain alive during this gzopen call.
         let file = unsafe {
             gzopen(
                 CString::new(crate_path("src/test-data/example.txt"))
-                    .unwrap()
+                    .map_err(|_| ())?
                     .as_ptr(),
-                CString::new("r").unwrap().as_ptr(),
+                CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
         assert!(!file.is_null());
+        // SAFETY: gzdirect receives the live gzip handle opened immediately above, including its owned buffer state.
         assert_eq!(unsafe { gzdirect(file) }, 1);
         // gzdirect should have pulled the entire contents of the file (which is smaller than
         // GZBUFSIZE) into `file`'s internal output buffer.
-        assert_eq!(unsafe { file.cast::<GzState>().as_ref().unwrap().have }, 20);
         assert_eq!(
-            unsafe { file.cast::<GzState>().as_ref().unwrap().stream.avail_in },
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.have },
+            20
+        );
+        assert_eq!(
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.stream.avail_in },
             0
         );
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
 
         // Open a file containing only the gzip magic number. gzdirect should return 0.
+        // SAFETY: both path and mode are NUL-terminated CString buffers that remain alive during this gzopen call.
         let file = unsafe {
             gzopen(
                 CString::new(crate_path("src/test-data/magic-only.gz"))
-                    .unwrap()
+                    .map_err(|_| ())?
                     .as_ptr(),
-                CString::new("r").unwrap().as_ptr(),
+                CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
         assert!(!file.is_null());
+        // SAFETY: gzdirect receives the live gzip handle opened immediately above, including its owned buffer state.
         assert_eq!(unsafe { gzdirect(file) }, 0);
-        assert_eq!(unsafe { file.cast::<GzState>().as_ref().unwrap().have }, 0);
         assert_eq!(
-            unsafe { file.cast::<GzState>().as_ref().unwrap().stream.avail_in },
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.have },
+            0
+        );
+        assert_eq!(
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.stream.avail_in },
             2
         );
 
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
 
         // Open a file containing only the first byte of the gzip magic number. gzdirect should return 1.
+        // SAFETY: both path and mode are NUL-terminated CString buffers that remain alive during this gzopen call.
         let file = unsafe {
             gzopen(
                 CString::new(crate_path("src/test-data/incomplete-magic.gz"))
-                    .unwrap()
+                    .map_err(|_| ())?
                     .as_ptr(),
-                CString::new("r").unwrap().as_ptr(),
+                CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
         assert!(!file.is_null());
+        // SAFETY: gzdirect receives the live gzip handle opened immediately above, including its owned buffer state.
         assert_eq!(unsafe { gzdirect(file) }, 1);
-        assert_eq!(unsafe { file.cast::<GzState>().as_ref().unwrap().have }, 1);
         assert_eq!(
-            unsafe { file.cast::<GzState>().as_ref().unwrap().stream.avail_in },
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.have },
+            1
+        );
+        assert_eq!(
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.stream.avail_in },
             0
         );
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
+        Ok(())
     }
 
     #[test]
@@ -4609,36 +4813,56 @@ mod tests {
         not(any(target_os = "linux", target_os = "macos")),
         ignore = "lseek is not implemented"
     )]
-    fn test_gzbuffer() {
+    fn test_gzbuffer() -> Result<(), ()> {
         // gzbuffer on a null file handle should return -1.
+        // SAFETY: gzbuffer explicitly checks a null handle and returns -1 without dereferencing it.
         assert_eq!(unsafe { gzbuffer(ptr::null_mut(), 1024) }, -1);
 
         // Open a valid file handle to test the remaining gzbuffer edge cases.
+        // SAFETY: both path and mode are NUL-terminated CString buffers that remain alive during this gzopen call.
         let file = unsafe {
             gzopen(
                 CString::new(crate_path("src/test-data/example.txt"))
-                    .unwrap()
+                    .map_err(|_| ())?
                     .as_ptr(),
-                CString::new("r").unwrap().as_ptr(),
+                CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
         // Temporarily put the file handle in a stat that isn't read or write. gzbuffer should fail.
-        unsafe { file.cast::<GzState>().as_mut().unwrap().mode = GzMode::None };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { file.cast::<GzState>().as_mut().ok_or(())?.mode = GzMode::None };
+        // SAFETY: the gzip handle is live and exclusively held when non-null; the C API explicitly accepts null and reports an error.
         assert_eq!(unsafe { gzbuffer(file, 1024) }, -1);
         // Put the file handle back in read mode, and now gzbuffer should work.
-        unsafe { file.cast::<GzState>().as_mut().unwrap().mode = GzMode::Read };
+        // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
+        unsafe { file.cast::<GzState>().as_mut().ok_or(())?.mode = GzMode::Read };
+        // SAFETY: the gzip handle is live and exclusively held when non-null; the C API explicitly accepts null and reports an error.
         assert_eq!(unsafe { gzbuffer(file, 1024) }, 0);
         assert_eq!(
-            unsafe { file.cast::<GzState>().as_ref().unwrap().want },
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.want },
             1024
         );
         // Request a very small buffer size. gzbuffer should instead use the min size, 8 bytes.
+        // SAFETY: the gzip handle is live and exclusively held when non-null; the C API explicitly accepts null and reports an error.
         assert_eq!(unsafe { gzbuffer(file, 5) }, 0);
-        assert_eq!(unsafe { file.cast::<GzState>().as_ref().unwrap().want }, 8);
+        assert_eq!(
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.want },
+            8
+        );
         // Call gzdirect to force the allocation of buffers. After that, gzbuffer should fail.
+        // SAFETY: gzdirect receives the live gzip handle opened immediately above, including its owned buffer state.
         assert_eq!(unsafe { gzdirect(file) }, 1);
+        // SAFETY: the gzip handle is live and exclusively held when non-null; the C API explicitly accepts null and reports an error.
         assert_eq!(unsafe { gzbuffer(file, 1024) }, -1);
-        assert_eq!(unsafe { file.cast::<GzState>().as_ref().unwrap().want }, 8);
+        assert_eq!(
+            // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
+            unsafe { file.cast::<GzState>().as_ref().ok_or(())?.want },
+            8
+        );
+        // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
+        Ok(())
     }
 }
