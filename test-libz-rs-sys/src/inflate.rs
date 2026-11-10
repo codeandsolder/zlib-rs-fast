@@ -12,6 +12,14 @@ use crate::assert_eq_rs_ng;
 
 const VERSION: *const c_char = libz_rs_sys::zlibVersion();
 
+// These libc allocation functions back the test's stateful C-ABI allocator.
+// Keep their declarations at module scope rather than hiding items among
+// executable statements inside allocator callbacks.
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut c_void;
+    fn free(ptr: *mut c_void);
+}
+
 #[derive(Clone, Copy)]
 struct MemItem {
     ptr: *mut c_void,
@@ -61,10 +69,6 @@ unsafe extern "C" fn mem_alloc(mem: *mut c_void, count: u32, size: u32) -> *mut 
         return core::ptr::null_mut();
     }
 
-    extern "C" {
-        fn malloc(size: usize) -> *mut c_void;
-    }
-
     // SAFETY: libc malloc accepts any usize request and returns either a
     // fresh allocation of at least len bytes or null on failure.
     let ptr = unsafe { malloc(len) };
@@ -91,10 +95,6 @@ unsafe extern "C" fn mem_alloc(mem: *mut c_void, count: u32, size: u32) -> *mut 
 }
 
 unsafe extern "C" fn mem_free(mem: *mut c_void, ptr: *mut c_void) {
-    extern "C" {
-        fn free(p: *mut c_void);
-    }
-
     if ptr.is_null() {
         // C free(NULL) is an ordinary no-op, not an unrecognized allocation.
         return;
@@ -155,7 +155,7 @@ fn mem_setup() -> libz_rs_sys::z_stream {
     };
     let zone = Box::new(zone);
 
-    let stream = libz_rs_sys::z_stream {
+    libz_rs_sys::z_stream {
         next_in: std::ptr::null_mut(),
         avail_in: 0,
         total_in: 0,
@@ -170,9 +170,7 @@ fn mem_setup() -> libz_rs_sys::z_stream {
         data_type: 0,
         adler: 0,
         reserved: 0,
-    };
-
-    stream
+    }
 }
 
 fn mem_limit(stream: &mut libz_rs_sys::z_stream, limit: usize) {
@@ -193,10 +191,6 @@ fn mem_highwater(stream: &libz_rs_sys::z_stream) -> usize {
 
 fn mem_done(stream: &mut libz_rs_sys::z_stream) {
     assert!(!stream.opaque.is_null());
-
-    extern "C" {
-        fn free(p: *mut c_void);
-    }
 
     // zone not wrapped in ManuallyDrop so it is free'd
     // SAFETY: this is the only transfer of ownership back from the raw
@@ -260,9 +254,11 @@ fn mem_allocator_rejects_unknown_and_duplicate_free_without_touching_memory() {
 fn mem_allocator_rejects_overflow_without_unwinding_through_ffi() {
     let mut stream = mem_setup();
 
-    // A u32 count * size exceeds usize on 32-bit targets. On 64-bit
+    // A \`u32\` count * size exceeds \`usize\` on 32-bit targets. On 64-bit
     // targets the limit prevents an impractically large allocation.
     mem_limit(&mut stream, 1);
+    // SAFETY: the live and exclusively owned MemZone rejects an allocation
+    // exceeding its configured limit without attempting to allocate memory.
     assert!(unsafe { mem_alloc(stream.opaque, u32::MAX, u32::MAX) }.is_null());
 
     // The running total can overflow even when the new request fits
@@ -278,7 +274,11 @@ fn mem_allocator_rejects_overflow_without_unwinding_through_ffi() {
     }
     // SAFETY: opaque remains a live MemZone; no memory was allocated and
     // the deliberately overflowed accounting prevents any access to malloc.
-    assert!(unsafe { mem_alloc(stream.opaque, 1, 1) }.is_null());
+    assert!(
+        // SAFETY: this live callback context holds an overflowed total
+        // and rejects the request before invoking malloc.
+        unsafe { mem_alloc(stream.opaque, 1, 1) }.is_null()
+    );
     // SAFETY: the callback completed and the same owned zone is still live.
     unsafe { (*stream.opaque.cast::<MemZone>()).total = 0 };
 
@@ -303,10 +303,7 @@ struct BackRoundTrip {
 fn callback_chunk_size(requested: usize, remaining: usize) -> (usize, c_uint) {
     let max_count = usize::try_from(c_uint::MAX).unwrap_or(usize::MAX);
     let len = requested.min(remaining).min(max_count);
-    match c_uint::try_from(len) {
-        Ok(count) => (len, count),
-        Err(_) => (0, 0),
-    }
+    c_uint::try_from(len).map_or((0, 0), |count| (len, count))
 }
 
 #[test]
@@ -475,7 +472,10 @@ fn inflate_back_init_allocates_state_only() {
     use libz_rs_sys::*;
 
     let mut regular = mem_setup();
+    // SAFETY: mem_setup supplies allocator callbacks and writable stream
+    // storage; matched C ABI metadata is provided during initialization.
     assert_eq!(
+        // SAFETY: stream storage and matching ABI metadata are live.
         unsafe {
             inflateInit_(
                 &raw mut regular,
@@ -486,12 +486,20 @@ fn inflate_back_init_allocates_state_only() {
         Z_OK
     );
     let regular_highwater = mem_highwater(&regular);
-    assert_eq!(unsafe { inflateEnd(&raw mut regular) }, Z_OK);
+    // SAFETY: the initialized regular stream is ended exactly once.
+    assert_eq!(
+        // SAFETY: the initialized regular decoder is ended once.
+        unsafe { inflateEnd(&raw mut regular) },
+        Z_OK
+    );
     mem_done(&mut regular);
 
     let mut back = mem_setup();
     let mut window = vec![0u8; 1 << 15];
+    // SAFETY: the 32KiB window and C stream allocator remain live for the
+    // entire independent back-inflate decoder lifetime.
     assert_eq!(
+        // SAFETY: writable window, stream and allocator stay live for init.
         unsafe {
             inflateBackInit_(
                 &raw mut back,
@@ -504,7 +512,16 @@ fn inflate_back_init_allocates_state_only() {
         Z_OK
     );
     let back_highwater = mem_highwater(&back);
-    assert_eq!(unsafe { inflateBackEnd(&raw mut back) }, Z_OK);
+    assert!(
+        back_highwater > 0,
+        "inflateBackInit did not allocate decoder state"
+    );
+    // SAFETY: this initialized back decoder is ended exactly once.
+    assert_eq!(
+        // SAFETY: the initialized callback decoder is ended once.
+        unsafe { inflateBackEnd(&raw mut back) },
+        Z_OK
+    );
     mem_done(&mut back);
 
     assert!(
@@ -784,22 +801,46 @@ fn support() {
     use libz_rs_sys::*;
 
     let mut stream = mem_setup();
-
-    let ret = unsafe {
+    // SAFETY: the live C stream and allocator callbacks come from mem_setup;
+    // the version and checked struct size match the local C ABI.
+    let init_status = unsafe {
         inflateInit_(
             &raw mut stream,
             zlibVersion(),
             test_c_stream_size::<z_stream>(),
         )
     };
-    assert_eq!(ret, Z_OK);
+    assert_eq!(init_status, Z_OK);
 
-    let ret = unsafe { inflateSetDictionary(&raw mut stream, std::ptr::null(), 0) };
-    assert_eq!(ret, Z_STREAM_ERROR);
+    // SAFETY: initialized zlib decoding state is live; the null dictionary
+    // is deliberately rejected in ordinary zlib wrapper mode.
+    let dict_status = unsafe { inflateSetDictionary(&raw mut stream, core::ptr::null(), 0) };
+    assert_eq!(dict_status, Z_STREAM_ERROR);
 
-    let ret = unsafe { inflateEnd(&raw mut stream) };
-    assert_eq!(ret, Z_OK);
+    // Rejected dictionary registration must not poison this decoder.
+    let input = b"valid zlib input after dictionary rejection";
+    let mut compressed_space = [0u8; 128];
+    let (compressed, compression_status) =
+        compress_slice(&mut compressed_space, input, DeflateConfig::new(6));
+    assert_eq!(compression_status, ReturnCode::Ok);
 
+    let mut decoded = [0xa5u8; 128];
+    stream.next_in = compressed.as_ptr().cast_mut();
+    stream.avail_in = test_c_uint_len(compressed.len());
+    stream.next_out = decoded.as_mut_ptr();
+    stream.avail_out = test_c_uint_len(decoded.len());
+    // SAFETY: compressed bytes and independent mutable output remain
+    // live, bounded, and disjoint throughout the C decoder invocation.
+    let decode_status = unsafe { inflate(&raw mut stream, Z_FINISH) };
+    assert_eq!(decode_status, Z_STREAM_END);
+    assert_eq!(stream.avail_in, 0);
+    assert_eq!(usize::try_from(stream.total_in), Ok(compressed.len()));
+    assert_eq!(usize::try_from(stream.total_out), Ok(input.len()));
+    assert_eq!(&decoded[..input.len()], input);
+
+    // SAFETY: exactly one teardown for the successfully initialized stream.
+    let end_status = unsafe { inflateEnd(&raw mut stream) };
+    assert_eq!(end_status, Z_OK);
     mem_done(&mut stream);
 }
 
@@ -945,8 +986,10 @@ fn bad_window_size() {
 fn cover_wrap() {
     use libz_rs_sys::*;
 
-    assert_eq!(unsafe { inflate(std::ptr::null_mut(), 0) }, Z_STREAM_ERROR);
-    assert_eq!(unsafe { inflateEnd(std::ptr::null_mut()) }, Z_STREAM_ERROR);
+    // SAFETY: the NULL decoder must be rejected before accessing any state.
+    assert_eq!(unsafe { inflate(core::ptr::null_mut(), 0) }, Z_STREAM_ERROR);
+    // SAFETY: likewise, ending a NULL decoder must be a stream error.
+    assert_eq!(unsafe { inflateEnd(core::ptr::null_mut()) }, Z_STREAM_ERROR);
 
     let mut strm = mem_setup();
     strm.avail_in = 0;
@@ -1279,7 +1322,7 @@ fn bad_gzip_method() {
         31,
         0,
         Z_DATA_ERROR,
-    )
+    );
 }
 #[test]
 fn bad_gzip_flags() {
@@ -1290,19 +1333,19 @@ fn bad_gzip_flags() {
         31,
         0,
         Z_DATA_ERROR,
-    )
+    );
 }
 #[test]
 fn bad_zlib_method() {
-    inf(&[0x77, 0x85], "bad zlib method", 0, 15, 0, Z_DATA_ERROR)
+    inf(&[0x77, 0x85], "bad zlib method", 0, 15, 0, Z_DATA_ERROR);
 }
 #[test]
 fn set_window_size_from_header() {
-    inf(&[0x08, 0x99], "set window size from header", 0, 0, 0, Z_OK)
+    inf(&[0x08, 0x99], "set window size from header", 0, 0, 0, Z_OK);
 }
 #[test]
 fn bad_zlib_window_size() {
-    inf(&[0x78, 0x9c], "bad zlib window size", 0, 8, 0, Z_DATA_ERROR)
+    inf(&[0x78, 0x9c], "bad zlib window size", 0, 8, 0, Z_DATA_ERROR);
 }
 #[test]
 fn check_adler32() {
@@ -1313,7 +1356,7 @@ fn check_adler32() {
         15,
         1,
         Z_STREAM_END,
-    )
+    );
 }
 #[test]
 fn bad_header_crc() {
@@ -1326,7 +1369,7 @@ fn bad_header_crc() {
         47,
         1,
         Z_DATA_ERROR,
-    )
+    );
 }
 
 #[test]
@@ -1341,7 +1384,7 @@ fn check_gzip_length() {
         47,
         0,
         Z_STREAM_END,
-    )
+    );
 }
 
 #[test]
@@ -1353,7 +1396,7 @@ fn bad_zlib_header_check() {
         47,
         0,
         Z_DATA_ERROR,
-    )
+    );
 }
 
 #[test]
@@ -1370,7 +1413,7 @@ fn good_zlib_header_check() {
         47,
         0,
         Z_OK,
-    )
+    );
 }
 
 #[test]
@@ -1382,12 +1425,12 @@ fn need_dictionary() {
         8,
         0,
         Z_NEED_DICT,
-    )
+    );
 }
 
 #[test]
 fn compute_adler32() {
-    inf(&[0x78, 0x9c, 0x63, 0x0], "compute adler32", 0, 15, 1, Z_OK)
+    inf(&[0x78, 0x9c, 0x63, 0x0], "compute adler32", 0, 15, 1, Z_OK);
 }
 
 /* do a raw inflate of data in hexadecimal with both inflate and inflateBack */
@@ -1735,7 +1778,7 @@ fn fast_distance_extra_bits() {
         -8,
         258,
         Z_DATA_ERROR,
-    )
+    );
 }
 #[test]
 fn fast_invalid_distance_code() {
@@ -1899,134 +1942,150 @@ fn copy_direct_from_next_in_to_next_out() {
     });
 }
 
-/// Unit tests for the _z variants of (un)compress(2).
+/// Compare the native C unsigned-long and extended usize compression ABIs
+/// at one selected level, returning the validated complete compressed bytes.
+fn encode_with_both_length_abis(source: &[u8], level: Option<c_int>) -> Vec<u8> {
+    use libz_rs_sys::{compress, compress2, compress2_z, compress_z};
+
+    let mut extended = vec![0u8; 128];
+    let mut legacy = vec![0u8; 128];
+    let mut wide_len = extended.len();
+    let mut c_len = test_c_ulong_len(legacy.len());
+
+    let (wide_status, c_status) = match level {
+        Some(level) => {
+            // SAFETY: both calls read the same live source, and write to
+            // distinct writable buffers with their exact C capacities.
+            unsafe {
+                (
+                    compress2_z(
+                        extended.as_mut_ptr(),
+                        &raw mut wide_len,
+                        source.as_ptr(),
+                        source.len(),
+                        level,
+                    ),
+                    compress2(
+                        legacy.as_mut_ptr(),
+                        &raw mut c_len,
+                        source.as_ptr(),
+                        test_c_ulong_len(source.len()),
+                        level,
+                    ),
+                )
+            }
+        }
+        None => {
+            // SAFETY: live immutable source and two disjoint writable C
+            // output buffers, with exact checked input/output capacities.
+            unsafe {
+                (
+                    compress_z(
+                        extended.as_mut_ptr(),
+                        &raw mut wide_len,
+                        source.as_ptr(),
+                        source.len(),
+                    ),
+                    compress(
+                        legacy.as_mut_ptr(),
+                        &raw mut c_len,
+                        source.as_ptr(),
+                        test_c_ulong_len(source.len()),
+                    ),
+                )
+            }
+        }
+    };
+    assert_eq!(wide_status, Z_OK);
+    assert_eq!(c_status, Z_OK);
+    assert_eq!(usize::try_from(c_len), Ok(wide_len));
+    assert!(wide_len <= extended.len() && wide_len <= legacy.len());
+    assert_eq!(&extended[..wide_len], &legacy[..wide_len]);
+    extended.truncate(wide_len);
+    extended
+}
+
+/// Validate all four decompressor variants and their exact bytes-in/out
+/// contracts, not merely the output of the one-shot uncompress family.
+fn assert_decompress_length_abi_parity(compressed: &[u8], expected: &[u8]) {
+    use libz_rs_sys::{uncompress, uncompress2, uncompress2_z, uncompress_z};
+
+    let mut extended = vec![0xa5u8; expected.len() + 8];
+    let mut legacy = vec![0xa5u8; expected.len() + 8];
+    let mut wide_len = extended.len();
+    let mut c_len = test_c_ulong_len(legacy.len());
+
+    // SAFETY: the compressed span is live/readable and the two output
+    // allocations are writable and disjoint from each other and the input.
+    let (wide_status, c_status) = unsafe {
+        (
+            uncompress_z(
+                extended.as_mut_ptr(),
+                &raw mut wide_len,
+                compressed.as_ptr(),
+                compressed.len(),
+            ),
+            uncompress(
+                legacy.as_mut_ptr(),
+                &raw mut c_len,
+                compressed.as_ptr(),
+                test_c_ulong_len(compressed.len()),
+            ),
+        )
+    };
+    assert_eq!((wide_status, c_status), (Z_OK, Z_OK));
+    assert_eq!(usize::try_from(c_len), Ok(expected.len()));
+    assert_eq!(wide_len, expected.len());
+    assert_eq!(&extended[..wide_len], expected);
+    assert_eq!(&legacy[..wide_len], expected);
+    assert_eq!(&extended[wide_len..], [0xa5; 8]);
+    assert_eq!(&legacy[wide_len..], [0xa5; 8]);
+
+    // Reuse the allocations but require uncompress2 to report exactly how
+    // much compressed input was consumed, not only decoded output size.
+    extended.fill(0xa5);
+    legacy.fill(0xa5);
+    wide_len = extended.len();
+    c_len = test_c_ulong_len(legacy.len());
+    let mut wide_consumed = compressed.len();
+    let mut c_consumed = test_c_ulong_len(compressed.len());
+
+    // SAFETY: the C input and output length pointers are writable independent
+    // locals and the declared byte spans live throughout each C call.
+    let (wide_status, c_status) = unsafe {
+        (
+            uncompress2_z(
+                extended.as_mut_ptr(),
+                &raw mut wide_len,
+                compressed.as_ptr(),
+                &raw mut wide_consumed,
+            ),
+            uncompress2(
+                legacy.as_mut_ptr(),
+                &raw mut c_len,
+                compressed.as_ptr(),
+                &raw mut c_consumed,
+            ),
+        )
+    };
+    assert_eq!((wide_status, c_status), (Z_OK, Z_OK));
+    assert_eq!(wide_consumed, compressed.len());
+    assert_eq!(usize::try_from(c_consumed), Ok(compressed.len()));
+    assert_eq!(wide_len, expected.len());
+    assert_eq!(usize::try_from(c_len), Ok(expected.len()));
+    assert_eq!(&extended[..wide_len], expected);
+    assert_eq!(&legacy[..wide_len], expected);
+    assert_eq!(&extended[wide_len..], [0xa5; 8]);
+    assert_eq!(&legacy[wide_len..], [0xa5; 8]);
+}
+
 #[test]
 fn compress_uncompress_z() {
-    use libz_rs_sys::{compress, compress_z, uncompress, uncompress_z};
-
     let source = b"there is no horizon";
-
-    let mut compr_z = vec![0u8; 128];
-    let mut compr_z_len = compr_z.len();
-
-    let mut compr = vec![0u8; 128];
-    let mut compr_len = test_c_ulong_len(compr.len());
-
-    // SAFETY: the live source and distinct compressor output spans
-    // are valid for the declared checked C buffer lengths.
-    unsafe {
-        assert_eq!(
-            compress_z(
-                compr_z.as_mut_ptr(),
-                &raw mut compr_z_len,
-                source.as_ptr(),
-                source.len(),
-            ),
-            Z_OK,
-        );
-        assert_eq!(
-            compress(
-                compr.as_mut_ptr(),
-                &raw mut compr_len,
-                source.as_ptr(),
-                test_c_ulong_len(source.len()),
-            ),
-            Z_OK,
-        );
+    for level in [None, Some(9)] {
+        let encoded = encode_with_both_length_abis(source, level);
+        assert_decompress_length_abi_parity(&encoded, source);
     }
-
-    assert_eq!(usize::try_from(compr_len), Ok(compr_z_len));
-    assert!(compr_z_len <= compr_z.len() && compr_z_len <= compr.len());
-    assert_eq!(&compr_z[..compr_z_len], &compr[..compr_z_len]);
-
-    let mut compr2_z = vec![0u8; 128];
-    let mut compr2_z_len = compr2_z.len();
-
-    let mut compr2 = vec![0u8; 128];
-    let mut compr2_len = test_c_ulong_len(compr2.len());
-
-    // SAFETY: both level-9 encoders read the same live input and write
-    // to separate output buffers with correctly described capacities.
-    unsafe {
-        assert_eq!(
-            libz_rs_sys::compress2_z(
-                compr2_z.as_mut_ptr(),
-                &raw mut compr2_z_len,
-                source.as_ptr(),
-                source.len(),
-                9,
-            ),
-            Z_OK,
-        );
-        assert_eq!(
-            libz_rs_sys::compress2(
-                compr2.as_mut_ptr(),
-                &raw mut compr2_len,
-                source.as_ptr(),
-                test_c_ulong_len(source.len()),
-                9,
-            ),
-            Z_OK,
-        );
-    }
-
-    assert_eq!(usize::try_from(compr2_len), Ok(compr2_z_len));
-    assert!(compr2_z_len <= compr2_z.len() && compr2_z_len <= compr2.len());
-    assert_eq!(&compr2_z[..compr2_z_len], &compr2[..compr2_z_len]);
-
-    assert!(compr_z_len <= compr_z.len());
-    assert!(compr2_z_len <= compr2_z.len());
-
-    let mut dest_z = vec![0u8; source.len()];
-    let mut dest_z_len = dest_z.len();
-
-    let mut dest = vec![0u8; source.len()];
-    let mut dest_len = test_c_ulong_len(dest.len());
-
-    // SAFETY: all three decompressors have live, disjoint input/output
-    // spans and the reported compressed lengths were bounded above.
-    unsafe {
-        assert_eq!(
-            uncompress_z(
-                dest_z.as_mut_ptr(),
-                &raw mut dest_z_len,
-                compr_z.as_ptr(),
-                compr_z_len,
-            ),
-            Z_OK,
-        );
-        assert_eq!(
-            uncompress(
-                dest.as_mut_ptr(),
-                &raw mut dest_len,
-                compr.as_ptr(),
-                compr_len
-            ),
-            Z_OK,
-        );
-
-        let mut dest2 = vec![0u8; source.len()];
-        let mut dest2_len = dest2.len();
-        let mut source2_len = compr_z_len;
-        assert_eq!(
-            libz_rs_sys::uncompress2_z(
-                dest2.as_mut_ptr(),
-                &raw mut dest2_len,
-                compr_z.as_ptr(),
-                &raw mut source2_len,
-            ),
-            Z_OK,
-        );
-
-        assert_eq!(source2_len, compr_z_len);
-        assert_eq!(dest2_len, source.len());
-        assert_eq!(&dest2[..dest2_len], source);
-    }
-
-    assert_eq!(usize::try_from(dest_len), Ok(dest_z_len));
-    assert_eq!(dest_z_len, source.len());
-    assert_eq!(&dest_z[..dest_z_len], source);
-    assert_eq!(&dest[..dest_z_len], source);
 }
 
 #[test]
@@ -2338,12 +2397,13 @@ fn uncompress_edge_cases() {
 
     let (result, err) = decompress_slice(&mut [], &[], config);
     assert_eq!(err, ReturnCode::DataError);
-    assert!(result.is_empty());
+    assert_eq!(result, b"");
 
-    let mut output = [0; 1];
+    let mut output = [0xa5u8; 1];
     let (result, err) = decompress_slice(&mut output, &[], config);
     assert_eq!(err, ReturnCode::DataError);
-    assert!(result.is_empty());
+    assert_eq!(result, b"");
+    assert_eq!(output, [0xa5], "empty compressed input modified output");
 
     let input = b"Hello World!\n";
 
@@ -2353,7 +2413,7 @@ fn uncompress_edge_cases() {
 
     let (result, err) = decompress_slice(&mut [], compressed, config);
     assert_eq!(err, ReturnCode::DataError);
-    assert!(result.is_empty());
+    assert_eq!(result, b"");
 }
 
 /// Convert a test's real buffer extent to the C ABI byte-count type.
@@ -3033,17 +3093,19 @@ fn window_match_bug() {
             let produced = scratch.len() - remaining_out;
             decoded.extend_from_slice(&scratch[..produced]);
 
-            match ReturnCode::from(err) {
-                ReturnCode::BufError => {
-                    assert_eq!(remaining_out, 0, "buffer error without full output");
-                    assert!(
-                        produced > 0 || stream.avail_in < remaining_before,
-                        "decoder stalled with input remaining"
-                    );
-                }
-                ReturnCode::StreamEnd => break,
-                other => panic!("unexpected raw DEFLATE decoder status: {other:?}"),
+            let status = ReturnCode::from(err);
+            assert!(
+                matches!(status, ReturnCode::BufError | ReturnCode::StreamEnd),
+                "unexpected raw DEFLATE decoder status: {status:?}"
+            );
+            if status == ReturnCode::StreamEnd {
+                break;
             }
+            assert_eq!(remaining_out, 0, "buffer error without full output");
+            assert!(
+                produced > 0 || stream.avail_in < remaining_before,
+                "decoder stalled with input remaining"
+            );
         }
 
         assert_eq!(stream.avail_in, 0, "trailing raw DEFLATE bytes ignored");
@@ -3142,12 +3204,17 @@ fn op_len_edge_case() {
 // Fills the provided buffer with pseudorandom bytes based on the given seed
 // Duplicates bytes by `step` in a row
 fn prng_bytes(seed: u64, bytes: &mut [u8], step: usize) {
-    const M: u64 = 2u64.pow(32);
-    const A: u64 = 1664525;
-    const C: u64 = 1013904223;
+    const MODULUS: u64 = 1_u64 << 32;
+    const MULTIPLIER: u64 = 1_664_525;
+    const INCREMENT: u64 = 1_013_904_223;
+    let stride = step.checked_mul(4);
+    assert!(
+        stride.is_some_and(|size| size > 0),
+        "invalid PRNG output step"
+    );
     let mut state = seed;
-    for chunk in bytes.chunks_mut(4 * step) {
-        state = (A * state + C) % M;
+    for chunk in bytes.chunks_mut(stride.unwrap_or_default()) {
+        state = MULTIPLIER.wrapping_mul(state).wrapping_add(INCREMENT) % MODULUS;
         let rand_bytes = state.to_le_bytes();
         for (i, byte) in chunk.iter_mut().enumerate() {
             *byte = rand_bytes[i / step];
@@ -3158,12 +3225,12 @@ fn prng_bytes(seed: u64, bytes: &mut [u8], step: usize) {
 #[test]
 #[cfg_attr(miri, ignore = "slow")]
 fn test_inflate_flush_block() {
+    const CHUNK: usize = 16_384;
     let window_bits = -15; // Raw
-    const CHUNK: usize = 16384;
 
     // Create a compressed vector of random data that's bigger then the zlib block size
-    let mut data = vec![0u8; 160000];
-    prng_bytes(314159, &mut data, 4);
+    let mut data = vec![0u8; 160_000];
+    prng_bytes(314_159, &mut data, 4);
     let config = DeflateConfig {
         window_bits,
         ..DeflateConfig::default()
@@ -3673,8 +3740,12 @@ fn blow_up_the_stack_2() {
 #[test]
 fn codes_used() {
     // -1 is returned on NULL
-    assert_eq_rs_ng!(unsafe { inflateCodesUsed(core::ptr::null_mut()) });
+    assert_eq_rs_ng!({
+        // SAFETY: NULL is deliberately rejected without reading decoder state.
+        unsafe { inflateCodesUsed(core::ptr::null_mut()) }
+    });
     assert_eq!(
+        // SAFETY: the same NULL-pointer contract holds for the fork C ABI.
         unsafe { libz_rs_sys::inflateCodesUsed(core::ptr::null_mut()) },
         c_ulong::MAX
     );
@@ -3803,6 +3874,8 @@ fn test_dict_inflate() {
 
         let mut strm = MaybeUninit::zeroed();
 
+        // SAFETY: writable C stream storage, matching ABI version
+        // and checked struct size are provided to the encoder.
         let ret = unsafe {
             deflateInit_(
                 strm.as_mut_ptr(),
@@ -3885,7 +3958,7 @@ fn test_dict_inflate() {
         d_stream.avail_out = test_c_uint_len(uncompr.len());
         d_stream.next_out = uncompr.as_mut_ptr();
 
-        let mut check_dictionary = [0u8; MAX_DICTIONARY_SIZE];
+        let mut check_dictionary = vec![0u8; MAX_DICTIONARY_SIZE];
         let mut supplied_dictionary = false;
 
         loop {
@@ -3905,6 +3978,24 @@ fn test_dict_inflate() {
                     "inflate requested the dictionary twice"
                 );
                 assert_eq!(d_stream.adler, dict_id, "incorrect dictionary identifier");
+
+                // Supplying the wrong dictionary must report DataError while
+                // retaining the requested Adler ID and input/output cursors.
+                let wrong = b"wrong";
+                let before = (d_stream.avail_in, d_stream.total_in, d_stream.total_out);
+                // SAFETY: wrong is a live readable buffer, and d_stream is in
+                // the dictionary-request state, with exclusive C ABI access.
+                let wrong_status = unsafe {
+                    inflateSetDictionary(d_stream, wrong.as_ptr(), test_c_uint_len(wrong.len()))
+                };
+                assert_eq!(wrong_status, Z_DATA_ERROR);
+                assert_eq!(d_stream.adler, dict_id);
+                assert_eq!(
+                    (d_stream.avail_in, d_stream.total_in, d_stream.total_out),
+                    before,
+                    "wrong dictionary modified decoder input/output state"
+                );
+
                 // SAFETY: the borrowed dictionary bytes remain live until this
                 // synchronous inflateSetDictionary call returns.
                 err = unsafe {
@@ -4055,13 +4146,13 @@ mod stable_api {
 
     #[test]
     fn reset_reuse() {
-        let first = b"Hello World!";
-        let second = b"Goodbye World!";
+        let wrapped_plaintext = b"Hello World!";
+        let raw_plaintext = b"Goodbye World!";
 
-        let mut first_compressed = [0u8; 64];
-        let (first_stream, status) = compress_slice(
-            &mut first_compressed,
-            first,
+        let mut wrapped_storage = [0u8; 64];
+        let (wrapped_stream, status) = compress_slice(
+            &mut wrapped_storage,
+            wrapped_plaintext,
             DeflateConfig {
                 window_bits: 15,
                 ..DeflateConfig::default()
@@ -4069,10 +4160,10 @@ mod stable_api {
         );
         assert_eq!(status, ReturnCode::Ok);
 
-        let mut second_compressed = [0u8; 64];
-        let (second_stream, status) = compress_slice(
-            &mut second_compressed,
-            second,
+        let mut raw_storage = [0u8; 64];
+        let (raw_stream, status) = compress_slice(
+            &mut raw_storage,
+            raw_plaintext,
             DeflateConfig {
                 window_bits: -15,
                 ..DeflateConfig::default()
@@ -4084,12 +4175,18 @@ mod stable_api {
         let mut decoder = zlib_rs::Inflate::new(true, 15);
         let mut decoded = [0xa5u8; 64];
         assert_eq!(
-            decoder.decompress(first_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
+            decoder.decompress(wrapped_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
             Ok(Status::StreamEnd)
         );
-        assert_eq!(usize::try_from(decoder.total_in()), Ok(first_stream.len()));
-        assert_eq!(usize::try_from(decoder.total_out()), Ok(first.len()));
-        assert_eq!(&decoded[..first.len()], first);
+        assert_eq!(
+            usize::try_from(decoder.total_in()),
+            Ok(wrapped_stream.len())
+        );
+        assert_eq!(
+            usize::try_from(decoder.total_out()),
+            Ok(wrapped_plaintext.len())
+        );
+        assert_eq!(&decoded[..wrapped_plaintext.len()], wrapped_plaintext);
 
         // Reuse the very same decoder for a raw DEFLATE stream. Reset
         // must clear counters and old wrapper state before the new call.
@@ -4098,12 +4195,15 @@ mod stable_api {
         assert_eq!(decoder.total_out(), 0);
         decoded.fill(0xa5);
         assert_eq!(
-            decoder.decompress(second_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
+            decoder.decompress(raw_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
             Ok(Status::StreamEnd)
         );
-        assert_eq!(usize::try_from(decoder.total_in()), Ok(second_stream.len()));
-        assert_eq!(usize::try_from(decoder.total_out()), Ok(second.len()));
-        assert_eq!(&decoded[..second.len()], second);
+        assert_eq!(usize::try_from(decoder.total_in()), Ok(raw_stream.len()));
+        assert_eq!(
+            usize::try_from(decoder.total_out()),
+            Ok(raw_plaintext.len())
+        );
+        assert_eq!(&decoded[..raw_plaintext.len()], raw_plaintext);
 
         // Switching the same decoder back to wrapped mode catches stale
         // raw-state history which a one-way reset cannot reveal.
@@ -4112,12 +4212,18 @@ mod stable_api {
         assert_eq!(decoder.total_out(), 0);
         decoded.fill(0xa5);
         assert_eq!(
-            decoder.decompress(first_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
+            decoder.decompress(wrapped_stream, &mut decoded, zlib_rs::InflateFlush::Finish),
             Ok(Status::StreamEnd)
         );
-        assert_eq!(usize::try_from(decoder.total_in()), Ok(first_stream.len()));
-        assert_eq!(usize::try_from(decoder.total_out()), Ok(first.len()));
-        assert_eq!(&decoded[..first.len()], first);
+        assert_eq!(
+            usize::try_from(decoder.total_in()),
+            Ok(wrapped_stream.len())
+        );
+        assert_eq!(
+            usize::try_from(decoder.total_out()),
+            Ok(wrapped_plaintext.len())
+        );
+        assert_eq!(&decoded[..wrapped_plaintext.len()], wrapped_plaintext);
     }
 
     #[test]
@@ -4133,24 +4239,37 @@ mod stable_api {
             0x6f, 0x72, 0x6c, 0x64, 0x21, 0x0a, 0x20, 0x91, 0x04, 0x48,
         ];
 
-        let mut v = vec![0u8; u32::MAX as usize + deflated.len() / 2];
+        let oversize = usize::try_from(u32::MAX)
+            .ok()
+            .and_then(|limit| limit.checked_add(deflated.len() / 2))
+            .unwrap_or(0);
+        assert!(oversize > usize::try_from(u32::MAX).unwrap_or(usize::MAX));
+        let mut v = vec![0u8; oversize];
         v[..deflated.len()].copy_from_slice(&deflated);
 
-        assert!(((v.len() as u32) as usize) < deflated.len());
+        // The low C-width portion is deliberately smaller than the
+        // compressed fixture, proving the C uint count would truncate.
+        let truncated = u32::try_from(
+            v.len()
+                % (usize::try_from(u32::MAX)
+                    .unwrap_or(usize::MAX)
+                    .checked_add(1)
+                    .unwrap_or(1)),
+        )
+        .unwrap_or(u32::MAX);
+        assert!(usize::try_from(truncated).unwrap_or(usize::MAX) < deflated.len());
 
         let mut decompressed = [0u8; 64];
         let mut inflate = zlib_rs::Inflate::new(true, 15);
-        let status = inflate
-            .decompress(&v, &mut decompressed, zlib_rs::InflateFlush::Finish)
-            .unwrap();
+        let status = inflate.decompress(&v, &mut decompressed, zlib_rs::InflateFlush::Finish);
+        assert_eq!(status, Ok(zlib_rs::Status::StreamEnd));
 
-        assert_eq!(status, zlib_rs::Status::StreamEnd);
         assert_eq!(b"Hello World!", &decompressed[..12]);
     }
 }
 
 extern "C" fn push(desc: *mut c_void, _buf: *mut c_uchar, _len: c_uint) -> c_int {
-    (!desc.is_null()) as _
+    i32::from(!desc.is_null())
 }
 
 // Callback input is per-invocation, not shared between parallel test runs.
@@ -4186,7 +4305,7 @@ unsafe extern "C" fn pull(desc: *mut c_void, buf: *mut *const c_uchar) -> c_uint
 /// Cover `inflateBack` edge cases.
 #[test]
 fn cover_back_invalid_api_calls() {
-    let mut window = [0u8; 32768];
+    let mut window = vec![0u8; 32768];
 
     let ret = assert_eq_rs_ng!({
         // SAFETY: this negative C ABI case deliberately supplies an
@@ -4241,7 +4360,7 @@ fn cover_back_invalid_api_calls() {
 #[test]
 fn cover_back() {
     use libz_rs_sys::*;
-    let mut window = [0u8; 32768];
+    let mut window = vec![0u8; 32768];
 
     let mut stream = mem_setup();
     // SAFETY: the custom allocator, C stream and full 32 KiB output window
@@ -4357,11 +4476,11 @@ fn cover_back() {
 
 #[test]
 fn done_state_returns_stream_end() {
+    const PLAIN: &[u8] = b"hello world hello hello world world hello world hello";
     let input = [
         31u8, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 87, 40, 207, 47, 202, 73, 81,
         200, 0, 179, 33, 36, 68, 4, 89, 28, 137, 13, 0, 181, 147, 9, 162, 53, 0, 0, 0,
     ];
-    const PLAIN: &[u8] = b"hello world hello hello world world hello world hello";
 
     assert_eq_rs_ng!({
         let mut output = [0u8; 64];
@@ -4651,7 +4770,7 @@ fn inflate_validate_toggles_checksum_update() {
                 // after the preceding run completed successfully.
                 assert_eq!(unsafe { inflateReset(stream) }, Z_OK);
             }
-            let validate = if pass == 1 { 0 } else { 1 };
+            let validate = c_int::from(pass != 1);
             if pass == 2 {
                 // This third run exercises the *transition* back to enabled,
                 // not just starting with validation already enabled.
