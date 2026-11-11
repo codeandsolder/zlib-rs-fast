@@ -1131,8 +1131,9 @@ fn deflate_prime_only_inserts_requested_bits() {
     fn compress_after_prime(bits: i32, value: i32) -> Vec<u8> {
         use libz_rs_sys::*;
         let mut raw = MaybeUninit::<z_stream>::zeroed();
-        // SAFETY: supplied version and size match the C ABI stream.
         assert_eq!(
+            // SAFETY: writable C stream storage, matching checked ABI
+            // version/size and supported raw compressor configuration.
             unsafe {
                 deflateInit2_(
                     raw.as_mut_ptr(),
@@ -1142,21 +1143,37 @@ fn deflate_prime_only_inserts_requested_bits() {
                     8,
                     Z_DEFAULT_STRATEGY,
                     zlibVersion(),
-                    c_int::try_from(core::mem::size_of::<z_stream>()).unwrap_or(c_int::MAX),
+                    test_c_stream_size::<z_stream>(),
                 )
             },
             Z_OK
         );
         // SAFETY: successful initialization created a live stream.
         let stream = unsafe { raw.assume_init_mut() };
-        assert_eq!(unsafe { deflatePrime(stream, bits, value) }, Z_OK);
-        let mut output = [0u8; 128];
+        assert_eq!(
+            // SAFETY: the initialized raw stream accepts the requested
+            // 0..=31-bit prefix, after which Finish flushes the pending bits.
+            unsafe { deflatePrime(stream, bits, value) },
+            Z_OK
+        );
+        let mut output = [0xa5u8; 128];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = c_uint::try_from(output.len()).unwrap_or(c_uint::MAX);
-        // SAFETY: the output remains live and writable, with zero input available.
-        assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
-        let len = output.len() - stream.avail_out as usize;
-        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        stream.avail_out = test_c_uint_len(output.len());
+        assert_eq!(
+            // SAFETY: only the allocated output is writable, with zero
+            // compressed input and a live initialized encoder.
+            unsafe { deflate(stream, Z_FINISH) },
+            Z_STREAM_END
+        );
+        let len = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(len <= output.len());
+        assert_eq!(usize::try_from(stream.avail_out), Ok(output.len() - len));
+        assert!(output[len..].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(
+            // SAFETY: this encoder is closed once after StreamEnd.
+            unsafe { deflateEnd(stream) },
+            Z_OK
+        );
         output[..len].to_vec()
     }
 
@@ -1205,124 +1222,138 @@ fn deflate_prime_accepts_32_bits_like_zlib_ng() {
     });
 }
 
+/// Prime 32 gzip bits as two low-first 16-bit chunks.
+/// Explicit byte extraction preserves the sign bit of CRC32 values.
+fn prime_gzip_word(stream: &mut libz_rs_sys::z_stream, value: u32) -> c_int {
+    let bytes = value.to_le_bytes();
+    let low = i32::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+    let high = i32::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+    // SAFETY: live initialized raw deflater accepts 16 primed bits.
+    let status = unsafe { libz_rs_sys::deflatePrime(stream, 16, low) };
+    if status != libz_rs_sys::Z_OK {
+        return status;
+    }
+    // SAFETY: first prime succeeded; the same raw deflater remains live.
+    unsafe { libz_rs_sys::deflatePrime(stream, 16, high) }
+}
+
+/// Prime the gzip header with the original split 3+5-bit flags.
+fn prime_gzip_header(stream: &mut libz_rs_sys::z_stream) {
+    for (bits, value) in [(16, 0x8b1f), (8, 8), (3, 0), (5, 0)] {
+        assert_eq!(
+            // SAFETY: the initialized raw deflater accepts up to 16 bits.
+            unsafe { libz_rs_sys::deflatePrime(stream, bits, value) },
+            libz_rs_sys::Z_OK
+        );
+    }
+    assert_eq!(prime_gzip_word(stream, 0), libz_rs_sys::Z_OK);
+    for (bits, value) in [(8, 0), (8, 255)] {
+        assert_eq!(
+            // SAFETY: two valid eight-bit gzip header fields.
+            unsafe { libz_rs_sys::deflatePrime(stream, bits, value) },
+            libz_rs_sys::Z_OK
+        );
+    }
+}
+
 #[test]
 fn test_deflate_prime() {
-    unsafe fn deflate_prime_32(stream: &mut libz_rs_sys::z_stream, value: i32) -> i32 {
-        // zlib's deflatePrime() takes at most 16 bits
-        let err = libz_rs_sys::deflatePrime(stream, 16, value & 0xffff);
-        if err != libz_rs_sys::Z_OK {
-            return err;
-        }
-
-        libz_rs_sys::deflatePrime(stream, 16, value >> 16)
-    }
-
+    const HELLO: &[u8] = b"hello, hello!\0";
     let config = DeflateConfig {
         level: -1,
         method: Method::Deflated,
-        window_bits: -15, // deflate as raw bytes
+        window_bits: -15,
         mem_level: 8,
         strategy: Strategy::Default,
     };
-
-    unsafe {
-        let mut strm = MaybeUninit::zeroed();
-
-        // first validate the config
-        let err = libz_rs_sys::deflateInit2_(
-            strm.as_mut_ptr(),
+    let mut encoder_raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: writable C stream, matching library ABI and valid raw options.
+    let init = unsafe {
+        libz_rs_sys::deflateInit2_(
+            encoder_raw.as_mut_ptr(),
             config.level,
-            config.method as i32,
+            config.method as c_int,
             config.window_bits,
             config.mem_level,
-            config.strategy as i32,
+            config.strategy as c_int,
             VERSION,
             test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
+        )
+    };
+    assert_eq!(init, libz_rs_sys::Z_OK);
+    // SAFETY: successful initialization populated the C encoder stream.
+    let encoder = unsafe { encoder_raw.assume_init_mut() };
+    prime_gzip_header(encoder);
 
-        let strm = strm.assume_init_mut();
+    encoder.next_in = HELLO.as_ptr().cast_mut();
+    encoder.avail_in = test_c_uint_len(HELLO.len());
+    let mut compressed = [0xaau8; 64];
+    encoder.next_out = compressed.as_mut_ptr();
+    encoder.avail_out = test_c_uint_len(compressed.len());
+    assert_eq!(
+        // SAFETY: live disjoint input/output spans with checked C capacities.
+        unsafe { libz_rs_sys::deflate(encoder, DeflateFlush::Finish as c_int) },
+        libz_rs_sys::Z_STREAM_END
+    );
+    assert_eq!(encoder.avail_in, 0);
+    assert_eq!(usize::try_from(encoder.total_in), Ok(HELLO.len()));
+    let produced = usize::try_from(encoder.total_out).unwrap_or(usize::MAX);
+    assert!(produced <= compressed.len());
+    assert!(compressed[produced..].iter().all(|&b| b == 0xaa));
+    assert_eq!(&compressed[..10], &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]);
 
-        /* Gzip magic number */
-        use libz_rs_sys::deflatePrime;
-        let mut err;
-        err = deflatePrime(strm, 16, 0x8b1f);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        /* Gzip compression method (deflate) */
-        err = deflatePrime(strm, 8, 0x08);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        /* Gzip flags (one byte, using two odd bit calls) */
-        err = deflatePrime(strm, 3, 0x0);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        err = deflatePrime(strm, 5, 0x0);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        /* Gzip modified time */
-        err = deflate_prime_32(strm, 0);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        /* Gzip extra flags */
-        err = deflatePrime(strm, 8, 0x0);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        /* Gzip operating system */
-        err = deflatePrime(strm, 8, 255);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    // CRC and ISIZE are deliberately primed after the raw encoder finished,
+    // so they are not flushed to the compressed stream. The gzip decoder
+    // should subsequently report that its eight-byte trailer is missing.
+    // SAFETY: HELLO is live and its C byte length is checked.
+    let crc = unsafe { libz_rs_sys::crc32(0, HELLO.as_ptr(), test_c_uint_len(HELLO.len())) };
+    let crc_bits = u32::try_from(crc).unwrap_or_default();
+    assert_eq!(c_ulong::from(crc_bits), crc);
+    assert_eq!(prime_gzip_word(encoder, crc_bits), libz_rs_sys::Z_OK);
+    let len_bits = u32::try_from(HELLO.len()).unwrap_or_default();
+    assert_eq!(usize::try_from(len_bits), Ok(HELLO.len()));
+    assert_eq!(prime_gzip_word(encoder, len_bits), libz_rs_sys::Z_OK);
+    assert_eq!(usize::try_from(encoder.total_out), Ok(produced));
+    // SAFETY: the finished encoder is closed once.
+    assert_eq!(
+        // SAFETY: the initialized encoder is closed exactly once.
+        unsafe { libz_rs_sys::deflateEnd(encoder) },
+        libz_rs_sys::Z_OK
+    );
 
-        const HELLO: &str = "hello, hello!\0";
-
-        strm.next_in = HELLO.as_ptr().cast_mut();
-        strm.avail_in = test_c_uint_len(HELLO.len());
-
-        let mut compr = [0xAA; 64];
-        strm.next_out = compr.as_mut_ptr();
-        strm.avail_out = test_c_uint_len(compr.len());
-
-        err = libz_rs_sys::deflate(strm, DeflateFlush::Finish as i32);
-        assert_eq!(err, ReturnCode::StreamEnd as i32);
-
-        /* Gzip uncompressed data crc32 */
-        let crc = libz_rs_sys::crc32(0, HELLO.as_ptr(), HELLO.len() as _);
-        err = deflate_prime_32(strm, crc as _);
-        assert_eq!(err, 0);
-        /* Gzip uncompressed data length */
-        err = deflate_prime_32(strm, HELLO.len() as _);
-        assert_eq!(err, 0);
-
-        let total_out = strm.total_out;
-
-        err = libz_rs_sys::deflateEnd(strm);
-        assert_eq!(err, 0); // inflate with gzip header
-
-        // now inflate it again
-        let inflate_config = InflateConfig {
-            window_bits: 15 + 32,
-        };
-
-        let mut strm = MaybeUninit::zeroed();
-
-        let err = libz_rs_sys::inflateInit2_(
-            strm.as_mut_ptr(),
-            inflate_config.window_bits,
+    let mut decoder_raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: distinct writable stream, valid gzip inflate window and ABI.
+    let init = unsafe {
+        libz_rs_sys::inflateInit2_(
+            decoder_raw.as_mut_ptr(),
+            15 + 32,
             VERSION,
             test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        )
+    };
+    assert_eq!(init, libz_rs_sys::Z_OK);
+    // SAFETY: successful initialization populated the decoder.
+    let decoder = unsafe { decoder_raw.assume_init_mut() };
+    decoder.next_in = compressed.as_mut_ptr();
+    decoder.avail_in = test_c_uint_len(produced);
+    let mut restored = [0xa5u8; 32];
+    decoder.next_out = restored.as_mut_ptr();
+    decoder.avail_out = test_c_uint_len(restored.len());
 
-        let strm = strm.assume_init_mut();
-
-        strm.next_in = compr.as_mut_ptr();
-        strm.avail_in = total_out as _;
-
-        let mut uncompr = vec![0; 32];
-        strm.next_out = uncompr.as_mut_ptr();
-        strm.avail_out = test_c_uint_len(uncompr.len());
-
-        // the crc checksum is not actually in the buffer, so the check of the checksum will error
-        // out with a BufError because there is insufficient input.
-        let err = libz_rs_sys::inflate(strm, DeflateFlush::Finish as i32);
-        assert_eq!(ReturnCode::from(err), ReturnCode::BufError);
-        assert_eq!(&uncompr[..strm.total_out as usize], HELLO.as_bytes());
-
-        inflateEnd(strm);
-    }
+    // SAFETY: live incomplete gzip member and disjoint writable buffer.
+    let status = unsafe { libz_rs_sys::inflate(decoder, DeflateFlush::Finish as c_int) };
+    assert_eq!(ReturnCode::from(status), ReturnCode::BufError);
+    assert_eq!(decoder.avail_in, 0);
+    assert_eq!(usize::try_from(decoder.total_in), Ok(produced));
+    assert_eq!(usize::try_from(decoder.total_out), Ok(HELLO.len()));
+    assert_eq!(&restored[..HELLO.len()], HELLO);
+    assert!(restored[HELLO.len()..].iter().all(|&b| b == 0xa5));
+    // SAFETY: initialized decoder closed exactly once, even on BufError.
+    assert_eq!(
+        // SAFETY: the initialized decoder is closed exactly once.
+        unsafe { libz_rs_sys::inflateEnd(decoder) },
+        libz_rs_sys::Z_OK
+    );
 }
 
 #[test]
@@ -1367,90 +1398,137 @@ fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
 fn small_window() {
     let deflate_config = DeflateConfig {
         level: Z_BEST_COMPRESSION,
-        method: Method::Deflated,
         window_bits: -9,
-        mem_level: 8,
-        strategy: Strategy::Default,
+        ..DeflateConfig::default()
     };
+    let plain: [u8; 128] = std::array::from_fn(|i| u8::try_from(i).unwrap_or(u8::MAX));
+    let previous_dictionary = vec![b'a'; (1 << 9) - plain.len() / 2];
 
-    let inflate_config = InflateConfig {
-        window_bits: deflate_config.window_bits,
-    };
+    let compressed = assert_eq_rs_ng!({
+        let mut encoder_raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable uninitialized stream storage, matching ABI size
+        // and version, and supported raw 9-bit DEFLATE window.
+        let init = unsafe {
+            deflateInit2_(
+                encoder_raw.as_mut_ptr(),
+                deflate_config.level,
+                deflate_config.method as c_int,
+                deflate_config.window_bits,
+                deflate_config.mem_level,
+                deflate_config.strategy as c_int,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(init, Z_OK);
+        // SAFETY: successful initialization populated the full C stream.
+        let encoder = unsafe { encoder_raw.assume_init_mut() };
 
-    let plain: [u8; 128] = std::array::from_fn(|i| i as u8);
-    let dictionary1 = vec![b'a'; (1 << 9) - plain.len() / 2];
-
-    assert_eq_rs_ng!(unsafe {
-        let mut strm = MaybeUninit::zeroed();
-
-        // first validate the config
-        let err = deflateInit2_(
-            strm.as_mut_ptr(),
-            deflate_config.level,
-            deflate_config.method as i32,
-            deflate_config.window_bits,
-            deflate_config.mem_level,
-            deflate_config.strategy as i32,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        // SAFETY: both consecutive dictionaries are live, readable
+        // binary arrays. Replacing history before input is intentional.
+        assert_eq!(
+            // SAFETY: the first dictionary is readable for its checked C length.
+            unsafe {
+                deflateSetDictionary(
+                    encoder,
+                    previous_dictionary.as_ptr(),
+                    test_c_uint_len(previous_dictionary.len()),
+                )
+            },
+            Z_OK
         );
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let strm = strm.assume_init_mut();
-
-        let err = deflateSetDictionary(strm, dictionary1.as_ptr(), dictionary1.len() as _);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let err = deflateSetDictionary(strm, plain.as_ptr(), plain.len() as _);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        strm.next_in = plain.as_ptr().cast_mut();
-        strm.avail_in = test_c_uint_len(plain.len());
-
-        let mut compr = [0; 32];
-        strm.next_out = compr.as_mut_ptr();
-        strm.avail_out = test_c_uint_len(compr.len());
-
-        let err = deflate(strm, DeflateFlush::Finish as i32);
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-        let err = deflateEnd(strm);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        // now inflate it again
-        let mut strm = MaybeUninit::zeroed();
-
-        let err = inflateInit2_(
-            strm.as_mut_ptr(),
-            inflate_config.window_bits,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        assert_eq!(
+            // SAFETY: the second dictionary is readable and must replace history.
+            unsafe { deflateSetDictionary(encoder, plain.as_ptr(), test_c_uint_len(plain.len())) },
+            Z_OK
         );
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
 
-        let strm = strm.assume_init_mut();
+        // Dictionary registration contributes bytes to total_in; the
+        // subsequent payload's consumption must be measured as a delta.
+        let dictionary_total_in = encoder.total_in;
+        let mut compressed_output = [0xa5u8; 32];
+        encoder.next_in = plain.as_ptr().cast_mut();
+        encoder.avail_in = test_c_uint_len(plain.len());
+        encoder.next_out = compressed_output.as_mut_ptr();
+        encoder.avail_out = test_c_uint_len(compressed_output.len());
+        // SAFETY: input and writable 32-byte output are live, disjoint
+        // buffers and the initialized raw encoder owns its state.
+        assert_eq!(
+            // SAFETY: the live input and disjoint, writable 32-byte
+            // output span have checked exact C byte lengths.
+            unsafe { deflate(encoder, DeflateFlush::Finish as c_int) },
+            Z_STREAM_END
+        );
+        assert_eq!(encoder.avail_in, 0);
+        assert_eq!(
+            encoder.total_in.wrapping_sub(dictionary_total_in),
+            test_c_ulong_len(plain.len()),
+            "encoder did not consume exactly the payload after its dictionaries"
+        );
+        let produced = usize::try_from(encoder.total_out).unwrap_or(usize::MAX);
+        assert!(produced <= compressed_output.len());
+        assert!(compressed_output[produced..]
+            .iter()
+            .all(|&byte| byte == 0xa5));
+        // SAFETY: this finished encoder is ended once.
+        assert_eq!(unsafe { deflateEnd(encoder) }, Z_OK);
 
-        let err = inflateSetDictionary(strm, dictionary1.as_ptr(), dictionary1.len() as _);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        let mut decoder_raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: another independent writable C stream for matching
+        // raw -9-bit inflate, initialized with checked ABI metadata.
+        let init = unsafe {
+            inflateInit2_(
+                decoder_raw.as_mut_ptr(),
+                deflate_config.window_bits,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(init, Z_OK);
+        // SAFETY: successful inflateInit2_ populated this decoder stream.
+        let decoder = unsafe { decoder_raw.assume_init_mut() };
 
-        let err = inflateSetDictionary(strm, plain.as_ptr(), plain.len() as _);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        // SAFETY: the decoder dictionaries are live and readable, matching
+        // exactly the sequence installed on the encoder above.
+        assert_eq!(
+            // SAFETY: the first history array has a checked C capacity.
+            unsafe {
+                inflateSetDictionary(
+                    decoder,
+                    previous_dictionary.as_ptr(),
+                    test_c_uint_len(previous_dictionary.len()),
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(
+            // SAFETY: the second history array is live for this C call.
+            unsafe { inflateSetDictionary(decoder, plain.as_ptr(), test_c_uint_len(plain.len())) },
+            Z_OK
+        );
 
-        strm.next_in = compr.as_mut_ptr();
-        strm.avail_in = test_c_uint_len(compr.len());
+        decoder.next_in = compressed_output.as_mut_ptr();
+        decoder.avail_in = test_c_uint_len(produced);
+        let mut restored = [0xa5u8; 128 + 16];
+        decoder.next_out = restored.as_mut_ptr();
+        decoder.avail_out = test_c_uint_len(restored.len());
+        // SAFETY: only the produced compressed prefix is offered, and the
+        // writable plaintext array is independent of it and C state.
+        assert_eq!(unsafe { inflate(decoder, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!(decoder.avail_in, 0);
+        assert_eq!(usize::try_from(decoder.total_in), Ok(produced));
+        assert_eq!(usize::try_from(decoder.total_out), Ok(plain.len()));
+        assert_eq!(&restored[..plain.len()], &plain);
+        assert_eq!(&restored[plain.len()..], &[0xa5u8; 16]);
+        // SAFETY: decoder initialization is paired with one successful close.
+        assert_eq!(unsafe { inflateEnd(decoder) }, Z_OK);
 
-        let mut plain_again = vec![0; plain.len()];
-        strm.next_out = plain_again.as_mut_ptr();
-        strm.avail_out = test_c_uint_len(plain_again.len());
-
-        let err = inflate(strm, DeflateFlush::NoFlush as i32);
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-        let err = inflateEnd(strm);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        compr
+        compressed_output[..produced].to_vec()
     });
+    assert!(
+        !compressed.is_empty(),
+        "small-window encoder emitted no data"
+    );
 }
 
 #[test]
@@ -3405,49 +3483,76 @@ fn crc32_hash_calc_uninitialized_memory() {
 
 #[test]
 fn test_deflate_get_dict() {
-    assert_eq_rs_ng!({
-        let mut compr = [0u8; 1024];
-
-        let mut strm = MaybeUninit::zeroed();
-
-        let ret = unsafe {
+    // deflateGetDictionary returns a binary span and its explicit length,
+    // never a NUL-terminated C string. Include a trailing NUL in the input
+    // specifically to detect accidental CStr-style truncation.
+    let plain = *b"hello, hello!\0";
+    let (dictionary, compressed) = assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: live writable C stream storage, matching library version
+        // and checked ABI structure size.
+        let init = unsafe {
             deflateInit_(
-                strm.as_mut_ptr(),
+                raw.as_mut_ptr(),
                 Z_BEST_COMPRESSION,
                 zlibVersion(),
                 test_c_stream_size::<z_stream>(),
             )
         };
+        assert_eq!(init, Z_OK);
+        // SAFETY: successful initialization populated the entire stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        let c_stream = unsafe { strm.assume_init_mut() };
+        let mut encoded = [0xa5u8; 1_024];
+        stream.next_out = encoded.as_mut_ptr();
+        stream.avail_out = test_c_uint_len(encoded.len());
+        stream.next_in = plain.as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(plain.len());
 
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+        // SAFETY: live, disjoint source and writable output buffers
+        // are advertised with exact C byte counts.
+        assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(plain.len()));
+        let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(produced <= encoded.len());
+        assert!(encoded[produced..].iter().all(|&b| b == 0xa5));
 
-        c_stream.avail_out = test_c_uint_len(compr.len());
-        c_stream.next_out = compr.as_mut_ptr();
+        let mut dictionary_storage = [0xa5u8; 256];
+        let mut dictionary_len = test_c_uint_len(dictionary_storage.len());
+        // SAFETY: live initialized stream and writable destination,
+        // whose actual 256-byte capacity fits in the checked C length.
+        assert_eq!(
+            // SAFETY: the dictionary bytes are binary; the C API returns
+            // the exact number of initialized bytes through dictionary_len.
+            unsafe {
+                deflateGetDictionary(
+                    stream,
+                    dictionary_storage.as_mut_ptr(),
+                    &raw mut dictionary_len,
+                )
+            },
+            Z_OK
+        );
+        let dictionary_len = usize::try_from(dictionary_len).unwrap_or(usize::MAX);
+        assert!(dictionary_len <= dictionary_storage.len());
+        assert!(dictionary_storage[dictionary_len..]
+            .iter()
+            .all(|&b| b == 0xa5));
+        let dictionary = dictionary_storage[..dictionary_len].to_vec();
 
-        let mut hello = *b"hello, hello!\0";
-
-        c_stream.avail_in = test_c_uint_len(hello.len());
-        c_stream.next_in = hello.as_mut_ptr();
-
-        let ret = unsafe { deflate(c_stream, Z_FINISH) };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::StreamEnd);
-
-        let mut dict_new = vec![0; 256];
-        let mut dict_len = dict_new.len() as c_uint;
-
-        let ret =
-            unsafe { deflateGetDictionary(c_stream, dict_new.as_mut_ptr(), &raw mut dict_len) };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
-
-        let dictionary = unsafe { CStr::from_ptr(dict_new.as_ptr().cast()) }.to_owned();
-
-        let ret = unsafe { deflateEnd(c_stream) };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
-
-        dictionary
+        // SAFETY: encoder initialized successfully and is closed once.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        (dictionary, encoded[..produced].to_vec())
     });
+
+    assert_eq!(dictionary, plain, "incorrect binary dictionary history");
+    let mut restored = [0xa5u8; 64];
+    let (decoded, status) =
+        zlib_rs::decompress_slice(&mut restored, &compressed, InflateConfig::default());
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, plain);
+    assert!(restored[plain.len()..].iter().all(|&b| b == 0xa5));
 }
 
 #[derive(Debug, Clone)]
