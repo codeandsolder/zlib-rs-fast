@@ -69,26 +69,12 @@ pub mod quick {
 
     #[test]
     fn bi_valid() {
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
-
-        let err = unsafe {
+        let mut raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+        // SAFETY: writable C stream with valid gzip settings, version and
+        // checked structure size. Initial mem_level=1 is deliberate.
+        let init = unsafe {
             deflateInit2_(
-                &raw mut stream,
+                raw.as_mut_ptr(),
                 1,
                 Z_DEFLATED,
                 31,
@@ -98,26 +84,69 @@ pub mod quick {
                 test_c_stream_size::<libz_rs_sys::z_stream>(),
             )
         };
+        assert_eq!(init, libz_rs_sys::Z_OK);
+        // SAFETY: the successful C initialization populates the stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
+        let mut compressed = [0xa5u8; 1_236];
         stream.next_in = BI_VALID_INPUT.as_ptr().cast_mut();
-        let mut next_out = [0u8; 1236];
-        stream.next_out = next_out.as_mut_ptr();
-
-        stream.avail_in = 554;
+        stream.avail_in = test_c_uint_len(BI_VALID_INPUT.len());
+        stream.next_out = compressed.as_mut_ptr();
         stream.avail_out = 31;
 
-        let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        // SAFETY: the live source is readable; only the first 31 bytes
+        // of the independent compressed allocation are writable.
+        assert_eq!(
+            // SAFETY: the live input and exactly 31 writable output bytes
+            // are disjoint and the C encoder was initialized successfully.
+            unsafe { deflate(stream, DeflateFlush::Finish as c_int) },
+            libz_rs_sys::Z_OK
+        );
+        let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(written <= 31);
+        assert!(compressed[written..].iter().all(|&b| b == 0xa5));
 
-        stream.avail_in = 0;
-        stream.avail_out = 498;
-        let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
+        // Preserve stream.avail_in: an earlier Z_OK does *not* imply that
+        // all offered source bytes were consumed. Continue from the real
+        // next_in and total_out cursors until StreamEnd.
+        loop {
+            let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(written < compressed.len(), "compressed output overflow");
+            let offer = (compressed.len() - written).min(498);
+            stream.next_out = compressed[written..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(offer);
+            let before = (stream.total_in, stream.total_out);
+            // SAFETY: input and output refer to live, disjoint allocations;
+            // next_in and avail_in retain the actual unread source suffix.
+            let status = unsafe { deflate(stream, DeflateFlush::Finish as c_int) };
+            if status == libz_rs_sys::Z_STREAM_END {
+                break;
+            }
+            assert_eq!(status, libz_rs_sys::Z_OK);
+            assert_ne!(
+                (stream.total_in, stream.total_out),
+                before,
+                "encoder stalled before finishing"
+            );
+        }
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(BI_VALID_INPUT.len()));
+        let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(produced <= compressed.len());
+        assert!(compressed[produced..].iter().all(|&b| b == 0xa5));
+        // SAFETY: the finished encoder is closed once with all borrowed
+        // allocations still valid.
+        assert_eq!(unsafe { deflateEnd(stream) }, libz_rs_sys::Z_OK);
 
-        let err = unsafe { deflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        let mut plaintext = [0xa5u8; BI_VALID_INPUT.len() + 16];
+        let (decoded, status) = zlib_rs::decompress_slice(
+            &mut plaintext,
+            &compressed[..produced],
+            InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, BI_VALID_INPUT);
+        assert_eq!(&plaintext[BI_VALID_INPUT.len()..], &[0xa5u8; 16]);
     }
 
     #[rustfmt::skip]
@@ -155,31 +184,21 @@ pub mod quick {
         0xff, 0xff, 0x6a, 0x2b, 0xee, 0xe6, 0x6a, 0x2b, 0xee, 0x2b, 0xee, 0xee, 0x2b, 0xee, 0x00
     ];
 
-    #[test]
-    fn block_open_quick() {
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
+    /// The original block-open cases differ only by compression level.
+    /// Keep their raw-DEFLATE ABI setup, 38-byte finish windows, and the
+    /// exact historical 495-byte fixture in one bounded regression oracle.
+    fn compress_block_open(level: c_int) -> Vec<u8> {
+        const MAX_WBITS: c_int = 15;
+        const FINISH_WINDOW: usize = 38;
+        let mut raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
 
-        const MAX_WBITS: i32 = 15; // 32kb LZ77 window
-
-        let err = unsafe {
+        // SAFETY: writable C stream storage and matching ABI metadata;
+        // level is a valid tested compression level, window -15 selects
+        // raw DEFLATE, with the original minimal mem_level=1 configuration.
+        let init = unsafe {
             deflateInit2_(
-                &raw mut stream,
-                1,
+                raw.as_mut_ptr(),
+                level,
                 Z_DEFLATED,
                 -MAX_WBITS,
                 1,
@@ -188,289 +207,110 @@ pub mod quick {
                 test_c_stream_size::<libz_rs_sys::z_stream>(),
             )
         };
+        assert_eq!(init, libz_rs_sys::Z_OK);
+        // SAFETY: successful initialization wrote the entire C stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
+        let mut compressed = [0xa5u8; 1_116];
         stream.next_in = BLOCK_OPEN_INPUT.as_ptr().cast_mut();
-        let mut next_out = [0u8; 1116];
-        let next_out_start = next_out.as_ptr() as usize;
-        stream.next_out = next_out.as_mut_ptr();
-
         stream.avail_in = test_c_uint_len(BLOCK_OPEN_INPUT.len());
+
         loop {
-            let written = stream.next_out as usize - next_out_start;
-            stream.avail_out = (next_out.len() - written) as _;
-
-            if stream.avail_out > 38 {
-                stream.avail_out = 38;
-            }
-
-            let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
-            if ReturnCode::from(err) == ReturnCode::StreamEnd {
+            let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(written < compressed.len(), "compressed buffer exhausted");
+            let free = (compressed.len() - written).min(FINISH_WINDOW);
+            stream.next_out = compressed[written..].as_mut_ptr();
+            stream.avail_out = test_c_uint_len(free);
+            let before = (stream.total_in, stream.total_out);
+            // SAFETY: the live input is the unread suffix of BLOCK_OPEN_INPUT
+            // and the output is the disjoint unwritten portion of compressed.
+            let ret = unsafe { deflate(stream, DeflateFlush::Finish as c_int) };
+            if ret == libz_rs_sys::Z_STREAM_END {
                 break;
             }
-
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+            assert_eq!(ret, libz_rs_sys::Z_OK, "finish must make progress");
+            assert_ne!(
+                (stream.total_in, stream.total_out),
+                before,
+                "finish stalled without consuming input or producing output"
+            );
         }
 
-        let compressed_size = stream.next_out as usize - next_out.as_mut_ptr() as usize;
+        let compressed_size = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(compressed_size <= compressed.len());
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(BLOCK_OPEN_INPUT.len()));
+        assert!(
+            compressed[compressed_size..].iter().all(|&b| b == 0xa5),
+            "raw compressor overwrote unoffered output"
+        );
+        // SAFETY: the successfully initialized and finished encoder is
+        // ended once; all caller-owned input/output buffers remain live.
+        assert_eq!(unsafe { deflateEnd(stream) }, libz_rs_sys::Z_OK);
 
-        let err = unsafe { deflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        compressed[..compressed_size].to_vec()
+    }
 
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
-
-        let err = unsafe {
+    fn assert_block_open_decodes(compressed: &[u8]) {
+        const MAX_WBITS: c_int = 15;
+        let mut decoded_raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+        // SAFETY: separate writable stream and matching checked C ABI
+        // metadata; -15 selects the same raw wrapper as the encoder.
+        let init = unsafe {
             inflateInit2_(
-                &raw mut stream,
+                decoded_raw.as_mut_ptr(),
                 -MAX_WBITS,
                 VERSION,
                 test_c_stream_size::<libz_rs_sys::z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(init, libz_rs_sys::Z_OK);
+        // SAFETY: inflateInit2_ successfully initialized this C stream.
+        let decoder = unsafe { decoded_raw.assume_init_mut() };
+        decoder.next_in = compressed.as_ptr().cast_mut();
+        decoder.avail_in = test_c_uint_len(compressed.len());
+        let mut plaintext = [0xa5u8; BLOCK_OPEN_INPUT.len() + 16];
+        decoder.next_out = plaintext.as_mut_ptr();
+        decoder.avail_out = test_c_uint_len(plaintext.len());
+        // SAFETY: encoded data and plaintext are distinct, live, properly
+        // sized C buffers; decoder state was initialized successfully.
+        assert_eq!(
+            // SAFETY: independent live compressed input and writable
+            // plaintext arrays, with bounded C byte counts and decoder state.
+            unsafe { inflate(decoder, Z_NO_FLUSH) },
+            libz_rs_sys::Z_STREAM_END
+        );
+        assert_eq!(decoder.avail_in, 0);
+        assert_eq!(usize::try_from(decoder.total_in), Ok(compressed.len()));
+        assert_eq!(
+            usize::try_from(decoder.total_out),
+            Ok(BLOCK_OPEN_INPUT.len())
+        );
+        assert_eq!(&plaintext[..BLOCK_OPEN_INPUT.len()], &BLOCK_OPEN_INPUT);
+        assert_eq!(&plaintext[BLOCK_OPEN_INPUT.len()..], &[0xa5u8; 16]);
+        // SAFETY: the initialized decoder has reached stream end and is
+        // closed once before its borrowed allocations leave scope.
+        assert_eq!(unsafe { inflateEnd(decoder) }, libz_rs_sys::Z_OK);
+    }
+    /// Complete C-ABI round trip for the original narrow-window regression.
+    fn block_open_round_trip(level: c_int) {
+        let compressed = compress_block_open(level);
+        assert_block_open_decodes(&compressed);
+    }
 
-        stream.next_in = next_out.as_mut_ptr();
-        stream.avail_in = compressed_size as _;
-
-        let mut uncompressed = [0u8; BLOCK_OPEN_INPUT.len()];
-        stream.next_out = uncompressed.as_mut_ptr();
-        stream.avail_out = test_c_uint_len(uncompressed.len());
-
-        let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-        let err = unsafe { inflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        assert_eq!(uncompressed, BLOCK_OPEN_INPUT);
+    #[test]
+    fn block_open_quick() {
+        block_open_round_trip(1);
     }
 
     #[test]
     fn block_open_fast() {
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
-
-        const MAX_WBITS: i32 = 15; // 32kb LZ77 window
-
-        let err = unsafe {
-            deflateInit2_(
-                &raw mut stream,
-                2, // fast
-                Z_DEFLATED,
-                -MAX_WBITS,
-                1,
-                Z_FILTERED,
-                VERSION,
-                test_c_stream_size::<libz_rs_sys::z_stream>(),
-            )
-        };
-
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        stream.next_in = BLOCK_OPEN_INPUT.as_ptr().cast_mut();
-        let mut next_out = [0u8; 1116];
-        let next_out_start = next_out.as_ptr() as usize;
-        stream.next_out = next_out.as_mut_ptr();
-
-        stream.avail_in = test_c_uint_len(BLOCK_OPEN_INPUT.len());
-        loop {
-            let written = stream.next_out as usize - next_out_start;
-            stream.avail_out = (next_out.len() - written) as _;
-
-            if stream.avail_out > 38 {
-                stream.avail_out = 38;
-            }
-
-            let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
-            if ReturnCode::from(err) == ReturnCode::StreamEnd {
-                break;
-            }
-
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        }
-
-        let compressed_size = stream.next_out as usize - next_out_start;
-
-        let err = unsafe { deflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
-
-        let err = unsafe {
-            inflateInit2_(
-                &raw mut stream,
-                -MAX_WBITS,
-                VERSION,
-                test_c_stream_size::<libz_rs_sys::z_stream>(),
-            )
-        };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        stream.next_in = next_out.as_mut_ptr();
-        stream.avail_in = compressed_size as _;
-
-        let mut uncompressed = [0u8; BLOCK_OPEN_INPUT.len()];
-        stream.next_out = uncompressed.as_mut_ptr();
-        stream.avail_out = test_c_uint_len(uncompressed.len());
-
-        let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-        let err = unsafe { inflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        assert_eq!(uncompressed, BLOCK_OPEN_INPUT);
+        block_open_round_trip(2);
     }
 
     #[test]
     fn block_open_slow() {
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
-
-        const MAX_WBITS: i32 = 15; // 32kb LZ77 window
-
-        let err = unsafe {
-            deflateInit2_(
-                &raw mut stream,
-                9, // fast
-                Z_DEFLATED,
-                -MAX_WBITS,
-                1,
-                Z_FILTERED,
-                VERSION,
-                test_c_stream_size::<libz_rs_sys::z_stream>(),
-            )
-        };
-
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        stream.next_in = BLOCK_OPEN_INPUT.as_ptr().cast_mut();
-        let mut next_out = [0u8; 1116];
-        let next_out_start = next_out.as_ptr() as usize;
-        stream.next_out = next_out.as_mut_ptr();
-
-        stream.avail_in = test_c_uint_len(BLOCK_OPEN_INPUT.len());
-        loop {
-            let written = stream.next_out as usize - next_out_start;
-            stream.avail_out = (next_out.len() - written) as _;
-
-            if stream.avail_out > 38 {
-                stream.avail_out = 38;
-            }
-
-            let err = unsafe { deflate(&raw mut stream, DeflateFlush::Finish as i32) };
-            if ReturnCode::from(err) == ReturnCode::StreamEnd {
-                break;
-            }
-
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-        }
-
-        let compressed_size = stream.next_out as usize - next_out_start;
-
-        let err = unsafe { deflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let mut stream = libz_rs_sys::z_stream {
-            next_in: std::ptr::null_mut(),
-            avail_in: 0,
-            total_in: 0,
-            next_out: std::ptr::null_mut(),
-            avail_out: 0,
-            total_out: 0,
-            msg: std::ptr::null_mut(),
-            state: std::ptr::null_mut(),
-            zalloc: None,
-            zfree: None,
-            opaque: std::ptr::null_mut(),
-            data_type: 0,
-            adler: 0,
-            reserved: 0,
-        };
-
-        let err = unsafe {
-            inflateInit2_(
-                &raw mut stream,
-                -MAX_WBITS,
-                VERSION,
-                test_c_stream_size::<libz_rs_sys::z_stream>(),
-            )
-        };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        stream.next_in = next_out.as_mut_ptr();
-        stream.avail_in = compressed_size as _;
-
-        let mut uncompressed = [0u8; BLOCK_OPEN_INPUT.len()];
-        stream.next_out = uncompressed.as_mut_ptr();
-        stream.avail_out = test_c_uint_len(uncompressed.len());
-
-        let err = unsafe { inflate(&raw mut stream, Z_NO_FLUSH) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
-
-        let err = unsafe { inflateEnd(&raw mut stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        assert_eq!(uncompressed, BLOCK_OPEN_INPUT);
+        block_open_round_trip(9);
     }
 }
 
