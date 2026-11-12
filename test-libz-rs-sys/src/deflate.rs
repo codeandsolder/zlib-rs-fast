@@ -2513,21 +2513,29 @@ fn version_error() {
 
 #[test]
 fn gzip_header_survives_deflate_resets_like_zlib_ng() {
+    const NAME: &[u8] = b"survives-reset\0";
+    const INPUT: &[u8] = b"payload after reset";
+
     for reset_keep in [false, true] {
-        assert_eq_rs_ng!(unsafe {
+        let compressed = assert_eq_rs_ng!({
             let mut raw = MaybeUninit::<z_stream>::zeroed();
-            let init = deflateInit2_(
-                raw.as_mut_ptr(),
-                6,
-                Z_DEFLATED,
-                31,
-                8,
-                Z_DEFAULT_STRATEGY,
-                zlibVersion(),
-                test_c_stream_size::<z_stream>(),
-            );
+            // SAFETY: caller-owned writable stream, valid gzip encoder options
+            // and matching C ABI metadata are live for initialization.
+            let init = unsafe {
+                deflateInit2_(
+                    raw.as_mut_ptr(),
+                    6,
+                    Z_DEFLATED,
+                    31,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    zlibVersion(),
+                    test_c_stream_size::<z_stream>(),
+                )
+            };
             assert_eq!(init, Z_OK);
-            let stream = raw.assume_init_mut();
+            // SAFETY: successful initialization populated the C stream.
+            let stream = unsafe { raw.assume_init_mut() };
 
             let mut name = *b"survives-reset\0";
             let mut header = gz_header {
@@ -2545,28 +2553,49 @@ fn gzip_header_survives_deflate_resets_like_zlib_ng() {
                 hcrc: 1,
                 done: 0,
             };
-            assert_eq!(deflateSetHeader(stream, &raw mut header), Z_OK);
+            // SAFETY: gzip metadata and its NUL-terminated name remain alive
+            // through both the reset and the completed encode.
+            assert_eq!(unsafe { deflateSetHeader(stream, &raw mut header) }, Z_OK);
 
-            let reset = if reset_keep {
-                deflateResetKeep(stream)
-            } else {
-                deflateReset(stream)
+            // SAFETY: an initialized C stream is live and no I/O is active.
+            let reset = unsafe {
+                if reset_keep {
+                    deflateResetKeep(stream)
+                } else {
+                    deflateReset(stream)
+                }
             };
             assert_eq!(reset, Z_OK);
+            assert_eq!(stream.total_in, 0);
+            assert_eq!(stream.total_out, 0);
 
-            let input = b"payload after reset";
-            let mut output = [0u8; 256];
-            stream.next_in = input.as_ptr().cast_mut();
-            stream.avail_in = test_c_uint_len(input.len());
+            let mut output = [0xa5u8; 256];
+            stream.next_in = INPUT.as_ptr().cast_mut();
+            stream.avail_in = test_c_uint_len(INPUT.len());
             stream.next_out = output.as_mut_ptr();
             stream.avail_out = test_c_uint_len(output.len());
-            assert_eq!(deflate(stream, Z_FINISH), Z_STREAM_END);
-
-            let len = stream.total_out as usize;
-            let result = output[..len].to_vec();
-            assert_eq!(deflateEnd(stream), Z_OK);
-            result
+            // SAFETY: exact input span is readable and the disjoint output
+            // buffer remains writable for its advertised C byte count.
+            assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
+            assert_eq!(stream.avail_in, 0);
+            assert_eq!(usize::try_from(stream.total_in), Ok(INPUT.len()));
+            let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(produced <= output.len());
+            assert!(output[produced..].iter().all(|&byte| byte == 0xa5));
+            // SAFETY: the finished stream is ended once before metadata drops.
+            assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+            output[..produced].to_vec()
         });
+
+        assert!(compressed.starts_with(&[0x1f, 0x8b, 0x08]));
+        assert_eq!(compressed[3] & 0x0b, 0x0b); // FTEXT | FHCRC | FNAME
+        assert!(compressed.windows(NAME.len()).any(|part| part == NAME));
+        let mut output = [0xa5u8; INPUT.len() + 16];
+        let (decoded, status) =
+            zlib_rs::decompress_slice(&mut output, &compressed, InflateConfig { window_bits: 31 });
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, INPUT);
+        assert_eq!(&output[INPUT.len()..], &[0xa5u8; 16]);
     }
 }
 
@@ -3124,74 +3153,84 @@ mod fuzz_based_tests {
 
 #[test]
 fn issue_169() {
-    const INPUT: &str = include_str!("test-data/issue-169.js");
-    let buf = INPUT;
+    const INPUT: &[u8] = include_bytes!("test-data/issue-169.js");
+    const FIRST_CHUNK: usize = 2_048;
+    const LAST_CHUNK: usize = 67;
+    const FIRST_OUTPUT: usize = 1_053;
+    const INPUT_LEN: usize = FIRST_CHUNK + LAST_CHUNK;
+    assert!(INPUT.len() >= INPUT_LEN);
 
-    crate::assert_eq_rs_ng!(unsafe {
-        let mut out = [0u8; 4096];
-        let mut ret;
+    let encoded = assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable stream, valid raw-DEFLATE options and matching C ABI metadata.
+        let init = unsafe {
+            deflateInit2_(
+                raw.as_mut_ptr(),
+                Z_BEST_SPEED,
+                Z_DEFLATED,
+                -15,
+                8,
+                Z_DEFAULT_STRATEGY,
+                VERSION,
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(init, Z_OK);
+        // SAFETY: deflateInit2_ fully initialized the caller-owned stream.
+        let stream = unsafe { raw.assume_init_mut() };
 
-        let mut strm = MaybeUninit::zeroed();
+        let mut output = [0xa5u8; 4_096];
+        stream.next_in = INPUT.as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(FIRST_CHUNK);
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = test_c_uint_len(FIRST_OUTPUT);
+        // SAFETY: first 2,048 input bytes are live and the first 1,053
+        // output bytes are writable; the regions do not overlap.
+        assert_eq!(unsafe { deflate(stream, Z_NO_FLUSH) }, Z_OK);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.avail_out, test_c_uint_len(FIRST_OUTPUT));
+        assert_eq!(usize::try_from(stream.total_in), Ok(FIRST_CHUNK));
+        assert_eq!(stream.total_out, 0);
 
-        // first validate the config
-        ret = deflateInit2_(
-            strm.as_mut_ptr(),
-            Z_BEST_SPEED,
-            Z_DEFLATED,
-            -15,
-            8,
-            Z_DEFAULT_STRATEGY,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(ret, Z_OK);
-
-        let strm = strm.assume_init_mut();
-
-        strm.avail_in = 2048;
-        strm.avail_out = 1053;
-        strm.next_in = buf.as_ptr().cast_mut();
-        strm.next_out = out.as_mut_ptr();
-        ret = deflate(strm, Z_NO_FLUSH);
-        assert_eq!(ret, Z_OK);
-
-        assert_eq!(strm.avail_in, 0);
-        assert_eq!(strm.avail_out, 1053);
-        assert_eq!(strm.total_in, 2048);
-        assert_eq!(strm.total_out, 0);
-
-        strm.avail_in = 67;
-        ret = deflate(strm, Z_FINISH);
-        assert_eq!(ret, Z_OK);
-
-        // libz-sys behavior is sligtly different on CI windows
+        // next_in was advanced by the first call; preserve its C cursor.
+        stream.avail_in = test_c_uint_len(LAST_CHUNK);
+        // SAFETY: 67 additional input bytes are in INPUT, and output
+        // remains a writable 1,053-byte span.
+        assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_OK);
+        // zlib-ng's Windows build has a different intermediate flush boundary.
         #[cfg(not(windows))]
         {
-            assert_eq!(strm.avail_in, 67);
-            assert_eq!(strm.avail_out, 0);
-            assert_eq!(strm.total_in, 2048);
-            assert_eq!(strm.total_out, 1053);
+            assert_eq!(stream.avail_in, test_c_uint_len(LAST_CHUNK));
+            assert_eq!(stream.avail_out, 0);
+            assert_eq!(usize::try_from(stream.total_in), Ok(FIRST_CHUNK));
+            assert_eq!(usize::try_from(stream.total_out), Ok(FIRST_OUTPUT));
         }
 
-        strm.avail_out = (out.len() as core::ffi::c_ulong - strm.total_out) as uInt;
-        ret = deflate(strm, Z_FINISH);
-
-        // libz-sys behavior is sligtly different on CI windows
+        let already_written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(already_written < output.len());
+        stream.next_out = output[already_written..].as_mut_ptr();
+        stream.avail_out = test_c_uint_len(output.len() - already_written);
+        // SAFETY: next_in/avail_in point to the actual unread source suffix,
+        // and next_out/avail_out cover only the unfilled output suffix.
+        assert_eq!(unsafe { deflate(stream, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(INPUT_LEN));
+        let produced = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(produced <= output.len());
         #[cfg(not(windows))]
-        {
-            assert_eq!(strm.avail_in, 0);
-            assert_eq!(strm.avail_out, 2854);
-            assert_eq!(strm.total_in, 2115);
-            assert_eq!(strm.total_out, 1242);
-        }
-
-        assert_eq!(ret, Z_STREAM_END);
-        assert_eq!(strm.avail_in, 0);
-
-        deflateEnd(strm);
-
-        out
+        assert_eq!(produced, 1_242);
+        assert!(output[produced..].iter().all(|&byte| byte == 0xa5));
+        // SAFETY: initialized stream is ended exactly once before its buffers expire.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        output[..produced].to_vec()
     });
+
+    let mut restored = vec![0xa5u8; INPUT_LEN + 16];
+    let (decoded, status) =
+        zlib_rs::decompress_slice(&mut restored, &encoded, InflateConfig { window_bits: -15 });
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, &INPUT[..INPUT_LEN]);
+    assert_eq!(&restored[INPUT_LEN..], &[0xa5u8; 16]);
 }
 
 // Exact original regression header bytes; this fixture must remain unchanged.
