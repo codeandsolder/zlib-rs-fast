@@ -204,11 +204,11 @@ pub(super) fn decode_back(
                     ret = code;
                     break 'inf_leave;
                 }
-                state.nlen = input.bits(5) as usize + 257;
+                state.nlen = input.bits_usize(5) + 257;
                 input.drop_bits(5);
-                state.ndist = input.bits(5) as usize + 1;
+                state.ndist = input.bits_usize(5) + 1;
                 input.drop_bits(5);
-                state.ncode = input.bits(4) as usize + 4;
+                state.ncode = input.bits_usize(4) + 4;
                 input.drop_bits(4);
 
                 // TODO pkzit_bug_workaround
@@ -226,7 +226,7 @@ pub(super) fn decode_back(
                         ret = code;
                         break 'inf_leave;
                     }
-                    state.append_code_length_alphabet(input.bits(3) as u16);
+                    state.append_code_length_alphabet(input.bits_u16(3));
                     input.drop_bits(3);
                 }
 
@@ -240,7 +240,7 @@ pub(super) fn decode_back(
 
                 while state.have < state.nlen + state.ndist {
                     let here = loop {
-                        let here = state.len_table_get(input.bits(state.len_table.bits) as usize);
+                        let here = state.len_table_get(input.bits_usize(state.len_table.bits));
                         if here.bits <= input.bits_in_buffer() {
                             break here;
                         }
@@ -321,7 +321,7 @@ pub(super) fn decode_back(
                 // get a literal, length, or end-of-block code
                 let mut here;
                 loop {
-                    here = len_table[input.bits(state.len_table.bits) as usize];
+                    here = len_table[input.bits_usize(state.len_table.bits)];
 
                     if here.bits <= input.bits_in_buffer() {
                         break;
@@ -337,8 +337,8 @@ pub(super) fn decode_back(
                 if here.op != 0 && here.op & 0xf0 == 0 {
                     let last = here;
                     loop {
-                        let tmp = input.bits((last.bits + last.op) as usize) as u16;
-                        here = len_table[(last.val + (tmp >> last.bits)) as usize];
+                        let tmp = input.bits_u16(usize::from(last.bits + last.op));
+                        here = len_table[usize::from(last.val + (tmp >> last.bits))];
                         if last.bits + here.bits <= input.bits_in_buffer() {
                             break;
                         }
@@ -383,24 +383,24 @@ pub(super) fn decode_back(
                     continue;
                 } else {
                     // length code
-                    state.extra = (here.op & MAX_BITS) as usize;
+                    state.extra = here.op & MAX_BITS;
                 }
 
                 // get extra bits, if any
                 if state.extra != 0 {
-                    if let Err(code) = input.need_bits(state.extra) {
+                    if let Err(code) = input.need_bits(usize::from(state.extra)) {
                         ret = code;
                         break 'inf_leave;
                     }
-                    state.length += input.bits(state.extra) as usize;
-                    input.drop_bits(state.extra as u8);
+                    state.length += input.bits_usize(usize::from(state.extra));
+                    input.drop_bits(state.extra);
                 }
                 traceln!("inflate:         length {}", state.length);
 
                 // get distance code
                 let mut here;
                 loop {
-                    here = state.dist_table_get(input.bits(state.dist_table.bits) as usize);
+                    here = state.dist_table_get(input.bits_usize(state.dist_table.bits));
                     if here.bits <= input.bits_in_buffer() {
                         break;
                     }
@@ -417,9 +417,8 @@ pub(super) fn decode_back(
 
                     loop {
                         here = state.dist_table_get(
-                            last.val as usize
-                                + ((input.bits((last.bits + last.op) as usize) as usize)
-                                    >> last.bits),
+                            usize::from(last.val)
+                                + (input.bits_usize(usize::from(last.bits + last.op)) >> last.bits),
                         );
 
                         if last.bits + here.bits <= input.bits_in_buffer() {
@@ -446,17 +445,17 @@ pub(super) fn decode_back(
 
                 state.offset = here.val as usize;
 
-                state.extra = (here.op & MAX_BITS) as usize;
+                state.extra = here.op & MAX_BITS;
 
                 let extra = state.extra;
 
                 if extra > 0 {
-                    if let Err(code) = input.need_bits(extra) {
+                    if let Err(code) = input.need_bits(usize::from(extra)) {
                         ret = code;
                         break 'inf_leave;
                     }
-                    state.offset += input.bits(extra) as usize;
-                    input.drop_bits(extra as u8);
+                    state.offset += input.bits_usize(usize::from(extra));
+                    input.drop_bits(extra);
                 }
 
                 if INFLATE_STRICT && state.offset > output.history_available(&window) {

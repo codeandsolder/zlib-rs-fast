@@ -25,6 +25,26 @@ impl BitBuffer {
         self.bit_buffer & lowest_n_bits
     }
 
+    /// Extract a DEFLATE code or extra field as its native bounded
+    /// representation. Huffman lookup widths and extra fields are at most
+    /// 15 bits; accepting 16 also covers the gzip XLEN field.
+    ///
+    /// The check prevents silently losing high bits if a decoder ever
+    /// passes a wider width. Extracting the two low bytes is portable to
+    /// 32-bit hosts and avoids narrowing a general 64-bit reservoir value.
+    #[inline]
+    pub const fn bits_u16(&self, n: usize) -> u16 {
+        assert!(n <= 16, "DEFLATE code/field exceeds 16 bits");
+        let bytes = self.bits(n).to_le_bytes();
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// Bounded bit extraction for Rust slice and lookup-table indices.
+    #[inline]
+    pub fn bits_usize(&self, n: usize) -> usize {
+        usize::from(self.bits_u16(n))
+    }
+
     #[inline]
     pub const fn drop_bits(&mut self, n: u8) {
         self.bit_buffer >>= n;
@@ -47,6 +67,22 @@ impl BitBuffer {
         let value = value & ((1 << bits) - 1);
         self.bit_buffer += value << self.bits_used;
         self.bits_used += bits;
+    }
+
+    /// Validate a Huffman lookup width once per fast-decoder invocation,
+    /// instead of rechecking its range for every decoded symbol.
+    #[inline]
+    pub(super) fn huffman_mask(width: usize) -> Option<u16> {
+        let width = u32::try_from(width).ok()?;
+        1u16.checked_shl(width).map(|shifted| shifted - 1)
+    }
+
+    /// Index a validated 15-bit table mask against a reservoir snapshot.
+    /// The fast decoder also uses snapshots captured before a refill.
+    #[inline]
+    pub(super) fn lookup_index(hold: u64, mask: u16) -> usize {
+        let bytes = hold.to_le_bytes();
+        usize::from(u16::from_le_bytes([bytes[0], bytes[1]]) & mask)
     }
 
     /// Return the number of bytes contributed to the reservoir by an
@@ -210,6 +246,16 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline]
+    pub const fn bits_u16(&self, n: usize) -> u16 {
+        self.bits.bits_u16(n)
+    }
+
+    #[inline]
+    pub fn bits_usize(&self, n: usize) -> usize {
+        self.bits.bits_usize(n)
+    }
+
+    #[inline]
     pub const fn drop_bits(&mut self, n: u8) {
         self.bits.drop_bits(n);
     }
@@ -266,6 +312,55 @@ mod tests {
         assert_eq!(len, 2);
         assert_eq!(&buf[..len], &[0x00, 0x00]);
         assert_eq!(bits.bits_in_buffer(), 0);
+    }
+
+    #[test]
+    fn table_lookup_index_preserves_all_15_code_bits_on_wide_reservoirs() -> Result<(), &'static str>
+    {
+        for width in 0..=15 {
+            let mask = BitBuffer::huffman_mask(width).ok_or("valid Huffman width was rejected")?;
+            for value in [0, 1, 0xffff, 0xffff_0000, 0x1234_abcd_5678_ef01, u64::MAX] {
+                assert_eq!(
+                    u64::try_from(BitBuffer::lookup_index(value, mask)),
+                    Ok(value & u64::from(mask)),
+                    "DEFLATE lookup bits={width}, value={value:x}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn table_lookup_mask_rejects_widths_outside_deflate() {
+        assert_eq!(BitBuffer::huffman_mask(15), Some(0x7fff));
+        assert_eq!(BitBuffer::huffman_mask(16), None);
+        assert_eq!(BitBuffer::huffman_mask(usize::MAX), None);
+    }
+
+    #[test]
+    fn short_code_extraction_is_exact_for_every_width_and_portable_to_32_bit() {
+        let mut bits = BitBuffer::default();
+        bits.prime(32, 0x9abc_def0);
+        let reader = BitReader::from_buffer(bits, &[]);
+        for width in 0..=16 {
+            assert_eq!(
+                u64::from(reader.bits_u16(width)),
+                reader.bits(width),
+                "DEFLATE field width {width}"
+            );
+            assert_eq!(
+                reader.bits_usize(width),
+                usize::from(reader.bits_u16(width))
+            );
+        }
+        assert_eq!(reader.bits_u16(16), 0xdef0);
+    }
+
+    #[test]
+    #[should_panic(expected = "DEFLATE code/field exceeds 16 bits")]
+    fn short_code_extraction_rejects_widths_that_would_truncate() {
+        let reader = BitReader::from_buffer(BitBuffer::default(), &[]);
+        let _ = reader.bits_u16(17);
     }
 
     #[test]

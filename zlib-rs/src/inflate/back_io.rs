@@ -90,6 +90,16 @@ impl BackInput {
     }
 
     #[inline]
+    pub(super) const fn bits_u16(&self, count: usize) -> u16 {
+        self.bits.bits_u16(count)
+    }
+
+    #[inline]
+    pub(super) fn bits_usize(&self, count: usize) -> usize {
+        self.bits.bits_usize(count)
+    }
+
+    #[inline]
     pub(super) const fn hold(&self) -> u64 {
         self.bits.hold()
     }

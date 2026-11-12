@@ -748,8 +748,8 @@ pub struct State<'a> {
     /// distance back to copy the string from
     offset: usize,
 
-    /// extra bits needed
-    extra: usize,
+    /// DEFLATE extra-bit count (at most 15 bits), stored in its native width.
+    extra: u8,
 
     /// bits back of last unprocessed length/lit
     back: usize,
@@ -1149,7 +1149,7 @@ enum DistanceDecodeError {
 #[derive(Debug, Clone, Copy)]
 struct DecodedDistance {
     offset: usize,
-    extra: usize,
+    extra: u8,
     back_bits: usize,
 }
 
@@ -1165,15 +1165,16 @@ const fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
 #[inline]
 fn consume_extra_bits(
     reader: &mut BitReader<'_>,
-    extra: usize,
+    extra: u8,
     value: &mut usize,
     back: &mut usize,
 ) -> Result<(), ReturnCode> {
     if extra != 0 {
-        reader.need_bits(extra)?;
-        *value += reader.bits(extra) as usize;
-        reader.drop_bits(extra as u8);
-        *back += extra;
+        let width = usize::from(extra);
+        reader.need_bits(width)?;
+        *value += reader.bits_usize(width);
+        reader.drop_bits(extra);
+        *back += width;
     }
     Ok(())
 }
@@ -1186,7 +1187,7 @@ fn decode_distance_code(
 ) -> Result<DecodedDistance, DistanceDecodeError> {
     let mut here;
     loop {
-        here = table[reader.bits(table_bits) as usize];
+        here = table[reader.bits_usize(table_bits)];
         if here.bits <= reader.bits_in_buffer() {
             break;
         }
@@ -1197,8 +1198,8 @@ fn decode_distance_code(
     if here.op & 0xf0 == 0 {
         let last = here;
         loop {
-            let bits = reader.bits((last.bits + last.op) as usize) as usize;
-            here = table[last.val as usize + (bits >> last.bits)];
+            let bits = reader.bits_usize(usize::from(last.bits + last.op));
+            here = table[usize::from(last.val) + (bits >> last.bits)];
             if last.bits + here.bits <= reader.bits_in_buffer() {
                 break;
             }
@@ -1215,7 +1216,7 @@ fn decode_distance_code(
 
     Ok(DecodedDistance {
         offset: here.val as usize,
-        extra: (here.op & MAX_BITS) as usize,
+        extra: here.op & MAX_BITS,
         back_bits,
     })
 }
@@ -1343,8 +1344,8 @@ impl State<'_> {
                         // get a literal, length, or end-of-block code
                         let mut here;
                         loop {
-                            let bits = bit_reader.bits(self.len_table.bits);
-                            here = len_table[bits as usize];
+                            let bits = bit_reader.bits_usize(self.len_table.bits);
+                            here = len_table[bits];
 
                             if here.bits <= bit_reader.bits_in_buffer() {
                                 break;
@@ -1358,8 +1359,8 @@ impl State<'_> {
                         if here.op != 0 && here.op & 0xf0 == 0 {
                             let last = here;
                             loop {
-                                let bits = bit_reader.bits((last.bits + last.op) as usize) as u16;
-                                here = len_table[(last.val + (bits >> last.bits)) as usize];
+                                let bits = bit_reader.bits_u16(usize::from(last.bits + last.op));
+                                here = len_table[usize::from(last.val + (bits >> last.bits))];
                                 if last.bits + here.bits <= bit_reader.bits_in_buffer() {
                                     break;
                                 }
@@ -1405,7 +1406,7 @@ impl State<'_> {
                             }
                         } else {
                             // length code
-                            self.extra = (here.op & MAX_BITS) as usize;
+                            self.extra = here.op & MAX_BITS;
                             break 'top Mode::LenExt;
                         }
                     }
@@ -1557,7 +1558,7 @@ impl State<'_> {
                                 self.wbits = 15;
                             }
 
-                            let b0 = bit_reader.bits(8) as u8;
+                            let b0 = bit_reader.bits_u16(8).to_le_bytes()[0];
                             let b1 = (bit_reader.hold() >> 8) as u8;
                             self.checksum = crc32(crate::CRC32_INITIAL_VALUE, &[b0, b1]);
                             bit_reader.init_bits();
@@ -1583,7 +1584,7 @@ impl State<'_> {
                         }
 
                         bit_reader.drop_bits(4);
-                        let len = bit_reader.bits(4) as u8 + 8;
+                        let len = bit_reader.bits_u16(4).to_le_bytes()[0] + 8;
 
                         if self.wbits == 0 {
                             self.wbits = len;
@@ -1628,7 +1629,7 @@ impl State<'_> {
                         }
 
                         if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let b0 = bit_reader.bits(8) as u8;
+                            let b0 = bit_reader.bits_u16(8).to_le_bytes()[0];
                             let b1 = (bit_reader.hold() >> 8) as u8;
                             self.checksum = crc32(self.checksum, &[b0, b1]);
                         }
@@ -2054,11 +2055,11 @@ impl State<'_> {
                     },
                     Mode::Table => {
                         need_bits_for_mode(bit_reader, 14, mode)?;
-                        self.nlen = bit_reader.bits(5) as usize + 257;
+                        self.nlen = bit_reader.bits_usize(5) + 257;
                         bit_reader.drop_bits(5);
-                        self.ndist = bit_reader.bits(5) as usize + 1;
+                        self.ndist = bit_reader.bits_usize(5) + 1;
                         bit_reader.drop_bits(5);
-                        self.ncode = bit_reader.bits(4) as usize + 4;
+                        self.ncode = bit_reader.bits_usize(4) + 4;
                         bit_reader.drop_bits(4);
 
                         // TODO pkzit_bug_workaround
@@ -2074,7 +2075,7 @@ impl State<'_> {
                     Mode::LenLens => {
                         while self.have < self.ncode {
                             need_bits_for_mode(bit_reader, 3, mode)?;
-                            self.append_code_length_alphabet(bit_reader.bits(3) as u16);
+                            self.append_code_length_alphabet(bit_reader.bits_u16(3));
                             bit_reader.drop_bits(3);
                         }
 
@@ -2087,8 +2088,8 @@ impl State<'_> {
                     Mode::CodeLens => {
                         while self.have < self.nlen + self.ndist {
                             let here = loop {
-                                let bits = bit_reader.bits(self.len_table.bits);
-                                let here = self.len_table_get(bits as usize);
+                                let bits = bit_reader.bits_usize(self.len_table.bits);
+                                let here = self.len_table_get(bits);
                                 if here.bits <= bit_reader.bits_in_buffer() {
                                     break here;
                                 }
@@ -2366,9 +2367,16 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
     let lcode = state.len_table_ref();
     let dcode = state.dist_table_ref();
 
-    // IDEA: use const generics for the bits here?
-    let lmask = (1u64 << state.len_table.bits) - 1;
-    let dmask = (1u64 << state.dist_table.bits) - 1;
+    // Validate table widths once per decoder invocation; retain bounded
+    // u16 masks for the entire hot loop, avoiding per-symbol validation.
+    let (Some(lmask), Some(dmask)) = (
+        BitBuffer::huffman_mask(state.len_table.bits),
+        BitBuffer::huffman_mask(state.dist_table.bits),
+    ) else {
+        state.mode = Mode::Bad;
+        state.error_message = Some("invalid Huffman decode table width\0");
+        return;
+    };
 
     let mut bad = None;
 
@@ -2411,21 +2419,21 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             // in most cases, the read can be interleaved with the logic
             // based on benchmarks this matters in practice. wild.
             if bits as usize >= state.len_table.bits {
-                lcode[(hold & lmask) as usize]
+                lcode[BitBuffer::lookup_index(hold, lmask)]
             } else {
-                lcode[(bit_reader.hold() & lmask) as usize]
+                lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)]
             }
         };
 
         if here.op == 0 {
             output.push(here.val as u8);
             bit_reader.drop_bits(here.bits);
-            here = lcode[(bit_reader.hold() & lmask) as usize];
+            here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
 
             if here.op == 0 {
                 output.push(here.val as u8);
                 bit_reader.drop_bits(here.bits);
-                here = lcode[(bit_reader.hold() & lmask) as usize];
+                here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
             }
         }
 
@@ -2437,10 +2445,10 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 output.push(here.val as u8);
             } else if op & 16 != 0 {
                 let op = op & MAX_BITS;
-                let len = here.val + bit_reader.bits(op as usize) as u16;
+                let len = here.val + bit_reader.bits_u16(usize::from(op));
                 bit_reader.drop_bits(op);
 
-                here = dcode[(bit_reader.hold() & dmask) as usize];
+                here = dcode[BitBuffer::lookup_index(bit_reader.hold(), dmask)];
 
                 // we have two fast-path loads: 10+10 + 15+5 = 40,
                 // but we may need to refill here in the worst case
@@ -2461,7 +2469,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
 
                     if op & 16 != 0 {
                         let op = op & MAX_BITS;
-                        let dist = here.val + bit_reader.bits(op as usize) as u16;
+                        let dist = here.val + bit_reader.bits_u16(usize::from(op));
 
                         if INFLATE_STRICT && dist as usize > state.dmax {
                             bad = Some("invalid distance too far back\0");
@@ -2480,7 +2488,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                         }
                     } else if (op & 64) == 0 {
                         // 2nd level distance code
-                        here = dcode[(here.val + bit_reader.bits(op as usize) as u16) as usize];
+                        here = dcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
                         continue 'dodist;
                     } else {
                         bad = Some("invalid distance code\0");
@@ -2492,7 +2500,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 }
             } else if (op & 64) == 0 {
                 // 2nd level length code
-                here = lcode[(here.val + bit_reader.bits(op as usize) as u16) as usize];
+                here = lcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
                 continue 'dolen;
             } else if op & 32 != 0 {
                 // end of block
@@ -3221,6 +3229,41 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_decoder_rejects_invalid_table_width_before_consuming_input_or_output() {
+        let input = [0xa5u8; 32];
+        let mut output_bytes = [core::mem::MaybeUninit::<u8>::uninit(); 260];
+
+        for (len_bits, dist_bits) in [(16, 5), (9, 16), (usize::MAX, 5)] {
+            let mut state = State::new(InflateStateKind::Regular);
+            state.len_table = Table {
+                codes: Codes::Fixed,
+                bits: len_bits,
+            };
+            state.dist_table = Table {
+                codes: Codes::Fixed,
+                bits: dist_bits,
+            };
+            let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
+            // SAFETY: the stack array is writable for exactly its declared length;
+            // InflateOutput tracks the initialized prefix and no other borrow exists.
+            let mut output = unsafe {
+                InflateOutput::new_uninit(output_bytes.as_mut_ptr().cast(), output_bytes.len())
+            };
+
+            inflate_fast_help_impl::<true, _>(&mut state, &mut reader, &mut output);
+
+            assert!(matches!(state.mode, Mode::Bad));
+            assert_eq!(
+                state.error_message,
+                Some("invalid Huffman decode table width\0")
+            );
+            assert_eq!(reader.bytes_remaining(), input.len());
+            assert_eq!(reader.bits_in_buffer(), 0);
+            assert_eq!(output.len(), 0);
+        }
+    }
 
     #[test]
     fn dynamic_code_length_runs_validate_without_partial_writes() -> Result<(), &'static str> {
