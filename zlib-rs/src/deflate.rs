@@ -230,12 +230,17 @@ impl StreamChecksum {
         self.0 = ADLER32_INITIAL_VALUE as _;
     }
 
+    const fn low_word(self) -> u32 {
+        let bytes = self.0.to_le_bytes();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
     fn update_adler(&mut self, bytes: &[u8]) {
-        self.0 = adler32(self.0 as u32, bytes).into();
+        self.0 = adler32(self.low_word(), bytes).into();
     }
 
     fn update_crc(&mut self, bytes: &[u8]) {
-        self.0 = crc32(self.0 as u32, bytes).into();
+        self.0 = crc32(self.low_word(), bytes).into();
     }
 }
 
@@ -268,19 +273,23 @@ impl<'a> GzipHeaderRef<'a> {
         unsafe { self.ptr.as_ref() }
     }
 
-    const fn flags(&self) -> u8 {
+    const fn flags(self) -> u8 {
         self.header().flags()
     }
 
-    const fn time(&self) -> u32 {
-        self.header().time as u32
+    const fn time(self) -> u32 {
+        // GZIP MTIME carries only the low four bytes of C unsigned long.
+        let bytes = self.header().time.to_le_bytes();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 
-    const fn os(&self) -> u8 {
-        self.header().os as u8
+    const fn os(self) -> u8 {
+        // The RFC 1952 OS field is the low byte of a signed C int,
+        // including a caller-supplied negative value such as -1.
+        self.header().os.to_le_bytes()[0]
     }
 
-    const fn hcrc(&self) -> bool {
+    const fn hcrc(self) -> bool {
         self.header().hcrc != 0
     }
 
@@ -364,7 +373,7 @@ impl OutputCursor {
     ///
     /// # Safety
     /// `source` must be readable for `len` bytes and must not overlap the cursor's writable output.
-    unsafe fn copy_from_raw<'a>(&'a mut self, source: *const u8, len: usize) -> &'a [u8] {
+    unsafe fn copy_from_raw(&mut self, source: *const u8, len: usize) -> &[u8] {
         assert!(len <= self.avail_out as usize);
         if len == 0 {
             return &[];
@@ -511,8 +520,8 @@ impl<'a, 'state> Compressor<'a, 'state> {
         // region ending at the current input cursor remains within the caller's input allocation.
         unsafe {
             self.input
-                .copy_recent_to_window(&mut self.state.window, destination, bytes_back)
-        };
+                .copy_recent_to_window(&mut self.state.window, destination, bytes_back);
+        }
     }
 }
 
@@ -549,7 +558,7 @@ impl<'a> DeflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_mut`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_mut
-    #[inline(always)]
+    #[inline]
     pub unsafe fn from_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
         {
             // Safety: ptr points to a valid value of type z_stream (if non-null)
@@ -576,7 +585,8 @@ impl<'a> DeflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
-    #[inline(always)]
+    #[must_use]
+    #[inline]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
         {
             // Safety: ptr points to a valid value of type z_stream (if non-null)
@@ -597,9 +607,10 @@ impl<'a> DeflateStream<'a> {
 
     fn as_z_stream_mut(&mut self) -> &mut z_stream {
         // SAFETY: a valid &mut DeflateStream is also a valid &mut z_stream
-        unsafe { &mut *(self as *mut DeflateStream as *mut z_stream) }
+        unsafe { &mut *core::ptr::from_mut(self).cast::<z_stream>() }
     }
 
+    #[must_use]
     pub fn pending(&self) -> (usize, u8) {
         (
             self.state.bit_writer.pending.len(),
@@ -608,6 +619,7 @@ impl<'a> DeflateStream<'a> {
     }
 
     /// Last number of used bits when going to a byte boundary.
+    #[must_use]
     pub fn bits_used(&self) -> u8 {
         self.state.bit_writer.bits_used
     }
@@ -4429,6 +4441,42 @@ mod test {
     use super::*;
 
     use core::{ffi::CStr, sync::atomic::AtomicUsize};
+
+    #[test]
+    fn gzip_header_and_checksum_preserve_low_wire_bits() {
+        let mut header = gz_header {
+            time: crate::c_api::z_checksum::MAX,
+            os: -1,
+            hcrc: 1,
+            ..gz_header::default()
+        };
+        // SAFETY: all header metadata pointers are null; the live C header
+        // outlives the borrowed view in this test.
+        let view = unsafe { GzipHeaderRef::new(&mut header) };
+        assert_eq!(view.time(), u32::MAX);
+        assert_eq!(view.os(), u8::MAX);
+        assert!(view.hcrc());
+        assert_eq!(view.flags() & 2, 2);
+
+        let bytes = b"stream checksum high-bits";
+        for initial in [
+            crate::c_api::z_checksum::from(u32::MAX),
+            crate::c_api::z_checksum::MAX,
+        ] {
+            let mut adler = StreamChecksum(initial);
+            adler.update_adler(bytes);
+            assert_eq!(
+                adler.value(),
+                crate::c_api::z_checksum::from(adler32(u32::MAX, bytes))
+            );
+            let mut crc = StreamChecksum(initial);
+            crc.update_crc(bytes);
+            assert_eq!(
+                crc.value(),
+                crate::c_api::z_checksum::from(crc32(u32::MAX, bytes))
+            );
+        }
+    }
 
     #[test]
     fn compress_bound_never_wraps_below_its_input_length() {
