@@ -95,6 +95,9 @@ pub struct BatchCompressor {
 #[cfg(feature = "parallel")]
 impl BatchCompressor {
     /// Create a reusable batch compressor with exactly `workers` worker threads.
+    /// # Errors
+    ///
+    /// Returns a Rayon pool-construction error if the worker threads cannot be created.
     pub fn new(workers: core::num::NonZeroUsize) -> Result<Self, rayon_core::ThreadPoolBuildError> {
         rayon_core::ThreadPoolBuilder::new()
             .num_threads(workers.get())
@@ -103,6 +106,7 @@ impl BatchCompressor {
     }
 
     /// Number of workers owned by this compressor.
+    #[must_use]
     pub fn workers(&self) -> usize {
         self.pool.current_num_threads()
     }
@@ -189,6 +193,11 @@ pub fn compress_slices_batch_with_backend(
 /// detached match-search request, the scheduler resolves it from that table instead of walking the
 /// hash chain on the CPU. Framing, parsing, token emission, Huffman coding, and output draining stay
 /// on the existing CPU path.
+///
+/// # Errors
+///
+/// Returns an error if the GPU match search cannot accept the workload,
+/// allocate, dispatch, or retrieve its results.
 #[cfg(feature = "gpu")]
 pub fn compress_slices_batch_gpu(
     jobs: &mut [BatchCompressJob<'_>],
@@ -1053,32 +1062,36 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn explicit_single_worker_batch_matches_scalar() {
+    fn explicit_single_worker_batch_matches_scalar() -> Result<(), &'static str> {
         let input = b"single-worker-batch/".repeat(4_000);
         let config = DeflateConfig::new(9);
         let (reference, code) = independent(&input, config, compress_bound(input.len()) + 64);
         let mut output = vec![0u8; compress_bound(input.len()) + 64];
-        let mut jobs = [BatchCompressJob::new(&input, &mut output)];
-        let compressor = BatchCompressor::new(core::num::NonZeroUsize::new(1).unwrap())
-            .expect("one-worker batch compressor should initialize");
-
-        let results = compressor.compress(&mut jobs, config);
-        drop(jobs);
+        let compressor = BatchCompressor::new(core::num::NonZeroUsize::MIN)
+            .map_err(|_| "one-worker batch compressor failed initialization")?;
+        let results = {
+            let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+            compressor.compress(&mut jobs, config)
+        };
 
         assert_eq!(compressor.workers(), 1);
         assert_eq!(results[0].code, code);
         assert_eq!(results[0].written, reference.len());
         assert_eq!(&output[..results[0].written], reference);
+        Ok(())
     }
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_streams_match_independent_compression() {
+    fn parallel_streams_match_independent_compression() -> Result<(), &'static str> {
         let inputs = [
             b"parallel-alpha/".repeat(8_000),
             (0..180_000)
-                .map(|i| ((i * 73 + i / 19) % 251) as u8)
-                .collect(),
+                .map(|i| {
+                    u8::try_from((i * 73 + i / 19) % 251)
+                        .map_err(|_| "generated parallel input byte is out of range")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".repeat(5_000),
             Vec::new(),
         ];
@@ -1118,8 +1131,9 @@ mod tests {
                 .map(|(input, output)| BatchCompressJob::new(input, output))
                 .collect::<Vec<_>>();
 
-            let compressor = BatchCompressor::new(core::num::NonZeroUsize::new(4).unwrap())
-                .expect("four-worker batch compressor should initialize");
+            let workers = core::num::NonZeroUsize::new(4).ok_or("four workers must be nonzero")?;
+            let compressor = BatchCompressor::new(workers)
+                .map_err(|_| "four-worker batch compressor failed initialization")?;
             assert_eq!(compressor.workers(), 4);
             let results = compressor.compress(&mut jobs, config);
             drop(jobs);
@@ -1138,6 +1152,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
