@@ -416,17 +416,14 @@ pub unsafe extern "C" fn adler32(adler: c_ulong, buf: *const Bytef, len: uInt) -
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_combine))]
 #[must_use]
 pub extern "C" fn adler32_combine(adler1: c_ulong, adler2: c_ulong, len2: z_off_t) -> c_ulong {
-    match u64::try_from(len2) {
-        Ok(len2) => c_ulong::from(zlib_rs::adler32::adler32_combine(
+    // A negative length returns an invalid checksum for diagnosis.
+    u64::try_from(len2).map_or(0xFFFF_FFFF, |len2| {
+        c_ulong::from(zlib_rs::adler32::adler32_combine(
             checksum_word(adler1),
             checksum_word(adler2),
             len2,
-        )),
-        Err(_) => {
-            // for negative len, return invalid adler32 as a clue for debugging
-            0xFFFF_FFFF
-        }
-    }
+        ))
+    })
 }
 
 /// Combines the checksum of two slices into one.
@@ -459,17 +456,14 @@ pub extern "C" fn adler32_combine(adler1: c_ulong, adler2: c_ulong, len2: z_off_
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_combine64))]
 #[must_use]
 pub extern "C" fn adler32_combine64(adler1: c_ulong, adler2: c_ulong, len2: z_off64_t) -> c_ulong {
-    match u64::try_from(len2) {
-        Ok(len2) => c_ulong::from(zlib_rs::adler32::adler32_combine(
+    // A negative length returns an invalid checksum for diagnosis.
+    u64::try_from(len2).map_or(0xFFFF_FFFF, |len2| {
+        c_ulong::from(zlib_rs::adler32::adler32_combine(
             checksum_word(adler1),
             checksum_word(adler2),
             len2,
-        )),
-        Err(_) => {
-            // for negative len, return invalid adler32 as a clue for debugging
-            0xFFFF_FFFF
-        }
-    }
+        ))
+    })
 }
 
 /// Like [`uncompress`] but takes a `usize` instead.
@@ -740,13 +734,11 @@ pub unsafe extern "C" fn inflate(strm: *mut z_stream, flush: i32) -> i32 {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateEnd))]
 pub unsafe extern "C" fn inflateEnd(strm: *mut z_stream) -> i32 {
     // SAFETY: the `inflateEnd` FFI contract requires any non-null stream pointer to reference a live, initialized stream of the matching kind; the converter handles null.
-    match unsafe { InflateStream::from_stream_mut(strm) } {
-        Some(stream) => {
-            zlib_rs::inflate::end(stream);
-            ReturnCode::Ok as _
-        }
-        None => ReturnCode::StreamError as _,
-    }
+    let Some(stream) = (unsafe { InflateStream::from_stream_mut(strm) }) else {
+        return ReturnCode::StreamError as _;
+    };
+    zlib_rs::inflate::end(stream);
+    ReturnCode::Ok as _
 }
 
 /// Initializes the state for decompression
@@ -1000,7 +992,7 @@ pub unsafe extern "C" fn inflateSyncPoint(strm: *mut z_stream) -> i32 {
     let Some(stream) = (unsafe { InflateStream::from_stream_ref(strm.cast_const()) }) else {
         return ReturnCode::StreamError as _;
     };
-    zlib_rs::inflate::sync_point(stream) as i32
+    c_int::from(zlib_rs::inflate::sync_point(stream))
 }
 
 /// Initializes the state for decompression
@@ -1070,11 +1062,12 @@ pub unsafe extern "C" fn inflateInit2_(
     stream_size: c_int,
 ) -> c_int {
     // SAFETY: the initialization contract requires non-null `version` to be a valid C string; the helper handles null and validates the ABI stream size.
-    if !unsafe { is_version_compatible(version, stream_size) } {
-        ReturnCode::VersionError as _
-    } else {
-        // SAFETY: the version/ABI check above validated this initialization call; the same caller-owned stream pointer is forwarded unchanged.
+    if unsafe { is_version_compatible(version, stream_size) } {
+        // SAFETY: compatible version and C stream layout were verified;
+        // the caller-supplied writable stream pointer is forwarded intact.
         unsafe { inflateInit2(strm, windowBits) }
+    } else {
+        ReturnCode::VersionError as _
     }
 }
 
@@ -1107,7 +1100,7 @@ unsafe extern "C" fn inflateInit2(strm: z_streamp, windowBits: c_int) -> c_int {
 /// Inserts bits in the inflate input stream.
 ///
 /// The intent is that this function is used to start inflating at a bit position in the middle of a byte.
-/// The provided bits will be used before any bytes are used from next_in.
+/// The provided bits will be used before any bytes are used from the input cursor.
 /// This function should only be used with raw inflate, and should be used before the first [`inflate`] call after [`inflateInit2_`] or [`inflateReset`].
 /// bits must be less than or equal to 16, and that many of the least significant bits of value will be inserted in the input.
 ///
@@ -1730,12 +1723,12 @@ pub const extern "C" fn compressBound(sourceLen: c_ulong) -> c_ulong {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(deflateEnd))]
 pub unsafe extern "C" fn deflateEnd(strm: *mut z_stream) -> i32 {
     // SAFETY: the `deflateEnd` FFI contract requires any non-null stream pointer to reference a live, initialized stream of the matching kind; the converter handles null.
-    match unsafe { DeflateStream::from_stream_mut(strm) } {
-        Some(stream) => match zlib_rs::deflate::end(stream) {
-            Ok(_) => ReturnCode::Ok as _,
-            Err(_) => ReturnCode::DataError as _,
-        },
-        None => ReturnCode::StreamError as _,
+    let Some(stream) = (unsafe { DeflateStream::from_stream_mut(strm) }) else {
+        return ReturnCode::StreamError as _;
+    };
+    match zlib_rs::deflate::end(stream) {
+        Ok(_) => ReturnCode::Ok as _,
+        Err(_) => ReturnCode::DataError as _,
     }
 }
 
@@ -1923,12 +1916,12 @@ pub unsafe extern "C" fn deflatePending(
 
     // SAFETY: The optional pending output pointer is writable and aligned when non-null; as_mut checks null.
     if let Some(pending) = unsafe { pending.as_mut() } {
-        *pending = current_pending as c_uint;
+        *pending = c_uint::try_from(current_pending).unwrap_or(c_uint::MAX);
     }
 
     // SAFETY: The optional bits output pointer is writable and aligned when non-null; as_mut checks null.
     if let Some(bits) = unsafe { bits.as_mut() } {
-        *bits = current_bits as c_int;
+        *bits = c_int::from(current_bits);
     }
 
     ReturnCode::Ok as _
@@ -2239,12 +2232,16 @@ pub unsafe extern "C" fn deflateTune(
         return ReturnCode::StreamError as _;
     };
 
+    // The core clamps each tuning threshold at u16::MAX. Negative C
+    // arguments previously became huge unsigned values before that clamp;
+    // retaining the maximum preserves this historical C tuning behavior.
+    let bound = |value: c_int| usize::try_from(value).unwrap_or(usize::MAX);
     zlib_rs::deflate::tune(
         stream,
-        good_length as usize,
-        max_lazy as usize,
-        nice_length as usize,
-        max_chain as usize,
+        bound(good_length),
+        bound(max_lazy),
+        bound(nice_length),
+        bound(max_chain),
     ) as _
 }
 
@@ -2299,17 +2296,18 @@ macro_rules! libz_rs_sys_version {
 // specific functions that were added later are used.
 const LIBZ_RS_SYS_VERSION: &str = concat!(libz_rs_sys_version!(), "\0");
 
-const unsafe fn is_version_compatible(version: *const c_char, stream_size: i32) -> bool {
+unsafe fn is_version_compatible(version: *const c_char, stream_size: i32) -> bool {
     // SAFETY: The version pointer is either null or points to the first byte of the valid C version string supplied by the caller.
     let Some(expected_major_version) = (unsafe { version.as_ref() }) else {
         return false;
     };
 
-    if *expected_major_version as u8 != LIBZ_RS_SYS_VERSION.as_bytes()[0] {
+    if (*expected_major_version).to_ne_bytes()[0] != LIBZ_RS_SYS_VERSION.as_bytes()[0] {
         return false;
     }
 
-    core::mem::size_of::<z_stream>() as i32 == stream_size
+    // The C ABI takes a signed int, not native usize, for this size.
+    i32::try_from(core::mem::size_of::<z_stream>()) == Ok(stream_size)
 }
 
 /// The version of the zlib library.
@@ -2389,8 +2387,6 @@ pub const extern "C" fn zlibVersion() -> *const c_char {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(zlibCompileFlags))]
 #[must_use]
 pub const extern "C" fn zlibCompileFlags() -> c_ulong {
-    let mut flags = 0;
-
     const fn encode_size<T>() -> c_ulong {
         match core::mem::size_of::<T>() {
             2 => 0b00,
@@ -2399,6 +2395,8 @@ pub const extern "C" fn zlibCompileFlags() -> c_ulong {
             _ => 0b11,
         }
     }
+
+    let mut flags = 0;
 
     flags |= encode_size::<uInt>();
     flags |= encode_size::<uLong>() << 2;
@@ -2483,7 +2481,7 @@ pub unsafe extern "C" fn inflateGetDictionary(
 
     // SAFETY: The caller’s optional dictionary-length output is writable and aligned when non-null.
     if let Some(dictLength) = unsafe { dictLength.as_mut() } {
-        *dictLength = dictionary_len as c_uint;
+        *dictLength = c_uint::try_from(dictionary_len).unwrap_or(c_uint::MAX);
     }
 
     ReturnCode::Ok as _
@@ -2535,7 +2533,7 @@ pub unsafe extern "C" fn deflateGetDictionary(
 
     // SAFETY: The caller’s optional dictionary-length output is writable and aligned when non-null.
     if let Some(dictLength) = unsafe { dictLength.as_mut() } {
-        *dictLength = history.len() as c_uint;
+        *dictLength = c_uint::try_from(history.len()).unwrap_or(c_uint::MAX);
     }
 
     ReturnCode::Ok as _
