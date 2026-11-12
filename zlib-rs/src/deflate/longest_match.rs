@@ -17,8 +17,11 @@ struct SearchCursor {
 }
 
 impl SearchCursor {
-    fn candidate_start(self) -> Option<usize> {
-        usize::from(self.hash_pos).checked_sub(self.offset)
+    // Hash-chain positions have an exact 16-bit representation. Retaining
+    // that representation makes it impossible for a search to return a start
+    // that cannot be stored in the DEFLATE state.
+    fn candidate_start(self) -> Option<Pos> {
+        self.hash_pos.checked_sub(Pos::try_from(self.offset).ok()?)
     }
 }
 
@@ -127,7 +130,7 @@ pub struct MatchSearchRequest<'a> {
 }
 
 impl MatchSearchParams {
-    #[inline(always)]
+    #[inline]
     const fn update_hash(self, hash: u32, value: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(hash, value),
@@ -353,10 +356,8 @@ fn longest_match_help<const SLOW: bool>(
 
     let early_exit = !SLOW && params.level < EARLY_EXIT_TRIGGER_LEVEL;
 
-    loop {
-        let Some(candidate_start) = cursor.candidate_start() else {
-            break;
-        };
+    while let Some(candidate_pos) = cursor.candidate_start() {
+        let candidate_start = usize::from(candidate_pos);
         if candidate_start >= params.strstart {
             break;
         }
@@ -390,7 +391,7 @@ fn longest_match_help<const SLOW: bool>(
         };
 
         if len > best_len {
-            match_start = candidate_start as Pos;
+            match_start = candidate_pos;
 
             if len >= params.lookahead {
                 return MatchSearchResult::new(params.lookahead, match_start);
@@ -406,7 +407,7 @@ fn longest_match_help<const SLOW: bool>(
                     resources,
                     params,
                     scan,
-                    candidate_start,
+                    candidate_pos,
                     len,
                     limit_base,
                     params.wmask,
@@ -469,16 +470,17 @@ fn next_slow_cursor(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
     scan: &[u8],
-    candidate_start: usize,
+    candidate_start: Pos,
     match_len: usize,
     limit_base: usize,
     wmask: usize,
 ) -> Option<SearchCursor> {
     let prev = resources.prev;
     let mut next = SearchCursor {
-        hash_pos: candidate_start as Pos,
+        hash_pos: candidate_start,
         offset: 0,
     };
+    let candidate_start = usize::from(candidate_start);
 
     for offset in 0..=match_len - STD_MIN_MATCH {
         let hash_pos = prev[(candidate_start + offset) & wmask];
@@ -535,7 +537,7 @@ enum CandidateProbe {
     CompareFrom(usize),
 }
 
-#[inline(always)]
+#[inline]
 fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateProbe {
     debug_assert_eq!(scan.len(), candidate.len());
     debug_assert!(best_len < scan.len());
@@ -577,13 +579,11 @@ fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateP
     CandidateProbe::CompareFrom(8)
 }
 
-#[inline(always)]
+#[inline]
 fn load_u64_le(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("candidate probe requires eight initialized bytes"),
-    )
+    // Callers have already established eight initialized bytes from offset.
+    // An array chunk retains that precondition without a fallible conversion.
+    u64::from_le_bytes(bytes[offset..].as_chunks::<8>().0[0])
 }
 
 #[inline]
@@ -604,6 +604,35 @@ fn break_matching(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_request<'a>(
+        initialized: &'a [u8],
+        prev: &'a [Pos],
+        head: &'a [Pos],
+    ) -> MatchSearchRequest<'a> {
+        MatchSearchRequest {
+            resources: MatchSearchResources {
+                initialized,
+                prev,
+                head,
+            },
+            params: MatchSearchParams {
+                cur_match: 0,
+                strstart: 16,
+                lookahead: 16,
+                wmask: 31,
+                max_dist: 16,
+                prev_length: 0,
+                match_start: 0,
+                max_chain_length: 1,
+                good_match: 4,
+                nice_match: 16,
+                level: 6,
+                hash_calc_variant: HashCalcVariant::Standard,
+                kind: MatchSearchKind::Standard,
+            },
+        }
+    }
 
     #[test]
     fn search_result_length_uses_deflate_domain_even_for_wide_backend_counters() {
@@ -630,38 +659,9 @@ mod tests {
         let prev = [0u16; 32];
         let head = [0u16; 1];
 
-        fn request<'a>(
-            initialized: &'a [u8],
-            prev: &'a [Pos],
-            head: &'a [Pos],
-        ) -> MatchSearchRequest<'a> {
-            MatchSearchRequest {
-                resources: MatchSearchResources {
-                    initialized,
-                    prev,
-                    head,
-                },
-                params: MatchSearchParams {
-                    cur_match: 0,
-                    strstart: 16,
-                    lookahead: 16,
-                    wmask: 31,
-                    max_dist: 16,
-                    prev_length: 0,
-                    match_start: 0,
-                    max_chain_length: 1,
-                    good_match: 4,
-                    nice_match: 16,
-                    level: 6,
-                    hash_calc_variant: HashCalcVariant::Standard,
-                    kind: MatchSearchKind::Standard,
-                },
-            }
-        }
-
         let requests = [
-            request(&initialized_a, &prev, &head),
-            request(&initialized_b, &prev, &head),
+            test_request(&initialized_a, &prev, &head),
+            test_request(&initialized_b, &prev, &head),
         ];
         // Independent requests can coexist and execute as one batch without borrowing mutable
         // compressor state.
@@ -696,6 +696,45 @@ mod tests {
                 start: 0
             }
         );
+    }
+
+    #[test]
+    fn search_cursor_rejects_offsets_beyond_the_16_bit_position_domain() {
+        let maximum = usize::from(Pos::MAX);
+        assert_eq!(
+            SearchCursor {
+                hash_pos: Pos::MAX,
+                offset: 0,
+            }
+            .candidate_start(),
+            Some(Pos::MAX)
+        );
+        assert_eq!(
+            SearchCursor {
+                hash_pos: Pos::MAX,
+                offset: maximum,
+            }
+            .candidate_start(),
+            Some(0)
+        );
+        assert_eq!(
+            SearchCursor {
+                hash_pos: Pos::MAX,
+                offset: maximum + 1,
+            }
+            .candidate_start(),
+            None
+        );
+    }
+
+    #[test]
+    fn word_probe_reads_exactly_the_initialized_eight_byte_array() {
+        let bytes = *b"0123456789abcdef";
+        assert_eq!(
+            load_u64_le(&bytes[..8], 0),
+            u64::from_le_bytes(*b"01234567")
+        );
+        assert_eq!(load_u64_le(&bytes, 8), u64::from_le_bytes(*b"89abcdef"));
     }
 
     #[test]
