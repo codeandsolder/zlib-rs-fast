@@ -47,17 +47,17 @@ impl BackInput {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn available(&self) -> usize {
         self.remaining
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn next_ptr(&self) -> *const u8 {
         self.next
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn as_slice(&self) -> &[u8] {
         if self.remaining == 0 {
             &[]
@@ -69,47 +69,47 @@ impl BackInput {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn bit_buffer(&self) -> BitBuffer {
         self.bits
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn set_bit_buffer(&mut self, bits: BitBuffer) {
         self.bits = bits;
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn bits_in_buffer(&self) -> u8 {
         self.bits.bits_in_buffer()
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn bits(&self, count: usize) -> u64 {
         self.bits.bits(count)
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn hold(&self) -> u64 {
         self.bits.hold()
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn drop_bits(&mut self, count: u8) {
         self.bits.drop_bits(count);
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn init_bits(&mut self) {
         self.bits.init_bits();
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn next_byte_boundary(&mut self) {
         self.bits.next_byte_boundary();
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) fn advance(&mut self, count: usize) {
         assert!(
             count <= self.remaining,
@@ -124,7 +124,7 @@ impl BackInput {
     }
 
     /// Ensure that at least one callback-owned byte is available.
-    #[inline(always)]
+    #[inline]
     pub(super) fn ensure_available(&mut self) -> Result<(), ReturnCode> {
         if self.remaining != 0 {
             return Ok(());
@@ -146,7 +146,7 @@ impl BackInput {
     }
 
     /// Pull one byte from the callback-fed stream into the shared DEFLATE reservoir.
-    #[inline(always)]
+    #[inline]
     pub(super) fn pull_byte(&mut self) -> Result<(), ReturnCode> {
         self.ensure_available()?;
         // SAFETY: `ensure_available` established one readable byte in the current callback span.
@@ -157,7 +157,7 @@ impl BackInput {
     }
 
     /// Fill the shared reservoir to `count` bits, asking the callback for another span as needed.
-    #[inline(always)]
+    #[inline]
     pub(super) fn need_bits(&mut self, count: usize) -> Result<(), ReturnCode> {
         while usize::from(self.bits.bits_in_buffer()) < count {
             self.pull_byte()?;
@@ -192,17 +192,18 @@ impl BackOutput {
         }
     }
 
-    #[inline(always)]
+    #[cfg(test)]
+    #[inline]
     pub(super) const fn len(&self) -> usize {
         self.filled
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn remaining(&self, window: &BackWindow<'_>) -> usize {
         window.buffer_size() - self.filled
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) const fn history_available(&self, window: &BackWindow<'_>) -> usize {
         if window.history_len() == 0 {
             self.filled
@@ -241,7 +242,7 @@ impl BackOutput {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) fn push(&mut self, window: &mut BackWindow<'_>, byte: u8) {
         self.with_writer(window, |writer| {
             assert_ne!(
@@ -253,7 +254,7 @@ impl BackOutput {
         });
     }
 
-    #[inline(always)]
+    #[inline]
     pub(super) fn extend(&mut self, window: &mut BackWindow<'_>, bytes: &[u8]) {
         self.with_writer(window, |writer| {
             assert!(
@@ -269,8 +270,12 @@ impl BackOutput {
     #[inline]
     fn deliver(&mut self, window: &mut BackWindow<'_>) -> Result<(), ReturnCode> {
         debug_assert!(self.filled > 0 && self.filled <= window.buffer_size());
-        // The window size was validated at inflateBackInit to be at most 32768.
-        let count = self.filled as u32;
+        // The initialized prefix is bounded by the validated 32 KiB
+        // inflateBack window, but preserve the callback's u32 ABI boundary
+        // explicitly in case that invariant changes.
+        let Ok(count) = u32::try_from(self.filled) else {
+            return Err(ReturnCode::StreamError);
+        };
         // SAFETY: BackOutput::new established the callback contract. Every
         // byte in 0..filled was initialized by BackWriter, and the callback
         // may read that prefix but may not invalidate the window storage.
@@ -288,7 +293,7 @@ impl BackOutput {
     }
 
     /// Flush a full output window and reset the prefix for the next chunk.
-    #[inline(always)]
+    #[inline]
     pub(super) fn flush_if_full(&mut self, window: &mut BackWindow<'_>) -> Result<(), ReturnCode> {
         if self.filled != window.buffer_size() {
             return Ok(());
@@ -302,7 +307,7 @@ impl BackOutput {
     }
 
     /// Deliver a final partial prefix, without marking incomplete history.
-    #[inline(always)]
+    #[inline]
     pub(super) fn flush_remaining(
         &mut self,
         window: &mut BackWindow<'_>,

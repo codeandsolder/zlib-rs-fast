@@ -1989,7 +1989,7 @@ impl<'a> State<'a> {
         u16::try_from(distance).ok()
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn update_hash(&self, h: u32, val: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(h, val),
@@ -1997,7 +1997,7 @@ impl<'a> State<'a> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn quick_insert_string(&mut self, string: usize) -> u16 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::quick_insert_string(self, string),
@@ -2005,7 +2005,7 @@ impl<'a> State<'a> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn insert_string(&mut self, string: usize, count: usize) {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::insert_string(self, string, count),
@@ -2013,7 +2013,7 @@ impl<'a> State<'a> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn tally_lit(&mut self, unmatched: u8) -> bool {
         Self::tally_lit_help(&mut self.sym_buf, &mut self.l_desc, unmatched)
     }
@@ -2055,7 +2055,7 @@ impl<'a> State<'a> {
         self::trees_tbl::DIST_CODE[index]
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn tally_dist(&mut self, dist: usize, len: usize) -> bool {
         let max_distance = self.max_dist();
         self.tally_dist_with_limit(dist, len, max_distance)
@@ -2063,13 +2063,13 @@ impl<'a> State<'a> {
 
     /// Tally a match found by a complete-buffer matcher that can safely use the entire configured
     /// DEFLATE history window rather than the streaming matchfinder's lookahead-reserved limit.
-    #[inline(always)]
+    #[inline]
     pub(crate) fn tally_dist_full_window(&mut self, dist: usize, len: usize) -> bool {
         let max_distance = self.w_mask() + 1;
         self.tally_dist_with_limit(dist, len, max_distance)
     }
 
-    #[inline(always)]
+    #[inline]
     fn tally_dist_with_limit(&mut self, dist: usize, len: usize, max_distance: usize) -> bool {
         // Validate the entire token before writing any of its three bytes
         // or incrementing Huffman frequencies. A distance is one-based and

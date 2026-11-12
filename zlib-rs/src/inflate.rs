@@ -214,7 +214,7 @@ impl<'a> InflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
-    #[inline(always)]
+    #[inline]
     unsafe fn from_stream_ref_kind(
         strm: *const z_stream,
         kind: InflateStateKind,
@@ -237,7 +237,7 @@ impl<'a> InflateStream<'a> {
         unsafe { strm.cast::<InflateStream>().as_ref() }
     }
 
-    #[inline(always)]
+    #[inline]
     unsafe fn from_stream_mut_kind(
         strm: *mut z_stream,
         kind: InflateStateKind,
@@ -250,7 +250,7 @@ impl<'a> InflateStream<'a> {
     }
 
     /// Convert a regular `inflateInit*` stream. `BackInit` streams are deliberately rejected.
-    #[inline(always)]
+    #[inline]
     /// # Safety
     ///
     /// If non-null, the stream pointer must be valid, initialized for inflate,
@@ -261,7 +261,7 @@ impl<'a> InflateStream<'a> {
     }
 
     /// Convert a regular `inflateInit*` stream. `BackInit` streams are deliberately rejected.
-    #[inline(always)]
+    #[inline]
     /// # Safety
     ///
     /// If non-null, the stream pointer must reference a live, initialized
@@ -272,7 +272,7 @@ impl<'a> InflateStream<'a> {
     }
 
     /// Convert an `inflateBackInit*` stream. Regular inflate streams are rejected.
-    #[inline(always)]
+    #[inline]
     /// # Safety
     ///
     /// If non-null, the pointer must reference a valid initialized `BackInit`
@@ -529,7 +529,7 @@ impl Flags {
         self.0 & other.0 != 0
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn update(&mut self, other: Self, value: bool) {
         if value {
             *self = Self(self.0 | other.0);
@@ -1102,7 +1102,7 @@ impl<'input> LenDecodeOutcome<'input> {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn need_bits_for_mode(
     reader: &mut BitReader<'_>,
     count: usize,
@@ -1113,7 +1113,7 @@ fn need_bits_for_mode(
         .map_err(|code| DispatchExit { mode, code })
 }
 
-#[inline(always)]
+#[inline]
 fn pull_byte_for_mode(reader: &mut BitReader<'_>, mode: Mode) -> Result<u8, DispatchExit> {
     reader
         .pull_byte()
@@ -1133,7 +1133,7 @@ struct DecodedDistance {
     back_bits: usize,
 }
 
-#[inline(always)]
+#[inline]
 const fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
     if output.is_full() {
         return false;
@@ -1142,7 +1142,7 @@ const fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
     true
 }
 
-#[inline(always)]
+#[inline]
 fn consume_extra_bits(
     reader: &mut BitReader<'_>,
     extra: usize,
@@ -1158,7 +1158,7 @@ fn consume_extra_bits(
     Ok(())
 }
 
-#[inline(always)]
+#[inline]
 fn decode_distance_code(
     reader: &mut BitReader<'_>,
     table: &[Code],
@@ -1200,7 +1200,7 @@ fn decode_distance_code(
     })
 }
 
-#[inline(always)]
+#[inline]
 fn copy_match_bytes(
     window: &Window<'_>,
     sane: bool,
@@ -2331,7 +2331,7 @@ impl FastDecodeOutput for writer::BackWriter<'_> {
 /// `INFLATE_FAST_MIN_LEFT` output bytes are available. The helper retains those fast-path
 /// invariants with assertions in the checked reader/output primitives rather than an unsafe
 /// caller contract.
-#[inline(always)]
+#[inline]
 fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
     state: &mut State,
     bit_reader: &mut BitReader<'_>,

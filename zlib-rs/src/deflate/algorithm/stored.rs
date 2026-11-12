@@ -47,6 +47,73 @@ fn stored_header_size(bits_valid: u8) -> usize {
     (usize::from(bits_valid) + 42) / 8
 }
 
+/// Keep the directly copied bytes as usable history for a later level change.
+/// A full-window copy supersedes the history; a shorter copy appends or slides it.
+fn remember_direct_stored_history(stream: &mut Compressor<'_, '_>, used: usize) {
+    if used == 0 {
+        return;
+    }
+    if used >= stream.state.w_size {
+        // Supplant the previous history with the last full window of directly copied input.
+        let w_size = stream.state.w_size;
+        stream.state.matches = 2; // clear hash on a later compressed-level transition
+        stream.copy_recent_input_to_window(0..w_size, w_size);
+        stream.state.strstart = w_size;
+        stream.state.insert = w_size;
+    } else {
+        if stream.state.window_size - stream.state.strstart <= used {
+            // Slide the initialized portion of the history window down.
+            let state = &mut *stream.state;
+            state.strstart -= state.w_size;
+            state.window.slide_down(state.w_size);
+            state.matches = (state.matches + 1).min(2); // pending slide_hash
+            state.insert = state.insert.min(state.strstart);
+        }
+
+        let start = stream.state.strstart;
+        stream.copy_recent_input_to_window(start..start + used, used);
+        let state = &mut *stream.state;
+        state.strstart += used;
+        state.insert += used.min(state.w_size - state.insert);
+    }
+    set_resident_origin(stream.state, stream.state.strstart);
+}
+
+/// Refill the resident stored-block window after attempting direct output.
+/// Preserve the pending hash-slide count so switching compression level later works.
+fn refill_stored_history(stream: &mut Compressor<'_, '_>) {
+    // Fill the window with any remaining input
+    let mut have = stream.state.window_size - stream.state.strstart;
+    if stream.input.avail_in as usize > have && resident_origin(stream.state) >= stream.state.w_size
+    {
+        // slide the window down
+        let state = &mut *stream.state;
+        let next_origin = resident_origin(state) - state.w_size;
+        state.strstart -= state.w_size;
+        set_resident_origin(state, next_origin);
+
+        // Preserve only the logically initialized upper-half history.
+        state.window.slide_down(state.w_size);
+
+        if state.matches < 2 {
+            // add a pending slide_hash
+            state.matches += 1;
+        }
+
+        have += state.w_size; // more space now
+        state.insert = Ord::min(state.insert, state.strstart);
+    }
+
+    let have = Ord::min(have, stream.input.avail_in as usize);
+    if have > 0 {
+        stream.read_buf_window(stream.state.strstart, have);
+
+        let state = &mut *stream.state;
+        state.strstart += have;
+        state.insert += Ord::min(have, state.w_size - state.insert);
+    }
+}
+
 pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     // Stored-mode output must be backed by bytes still in the sliding window.
     // The compressed-level transition path flushes before switching modes;
@@ -146,33 +213,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // a non-zero compression level.
     used -= stream.input.avail_in; /* number of input bytes directly copied */
 
-    if used > 0 {
-        let used = used as usize;
-        if used >= stream.state.w_size {
-            // Supplant the previous history with the last full window of directly copied input.
-            let w_size = stream.state.w_size;
-            stream.state.matches = 2; // clear hash on a later compressed-level transition
-            stream.copy_recent_input_to_window(0..w_size, w_size);
-            stream.state.strstart = w_size;
-            stream.state.insert = w_size;
-        } else {
-            if stream.state.window_size - stream.state.strstart <= used {
-                // Slide the initialized portion of the history window down.
-                let state = &mut stream.state;
-                state.strstart -= state.w_size;
-                state.window.slide_down(state.w_size);
-                state.matches = (state.matches + 1).min(2); // pending slide_hash
-                state.insert = state.insert.min(state.strstart);
-            }
-
-            let start = stream.state.strstart;
-            stream.copy_recent_input_to_window(start..start + used, used);
-            let state = &mut stream.state;
-            state.strstart += used;
-            state.insert += used.min(state.w_size - state.insert);
-        }
-        set_resident_origin(stream.state, stream.state.strstart);
-    }
+    remember_direct_stored_history(stream, used as usize);
 
     // If the last block was written to next_out, then done.
     if last {
@@ -189,36 +230,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         return BlockState::BlockDone;
     }
 
-    // Fill the window with any remaining input
-    let mut have = stream.state.window_size - stream.state.strstart;
-    if stream.input.avail_in as usize > have && resident_origin(stream.state) >= stream.state.w_size
-    {
-        // slide the window down
-        let state = &mut stream.state;
-        let next_origin = resident_origin(state) - state.w_size;
-        state.strstart -= state.w_size;
-        set_resident_origin(state, next_origin);
-
-        // Preserve only the logically initialized upper-half history.
-        state.window.slide_down(state.w_size);
-
-        if state.matches < 2 {
-            // add a pending slide_hash
-            state.matches += 1;
-        }
-
-        have += state.w_size; // more space now
-        state.insert = Ord::min(state.insert, state.strstart);
-    }
-
-    let have = Ord::min(have, stream.input.avail_in as usize);
-    if have > 0 {
-        stream.read_buf_window(stream.state.strstart, have);
-
-        let state = &mut stream.state;
-        state.strstart += have;
-        state.insert += Ord::min(have, state.w_size - state.insert);
-    }
+    refill_stored_history(stream);
 
     // There was not enough avail_out to write a complete worthy or flushed
     // stored block to next_out. Write a stored block to pending instead, if we
@@ -226,7 +238,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // room for the remaining input as a stored block in the pending buffer.
 
     // number of header bytes
-    let state = &mut stream.state;
+    let state = &mut *stream.state;
     let have = stored_header_size(state.bit_writer.bits_valid);
 
     // maximum stored block length that will fit in pending:

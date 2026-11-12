@@ -9,40 +9,40 @@ pub struct BitBuffer {
 }
 
 impl BitBuffer {
-    #[inline(always)]
+    #[inline]
     pub const fn bits_in_buffer(&self) -> u8 {
         self.bits_used
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn hold(&self) -> u64 {
         self.bit_buffer
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn bits(&self, n: usize) -> u64 {
         let lowest_n_bits = (1 << n) - 1;
         self.bit_buffer & lowest_n_bits
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn drop_bits(&mut self, n: u8) {
         self.bit_buffer >>= n;
         self.bits_used -= n;
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn next_byte_boundary(&mut self) {
         self.drop_bits(self.bits_used & 0b0111);
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn init_bits(&mut self) {
         self.bit_buffer = 0;
         self.bits_used = 0;
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn prime(&mut self, bits: u8, value: u64) {
         let value = value & ((1 << bits) - 1);
         self.bit_buffer += value << self.bits_used;
@@ -67,7 +67,7 @@ impl BitBuffer {
         loaded_bytes
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn start_sync_search(&mut self) -> ([u8; 4], usize) {
         assert!(
             self.bits_used <= 32,
@@ -79,7 +79,8 @@ impl BitBuffer {
 
         let mut len = 0;
         while self.bits_used >= 8 {
-            buf[len] = self.bit_buffer as u8;
+            // Sync search consumes the low byte of the little-endian reservoir.
+            buf[len] = self.bit_buffer.to_le_bytes()[0];
             len += 1;
             self.bit_buffer >>= 8;
             self.bits_used -= 8;
@@ -120,7 +121,7 @@ impl<'input> BitReader<'input> {
         self.bits
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn advance(&mut self, bytes: usize) {
         let next = self.position.saturating_add(bytes).min(self.input.len());
         if next != self.position {
@@ -131,32 +132,32 @@ impl<'input> BitReader<'input> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         &self.input[self.position..]
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn bits_in_buffer(&self) -> u8 {
         self.bits.bits_used
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn hold(&self) -> u64 {
         self.bits.hold()
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn bytes_remaining(&self) -> usize {
         self.input.len() - self.position
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn bytes_remaining_including_buffer(&self) -> usize {
         self.bytes_remaining() + (self.bits.bits_used as usize >> 3)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn need_bits(&mut self, n: usize) -> Result<(), ReturnCode> {
         while (self.bits.bits_used as usize) < n {
             self.pull_byte()?;
@@ -164,12 +165,12 @@ impl<'input> BitReader<'input> {
         Ok(())
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn next_byte_boundary(&mut self) {
         self.bits.next_byte_boundary();
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn pull_byte(&mut self) -> Result<u8, ReturnCode> {
         let Some(&byte) = self.input.get(self.position) else {
             return Err(ReturnCode::Ok);
@@ -185,7 +186,7 @@ impl<'input> BitReader<'input> {
     /// The fast decoder may load one byte beyond the logically consumed prefix; `position` advances
     /// only by the whole bytes that actually become valid reservoir bits, and
     /// [`Self::return_unused_bytes`] gives any remaining whole bytes back before the call returns.
-    #[inline(always)]
+    #[inline]
     pub fn refill(&mut self) {
         assert!(
             self.bytes_remaining() >= 8,
@@ -203,17 +204,17 @@ impl<'input> BitReader<'input> {
         self.loaded_input_bytes += loaded_bytes;
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn bits(&self, n: usize) -> u64 {
         self.bits.bits(n)
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn drop_bits(&mut self, n: u8) {
         self.bits.drop_bits(n);
     }
 
-    #[inline(always)]
+    #[inline]
     pub const fn init_bits(&mut self) {
         self.bits.init_bits();
     }
@@ -223,12 +224,16 @@ impl<'input> BitReader<'input> {
     /// The low reservoir bits may predate this input (including bits injected with
     /// `inflatePrime`), and `advance()` may consume input without loading it into the reservoir.
     /// Neither source is eligible for a rewind.
-    #[inline(always)]
+    #[inline]
     pub fn return_unused_bytes(&mut self) {
         let bytes = usize::from(self.bits.bits_used >> 3).min(self.loaded_input_bytes);
         self.position -= bytes;
         self.loaded_input_bytes -= bytes;
-        self.bits.bits_used -= (bytes as u8) << 3;
+        // At most seven whole bytes are refundable. Account for them in the
+        // reservoir's native bit-count domain rather than narrowing a host index.
+        for _ in 0..bytes {
+            self.bits.bits_used -= 8;
+        }
         self.bits.bit_buffer &= (1u64 << self.bits.bits_used) - 1u64;
         assert!(self.bits.bits_used <= 32);
     }
@@ -423,10 +428,7 @@ mod tests {
         reader.refill();
         assert_eq!(reader.bits_in_buffer(), 56);
         assert_eq!(reader.bytes_remaining(), 2);
-        assert_eq!(
-            reader.hold(),
-            u64::from_le_bytes(input[..8].try_into().unwrap())
-        );
+        assert_eq!(reader.hold(), 0x8776_6554_4332_2110);
 
         reader.return_unused_bytes();
         assert_eq!(reader.bits_in_buffer(), 0);
