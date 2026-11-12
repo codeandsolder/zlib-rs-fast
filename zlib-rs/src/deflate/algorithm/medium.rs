@@ -5,7 +5,7 @@ use super::{
 };
 use crate::deflate::hash_calc::{hash_chain_position, StandardHashCalc};
 use crate::deflate::longest_match::{
-    MatchSearchKind, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+    MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
 };
 use crate::deflate::{MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
@@ -193,6 +193,119 @@ impl MediumProducer {
     }
 }
 
+impl MediumProducer {
+    /// Prepare the current lazy-match candidate and optionally hand search work to the scheduler.
+    /// A None result means another phase can execute immediately on the same buffered window.
+    fn prepare_current_search(
+        &mut self,
+        state: &mut State<'_>,
+        allow_short_tail: bool,
+    ) -> Option<ProduceStatus> {
+        if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
+            return Some(ProduceStatus::NeedInput);
+        }
+
+        // A future match computed in the previous round already had its hash insertion
+        // and search performed. Reuse it directly; otherwise prepare a current search.
+        if !self.early_exit && self.next_match.match_length > 0 {
+            self.current_match = self.next_match;
+            self.next_match.match_length = 0;
+            self.phase = MediumPhase::AfterCurrentSearch;
+            return None;
+        }
+
+        self.current_match.strstart = hash_chain_position(state.strstart);
+        self.current_match.orgstart = self.current_match.strstart;
+
+        if self.match_source == MatchSourceKind::External {
+            if state.lookahead >= WANT_MIN_MATCH {
+                self.phase = MediumPhase::AwaitingCurrentSearch;
+                return Some(ProduceStatus::MatchSearch(MatchSearchWork::external()));
+            }
+        } else {
+            let hash_head = if state.lookahead >= WANT_MIN_MATCH {
+                StandardHashCalc::quick_insert_string(state, state.strstart)
+            } else {
+                0
+            };
+            if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
+                let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
+                if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                    let result = match work.request(state) {
+                        Ok(request) => request.execute(),
+                        Err(error) => return Some(ProduceStatus::MatchSearchError(error)),
+                    };
+                    self.apply_current_search(state, result);
+                    self.phase = MediumPhase::AfterCurrentSearch;
+                    return None;
+                }
+                self.phase = MediumPhase::AwaitingCurrentSearch;
+                return Some(ProduceStatus::MatchSearch(work));
+            }
+        }
+
+        self.current_match.match_start = 0;
+        self.current_match.match_length = 1;
+        self.phase = MediumPhase::AfterCurrentSearch;
+        None
+    }
+
+    /// Insert the current candidate and speculatively prepare the next match.
+    /// Detached requests retain the temporary future cursor until completion restores it.
+    fn prepare_future_search(&mut self, state: &mut State<'_>) -> Option<ProduceStatus> {
+        insert_match(state, self.current_match, self.match_source);
+
+        // Probe one match ahead. Keep the temporary future position installed while the
+        // immutable request is outstanding; completion restores the real current view.
+        let current_len = usize::from(self.current_match.match_length);
+        let future_start = usize::from(self.current_match.strstart) + current_len;
+        let future_lookahead = state.lookahead.saturating_sub(current_len);
+        if !self.early_exit
+            && state.lookahead > MIN_LOOKAHEAD
+            && future_lookahead >= WANT_MIN_MATCH
+            && future_start < state.window_size - MIN_LOOKAHEAD
+        {
+            let current_lookahead = state.lookahead;
+            state.strstart = future_start;
+            state.lookahead = future_lookahead;
+            self.next_match.strstart = hash_chain_position(state.strstart);
+            self.next_match.orgstart = self.next_match.strstart;
+
+            if self.match_source == MatchSourceKind::External {
+                self.phase = MediumPhase::AwaitingFutureSearch { current_lookahead };
+                return Some(ProduceStatus::MatchSearch(MatchSearchWork::external()));
+            }
+
+            let hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
+            if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
+                let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
+                if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                    let result = match work.request(state) {
+                        Ok(request) => request.execute(),
+                        Err(error) => return Some(ProduceStatus::MatchSearchError(error)),
+                    };
+                    self.apply_future_search(state, result);
+                    state.lookahead = current_lookahead;
+                    state.strstart = usize::from(self.current_match.strstart);
+                    self.phase = MediumPhase::AfterFutureSearch;
+                    return None;
+                }
+                self.phase = MediumPhase::AwaitingFutureSearch { current_lookahead };
+                return Some(ProduceStatus::MatchSearch(work));
+            }
+
+            self.next_match.match_start = 0;
+            self.next_match.match_length = 1;
+            state.lookahead = current_lookahead;
+            state.strstart = usize::from(self.current_match.strstart);
+        } else {
+            self.next_match.match_length = 0;
+        }
+        self.phase = MediumPhase::AfterFutureSearch;
+        None
+    }
+}
+
 impl TokenProducer for MediumProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         if self.match_source == MatchSourceKind::HashChain
@@ -205,111 +318,17 @@ impl TokenProducer for MediumProducer {
         loop {
             match self.phase {
                 MediumPhase::Ready => {
-                    if state.lookahead == 0
-                        || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD)
-                    {
-                        return ProduceStatus::NeedInput;
+                    if let Some(status) = self.prepare_current_search(state, allow_short_tail) {
+                        return status;
                     }
-
-                    // A future match computed in the previous round already had its hash insertion
-                    // and search performed. Reuse it directly; otherwise prepare a current search.
-                    if !self.early_exit && self.next_match.match_length > 0 {
-                        self.current_match = self.next_match;
-                        self.next_match.match_length = 0;
-                        self.phase = MediumPhase::AfterCurrentSearch;
-                        continue;
-                    }
-
-                    self.current_match.strstart = hash_chain_position(state.strstart);
-                    self.current_match.orgstart = self.current_match.strstart;
-
-                    if self.match_source == MatchSourceKind::External {
-                        if state.lookahead >= WANT_MIN_MATCH {
-                            self.phase = MediumPhase::AwaitingCurrentSearch;
-                            return ProduceStatus::MatchSearch(MatchSearchWork::external());
-                        }
-                    } else {
-                        let hash_head = if state.lookahead >= WANT_MIN_MATCH {
-                            StandardHashCalc::quick_insert_string(state, state.strstart)
-                        } else {
-                            0
-                        };
-                        if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
-                            let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
-                            if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
-                                let result = match work.request(state) {
-                                    Ok(request) => request.execute(),
-                                    Err(error) => return ProduceStatus::MatchSearchError(error),
-                                };
-                                self.apply_current_search(state, result);
-                                self.phase = MediumPhase::AfterCurrentSearch;
-                                continue;
-                            }
-                            self.phase = MediumPhase::AwaitingCurrentSearch;
-                            return ProduceStatus::MatchSearch(work);
-                        }
-                    }
-
-                    self.current_match.match_start = 0;
-                    self.current_match.match_length = 1;
-                    self.phase = MediumPhase::AfterCurrentSearch;
                 }
                 MediumPhase::AwaitingCurrentSearch | MediumPhase::AwaitingFutureSearch { .. } => {
-                    return ProduceStatus::MatchSearchError(
-                        MatchSearchRequestError::OutstandingSearch,
-                    );
+                    return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
                 }
                 MediumPhase::AfterCurrentSearch => {
-                    insert_match(state, self.current_match, self.match_source);
-
-                    // Probe one match ahead. Keep the temporary future position installed while the
-                    // immutable request is outstanding; completion restores the real current view.
-                    let current_len = usize::from(self.current_match.match_length);
-                    let future_start = usize::from(self.current_match.strstart) + current_len;
-                    let future_lookahead = state.lookahead.saturating_sub(current_len);
-                    if !self.early_exit
-                        && state.lookahead > MIN_LOOKAHEAD
-                        && future_lookahead >= WANT_MIN_MATCH
-                        && future_start < state.window_size - MIN_LOOKAHEAD
-                    {
-                        let current_lookahead = state.lookahead;
-                        state.strstart = future_start;
-                        state.lookahead = future_lookahead;
-                        self.next_match.strstart = hash_chain_position(state.strstart);
-                        self.next_match.orgstart = self.next_match.strstart;
-
-                        if self.match_source == MatchSourceKind::External {
-                            self.phase = MediumPhase::AwaitingFutureSearch { current_lookahead };
-                            return ProduceStatus::MatchSearch(MatchSearchWork::external());
-                        }
-
-                        let hash_head =
-                            StandardHashCalc::quick_insert_string(state, state.strstart);
-                        if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
-                            let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
-                            if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
-                                let result = match work.request(state) {
-                                    Ok(request) => request.execute(),
-                                    Err(error) => return ProduceStatus::MatchSearchError(error),
-                                };
-                                self.apply_future_search(state, result);
-                                state.lookahead = current_lookahead;
-                                state.strstart = usize::from(self.current_match.strstart);
-                                self.phase = MediumPhase::AfterFutureSearch;
-                                continue;
-                            }
-                            self.phase = MediumPhase::AwaitingFutureSearch { current_lookahead };
-                            return ProduceStatus::MatchSearch(work);
-                        }
-
-                        self.next_match.match_start = 0;
-                        self.next_match.match_length = 1;
-                        state.lookahead = current_lookahead;
-                        state.strstart = usize::from(self.current_match.strstart);
-                    } else {
-                        self.next_match.match_length = 0;
+                    if let Some(status) = self.prepare_future_search(state) {
+                        return status;
                     }
-                    self.phase = MediumPhase::AfterFutureSearch;
                 }
                 MediumPhase::AfterFutureSearch => {
                     let block_ready = emit_match(state, self.current_match);
@@ -325,7 +344,11 @@ impl TokenProducer for MediumProducer {
         }
     }
 
-    fn complete_match_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+    fn complete_match_search(
+        &mut self,
+        state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
         match self.phase {
             MediumPhase::AwaitingCurrentSearch => {
                 self.apply_current_search(state, result);
@@ -337,8 +360,9 @@ impl TokenProducer for MediumProducer {
                 state.strstart = usize::from(self.current_match.strstart);
                 self.phase = MediumPhase::AfterFutureSearch;
             }
-            _ => panic!("medium producer received a match result without an outstanding search"),
+            _ => return Err(MatchSearchError::UnexpectedMatchResult),
         }
+        Ok(())
     }
 
     fn after_refill(&mut self, state: &mut State<'_>) {
@@ -525,6 +549,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn match_result_completion_requires_an_awaiting_phase() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let state = &mut *stream.state;
+        let mut producer = MediumProducer::new(state, MatchSourceKind::HashChain);
+        let result = MatchSearchResult::new(0, 0);
+
+        for phase in [
+            MediumPhase::Ready,
+            MediumPhase::AfterCurrentSearch,
+            MediumPhase::AfterFutureSearch,
+        ] {
+            producer.phase = phase;
+            assert_eq!(
+                producer.complete_match_search(state, result),
+                Err(MatchSearchError::UnexpectedMatchResult)
+            );
+            assert_eq!(producer.phase, phase);
+        }
+        producer.phase = MediumPhase::AwaitingCurrentSearch;
+        assert_eq!(producer.complete_match_search(state, result), Ok(()));
+        assert_eq!(producer.phase, MediumPhase::AfterCurrentSearch);
+        producer.phase = MediumPhase::AwaitingFutureSearch {
+            current_lookahead: state.lookahead,
+        };
+        assert_eq!(producer.complete_match_search(state, result), Ok(()));
+        assert_eq!(producer.phase, MediumPhase::AfterFutureSearch);
+        Ok(())
+    }
+
+    #[test]
     fn producing_with_unfinished_search_returns_typed_error() -> Result<(), crate::ReturnCode> {
         use crate::deflate::{DeflateConfig, DeflateStream};
 
@@ -541,7 +596,7 @@ mod tests {
             producer.phase = phase;
             assert!(matches!(
                 producer.produce(state, false),
-                ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch)
+                ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch)
             ));
         }
         Ok(())

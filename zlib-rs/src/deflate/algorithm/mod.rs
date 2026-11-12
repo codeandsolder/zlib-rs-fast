@@ -2,7 +2,7 @@ use crate::{
     deflate::{
         drain_pending_output, fill_window_core, fill_window_core_with_hash_maintenance,
         longest_match::{
-            execute_match_search_batch, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+            execute_match_search_batch, MatchSearchError, MatchSearchResult, MatchSearchWork,
         },
         BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, StreamChecksum,
         MIN_LOOKAHEAD,
@@ -87,7 +87,7 @@ impl BlockContinuation {
 pub(super) enum ProduceStatus {
     NeedInput,
     MatchSearch(MatchSearchWork),
-    MatchSearchError(MatchSearchRequestError),
+    MatchSearchError(MatchSearchError),
     BlockReady(BlockContinuation),
 }
 
@@ -167,8 +167,12 @@ pub(super) trait TokenProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus;
 
     /// Consume a scheduler-computed match-search result for a producer that yielded one.
-    fn complete_match_search(&mut self, _state: &mut State<'_>, _result: MatchSearchResult) {
-        panic!("producer received a match-search result it did not request");
+    fn complete_match_search(
+        &mut self,
+        _state: &mut State<'_>,
+        _result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
+        Err(MatchSearchError::UnexpectedMatchResult)
     }
 
     /// A refill may slide the window, invalidating speculative positions cached by a producer.
@@ -236,13 +240,17 @@ impl TokenProducer for StandardProducer {
         }
     }
 
-    fn complete_match_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+    fn complete_match_search(
+        &mut self,
+        state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
         match &mut self.0 {
             StandardProducerKind::Fast(producer) => producer.complete_match_search(state, result),
             StandardProducerKind::Medium(producer) => producer.complete_match_search(state, result),
             StandardProducerKind::Slow(producer) => producer.complete_match_search(state, result),
             StandardProducerKind::Huffman(producer) => {
-                producer.complete_match_search(state, result);
+                producer.complete_match_search(state, result)
             }
             StandardProducerKind::Rle(producer) => producer.complete_match_search(state, result),
         }
@@ -354,14 +362,14 @@ impl StandardCore {
         &mut self,
         state: &mut State<'_>,
         result: MatchSearchResult,
-    ) {
-        assert_eq!(
-            self.phase,
-            StandardPhase::NeedsMatchSearch,
-            "match-search completion requires outstanding search work"
-        );
-        self.producer.complete_match_search(state, result);
+    ) -> Result<(), MatchSearchError> {
+        if self.phase != StandardPhase::NeedsMatchSearch {
+            return Err(MatchSearchError::UnexpectedMatchResult);
+        }
+        // Keep the core waiting if the concrete producer rejects this completion.
+        self.producer.complete_match_search(state, result)?;
         self.phase = StandardPhase::Producing;
+        Ok(())
     }
 
     pub(super) fn satisfy_input(
@@ -488,7 +496,7 @@ struct PendingDrain {
 pub(super) enum StandardTurnOutcome {
     Progress,
     MatchSearch(MatchSearchWork),
-    MatchSearchError(MatchSearchRequestError),
+    MatchSearchError(MatchSearchError),
     NeedMoreCallerInput,
     NeedMoreOutput { final_block: bool },
     SegmentDone(EndBlockKind),
@@ -531,7 +539,7 @@ impl StandardDriver {
         self.step_inner(state, input, output, checksum, mode)
     }
 
-    #[inline(always)]
+    #[inline]
     fn step_inner(
         &mut self,
         state: &mut State<'_>,
@@ -540,6 +548,12 @@ impl StandardDriver {
         checksum: &mut StreamChecksum,
         mode: StandardSegmentMode,
     ) -> StandardTurnOutcome {
+        enum OwnedCoreEvent {
+            NeedInput(InputDemand),
+            TokenBlockReady(TokenBlockWork),
+            EndOfInput(EndOfInputWork),
+        }
+
         if let Some(pending) = self.pending_drain.take() {
             return match self.core.drain_output(state, output, pending.work) {
                 PendingOutputOutcome::Ready => match pending.after {
@@ -556,12 +570,6 @@ impl StandardDriver {
                     }
                 }
             };
-        }
-
-        enum OwnedCoreEvent {
-            NeedInput(InputDemand),
-            TokenBlockReady(TokenBlockWork),
-            EndOfInput(EndOfInputWork),
         }
 
         let event = match self.core.next_event(state) {
@@ -618,8 +626,8 @@ impl StandardDriver {
         &mut self,
         state: &mut State<'_>,
         result: MatchSearchResult,
-    ) {
-        self.core.complete_match_search(state, result);
+    ) -> Result<(), MatchSearchError> {
+        self.core.complete_match_search(state, result)
     }
 }
 
@@ -649,7 +657,7 @@ pub(super) enum CoreEvent {
     /// The producer has paused on immutable longest-match work that may execute elsewhere.
     MatchSearch(MatchSearchWork),
     /// The producer saw an inconsistent hash-chain search snapshot.
-    MatchSearchError(MatchSearchRequestError),
+    MatchSearchError(MatchSearchError),
     /// A complete resident token block is ready to run as one owned block-encoding action.
     TokenBlockReady(TokenBlockWork),
     /// No more input remains for this call; orchestration must close this input segment.
@@ -666,6 +674,11 @@ fn next_core_event(
     input_phase: InputPhase,
     producer: &mut StandardProducer,
 ) -> CoreEvent {
+    enum OwnedProduceStatus {
+        NeedInput,
+        BlockReady(BlockContinuation),
+    }
+
     let preferred_lookahead = producer.preferred_lookahead();
 
     if state.lookahead < preferred_lookahead {
@@ -681,11 +694,6 @@ fn next_core_event(
     }
 
     let allow_short_tail = input_phase == InputPhase::FinalTail;
-    enum OwnedProduceStatus {
-        NeedInput,
-        BlockReady(BlockContinuation),
-    }
-
     let status = match producer.produce(state, allow_short_tail) {
         ProduceStatus::MatchSearch(request) => return CoreEvent::MatchSearch(request),
         ProduceStatus::MatchSearchError(error) => return CoreEvent::MatchSearchError(error),
@@ -781,7 +789,9 @@ pub(super) fn drive_standard(
                     start: 0,
                 }];
                 execute_match_search_batch(core::slice::from_ref(&request), &mut results);
-                driver.complete_match_search(state, results[0]);
+                if driver.complete_match_search(state, results[0]).is_err() {
+                    return BlockState::InvalidMatchState;
+                }
             }
             StandardTurnOutcome::MatchSearchError(_) => return BlockState::InvalidMatchState,
             StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
@@ -832,8 +842,10 @@ impl Algorithm {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
             algorithm => {
-                let mut driver = StandardDriver::for_algorithm(algorithm, stream.state)
-                    .expect("ordinary algorithm must have a token producer");
+                let Some(mut driver) = StandardDriver::for_algorithm(algorithm, stream.state)
+                else {
+                    return BlockState::InvalidMatchState;
+                };
                 drive_standard(
                     stream.state,
                     stream.input,
@@ -911,6 +923,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn core_rejects_match_completion_without_pending_work() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let result = MatchSearchResult::new(4, 1);
+        for algorithm in [
+            Algorithm::Fast,
+            Algorithm::Medium,
+            Algorithm::Slow,
+            Algorithm::Huffman,
+            Algorithm::Rle,
+        ] {
+            let mut core = StandardCore::for_algorithm(algorithm, &stream.state)
+                .ok_or(crate::ReturnCode::StreamError)?;
+            assert_eq!(
+                core.complete_match_search(&mut stream.state, result),
+                Err(MatchSearchError::UnexpectedMatchResult)
+            );
+            assert_eq!(core.phase, StandardPhase::Producing);
+
+            // A scheduler may have a pending token while the producer has no matching
+            // pending state. Reject the completion and leave the core suspended.
+            core.phase = StandardPhase::NeedsMatchSearch;
+            assert_eq!(
+                core.complete_match_search(&mut stream.state, result),
+                Err(MatchSearchError::UnexpectedMatchResult)
+            );
+            assert_eq!(core.phase, StandardPhase::NeedsMatchSearch);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn compression_levels_have_explicit_algorithm_families() {
         let expected = [
             Algorithm::Stored,
@@ -925,8 +970,8 @@ mod tests {
             Algorithm::Slow,
         ];
 
-        for (level, expected) in expected.into_iter().enumerate() {
-            assert_eq!(level_config(level as i8).algorithm, expected);
+        for (level, expected) in (0i8..).zip(expected) {
+            assert_eq!(level_config(level).algorithm, expected);
         }
     }
 

@@ -3,7 +3,7 @@
 use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::HashCalcVariant;
 use crate::deflate::longest_match::{
-    MatchSearchKind, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+    MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
 };
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
@@ -93,9 +93,7 @@ impl TokenProducer for SlowProducer {
                     NO_MATCH_LENGTH
                 }
                 SlowPhase::AwaitingSearch => {
-                    return ProduceStatus::MatchSearchError(
-                        MatchSearchRequestError::OutstandingSearch,
-                    );
+                    return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
                 }
             };
 
@@ -146,13 +144,16 @@ impl TokenProducer for SlowProducer {
         }
     }
 
-    fn complete_match_search(&mut self, _state: &mut State<'_>, result: MatchSearchResult) {
-        assert_eq!(
-            self.phase,
-            SlowPhase::AwaitingSearch,
-            "slow producer received a match result without an outstanding search"
-        );
+    fn complete_match_search(
+        &mut self,
+        _state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
+        if self.phase != SlowPhase::AwaitingSearch {
+            return Err(MatchSearchError::UnexpectedMatchResult);
+        }
         self.phase = SlowPhase::SearchReady(result);
+        Ok(())
     }
 
     fn finish(&mut self, state: &mut State<'_>) -> usize {
@@ -178,13 +179,38 @@ mod tests {
     use crate::ReturnCode;
 
     #[test]
+    fn match_result_completion_rejects_unsolicited_and_duplicate_results(
+    ) -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(7))?;
+        let mut producer = SlowProducer::new(&stream.state, MatchSourceKind::HashChain);
+        let result = MatchSearchResult::new(4, 1);
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        assert_eq!(producer.phase, SlowPhase::Ready);
+
+        producer.phase = SlowPhase::AwaitingSearch;
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Ok(())
+        );
+        assert_eq!(producer.phase, SlowPhase::SearchReady(result));
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn advancing_an_unfinished_match_returns_a_typed_error() -> Result<(), crate::ReturnCode> {
         let mut stream = DeflateStream::new(DeflateConfig::new(7))?;
         let mut producer = SlowProducer::new(&stream.state, MatchSourceKind::HashChain);
         producer.phase = SlowPhase::AwaitingSearch;
         assert!(matches!(
             producer.produce(&mut stream.state, false),
-            ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch)
+            ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch)
         ));
         Ok(())
     }

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::deflate::longest_match::{
-    MatchSearchKind, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+    MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
 };
 use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
@@ -90,7 +90,7 @@ impl TokenProducer for FastProducer {
             }
 
             if self.phase != FastPhase::Ready {
-                return ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch);
+                return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
             }
 
             if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
@@ -138,11 +138,16 @@ impl TokenProducer for FastProducer {
         }
     }
 
-    fn complete_match_search(&mut self, _state: &mut State<'_>, result: MatchSearchResult) {
+    fn complete_match_search(
+        &mut self,
+        _state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
         let FastPhase::AwaitingSearch { literal } = self.phase else {
-            panic!("fast producer received a match result without an outstanding search");
+            return Err(MatchSearchError::UnexpectedMatchResult);
         };
         self.phase = FastPhase::SearchReady { literal, result };
+        Ok(())
     }
 
     fn finish(&mut self, state: &mut State<'_>) -> usize {
@@ -160,6 +165,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn match_result_completion_rejects_wrong_phase_without_mutating_state(
+    ) -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(2))?;
+        let mut producer = FastProducer::new(MatchSourceKind::HashChain);
+        let result = MatchSearchResult::new(4, 1);
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        assert_eq!(producer.phase, FastPhase::Ready);
+
+        producer.phase = FastPhase::AwaitingSearch { literal: b'a' };
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Ok(())
+        );
+        assert!(matches!(
+            producer.phase,
+            FastPhase::SearchReady { literal: b'a', result: found } if found == result
+        ));
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unfinished_match_search_is_a_typed_error() -> Result<(), crate::ReturnCode> {
         use crate::deflate::{DeflateConfig, DeflateStream};
 
@@ -168,7 +202,7 @@ mod tests {
         producer.phase = FastPhase::AwaitingSearch { literal: b'a' };
         assert!(matches!(
             producer.produce(&mut stream.state, false),
-            ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch)
+            ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch)
         ));
         Ok(())
     }

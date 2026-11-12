@@ -68,9 +68,9 @@ pub enum MatchSearchWork {
     External,
 }
 
-/// Invalid detached match-search work or an inconsistent compressor snapshot.
+/// An invalid detached match-search request, producer phase, or completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MatchSearchRequestError {
+pub enum MatchSearchError {
     /// An external/device match request cannot be run by the hash-chain backend.
     ExternalWork,
     /// Hash-chain work was routed to an external/device-only match backend.
@@ -84,6 +84,8 @@ pub enum MatchSearchRequestError {
     InvalidHashHistory,
     /// A token producer was asked to advance before its prior search completed.
     OutstandingSearch,
+    /// A match result was delivered without a pending request.
+    UnexpectedMatchResult,
 }
 
 impl MatchSearchWork {
@@ -103,9 +105,9 @@ impl MatchSearchWork {
     pub(crate) fn request<'a>(
         self,
         state: &'a State<'_>,
-    ) -> Result<MatchSearchRequest<'a>, MatchSearchRequestError> {
+    ) -> Result<MatchSearchRequest<'a>, MatchSearchError> {
         let Self::HashChain { cur_match, kind } = self else {
-            return Err(MatchSearchRequestError::ExternalWork);
+            return Err(MatchSearchError::ExternalWork);
         };
         MatchSearchRequest::from_state(state, cur_match, kind)
     }
@@ -166,22 +168,22 @@ impl<'a> MatchSearchRequest<'a> {
         state: &'a State<'_>,
         cur_match: Pos,
         kind: MatchSearchKind,
-    ) -> Result<Self, MatchSearchRequestError> {
+    ) -> Result<Self, MatchSearchError> {
         let initialized_end = state
             .strstart
             .checked_add(state.lookahead)
-            .ok_or(MatchSearchRequestError::WindowPositionOverflow)?;
+            .ok_or(MatchSearchError::WindowPositionOverflow)?;
         let initialized = state
             .window
             .filled()
             .get(..initialized_end)
-            .ok_or(MatchSearchRequestError::UninitializedWindow)?;
+            .ok_or(MatchSearchError::UninitializedWindow)?;
         let wmask = state.w_mask();
         let prev = state
             .prev
             .as_slice()
             .get(..=wmask)
-            .ok_or(MatchSearchRequestError::InvalidHashHistory)?;
+            .ok_or(MatchSearchError::InvalidHashHistory)?;
 
         Ok(Self {
             resources: MatchSearchResources {
@@ -671,7 +673,7 @@ mod tests {
         let stream = DeflateStream::new(DeflateConfig::new(6))?;
         assert!(matches!(
             MatchSearchWork::external().request(&stream.state),
-            Err(MatchSearchRequestError::ExternalWork)
+            Err(MatchSearchError::ExternalWork)
         ));
         Ok(())
     }
@@ -686,12 +688,12 @@ mod tests {
         state.lookahead = usize::MAX;
         assert!(matches!(
             work.request(state),
-            Err(MatchSearchRequestError::WindowPositionOverflow)
+            Err(MatchSearchError::WindowPositionOverflow)
         ));
         state.lookahead = 2;
         assert!(matches!(
             work.request(state),
-            Err(MatchSearchRequestError::UninitializedWindow)
+            Err(MatchSearchError::UninitializedWindow)
         ));
         state.strstart = 0;
         state.lookahead = 0;
@@ -699,7 +701,7 @@ mod tests {
         state.w_size = state.prev.as_slice().len() + 1;
         assert!(matches!(
             work.request(state),
-            Err(MatchSearchRequestError::InvalidHashHistory)
+            Err(MatchSearchError::InvalidHashHistory)
         ));
         state.w_size = window_size;
         Ok(())
