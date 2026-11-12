@@ -74,6 +74,22 @@ fn crc_combine_length<L: Into<i64>>(length: L) -> u64 {
     signed.cast_unsigned()
 }
 
+/// Preserve the low native-address-width bits of a C unsigned long.
+///
+/// The C ABI's bound arithmetic wraps, even at sizes too large for an
+/// address-sized buffer. Work from bytes rather than a truncating cast so
+/// this is const-evaluable on the pinned compiler, on both LP64 and LLP64.
+const fn c_ulong_to_usize_wrapping(value: c_ulong) -> usize {
+    let bytes = value.to_le_bytes();
+    let mut result = 0usize;
+    let mut i = 0;
+    while i < bytes.len() && i < core::mem::size_of::<usize>() {
+        result |= (bytes[i] as usize) << (i * 8);
+        i += 1;
+    }
+    result
+}
+
 #[cfg(feature = "custom-prefix")]
 #[cfg(any(feature = "export-symbols", feature = "gz"))]
 macro_rules! prefix {
@@ -1497,7 +1513,7 @@ pub unsafe extern "C" fn deflateBound(strm: *mut z_stream, sourceLen: c_ulong) -
     zlib_rs::deflate::bound(
         // SAFETY: the `deflateBound` FFI contract requires any non-null stream pointer to reference a live, initialized stream of the matching kind; the converter handles null.
         unsafe { DeflateStream::from_stream_ref(strm.cast_const()) },
-        sourceLen as usize,
+        c_ulong_to_usize_wrapping(sourceLen),
     ) as c_ulong
 }
 
@@ -1722,7 +1738,7 @@ pub const extern "C" fn compressBound_z(sourceLen: usize) -> usize {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(compressBound))]
 #[must_use]
 pub const extern "C" fn compressBound(sourceLen: c_ulong) -> c_ulong {
-    zlib_rs::deflate::compress_bound_abi(sourceLen as usize) as c_ulong
+    zlib_rs::deflate::compress_bound_abi(c_ulong_to_usize_wrapping(sourceLen)) as c_ulong
 }
 
 /// Deallocates all dynamically allocated data structures for this stream.
@@ -2597,6 +2613,29 @@ const unsafe fn slice_from_raw_parts_uninit_mut<'a, T>(
 #[cfg(test)]
 mod checksum_abi_tests {
     use super::*;
+
+    #[test]
+    fn c_ulong_wrapping_conversion_preserves_low_address_width() {
+        const ZERO_BOUND: c_ulong = compressBound(0);
+        assert_eq!(ZERO_BOUND, compressBound_z(0) as c_ulong);
+
+        assert_eq!(c_ulong_to_usize_wrapping(0), 0);
+        assert_eq!(
+            c_ulong_to_usize_wrapping(c_ulong::MAX),
+            usize::try_from(c_ulong::MAX).unwrap_or(usize::MAX)
+        );
+        for raw in [
+            c_ulong::from(1u8),
+            c_ulong::from(u16::MAX),
+            c_ulong::from(u32::MAX),
+            c_ulong::MAX - 1,
+        ] {
+            assert_eq!(
+                c_ulong_to_usize_wrapping(raw),
+                usize::try_from(raw).unwrap_or(usize::MAX),
+            );
+        }
+    }
 
     #[test]
     fn crc_offset_length_preserves_signed_32_and_64_bit_representations() {
