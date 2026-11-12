@@ -694,28 +694,30 @@ fn deflate_medium_fizzle_bug() {
 }
 
 fn assert_deflate_bound_correct((config, source_len): (DeflateConfig, c_ulong)) {
-    assert_eq_rs_ng!(unsafe {
-        let mut strm = MaybeUninit::zeroed();
-
-        // first validate the config
-        let err = deflateInit2_(
-            strm.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
-
-        let bound = deflateBound(strm.as_mut_ptr(), source_len);
-
-        let ret = { deflateEnd(strm.as_mut_ptr()) };
-        assert_eq!(ret, Z_OK);
-
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: a live writable C stream and matching library ABI
+        // with the valid QuickCheck compressor configuration.
+        let init = unsafe {
+            deflateInit2_(
+                raw.as_mut_ptr(),
+                config.level,
+                config.method as c_int,
+                config.window_bits,
+                config.mem_level,
+                config.strategy as c_int,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(init, Z_OK);
+        // SAFETY: successful initialization populated all C stream fields.
+        let stream = unsafe { raw.assume_init_mut() };
+        // SAFETY: the live initialized encoder reads its internal state;
+        // source_len is a by-value C unsigned long, not a memory span.
+        let bound = unsafe { deflateBound(stream, source_len) };
+        // SAFETY: this initialized stream must be ended exactly once.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
         bound
     });
 }
@@ -723,13 +725,12 @@ fn assert_deflate_bound_correct((config, source_len): (DeflateConfig, c_ulong)) 
 #[test]
 #[cfg_attr(miri, ignore = "slow")]
 fn deflate_bound_correct() {
-    ::quickcheck::quickcheck(test as fn(_) -> _);
-
     fn test(input: (DeflateConfig, c_ulong)) -> bool {
         assert_deflate_bound_correct(input);
-
         true
     }
+
+    ::quickcheck::quickcheck(test as fn(_) -> _);
 }
 
 #[test]
@@ -737,7 +738,7 @@ fn deflate_bound_correct_basic() {
     let config = DeflateConfig::default();
 
     assert_deflate_bound_correct((config, 42));
-    assert_deflate_bound_correct((config, 123456));
+    assert_deflate_bound_correct((config, 123_456));
     assert_deflate_bound_correct((config, 1 << 24));
 }
 
@@ -755,8 +756,8 @@ fn deflate_bound_correct_windows() {
     };
 
     // this value is dangerously close to u32::MAX, and the calculation will run into overflow
-    //    u32::MAX = 4294967296
-    let source_len = 4294967233;
+    //    u32::MAX = 4_294_967_295
+    let source_len = 4_294_967_233;
 
     assert_deflate_bound_correct((config, source_len));
 
@@ -768,8 +769,8 @@ fn deflate_bound_correct_windows() {
         strategy: Strategy::HuffmanOnly,
     };
     // this value is dangerously close to u32::MAX, and the calculation will run into overflow
-    //    u32::MAX = 4294967296
-    let source_len = 4294967289;
+    //    u32::MAX = 4_294_967_295
+    let source_len = 4_294_967_289;
 
     assert_deflate_bound_correct((config, source_len));
 }
@@ -777,64 +778,73 @@ fn deflate_bound_correct_windows() {
 fn deflate_bound_gzip_header_help(
     (config, source_len, extra, name, comment): (DeflateConfig, c_ulong, CString, CString, CString),
 ) -> bool {
-    let extra_len = extra.as_bytes().len();
+    let extra_len = test_c_uint_len(extra.as_bytes().len());
+    // The three owning CStrings outlive both differential C ABI calls.
+    let extra_ptr = extra.as_ptr().cast_mut().cast::<u8>();
+    let name_ptr = name.as_ptr().cast_mut().cast::<u8>();
+    let comment_ptr = comment.as_ptr().cast_mut().cast::<u8>();
 
-    let extra = extra.as_ptr().cast_mut().cast::<u8>();
-    let name = name.as_ptr().cast_mut().cast::<u8>();
-    let comment = comment.as_ptr().cast_mut().cast::<u8>();
-
-    assert_eq_rs_ng!(unsafe {
-        let mut strm = MaybeUninit::zeroed();
-
-        // first validate the config
-        let err = deflateInit2_(
-            strm.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            zlibVersion(),
-            test_c_stream_size::<z_stream>(),
-        );
-
-        if err != 0 {
-            return true;
-        }
-
-        let mut header = gz_header {
-            text: 0,
-            time: 0,
-            xflags: 0,
-            os: 0,
-            extra_len: extra_len as _,
-            extra,
-            extra_max: 0,
-            name,
-            name_max: 0,
-            comment,
-            comm_max: 0,
-            hcrc: 1,
-            done: 0,
+    // Compare initialization status as well as metadata status and bound:
+    // failed init must never cause one backend to skip comparison entirely.
+    assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: live writable C storage, version/size match each backend,
+        // and the fuzzed compressor options are passed as scalar values.
+        let init = unsafe {
+            deflateInit2_(
+                raw.as_mut_ptr(),
+                config.level,
+                config.method as c_int,
+                config.window_bits,
+                config.mem_level,
+                config.strategy as c_int,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
         };
+        if init == Z_OK {
+            // SAFETY: successful initialization populated the C encoder.
+            let stream = unsafe { raw.assume_init_mut() };
+            let mut header = gz_header {
+                text: 0,
+                time: 0,
+                xflags: 0,
+                os: 0,
+                extra_len,
+                extra: extra_ptr,
+                extra_max: 0,
+                name: name_ptr,
+                name_max: 0,
+                comment: comment_ptr,
+                comm_max: 0,
+                hcrc: 1,
+                done: 0,
+            };
 
-        // this may fail if the config is not set up for gzip
-        let _ = deflateSetHeader(strm.as_mut_ptr(), &raw mut header);
-
-        let bound = deflateBound(strm.as_mut_ptr(), source_len);
-
-        deflateEnd(strm.as_mut_ptr());
-
-        bound
+            // SAFETY: all owner CStrings and the writable header remain
+            // live during this call. Non-gzip wrappers may reject it.
+            let header_status = unsafe { deflateSetHeader(stream, &raw mut header) };
+            if config.window_bits == 31 {
+                assert_eq!(header_status, Z_OK);
+            }
+            // SAFETY: initialized state and a by-value C unsigned long.
+            let bound = unsafe { deflateBound(stream, source_len) };
+            // SAFETY: the initialized stream is closed exactly once;
+            // the borrowed header strings still remain live.
+            let end_status = unsafe { deflateEnd(stream) };
+            assert_eq!(end_status, Z_OK);
+            (init, Some((header_status, bound, end_status)))
+        } else {
+            (init, None)
+        }
     });
-
     true
 }
 
 #[test]
 fn gz_header_text_and_hcrc_check() {
-    // when constructing the gz header flags, zlib-rs performed a check
-    // for `text > 0` that should have been `text != 0`, similarly for hcrc.
+    // Negative nonzero C flags must set FTEXT and FHCRC, not be treated as
+    // false because they happen to be less than zero.
     let config = DeflateConfig {
         level: 9,
         method: Method::Deflated,
@@ -842,27 +852,28 @@ fn gz_header_text_and_hcrc_check() {
         mem_level: 3,
         strategy: Strategy::Fixed,
     };
+    let original: &[u8] = b"\0\x02\0\0\0\0\0\0\0\x10";
 
-    assert_eq_rs_ng!(unsafe {
-        let mut strm = MaybeUninit::zeroed();
-
-        // first validate the config
-        let err = deflateInit2_(
-            strm.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            zlibVersion(),
-            test_c_stream_size::<z_stream>(),
-        );
-
-        assert_eq!(err, 0);
-
-        let strm = strm.assume_init_mut();
+    let compressed = assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable C stream and checked library ABI metadata
+        // with a supported gzip compression configuration.
+        let init = unsafe {
+            deflateInit2_(
+                raw.as_mut_ptr(),
+                config.level,
+                config.method as c_int,
+                config.window_bits,
+                config.mem_level,
+                config.strategy as c_int,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(init, Z_OK);
+        // SAFETY: successful initialization populated the complete stream.
+        let stream = unsafe { raw.assume_init_mut() };
         let empty_c_string = [0u8];
-
         let mut header = gz_header {
             text: -42,
             time: 0,
@@ -872,33 +883,66 @@ fn gz_header_text_and_hcrc_check() {
             name: empty_c_string.as_ptr().cast_mut(),
             comment: empty_c_string.as_ptr().cast_mut(),
             hcrc: -42,
-            //
             xflags: 0,
             extra_max: 0,
             name_max: 0,
             comm_max: 0,
             done: 0,
         };
+        // SAFETY: the writable header and both empty NUL-terminated
+        // metadata strings outlive the encoder.
+        assert_eq!(unsafe { deflateSetHeader(stream, &raw mut header) }, Z_OK);
 
-        // this may fail if the config is not set up for gzip
-        let _ = deflateSetHeader(strm, &raw mut header);
+        let mut output = vec![0xa5u8; 64];
+        stream.next_in = original.as_ptr().cast_mut();
+        stream.avail_in = test_c_uint_len(original.len());
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = test_c_uint_len(output.len());
+        // SAFETY: source and writable output are live disjoint buffers
+        // with checked C byte sizes.
+        assert_eq!(
+            // SAFETY: caller-owned input and output spans remain live,
+            // disjoint, and bounded to their exact C byte capacities.
+            unsafe { deflate(stream, DeflateFlush::NoFlush as c_int) },
+            Z_OK
+        );
+        loop {
+            let (next_out, avail_out) = checked_test_output_suffix(&mut output, stream.total_out);
+            stream.next_out = next_out;
+            stream.avail_out = avail_out;
+            let before = (stream.total_in, stream.total_out);
+            // SAFETY: the same input and writable output buffers remain
+            // live and their real C cursors describe the remaining spans.
+            let status = unsafe { deflate(stream, DeflateFlush::Finish as c_int) };
+            if status == Z_STREAM_END {
+                break;
+            }
+            assert_eq!(status, Z_OK);
+            assert_ne!((stream.total_in, stream.total_out), before);
+        }
 
-        let input = "\0\u{2}\0\0\0\0\0\0\0\u{10}";
-        let mut output = [0u8; 32];
-
-        strm.avail_in = test_c_uint_len(input.len());
-        strm.avail_out = test_c_uint_len(output.len());
-
-        strm.next_in = input.as_ptr().cast_mut();
-        strm.next_out = output.as_mut_ptr();
-
-        let err = deflate(strm, DeflateFlush::NoFlush as i32);
-        assert_eq!(err, 0);
-
-        deflateEnd(strm);
-
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(original.len()));
+        let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(written <= output.len());
+        assert!(output[written..].iter().all(|&b| b == 0xa5));
+        // SAFETY: the finished encoder is closed once before its C header
+        // and borrowed metadata strings leave their scope.
+        assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+        output.truncate(written);
         output
     });
+
+    // FTEXT and FHCRC must be set, alongside FNAME and FCOMMENT because
+    // both name and comment pointers are present (even though empty).
+    assert!(compressed.len() >= 14);
+    assert_eq!(&compressed[..4], &[0x1f, 0x8b, 8, 0x1b]);
+    assert_eq!(&compressed[4..8], &[0; 4]); // header mtime is zero.
+    assert_eq!(compressed[9], 0); // gzip OS header byte.
+    assert_eq!(&compressed[10..12], &[0, 0]); // empty name/comment strings.
+    let header_crc = zlib_rs::crc32::crc32(0, &compressed[..12]).to_le_bytes();
+    assert_eq!(&compressed[12..14], &header_crc[..2]);
+    assert_gzip_decodes_exact(&compressed, original);
 }
 
 #[test]
@@ -909,13 +953,32 @@ fn deflate_bound_gzip_header() {
 
 #[test]
 fn deflate_bound_gzip_header_basic() {
-    deflate_bound_gzip_header_help((
-        DeflateConfig::default(),
-        1234,
-        CString::from_vec_with_nul(b"extra\0".to_vec()).unwrap(),
-        CString::from_vec_with_nul(b"name\0".to_vec()).unwrap(),
-        CString::from_vec_with_nul(b"comment\0".to_vec()).unwrap(),
-    ));
+    // Both wrapper behaviors matter: the ordinary zlib stream rejects
+    // gzip metadata, whereas the gzip stream must accept it.
+    for window_bits in [15, 31] {
+        assert!(deflate_bound_gzip_header_help((
+            DeflateConfig {
+                window_bits,
+                ..DeflateConfig::default()
+            },
+            1_234,
+            CString::from(c"extra"),
+            CString::from(c"name"),
+            CString::from(c"comment"),
+        )));
+    }
+}
+
+/// Match zlib's C unsigned-long truncation of a `size_t` result.
+/// Byte extraction preserves modular wrapping on LLP64 (Windows) and
+/// avoids architecture-dependent integer casts.
+fn wrap_size_t_to_c_ulong(value: usize) -> c_ulong {
+    let source = value.to_le_bytes();
+    let mut low_bytes = [0u8; core::mem::size_of::<c_ulong>()];
+    for (target, byte) in low_bytes.iter_mut().zip(source) {
+        *target = byte;
+    }
+    c_ulong::from_le_bytes(low_bytes)
 }
 
 #[test]
@@ -924,15 +987,19 @@ fn deflate_bound_gzip_header_basic() {
     ignore = "we don't support DFLTCC, which changes the bounds in zlib-ng"
 )]
 fn test_compress_bound_windows() {
-    let source_len = (u32::MAX - 6) as core::ffi::c_ulong;
-
-    assert_eq_rs_ng!(unsafe { compressBound(source_len as _) }, {
-        compressBound(source_len as _)
+    // c_ulong is only 32 bits on Windows, even with 64-bit pointers.
+    let source_len = c_ulong::from(u32::MAX - 6);
+    // SAFETY: zlib-ng's compressBound reads only the by-value scalar.
+    assert_eq_rs_ng!(unsafe { compressBound(source_len) }, {
+        compressBound(source_len)
     });
 
+    let size = usize::try_from(source_len).unwrap_or(usize::MAX);
+    assert_eq!(c_ulong::try_from(size), Ok(source_len));
+    let wide_bound = libz_rs_sys::compressBound_z(size);
     assert_eq!(
-        libz_rs_sys::compressBound(source_len as _),
-        libz_rs_sys::compressBound_z(source_len as _) as c_ulong,
+        libz_rs_sys::compressBound(source_len),
+        wrap_size_t_to_c_ulong(wide_bound)
     );
 }
 
@@ -942,20 +1009,21 @@ fn test_compress_bound_windows() {
     ignore = "we don't support DFLTCC, which changes the bounds in zlib-ng"
 )]
 fn test_compress_bound() {
-    ::quickcheck::quickcheck(test as fn(_) -> _);
-
-    fn test(source_len: core::ffi::c_ulong) -> bool {
-        assert_eq_rs_ng!(unsafe { compressBound(source_len as _) }, {
-            compressBound(source_len as _)
+    fn test(source_len: c_ulong) -> bool {
+        // SAFETY: the reference implementation takes only a scalar length.
+        assert_eq_rs_ng!(unsafe { compressBound(source_len) }, {
+            compressBound(source_len)
         });
-
+        let size = usize::try_from(source_len).unwrap_or(usize::MAX);
+        assert_eq!(c_ulong::try_from(size), Ok(source_len));
         assert_eq!(
-            libz_rs_sys::compressBound(source_len as _),
-            libz_rs_sys::compressBound_z(source_len as _) as c_ulong,
+            libz_rs_sys::compressBound(source_len),
+            wrap_size_t_to_c_ulong(libz_rs_sys::compressBound_z(size))
         );
-
         true
     }
+
+    ::quickcheck::quickcheck(test as fn(_) -> _);
 }
 
 #[test]
@@ -975,11 +1043,18 @@ fn test_compress_bound_extreme_c_abi_matches_zlib_ng() {
     for len in samples {
         // SAFETY: zlib-ng's compressBound takes a by-value integer and accesses no buffers.
         assert_eq_rs_ng!(unsafe { compressBound(len) }, compressBound(len));
-        // The C ABI deliberately narrows by wrapping, not by saturating. On Windows x64,
+        // The C ABI deliberately narrows by wrapping, not by saturating.
+        assert_eq!(
+            c_ulong::try_from(usize::try_from(len).unwrap_or(usize::MAX)),
+            Ok(len)
+        );
+        // On Windows x64,
         // c_ulong is 32-bit even though compressBound_z takes a 64-bit usize.
         assert_eq!(
             libz_rs_sys::compressBound(len),
-            libz_rs_sys::compressBound_z(len as usize) as c_ulong,
+            wrap_size_t_to_c_ulong(libz_rs_sys::compressBound_z(
+                usize::try_from(len).unwrap_or(usize::MAX)
+            )),
         );
     }
 }
@@ -4128,23 +4203,31 @@ mod stable_api {
     }
 
     fn with_window_bits(window_bits: i32) {
-        let input = "Hello World!";
+        let input = b"Hello World!";
+        let absolute_window = window_bits.unsigned_abs();
+        let bits = u8::try_from(absolute_window).unwrap_or(u8::MAX);
+        assert_eq!(u32::from(bits), absolute_window);
 
-        let mut deflate =
-            zlib_rs::Deflate::new(9, window_bits >= 0, window_bits.unsigned_abs() as u8);
-        let mut compressed = [0u8; 64];
-        let ret = deflate.compress(input.as_bytes(), &mut compressed, DeflateFlush::Finish);
-        assert_eq!(ret, Ok(Status::StreamEnd));
+        let mut deflater = zlib_rs::Deflate::new(9, window_bits >= 0, bits);
+        let mut compressed = [0xa5u8; 64];
+        assert_eq!(
+            deflater.compress(input, &mut compressed, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        assert_eq!(usize::try_from(deflater.total_in()), Ok(input.len()));
 
-        assert_eq!(deflate.total_in() as usize, input.len());
-
-        let compressed = &compressed[..deflate.total_out() as usize];
-        let mut decompressed = [0u8; 64];
-        let (decompressed, ret) =
-            decompress_slice(&mut decompressed, compressed, InflateConfig { window_bits });
-        assert_eq!(ret, ReturnCode::Ok);
-
-        assert_eq!(decompressed, input.as_bytes());
+        let used = usize::try_from(deflater.total_out()).unwrap_or(usize::MAX);
+        assert!(used <= compressed.len());
+        assert!(compressed[used..].iter().all(|&b| b == 0xa5));
+        let mut restored = [0xa5u8; 64];
+        let (decoded, status) = decompress_slice(
+            &mut restored,
+            &compressed[..used],
+            InflateConfig { window_bits },
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+        assert!(restored[input.len()..].iter().all(|&b| b == 0xa5));
     }
 
     #[test]
@@ -4164,45 +4247,46 @@ mod stable_api {
 
     #[test]
     fn reset_reuse_stream() {
-        let input1 = "Hello World!";
-        let input2 = "Goodbye World!";
+        let input1 = b"Hello World!";
+        let input2 = b"Goodbye World!";
 
-        let mut deflate = zlib_rs::Deflate::new(9, true, 15);
-
-        let mut compressed1 = [0u8; 64];
-        let ret = deflate.compress(input1.as_bytes(), &mut compressed1, DeflateFlush::Finish);
-        assert_eq!(ret, Ok(Status::StreamEnd));
-        assert_eq!(deflate.total_in() as usize, input1.len());
-
-        let compressed1 = &compressed1[..deflate.total_out() as usize];
-
-        deflate.reset();
-
-        let mut compressed2 = [0u8; 64];
-        let ret = deflate.compress(input2.as_bytes(), &mut compressed2, DeflateFlush::Finish);
-        assert_eq!(ret, Ok(Status::StreamEnd));
-        // After reset, total_in should reflect only the second input
-        assert_eq!(deflate.total_in() as usize, input2.len());
-
-        let compressed2 = &compressed2[..deflate.total_out() as usize];
-
-        let mut decompressed1 = [0u8; 64];
-        let (decompressed1, ret) = decompress_slice(
-            &mut decompressed1,
-            compressed1,
-            InflateConfig { window_bits: 15 },
+        let mut deflater = zlib_rs::Deflate::new(9, true, 15);
+        let mut compressed1 = [0xa5u8; 64];
+        assert_eq!(
+            deflater.compress(input1, &mut compressed1, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
         );
-        assert_eq!(ret, ReturnCode::Ok);
-        assert_eq!(decompressed1, input1.as_bytes());
+        assert_eq!(usize::try_from(deflater.total_in()), Ok(input1.len()));
+        let used1 = usize::try_from(deflater.total_out()).unwrap_or(usize::MAX);
+        assert!(used1 <= compressed1.len());
+        assert!(compressed1[used1..].iter().all(|&b| b == 0xa5));
 
-        let mut decompressed2 = [0u8; 64];
-        let (decompressed2, ret) = decompress_slice(
-            &mut decompressed2,
-            compressed2,
-            InflateConfig { window_bits: 15 },
+        deflater.reset();
+        assert_eq!(deflater.total_in(), 0);
+        assert_eq!(deflater.total_out(), 0);
+
+        let mut compressed2 = [0xa5u8; 64];
+        assert_eq!(
+            deflater.compress(input2, &mut compressed2, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
         );
-        assert_eq!(ret, ReturnCode::Ok);
-        assert_eq!(decompressed2, input2.as_bytes());
+        // The reset instance must account for only the second input.
+        assert_eq!(usize::try_from(deflater.total_in()), Ok(input2.len()));
+        let used2 = usize::try_from(deflater.total_out()).unwrap_or(usize::MAX);
+        assert!(used2 <= compressed2.len());
+        assert!(compressed2[used2..].iter().all(|&b| b == 0xa5));
+
+        for (member, input) in [
+            (&compressed1[..used1], input1.as_slice()),
+            (&compressed2[..used2], input2.as_slice()),
+        ] {
+            let mut restored = [0xa5u8; 64];
+            let (decoded, status) =
+                decompress_slice(&mut restored, member, InflateConfig { window_bits: 15 });
+            assert_eq!(status, ReturnCode::Ok);
+            assert_eq!(decoded, input);
+            assert!(restored[input.len()..].iter().all(|&b| b == 0xa5));
+        }
     }
 
     #[test]
@@ -4213,8 +4297,9 @@ mod stable_api {
 
         {
             let mut output = vec![MaybeUninit::<u8>::uninit(); 512];
-            d.compress_uninit(&input, &mut output, DeflateFlush::NoFlush)
-                .unwrap();
+            assert!(d
+                .compress_uninit(&input, &mut output, DeflateFlush::NoFlush)
+                .is_ok());
         }
 
         // Due to NoFlush there is data to write, but no buffer to write it into.
@@ -4228,12 +4313,13 @@ mod stable_api {
 
         {
             let dict = vec![b'a'; 128];
-            d.set_dictionary(&dict).unwrap();
+            assert!(d.set_dictionary(&dict).is_ok());
         }
 
         let input = vec![b'a'; 128];
         let mut output = vec![MaybeUninit::<u8>::uninit(); 512];
-        d.compress_uninit(&input, &mut output, DeflateFlush::NoFlush)
-            .unwrap();
+        assert!(d
+            .compress_uninit(&input, &mut output, DeflateFlush::NoFlush)
+            .is_ok());
     }
 }
