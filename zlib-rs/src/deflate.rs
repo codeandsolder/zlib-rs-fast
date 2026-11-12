@@ -1250,7 +1250,7 @@ fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
     state.ins_h = 0;
 }
 
-fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConfig) {
+const fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConfig) {
     state.medium_next_match = MatchCandidate::EMPTY;
     state.max_insert_length = config.max_lazy;
     state.max_lazy_match = config.max_lazy;
@@ -1409,10 +1409,14 @@ impl PackedBits {
     }
 
     const fn code(symbol: Value) -> Self {
-        // A Huffman code is at most 15 bits. The representation's
-        // broader byte width is only an internal bitstream count.
-        debug_assert!(symbol.len() <= 15);
-        Self::new(symbol.code() as u64, symbol.len() as u8)
+        // Huffman tree nodes reuse a 16-bit field for parent indices and
+        // final lengths. Assert the <=15-bit wire contract *before* taking
+        // the low byte, so an invalid node cannot become a plausible code
+        // length even in a release build. This remains const on Rust 1.99.
+        let length = symbol.len();
+        assert!(length <= 15, "invalid DEFLATE Huffman code length");
+        let [length, _] = length.to_le_bytes();
+        Self::new(symbol.code() as u64, length)
     }
 
     const fn append(&mut self, suffix: Self) {
@@ -2046,7 +2050,7 @@ impl<'a> State<'a> {
             // Verify during compilation that every DIST_CODE value is < D_CODES.
             let mut i = 0;
             while i < trees_tbl::DIST_CODE.len() {
-                assert!(trees_tbl::DIST_CODE[i] < D_CODES as u8);
+                assert!((trees_tbl::DIST_CODE[i] as usize) < D_CODES);
                 i += 1;
             }
         };
@@ -4813,6 +4817,14 @@ mod test {
     #[should_panic(expected = "packed DEFLATE sequence contains bits beyond its width")]
     fn packed_bits_reject_unaccounted_high_bits() {
         let _ = PackedBits::new(0b100, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid DEFLATE Huffman code length")]
+    fn packed_huffman_length_is_checked_before_narrowing() {
+        // The Huffman node length shares storage with its 16-bit parent index.
+        // A malformed width of 256 must not silently encode as zero bits.
+        let _ = PackedBits::code(Value::new(0, 256));
     }
 
     #[test]

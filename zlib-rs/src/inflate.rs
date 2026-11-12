@@ -188,9 +188,9 @@ pub const INFLATE_STATE_SIZE: usize = core::mem::size_of::<crate::inflate::State
 /// The stream must be initialized for inflate, and its state pointer must
 /// refer to a live, exclusively borrowed inflate State allocation.
 pub unsafe fn set_mode_dict(strm: &mut z_stream) {
-    unsafe {
-        (*(strm.state as *mut State)).mode = Mode::Dict;
-    }
+    // SAFETY: the caller guarantees an initialized inflate state, exclusively
+    // borrowed through this z_stream for the duration of the assignment.
+    unsafe { (*strm.state.cast::<State>()).mode = Mode::Dict };
 }
 
 #[cfg(feature = "__internal-test")]
@@ -200,9 +200,9 @@ pub unsafe fn set_mode_dict(strm: &mut z_stream) {
 /// The pointer must be non-null, aligned, and valid for exclusive access
 /// to a live initialized inflate stream and its state allocation.
 pub unsafe fn set_mode_sync(strm: *mut z_stream) {
-    unsafe {
-        (*((*strm).state as *mut State)).mode = Mode::Sync;
-    }
+    // SAFETY: the caller guarantees a non-null, exclusive z_stream and its
+    // initialized inflate state, both live for the duration of this call.
+    unsafe { (*(*strm).state.cast::<State>()).mode = Mode::Sync };
 }
 
 impl<'a> InflateStream<'a> {
@@ -242,7 +242,9 @@ impl<'a> InflateStream<'a> {
         strm: *mut z_stream,
         kind: InflateStateKind,
     ) -> Option<&'a mut Self> {
-        // Validate through a shared borrow before constructing the exclusive ABI view.
+        // SAFETY: the caller guarantees a live initialized stream and
+        // exclusive ownership; temporarily inspect its kind through a
+        // shared borrow before constructing the mutable ABI view.
         unsafe { Self::from_stream_ref_kind(strm.cast_const(), kind)? };
         // SAFETY: InflateStream has an equivalent layout as z_stream and the caller supplied a
         // mutable raw pointer satisfying `pointer::as_mut`.
@@ -283,8 +285,10 @@ impl<'a> InflateStream<'a> {
     }
 
     fn as_z_stream_mut(&mut self) -> &mut z_stream {
-        // safety: a valid &mut InflateStream is also a valid &mut z_stream
-        unsafe { &mut *(self as *mut _ as *mut z_stream) }
+        // SAFETY: compile-time size, alignment and every field-offset
+        // assertion establish ABI layout equivalence. The exclusive borrow
+        // of Self permits exactly one mutable z_stream view.
+        unsafe { &mut *core::ptr::from_mut(self).cast::<z_stream>() }
     }
 
     pub fn new(config: InflateConfig) -> Self {
@@ -597,8 +601,8 @@ impl GzipHeaderOutput {
         });
     }
 
-    fn set_extra_len(&mut self, len: usize) {
-        self.with_header_mut(|head| head.extra_len = len as u32);
+    fn set_extra_len(&mut self, len: u16) {
+        self.with_header_mut(|head| head.extra_len = u32::from(len));
     }
 
     fn clear_extra(&mut self) {
@@ -638,13 +642,20 @@ impl GzipHeaderOutput {
         count
     }
 
-    fn write_extra(&mut self, remaining_before: usize, bytes: &[u8]) {
+    fn write_extra(&mut self, remaining_before: usize, bytes: &[u8]) -> Result<(), ReturnCode> {
         self.with_header_mut(|head| {
-            let written = (head.extra_len as usize)
-                .checked_sub(remaining_before)
-                .expect("extra-field progress stays within declared length");
+            // The wire length is u16. Reject inconsistent progress before
+            // touching caller-owned memory or consuming more compressed input.
+            let declared = usize::try_from(head.extra_len).map_err(|_| ReturnCode::StreamError)?;
+            let Some(written) = declared.checked_sub(remaining_before) else {
+                return Err(ReturnCode::StreamError);
+            };
+            if bytes.len() > remaining_before {
+                return Err(ReturnCode::StreamError);
+            }
             Self::write_bounded(head.extra, head.extra_max as usize, written, bytes);
-        });
+            Ok(())
+        })
     }
 
     fn write_string(&mut self, field: GzipStringField, offset: usize, bytes: &[u8]) -> usize {
@@ -1654,15 +1665,18 @@ impl State<'_> {
                         if (self.gzip_flags & 0x0400) != 0 {
                             need_bits_for_mode(bit_reader, 16, mode)?;
 
-                            // self.length (and head.extra_len) represent the length of the extra field
-                            self.length = bit_reader.hold() as usize;
+                            // XLEN occupies exactly two bytes on the wire. Keep the
+                            // parsed length in its native domain through the header
+                            // destination, and widen only for slice indexing.
+                            let raw = bit_reader.bits(16).to_le_bytes();
+                            let extra_len = u16::from_le_bytes([raw[0], raw[1]]);
+                            self.length = usize::from(extra_len);
                             if let Some(mut head) = self.head {
-                                head.set_extra_len(self.length);
+                                head.set_extra_len(extra_len);
                             }
 
                             if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                let bytes = (bit_reader.hold() as u16).to_le_bytes();
-                                self.checksum = crc32(self.checksum, &bytes);
+                                self.checksum = crc32(self.checksum, &extra_len.to_le_bytes());
                             }
                             bit_reader.init_bits();
                         } else if let Some(mut head) = self.head {
@@ -1682,7 +1696,8 @@ impl State<'_> {
                                     head.write_extra(
                                         self.length,
                                         &bit_reader.as_slice()[..extra_available],
-                                    );
+                                    )
+                                    .map_err(|code| DispatchExit { mode, code })?;
                                 }
 
                                 // Checksum
@@ -2509,14 +2524,23 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
 }
 
 pub fn prime(stream: &mut InflateStream, bits: i32, value: i32) -> ReturnCode {
-    if bits == 0 {
-        /* fall through */
-    } else if bits < 0 {
+    if bits < 0 {
         stream.state.bit_buffer.init_bits();
-    } else if bits > 16 || stream.state.bit_buffer.bits_in_buffer() + bits as u8 > 32 {
-        return ReturnCode::StreamError;
-    } else {
-        stream.state.bit_buffer.prime(bits as u8, value as u64);
+    } else if bits != 0 {
+        let Ok(width) = u8::try_from(bits) else {
+            return ReturnCode::StreamError;
+        };
+        if width > 16
+            || usize::from(stream.state.bit_buffer.bits_in_buffer()) + usize::from(width) > 32
+        {
+            return ReturnCode::StreamError;
+        }
+        // Preserve the signed C argument's bit pattern before extending it
+        // to the unsigned bit-reservoir representation.
+        stream
+            .state
+            .bit_buffer
+            .prime(width, u64::from(value.cast_unsigned()));
     }
 
     ReturnCode::Ok
@@ -2680,15 +2704,15 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
         stream.configure_default_c_allocator();
     }
 
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
+    let (Some(zalloc), Some(zfree)) = (stream.zalloc, stream.zfree) else {
         return ReturnCode::StreamError;
-    }
+    };
 
     let state = State::new(InflateStateKind::Regular);
 
     let alloc = Allocator {
-        zalloc: stream.zalloc.unwrap(),
-        zfree: stream.zfree.unwrap(),
+        zalloc,
+        zfree,
         opaque: stream.opaque,
         _marker: PhantomData,
     };
@@ -2737,8 +2761,11 @@ pub fn reset_with_config(stream: &mut InflateStream, config: InflateConfig) -> R
         return ReturnCode::StreamError;
     }
 
-    stream.state.wrap = wrap as u8;
-    stream.state.wbits = window_bits as _;
+    let (Ok(wrap), Ok(window_bits)) = (u8::try_from(wrap), u8::try_from(window_bits)) else {
+        return ReturnCode::StreamError;
+    };
+    stream.state.wrap = wrap;
+    stream.state.wbits = window_bits;
 
     reset(stream)
 }
@@ -3226,6 +3253,68 @@ mod tests {
     }
 
     #[test]
+    fn inflate_prime_keeps_signed_bit_patterns_and_rejects_overflow_without_mutation(
+    ) -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init succeeded and the state is exclusively borrowed for this test.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+
+        for width in [17, 32, 256, i32::MAX] {
+            let before = stream.state.bit_buffer;
+            assert_eq!(prime(stream, width, -1), ReturnCode::StreamError);
+            assert_eq!(stream.state.bit_buffer, before);
+        }
+
+        assert_eq!(prime(stream, 16, -1), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer.hold(), 0xffff);
+        assert_eq!(stream.state.bit_buffer.bits_in_buffer(), 16);
+
+        assert_eq!(prime(stream, 16, i32::MIN), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer.hold(), 0xffff);
+        assert_eq!(stream.state.bit_buffer.bits_in_buffer(), 32);
+
+        let before = stream.state.bit_buffer;
+        assert_eq!(prime(stream, 1, 1), ReturnCode::StreamError);
+        assert_eq!(stream.state.bit_buffer, before);
+        assert_eq!(prime(stream, 0, 5), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer, before);
+
+        assert_eq!(prime(stream, -1, 0), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer, BitBuffer::default());
+        assert_eq!(prime(stream, 16, i32::MIN), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer.hold(), 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_inflate_reconfiguration_preserves_existing_state() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init succeeded and the state is exclusively borrowed for this test.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+        let initial_wrap = stream.state.wrap;
+        let initial_window_bits = stream.state.wbits;
+        let initial_buffer = stream.state.bit_buffer;
+
+        for window_bits in [-16, 1, 7, 17, 23, 33, 39, 48, 64, i32::MIN, i32::MAX] {
+            assert_eq!(
+                reset_with_config(stream, InflateConfig { window_bits }),
+                ReturnCode::StreamError,
+                "invalid window bits {window_bits}",
+            );
+            assert_eq!(stream.state.wrap, initial_wrap);
+            assert_eq!(stream.state.wbits, initial_window_bits);
+            assert_eq!(stream.state.bit_buffer, initial_buffer);
+        }
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
     fn gzip_header_fields_clip_storage_but_consume_all_fragments() {
         let mut extra = [0xa5_u8; 6];
         let mut name = [0xa5_u8; 5];
@@ -3244,8 +3333,18 @@ mod tests {
         // SAFETY: every nested pointer refers to its independent, uniquely
         // writable stack buffer, with capacities no larger than those buffers.
         let mut destination = unsafe { GzipHeaderOutput::new(&mut header) };
-        destination.write_extra(8, b"abc");
-        destination.write_extra(5, b"defgh");
+        assert_eq!(destination.write_extra(8, b"abc"), Ok(()));
+        assert_eq!(destination.write_extra(5, b"defgh"), Ok(()));
+        // Invalid fragment ordering and overlong fragments must leave the
+        // already-written caller buffer untouched.
+        assert_eq!(
+            destination.write_extra(9, b"x"),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(
+            destination.write_extra(1, b"xy"),
+            Err(ReturnCode::StreamError)
+        );
         assert_eq!(extra, *b"abcd\xa5\xa5");
         assert_eq!(header.extra_len, 8);
 
