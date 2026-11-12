@@ -1106,6 +1106,8 @@ pub fn copy<'a>(
         avail_out: source.avail_out,
         total_out: source.total_out,
         msg: source.msg,
+        // SAFETY: clone_state allocated and initialized a separate live
+        // destination State; this wrapper owns it until deflateEnd.
         state: unsafe { StatePtr::from_raw(state_allocation.as_ptr()) },
         alloc: source.alloc,
         data_type: source.data_type,
@@ -1120,6 +1122,12 @@ pub fn copy<'a>(
 ///
 /// - Err when deflate is not done. A common cause is insufficient output space
 /// - Ok otherwise
+///
+/// # Errors
+///
+/// Returns the caller's C stream in the error variant if compression was
+/// interrupted or its state has already been released. In both cases the C
+/// stream remains caller-owned; an initialized allocation is freed exactly once.
 pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mut z_stream> {
     if stream.state.as_ptr().is_null() {
         return Err(stream.as_z_stream_mut());
@@ -1133,6 +1141,9 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
     let stream = stream.as_z_stream_mut();
     let _ = core::mem::replace(&mut stream.state, core::ptr::null_mut());
 
+    // SAFETY: this stream exclusively owns the live State allocation from
+    // init/copy; allocation_start and total_allocation_size came from that
+    // allocation, and stream.state was detached immediately above.
     unsafe { alloc.deallocate(allocation_start.as_ptr(), total_allocation_size) };
 
     match status {
@@ -1794,7 +1805,7 @@ pub struct State<'a> {
     /// Working copy of `z_stream::data_type`. Kept in compression state so block encoding is
     /// independent of caller I/O and synchronized once at the outer compression-call boundary.
     pub(crate) data_type: core::ffi::c_int,
-    _padding_0: [u8; 4],
+    padding_0: [u8; 4],
 
     _cache_line_3: (),
 
@@ -1852,14 +1863,18 @@ impl<'a> State<'a> {
     /// clone-policy decision instead of silently including them in a byte-for-byte state copy.
     fn clone_rebound(
         &self,
-        window: Window<'a>,
-        prev: WeakSliceMut<'a, Pos>,
-        head: WeakArrayMut<'a, Pos, HASH_SIZE>,
-        pending: Pending<'a>,
-        sym_buf: SymBuf<'a>,
+        buffers: DeflateAllocBuffers<'a>,
         allocation_start: NonNull<u8>,
         total_allocation_size: usize,
     ) -> Self {
+        let DeflateAllocBuffers {
+            state_ptr: _,
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+        } = buffers;
         Self {
             status: self.status,
             last_flush: self.last_flush,
@@ -1900,7 +1915,7 @@ impl<'a> State<'a> {
             gzindex: self.gzindex,
             medium_next_match: self.medium_next_match,
             data_type: self.data_type,
-            _padding_0: self._padding_0,
+            padding_0: self.padding_0,
             _cache_line_3: (),
             crc_fold: self.crc_fold,
             allocation_start,
@@ -4291,7 +4306,7 @@ impl DeflateAllocOffsets {
             gzindex: 0,
             medium_next_match: MatchCandidate::EMPTY,
             data_type: crate::c_api::Z_UNKNOWN,
-            _padding_0: [0; 4],
+            padding_0: [0; 4],
             _cache_line_3: (),
             crc_fold: Crc32Fold::new(),
             allocation_start,
@@ -4415,24 +4430,11 @@ impl DeflateAllocOffsets {
 
         // SAFETY: `aligned` is a fresh layout base and the cloned buffer views below are the only
         // destination views over their respective allocation regions.
-        let DeflateAllocBuffers {
-            state_ptr,
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
-        } = unsafe { self.clone_buffers(aligned, source) };
-
-        let state = source.clone_rebound(
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
-            allocation_start,
-            self.total_size,
-        );
+        let buffers = unsafe { self.clone_buffers(aligned, source) };
+        // The storage pointer must be saved before moving the live views into
+        // the destination State. Every view is tied to this same allocation.
+        let state_ptr = buffers.state_ptr;
+        let state = source.clone_rebound(buffers, allocation_start, self.total_size);
 
         // SAFETY: `state_ptr` is the aligned State region in this fresh allocation and no State
         // has previously been materialized there.
