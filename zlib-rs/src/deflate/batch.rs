@@ -283,7 +283,7 @@ struct ScopedThreadResolver {
 }
 
 impl ScopedThreadResolver {
-    fn new(workers: usize) -> Self {
+    const fn new(workers: usize) -> Self {
         Self {
             workers,
             request_indexes: Vec::new(),
