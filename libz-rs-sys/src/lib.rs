@@ -2619,20 +2619,22 @@ mod checksum_abi_tests {
         const ZERO_BOUND: c_ulong = compressBound(0);
         assert_eq!(ZERO_BOUND, compressBound_z(0) as c_ulong);
 
-        assert_eq!(c_ulong_to_usize_wrapping(0), 0);
-        assert_eq!(
-            c_ulong_to_usize_wrapping(c_ulong::MAX),
-            usize::try_from(c_ulong::MAX).unwrap_or(usize::MAX)
-        );
+        // Use a wider independent arithmetic oracle. The previous
+        // try_from(...).unwrap_or(MAX) expectation was incorrect if a C
+        // unsigned long were ever wider than native usize: wrapping keeps
+        // the low bits, not a saturating maximum.
+        let native_mask = u128::try_from(usize::MAX).unwrap_or(u128::MAX);
         for raw in [
+            0,
             c_ulong::from(1u8),
             c_ulong::from(u16::MAX),
             c_ulong::from(u32::MAX),
             c_ulong::MAX - 1,
+            c_ulong::MAX,
         ] {
             assert_eq!(
-                c_ulong_to_usize_wrapping(raw),
-                usize::try_from(raw).unwrap_or(usize::MAX),
+                u128::try_from(c_ulong_to_usize_wrapping(raw)).unwrap_or(u128::MAX),
+                u128::from(raw) & native_mask,
             );
         }
     }
