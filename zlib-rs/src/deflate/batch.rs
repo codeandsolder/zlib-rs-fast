@@ -17,7 +17,7 @@ use super::{
     },
     CallCursors, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode, Status,
 };
-use crate::c_api::z_stream;
+use crate::{abi_cursor::SliceBudget, c_api::z_stream};
 #[cfg(feature = "gpu")]
 use crate::{MAX_WBITS, MIN_WBITS};
 
@@ -407,10 +407,10 @@ fn compress_synchronously(
         .collect()
 }
 
-const fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
+fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
     let level = match config.level {
         crate::c_api::Z_DEFAULT_COMPRESSION => 6,
-        0..=9 => config.level as i8,
+        0..=9 => i8::try_from(config.level).ok()?,
         _ => return None,
     };
     Some(Algorithm::for_stream(level, config.strategy))
@@ -420,8 +420,8 @@ struct BatchRuntime<'a> {
     job_index: usize,
     raw: z_stream,
     driver: StandardDriver,
-    input_remaining: usize,
-    output_remaining: usize,
+    input_budget: SliceBudget,
+    output_budget: SliceBudget,
     done: bool,
     _buffers: PhantomData<(&'a [u8], &'a mut [u8])>,
 }
@@ -461,8 +461,8 @@ impl<'a> BatchRuntime<'a> {
                 )
                 .expect("batch runtime requires a standard token producer")
             },
-            input_remaining: input.len(),
-            output_remaining: output.len(),
+            input_budget: SliceBudget::new(input.len()),
+            output_budget: SliceBudget::new(output.len()),
             done: false,
             _buffers: PhantomData,
         };
@@ -507,31 +507,13 @@ impl<'a> BatchRuntime<'a> {
     }
 
     fn offer_input(&mut self) -> bool {
-        if self.raw.avail_in != 0 {
-            return true;
-        }
-        if self.input_remaining == 0 {
-            return false;
-        }
-
-        let offered = self.input_remaining.min(crate::c_api::uInt::MAX as usize);
-        self.raw.avail_in = offered as crate::c_api::uInt;
-        self.input_remaining -= offered;
-        true
+        self.input_budget.refill(&mut self.raw.avail_in);
+        self.raw.avail_in != 0
     }
 
     fn offer_output(&mut self) -> bool {
-        if self.raw.avail_out != 0 {
-            return true;
-        }
-        if self.output_remaining == 0 {
-            return false;
-        }
-
-        let offered = self.output_remaining.min(crate::c_api::uInt::MAX as usize);
-        self.raw.avail_out = offered as crate::c_api::uInt;
-        self.output_remaining -= offered;
-        true
+        self.output_budget.refill(&mut self.raw.avail_out);
+        self.raw.avail_out != 0
     }
 
     fn step(&mut self) -> RuntimeStep {
@@ -542,7 +524,7 @@ impl<'a> BatchRuntime<'a> {
             return RuntimeStep::Done(self.finish_error(ReturnCode::BufError));
         }
 
-        let mode = if self.input_remaining == 0 {
+        let mode = if self.input_budget.pending() == 0 {
             StandardSegmentMode::Final
         } else {
             StandardSegmentMode::Continue
@@ -663,7 +645,9 @@ impl<'a> BatchRuntime<'a> {
                 ReturnCode::StreamEnd => {
                     self.done = true;
                     return BatchCompressResult {
-                        written: self.raw.total_out as usize,
+                        // The output slice budget remains full-width even
+                        // when the C ABI's total_out counter wraps.
+                        written: self.output_budget.processed(self.raw.avail_out),
                         code: ReturnCode::Ok,
                     };
                 }
@@ -676,7 +660,7 @@ impl<'a> BatchRuntime<'a> {
     const fn finish_error(&mut self, code: ReturnCode) -> BatchCompressResult {
         self.done = true;
         BatchCompressResult {
-            written: self.raw.total_out as usize,
+            written: self.output_budget.processed(self.raw.avail_out),
             code,
         }
     }
@@ -702,6 +686,35 @@ mod tests {
         let len = written.len();
         output.truncate(len);
         (output, code)
+    }
+
+    #[test]
+    fn scheduled_result_size_uses_buffer_progress_not_wrapping_c_total() -> Result<(), &'static str>
+    {
+        let config = DeflateConfig::new(2);
+        let algorithm = configured_algorithm(config).ok_or("valid standard deflate level")?;
+        let input = b"scheduled output remains bounded by its caller buffer";
+        let mut output = [0u8; 128];
+        let output_capacity = output.len();
+        let mut runtime = BatchRuntime::new(
+            0,
+            input,
+            &mut output,
+            config,
+            algorithm,
+            MatchSourceKind::HashChain,
+        )
+        .map_err(|_| "batch runtime failed initialization")?;
+
+        let actual = runtime.output_budget.processed(runtime.raw.avail_out);
+        assert!(actual <= output_capacity);
+        // C z_size may wrap at the ABI width; a batch job still reports the
+        // exact number of bytes initialized in the caller-owned output slice.
+        runtime.raw.total_out = crate::c_api::z_size::MAX;
+        let failure = runtime.finish_error(ReturnCode::BufError);
+        assert_eq!(failure.code, ReturnCode::BufError);
+        assert_eq!(failure.written, actual);
+        Ok(())
     }
 
     #[cfg(feature = "gpu")]
