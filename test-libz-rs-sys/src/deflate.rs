@@ -441,8 +441,8 @@ fn deflate_tune_wide_parameters_round_trip_with_zlib_ng() -> Result<(), &'static
     ] {
         let compressed = assert_eq_rs_ng!({
             let mut raw = MaybeUninit::<z_stream>::zeroed();
-            // SAFETY: valid zlib ABI version and stream size for initialization.
             assert_eq!(
+                // SAFETY: valid zlib ABI version and stream size for initialization.
                 unsafe {
                     deflateInit_(
                         raw.as_mut_ptr(),
@@ -515,8 +515,8 @@ fn deflate_tune_hash_strategy_after_history_matches_zlib_ng_contract() -> Result
 
             let outcome = assert_eq_rs_ng!({
                 let mut raw = MaybeUninit::<z_stream>::zeroed();
-                // SAFETY: use a correctly sized z_stream and the valid zlib version.
                 assert_eq!(
+                    // SAFETY: use a correctly sized z_stream and the valid zlib version.
                     unsafe {
                         deflateInit_(
                             raw.as_mut_ptr(),
@@ -532,14 +532,14 @@ fn deflate_tune_hash_strategy_after_history_matches_zlib_ng_contract() -> Result
                 let mut output = vec![0u8; output_cap];
                 stream.next_out = output.as_mut_ptr();
                 stream.avail_out = output_abi_len;
-                let mut first_status = Z_OK;
-
-                if first_len != 0 {
+                let first_status = if first_len != 0 {
                     stream.next_in = input.as_ptr().cast_mut();
                     stream.avail_in = first_abi_len;
                     // SAFETY: current input and output spans remain live and disjoint.
-                    first_status = unsafe { deflate(stream, Z_NO_FLUSH) };
-                }
+                    unsafe { deflate(stream, Z_NO_FLUSH) }
+                } else {
+                    Z_OK
+                };
                 let first_left = stream.avail_in;
                 // SAFETY: stream remains initialized and deflateTune reads only scalar parameters.
                 let tune_status = unsafe { deflateTune(stream, 8, 16, 128, chain) };
@@ -599,8 +599,8 @@ fn deflate_params_preserves_hashed_history_across_levels() -> Result<(), &'stati
     for (old_level, new_level) in [(7, 9), (9, 7), (6, 9)] {
         let outcome = assert_eq_rs_ng!({
             let mut raw = MaybeUninit::<z_stream>::zeroed();
-            // SAFETY: the ABI stream version and size correspond to the initialized library.
             assert_eq!(
+                // SAFETY: the ABI stream version and size correspond to the initialized library.
                 unsafe {
                     deflateInit_(
                         raw.as_mut_ptr(),
@@ -1060,8 +1060,8 @@ fn test_compress_bound_extreme_c_abi_matches_zlib_ng() {
 fn deflate_total_out_counter_wraps_as_c_unsigned_long() {
     assert_eq_rs_ng!({
         let mut raw = MaybeUninit::<z_stream>::zeroed();
-        // SAFETY: initialize the zlib stream with the matching ABI struct size and version.
         assert_eq!(
+            // SAFETY: initialize the zlib stream with the matching ABI struct size and version.
             unsafe {
                 deflateInit_(
                     raw.as_mut_ptr(),
@@ -1387,26 +1387,33 @@ fn deflate_prime_only_inserts_requested_bits() {
 
 #[test]
 fn deflate_prime_accepts_32_bits_like_zlib_ng() {
-    assert_eq_rs_ng!(unsafe {
+    let (prime, end) = assert_eq_rs_ng!({
         let mut raw = MaybeUninit::<z_stream>::zeroed();
-        let init = deflateInit2_(
-            raw.as_mut_ptr(),
-            6,
-            Z_DEFLATED,
-            -15,
-            8,
-            Z_DEFAULT_STRATEGY,
-            zlibVersion(),
-            test_c_stream_size::<z_stream>(),
-        );
+        // SAFETY: valid raw-window z_stream initialization with the ABI's
+        // own version and checked structure size.
+        let init = unsafe {
+            deflateInit2_(
+                raw.as_mut_ptr(),
+                6,
+                Z_DEFLATED,
+                -15,
+                8,
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
         assert_eq!(init, Z_OK);
-        let stream = raw.assume_init_mut();
-
-        let prime = deflatePrime(stream, 32, 0x1234_5678);
-        let end = deflateEnd(stream);
-
+        // SAFETY: successful initialization populated the C stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        // SAFETY: 32-bit priming is valid on a live raw deflate stream.
+        let prime = unsafe { deflatePrime(stream, 32, 0x1234_5678) };
+        // SAFETY: the initialized stream is released exactly once.
+        let end = unsafe { deflateEnd(stream) };
         (prime, end)
     });
+    assert_eq!(prime, Z_OK);
+    assert!(matches!(end, Z_OK | libz_rs_sys::Z_DATA_ERROR));
 }
 
 /// Prime 32 gzip bits as two low-first 16-bit chunks.
@@ -1548,31 +1555,48 @@ fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
     let dictionary = vec![0x5a; (1 << 15) + 1];
 
     for initial_total_in in [0, c_ulong::MAX - 1] {
-        let result = assert_eq_rs_ng!(unsafe {
-            let mut strm = MaybeUninit::<z_stream>::zeroed();
-            let init = deflateInit2_(
-                strm.as_mut_ptr(),
-                6,
-                Z_DEFLATED,
-                15,
-                8,
-                Z_DEFAULT_STRATEGY,
-                zlibVersion(),
-                test_c_stream_size::<z_stream>(),
-            );
-            let strm = strm.assume_init_mut();
+        let result = assert_eq_rs_ng!({
+            let mut raw = MaybeUninit::<z_stream>::zeroed();
+            // SAFETY: the C stream has writable storage, a valid zlib
+            // version, supported 15-bit window and checked ABI size.
+            let init = unsafe {
+                deflateInit2_(
+                    raw.as_mut_ptr(),
+                    6,
+                    Z_DEFLATED,
+                    15,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    zlibVersion(),
+                    test_c_stream_size::<z_stream>(),
+                )
+            };
+            assert_eq!(init, Z_OK);
+            // SAFETY: successful initialization populated every stream field.
+            let strm = unsafe { raw.assume_init_mut() };
             strm.total_in = initial_total_in;
-            let set = deflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
+            // SAFETY: the dictionary is an immutable live input buffer with
+            // a checked C byte count, and the encoder owns its state.
+            let set = unsafe {
+                deflateSetDictionary(strm, dictionary.as_ptr(), test_c_uint_len(dictionary.len()))
+            };
             let total_in = strm.total_in;
             let adler = strm.adler;
             let mut dictionary_len = 0;
-            let get = deflateGetDictionary(strm, core::ptr::null_mut(), &raw mut dictionary_len);
-            let end = deflateEnd(strm);
+            // SAFETY: null dictionary-output pointer is supported; the
+            // dictionary_len output is a distinct, writable C unsigned int.
+            let get = unsafe {
+                deflateGetDictionary(strm, core::ptr::null_mut(), &raw mut dictionary_len)
+            };
+            // SAFETY: initialized encoder ended exactly once.
+            let end = unsafe { deflateEnd(strm) };
 
             (init, set, total_in, adler, get, dictionary_len, end)
         });
         assert_eq!(result.0, Z_OK);
         assert_eq!(result.1, Z_OK);
+        assert_eq!(result.4, Z_OK, "dictionary length query failed");
+        assert_eq!(result.5, 1 << 15, "only the last window is retained");
         assert_eq!(
             result.2,
             initial_total_in.wrapping_add((1 << 15) as c_ulong),
@@ -1581,16 +1605,13 @@ fn dictionary_just_over_window_is_truncated_like_zlib_ng() {
     }
 }
 
-#[test]
-fn small_window() {
-    let deflate_config = DeflateConfig {
-        level: Z_BEST_COMPRESSION,
-        window_bits: -9,
-        ..DeflateConfig::default()
-    };
-    let plain: [u8; 128] = std::array::from_fn(|i| u8::try_from(i).unwrap_or(u8::MAX));
-    let previous_dictionary = vec![b'a'; (1 << 9) - plain.len() / 2];
-
+/// Exercise a raw nine-bit window with replacement dictionaries and an
+/// independent C inflate pass using the exact same dictionary sequence.
+fn small_window_dictionary_round_trip(
+    deflate_config: DeflateConfig,
+    plain: &[u8],
+    previous_dictionary: &[u8],
+) -> Vec<u8> {
     let compressed = assert_eq_rs_ng!({
         let mut encoder_raw = MaybeUninit::<z_stream>::zeroed();
         // SAFETY: writable uninitialized stream storage, matching ABI size
@@ -1705,13 +1726,28 @@ fn small_window() {
         assert_eq!(decoder.avail_in, 0);
         assert_eq!(usize::try_from(decoder.total_in), Ok(produced));
         assert_eq!(usize::try_from(decoder.total_out), Ok(plain.len()));
-        assert_eq!(&restored[..plain.len()], &plain);
+        assert_eq!(&restored[..plain.len()], plain);
         assert_eq!(&restored[plain.len()..], &[0xa5u8; 16]);
         // SAFETY: decoder initialization is paired with one successful close.
         assert_eq!(unsafe { inflateEnd(decoder) }, Z_OK);
 
         compressed_output[..produced].to_vec()
     });
+    compressed
+}
+
+#[test]
+fn small_window() {
+    let deflate_config = DeflateConfig {
+        level: Z_BEST_COMPRESSION,
+        window_bits: -9,
+        ..DeflateConfig::default()
+    };
+    let plain: [u8; 128] = std::array::from_fn(|i| u8::try_from(i).unwrap_or(u8::MAX));
+    let previous_dictionary = vec![b'a'; (1 << 9) - plain.len() / 2];
+
+    let compressed =
+        small_window_dictionary_round_trip(deflate_config, &plain, &previous_dictionary);
     assert!(
         !compressed.is_empty(),
         "small-window encoder emitted no data"
@@ -2323,14 +2359,70 @@ fn test_deflate_copy_large() {
     test_deflate_copy_help(LCET10.as_bytes());
 }
 
+/// Each copy test retains a large enough output allocation for both the
+/// baseline and cloned encoders, including their extra sync-flush blocks.
+fn checked_copy_test_capacity(input_len: usize) -> usize {
+    let capacity = input_len
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(64))
+        .unwrap_or(0);
+    assert!(capacity >= input_len, "copy test output size overflow");
+    capacity
+}
+
+/// Require that the compressor stays within its advertised writable suffix.
+fn assert_unwritten_output_unchanged(output: &[u8], produced: usize) {
+    assert!(
+        produced <= output.len(),
+        "encoder exceeded the output allocation"
+    );
+    assert!(output[produced..].iter().all(|&byte| byte == 0xa5));
+}
+
+/// A pair of identical encoders could still agree on truncated or invalid
+/// output. Verify full decompression and protect the plaintext tail.
+fn assert_zlib_decodes_exact(compressed: &[u8], expected: &[u8]) {
+    let capacity = expected.len().checked_add(32).unwrap_or(0);
+    assert!(capacity >= expected.len(), "decoded output overflow");
+    let mut decoded = vec![0xa5u8; capacity];
+    let (plain, status) =
+        zlib_rs::decompress_slice(&mut decoded, compressed, InflateConfig::default());
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(plain, expected);
+    assert!(decoded[expected.len()..].iter().all(|&byte| byte == 0xa5));
+}
+
 /// A copied encoder must yield the same complete compressed bytes as the
 /// original encoder and both streams must decode to the original plaintext.
 /// The copy is made after half the data and a sync flush.
 fn test_deflate_copy_help(input: &[u8]) {
     let config = DeflateConfig::default();
     let compressed = assert_eq_rs_ng!({
-        // This function is instantiated independently for the two C ABIs
-        // by the differential test macro.
+        // Each expansion uses its own z_stream type and deflateInit2_
+        // binding, while sharing checked initialization and teardown.
+        fn init_stream<'a>(
+            raw: &'a mut MaybeUninit<z_stream>,
+            config: &DeflateConfig,
+        ) -> &'a mut z_stream {
+            // SAFETY: raw points to live, writable uninitialized C stream
+            // storage; configuration, version and ABI struct size are valid.
+            let init = unsafe {
+                deflateInit2_(
+                    raw.as_mut_ptr(),
+                    config.level,
+                    config.method as c_int,
+                    config.window_bits,
+                    config.mem_level,
+                    config.strategy as c_int,
+                    zlibVersion(),
+                    test_c_stream_size::<z_stream>(),
+                )
+            };
+            assert_eq!(init, Z_OK);
+            // SAFETY: the successful C initializer has populated the state
+            // represented by raw, which remains alive for its entire use.
+            unsafe { raw.assume_init_mut() }
+        }
         fn feed_until(stream: &mut z_stream, input: &[u8], position: &mut usize, stop: usize) {
             assert!(stop <= input.len());
             while *position < stop {
@@ -2376,34 +2468,11 @@ fn test_deflate_copy_help(input: &[u8]) {
             usize::try_from(stream.total_out).unwrap_or(usize::MAX)
         }
 
-        let capacity = input
-            .len()
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(64))
-            .unwrap_or(0);
-        assert!(capacity >= input.len());
+        let capacity = checked_copy_test_capacity(input.len());
         let half = input.len() / 2;
 
         let mut first_raw = MaybeUninit::<z_stream>::zeroed();
-        // SAFETY: writable stream storage and checked ABI metadata are
-        // passed with a valid standard compressor configuration.
-        assert_eq!(
-            unsafe {
-                deflateInit2_(
-                    first_raw.as_mut_ptr(),
-                    config.level,
-                    config.method as c_int,
-                    config.window_bits,
-                    config.mem_level,
-                    config.strategy as c_int,
-                    zlibVersion(),
-                    test_c_stream_size::<z_stream>(),
-                )
-            },
-            Z_OK
-        );
-        // SAFETY: successful initialization populated the whole C stream.
-        let first = unsafe { first_raw.assume_init_mut() };
+        let first = init_stream(&mut first_raw, &config);
         let mut full_output = vec![0xa5u8; capacity];
         first.next_out = full_output.as_mut_ptr();
         first.avail_out = test_c_uint_len(full_output.len());
@@ -2414,31 +2483,13 @@ fn test_deflate_copy_help(input: &[u8]) {
         flush_sync(first);
         let full_size = finish(first);
         assert_eq!(usize::try_from(first.total_in), Ok(input.len()));
-        assert!(full_size <= full_output.len());
-        assert!(full_output[full_size..].iter().all(|&byte| byte == 0xa5));
+        assert_unwritten_output_unchanged(&full_output, full_size);
         // SAFETY: the fully finished stream is ended exactly once.
         assert_eq!(unsafe { deflateEnd(first) }, Z_OK);
         full_output.truncate(full_size);
 
         let mut source_raw = MaybeUninit::<z_stream>::zeroed();
-        // SAFETY: a separate writable C stream and same valid configuration.
-        assert_eq!(
-            unsafe {
-                deflateInit2_(
-                    source_raw.as_mut_ptr(),
-                    config.level,
-                    config.method as c_int,
-                    config.window_bits,
-                    config.mem_level,
-                    config.strategy as c_int,
-                    zlibVersion(),
-                    test_c_stream_size::<z_stream>(),
-                )
-            },
-            Z_OK
-        );
-        // SAFETY: successful initialization populated the source stream.
-        let source = unsafe { source_raw.assume_init_mut() };
+        let source = init_stream(&mut source_raw, &config);
         let mut copy_output = vec![0xa5u8; capacity];
         source.next_out = copy_output.as_mut_ptr();
         source.avail_out = test_c_uint_len(copy_output.len());
@@ -2461,8 +2512,7 @@ fn test_deflate_copy_help(input: &[u8]) {
         flush_sync(copy);
         let copy_size = finish(copy);
         assert_eq!(usize::try_from(copy.total_in), Ok(input.len()));
-        assert!(copy_size <= copy_output.len());
-        assert!(copy_output[copy_size..].iter().all(|&byte| byte == 0xa5));
+        assert_unwritten_output_unchanged(&copy_output, copy_size);
         // SAFETY: only the source was ended; the copied stream still owns
         // its state and is independently ended once after StreamEnd.
         assert_eq!(unsafe { deflateEnd(copy) }, Z_OK);
@@ -2471,15 +2521,7 @@ fn test_deflate_copy_help(input: &[u8]) {
         full_output
     });
 
-    // Identical outputs alone are not an independent correctness oracle:
-    // verify exact round-trip bytes, including the end of the input.
-    let mut decoded = vec![0xa5u8; input.len().checked_add(32).unwrap_or(0)];
-    assert!(decoded.len() >= input.len());
-    let (plain, status) =
-        zlib_rs::decompress_slice(&mut decoded, &compressed, InflateConfig::default());
-    assert_eq!(status, ReturnCode::Ok);
-    assert_eq!(plain, input);
-    assert!(decoded[input.len()..].iter().all(|&byte| byte == 0xa5));
+    assert_zlib_decodes_exact(&compressed, input);
 }
 
 #[test]
@@ -2662,8 +2704,8 @@ fn gzip_header_survives_deflate_resets_like_zlib_ng() {
     }
 }
 
-#[test]
-fn gzip_with_header() {
+/// Encode the gzip member with all optional header fields; compare both C ABIs.
+fn gzip_with_header_encode() -> Vec<u8> {
     let extra = b"some extra stuff\0";
     let name = b"nomen est omen\0";
     let comment = b"such comment\0";
@@ -2718,9 +2760,9 @@ fn gzip_with_header() {
         stream.avail_in = test_c_uint_len(original.len());
         stream.next_out = compressed_storage.as_mut_ptr();
         stream.avail_out = test_c_uint_len(compressed_storage.len());
-        // SAFETY: read-only original and independent writable output spans
-        // have exact C byte counts and do not alias decoder state.
         assert_eq!(
+            // SAFETY: read-only original and independent writable output spans
+            // have exact C byte counts and do not alias decoder state.
             unsafe { deflate(stream, DeflateFlush::Finish as _) },
             ReturnCode::StreamEnd as c_int
         );
@@ -2739,6 +2781,23 @@ fn gzip_with_header() {
         assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
         compressed_storage[..produced].to_vec()
     });
+
+    compressed
+}
+
+#[test]
+fn gzip_with_header() {
+    let extra = b"some extra stuff\0";
+    let name = b"nomen est omen\0";
+    let comment = b"such comment\0";
+    let original = b"Hello World\n";
+
+    let config = DeflateConfig {
+        window_bits: 31,
+        ..Default::default()
+    };
+
+    let compressed = gzip_with_header_encode();
 
     assert_eq_rs_ng!({
         let mut raw = MaybeUninit::<z_stream>::zeroed();
@@ -2844,7 +2903,7 @@ mod fuzz_based_tests {
     #[test]
     #[cfg_attr(miri, ignore = "too slow")]
     fn compress_lcet10() {
-        fuzz_based_test(LCET10.as_bytes(), DeflateConfig::default(), &[])
+        fuzz_based_test(LCET10.as_bytes(), DeflateConfig::default(), &[]);
     }
 
     #[test]
@@ -2858,7 +2917,7 @@ mod fuzz_based_tests {
 
         for n in 0..=9 {
             config.level = n;
-            fuzz_based_test(PAPER_100K, config, &[])
+            fuzz_based_test(PAPER_100K, config, &[]);
         }
     }
 
@@ -2869,7 +2928,7 @@ mod fuzz_based_tests {
 
         for n in 0..=9 {
             config.level = n;
-            fuzz_based_test(FIREWORKS, config, &[])
+            fuzz_based_test(FIREWORKS, config, &[]);
         }
     }
 
@@ -2885,7 +2944,7 @@ mod fuzz_based_tests {
                 strategy: Strategy::Rle,
             },
             &[56, 17, 99, 0, 2, 54, 0, 0, 11, 0, 7],
-        )
+        );
     }
 
     #[test]
@@ -2975,7 +3034,7 @@ mod fuzz_based_tests {
                 0x0, 0x8e, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x6a,
                 0xf5, 0x63, 0x60, 0x60, 0x3, 0x0, 0xee, 0x8a, 0x88, 0x67,
             ],
-        )
+        );
     }
 
     #[test]
@@ -2993,7 +3052,7 @@ mod fuzz_based_tests {
                 strategy: Strategy::Default,
             },
             &[],
-        )
+        );
     }
 
     #[test]
@@ -3015,7 +3074,7 @@ mod fuzz_based_tests {
                 31, 139, 8, 0, 0, 0, 0, 0, 2, os, 243, 72, 205, 201, 201, 87, 8, 207, 47, 202, 73,
                 81, 4, 0, 163, 28, 41, 28, 12, 0, 0, 0,
             ],
-        )
+        );
     }
 
     #[test]
@@ -3036,7 +3095,7 @@ mod fuzz_based_tests {
                 31, 139, 8, 0, 0, 0, 0, 0, 4, gz_header::OS_CODE, 1, 18, 0, 237, 255, 27, 27, 27, 27, 27, 27, 27,
                 27, 27, 27, 27, 27, 27, 27, 27, 27, 9, 0, 60, 101, 156, 55, 18, 0, 0, 0,
             ],
-        )
+        );
     }
 
     #[test]
@@ -3079,7 +3138,7 @@ mod fuzz_based_tests {
                 strategy: Strategy::Default,
             },
             output,
-        )
+        );
     }
 
     #[test]
@@ -3117,7 +3176,7 @@ mod fuzz_based_tests {
                 strategy: Strategy::Default,
             },
             output,
-        )
+        );
     }
 
     // a change introduced in [commit].
@@ -3137,7 +3196,7 @@ mod fuzz_based_tests {
             &[
                 120, 156, 19, 99, 24, 5, 12, 12, 12, 172, 32, 2, 0, 24, 45, 0, 28,
             ],
-        )
+        );
     }
 
     // Found an arithmetic bug in `fill_window` when using small window_bits.
@@ -3453,97 +3512,99 @@ fn flood_pending_buffer() {
         encoded
     });
 
-    let payload = b"header spanning multiple pending-buffer flushes";
-    let mut restored = vec![0xa5u8; payload.len() + 16];
-    let (decoded, status) = zlib_rs::decompress_slice(
-        &mut restored,
+    assert_gzip_decodes_exact(
         &compressed,
-        InflateConfig { window_bits: 31 },
+        b"header spanning multiple pending-buffer flushes",
     );
-    assert_eq!(status, ReturnCode::Ok);
-    assert_eq!(decoded, payload);
-    assert!(restored[payload.len()..].iter().all(|&byte| byte == 0xa5));
 }
+
+/// Exact 2,067-byte issue #218 input. Kept outside the test body so the
+/// C-stream regression checks remain readable without mutating the trigger.
+const COPY_UNINITIALIZED_WINDOW_SECTION_INPUT: [u8; 2067] = [
+    0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 45, 0, 1, 1, 0, 0, 0, 9, 0, 0, 0, 39, 39, 39, 39, 39, 45,
+    45, 54, 0, 54, 38, 39, 39, 0, 0, 0, 0, 0, 78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 98, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 97, 97, 39, 97, 97, 97, 15, 0, 0, 0, 0,
+    0, 5, 0, 0, 113, 0, 0, 0, 0, 25, 26, 26, 0, 0, 0, 0, 5, 0, 0, 40, 0, 0, 0, 3, 0, 0, 0, 32, 59,
+    0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 2, 0, 0, 39, 39, 39, 39, 39, 39, 39, 61, 64, 61, 61, 61, 61, 61,
+    61, 61, 61, 61, 61, 61, 61, 61, 61, 39, 39, 39, 97, 113, 24, 113, 113, 113, 113, 113, 121, 113,
+    97, 97, 97, 97, 39, 97, 97, 97, 113, 113, 113, 113, 113, 113, 113, 113, 121, 113, 44, 44, 44,
+    0, 0, 0, 10, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 26, 65, 0, 0, 0, 0, 5, 0, 0, 40, 0,
+    0, 0, 3, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 108, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 39, 121, 31, 2, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 121, 0, 0, 0, 0, 123, 121, 0, 121, 121, 121, 0, 0, 0, 0, 0, 0, 110, 1,
+    8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 2, 16, 122, 0, 0, 0, 0, 8, 8, 0, 31, 0, 2, 16,
+    9, 0, 0, 0, 0, 0, 8, 0, 31, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 43, 0, 0, 0, 0, 0, 0, 0, 58,
+    0, 0, 0, 0, 31, 39, 97, 97, 97, 97, 39, 97, 97, 97, 15, 0, 0, 0, 0, 0, 5, 0, 0, 113, 0, 1, 39,
+    26, 26, 25, 48, 0, 0, 0, 0, 5, 0, 0, 40, 0, 0, 0, 3, 0, 0, 0, 32, 59, 0, 0, 0, 0, 0, 91, 31, 0,
+    0, 0, 2, 0, 0, 39, 39, 39, 39, 39, 39, 39, 61, 64, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61,
+    61, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 97, 39, 97, 97, 97, 15, 0, 0, 0, 0, 0, 5, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 61, 61,
+    61, 61, 61, 61, 61, 61, 61, 61, 61, 39, 39, 39, 97, 113, 24, 113, 113, 113, 113, 113, 121, 113,
+    97, 97, 97, 97, 39, 97, 97, 97, 113, 113, 113, 113, 113, 113, 113, 113, 121, 113, 44, 44, 44,
+    0, 0, 0, 10, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 26, 65, 0, 0, 0, 0, 5, 0, 0, 40, 0,
+    0, 0, 3, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 108, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 39, 121, 31, 2, 0, 0, 0, 0, 39, 49, 39, 49, 39, 39, 39, 0, 0, 0, 0, 0,
+    48, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 46, 6, 0, 0, 0, 0, 0, 0, 31, 0, 0,
+    0, 0, 0, 64, 0, 0, 0, 4, 0, 0, 9, 0, 0, 0, 0, 3, 0, 2, 61, 0, 0, 0, 0, 0, 1, 0, 0, 52, 56, 53,
+    53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 40, 0, 10, 4, 0, 0, 0, 0, 0, 0, 46, 121, 121,
+    121, 121, 121, 121, 121, 121, 0, 40, 0, 0, 0, 0, 16, 0, 0, 0, 0,
+];
 
 #[test]
 fn copy_uninitialized_window_section() {
-    // caused a panic because an attempt was made to copy uninitialized bytes within the window.
-    // see also https://github.com/trifectatechfoundation/zlib-rs/issues/218
-    const INPUT: [u8; 2067] = [
-        0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 45, 0, 1, 1, 0, 0, 0, 9, 0, 0, 0, 39, 39, 39, 39, 39,
-        45, 45, 54, 0, 54, 38, 39, 39, 0, 0, 0, 0, 0, 78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 98, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 97, 97, 39,
-        97, 97, 97, 15, 0, 0, 0, 0, 0, 5, 0, 0, 113, 0, 0, 0, 0, 25, 26, 26, 0, 0, 0, 0, 5, 0, 0,
-        40, 0, 0, 0, 3, 0, 0, 0, 32, 59, 0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 2, 0, 0, 39, 39, 39, 39,
-        39, 39, 39, 61, 64, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 39, 39, 39, 97,
-        113, 24, 113, 113, 113, 113, 113, 121, 113, 97, 97, 97, 97, 39, 97, 97, 97, 113, 113, 113,
-        113, 113, 113, 113, 113, 121, 113, 44, 44, 44, 0, 0, 0, 10, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 25, 26, 65, 0, 0, 0, 0, 5, 0, 0, 40, 0, 0, 0, 3, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 108, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 1, 0, 0, 39, 121, 31, 2, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 121, 0, 0, 0, 0, 123, 121, 0, 121, 121, 121, 0, 0, 0, 0, 0, 0, 110, 1, 8, 0,
-        0, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 2, 16, 122, 0, 0, 0, 0, 8, 8, 0, 31, 0, 2, 16, 9,
-        0, 0, 0, 0, 0, 8, 0, 31, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 43, 0, 0, 0, 0, 0, 0, 0,
-        58, 0, 0, 0, 0, 31, 39, 97, 97, 97, 97, 39, 97, 97, 97, 15, 0, 0, 0, 0, 0, 5, 0, 0, 113, 0,
-        1, 39, 26, 26, 25, 48, 0, 0, 0, 0, 5, 0, 0, 40, 0, 0, 0, 3, 0, 0, 0, 32, 59, 0, 0, 0, 0, 0,
-        91, 31, 0, 0, 0, 2, 0, 0, 39, 39, 39, 39, 39, 39, 39, 61, 64, 61, 61, 61, 61, 61, 61, 61,
-        61, 61, 61, 61, 61, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 97, 39, 97, 97, 97, 15, 0,
-        0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121,
-        31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        121, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61,
-        61, 39, 39, 39, 97, 113, 24, 113, 113, 113, 113, 113, 121, 113, 97, 97, 97, 97, 39, 97, 97,
-        97, 113, 113, 113, 113, 113, 113, 113, 113, 121, 113, 44, 44, 44, 0, 0, 0, 10, 0, 0, 1, 4,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 26, 65, 0, 0, 0, 0, 5, 0, 0, 40, 0, 0, 0, 3, 0, 0, 0, 32,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 108, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 31, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 39, 121, 31, 2, 0, 0, 0, 0, 39, 49, 39, 49, 39, 39, 39, 0,
-        0, 0, 0, 0, 48, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        7, 0, 46, 6, 0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 0, 0, 64, 0, 0, 0, 4, 0, 0, 9, 0, 0, 0, 0, 3,
-        0, 2, 61, 0, 0, 0, 0, 0, 1, 0, 0, 52, 56, 53, 53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0,
-        40, 0, 10, 4, 0, 0, 0, 0, 0, 0, 46, 121, 121, 121, 121, 121, 121, 121, 121, 0, 40, 0, 0, 0,
-        0, 16, 0, 0, 0, 0,
-    ];
+    // Regression for upstream issue #218: history-window copying must
+    // never read its as-yet-uninitialized section.
+    let input = &COPY_UNINITIALIZED_WINDOW_SECTION_INPUT;
+    let compressed = compress_issue_218_in_chunks(input);
+    assert_gzip_decodes_exact(&compressed, input);
+}
+
+/// Preserve the issue #218 stream shape: 47-byte chunks, partial flushes,
+/// and a bounded/growing C output suffix under both independent backends.
+fn compress_issue_218_in_chunks(input: &[u8]) -> Vec<u8> {
+    const CHUNK: usize = 47;
 
     let config = DeflateConfig {
         level: 0,
@@ -3554,24 +3615,8 @@ fn copy_uninitialized_window_section() {
     };
 
     let compressed = assert_eq_rs_ng!({
-        // This local helper is compiled separately against the reference
-        // zlib-ng and fork C ABI stream types by assert_eq_rs_ng!.
-        fn prepare_output(stream: &mut z_stream, output: &mut Vec<u8>) {
-            let used = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
-            assert!(used <= output.len(), "encoder exceeded output allocation");
-            if used == output.len() {
-                let expanded = output.len().checked_mul(2).unwrap_or(0);
-                assert!(expanded > output.len(), "compressed output size overflow");
-                output.resize(expanded, 0xa5);
-            }
-            // Previous output bytes must survive Vec growth/reallocation.
-            // Repoint to the unwritten suffix, never the buffer beginning.
-            stream.next_out = output[used..].as_mut_ptr();
-            stream.avail_out = test_c_uint_len(output.len() - used);
-        }
-
         let mut header = gz_header {
-            text: 825307441,
+            text: 825_307_441,
             time: 14641,
             xflags: 0,
             os: 0,
@@ -3611,19 +3656,19 @@ fn copy_uninitialized_window_section() {
         // The bound applies to a single finish operation; PartialFlush may
         // produce additional blocks, so the output can need more space.
         // SAFETY: deflateBound only reads the initialized encoder state.
-        let bound = unsafe { deflateBound(stream, test_c_ulong_len(INPUT.len())) };
+        let bound = unsafe { deflateBound(stream, test_c_ulong_len(input.len())) };
         let initial_capacity = usize::try_from(bound).unwrap_or(0);
         assert!(initial_capacity > 0, "invalid compressed output bound");
         let mut encoded = vec![0xa5u8; initial_capacity];
-        const CHUNK: usize = 47;
-
         // Offer each source span exactly once. A successful deflate call is
         // not guaranteed to have consumed the entire offered input chunk.
-        for part in INPUT.chunks(CHUNK) {
+        for part in input.chunks(CHUNK) {
             stream.next_in = part.as_ptr().cast_mut();
             stream.avail_in = test_c_uint_len(part.len());
             while stream.avail_in != 0 {
-                prepare_output(stream, &mut encoded);
+                let (out, available) = checked_test_output_suffix(&mut encoded, stream.total_out);
+                stream.next_out = out;
+                stream.avail_out = available;
                 let input_before = stream.total_in;
                 let output_before = stream.total_out;
                 // SAFETY: part is a live readable input span and the output
@@ -3640,12 +3685,14 @@ fn copy_uninitialized_window_section() {
                 );
             }
         }
-        assert_eq!(usize::try_from(stream.total_in), Ok(INPUT.len()));
+        assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
 
         // Finish while retaining all previously produced output and
         // requiring progress before retrying with any remaining capacity.
         loop {
-            prepare_output(stream, &mut encoded);
+            let (out, available) = checked_test_output_suffix(&mut encoded, stream.total_out);
+            stream.next_out = out;
+            stream.avail_out = available;
             let output_before = stream.total_out;
             // SAFETY: input has been consumed; the encoder has live state
             // and a writable, correctly sized output suffix.
@@ -3669,7 +3716,7 @@ fn copy_uninitialized_window_section() {
             produced <= encoded.len(),
             "encoder exceeded allocated output"
         );
-        assert_eq!(usize::try_from(stream.total_in), Ok(INPUT.len()));
+        assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
         assert_eq!(
             &encoded[produced..],
             &vec![0xa5u8; encoded.len() - produced]
@@ -3681,22 +3728,7 @@ fn copy_uninitialized_window_section() {
         encoded
     });
 
-    // Differential compressed-byte equality alone is insufficient:
-    // two backends could both produce the same truncated/corrupt member
-    // if the harness skipped input or reset next_out after reallocation.
-    let mut decoded = vec![0xa5u8; INPUT.len() + 32];
-    let (plain, status) = zlib_rs::inflate::decompress_slice(
-        &mut decoded,
-        &compressed,
-        InflateConfig { window_bits: 31 },
-    );
-    assert_eq!(status, ReturnCode::Ok);
-    assert_eq!(plain, INPUT);
-    assert_eq!(
-        &decoded[INPUT.len()..],
-        &vec![0xa5u8; 32],
-        "decoded output exceeded the expected payload"
-    );
+    compressed
 }
 
 /// Return the exact unwritten suffix of an initialized output buffer,
@@ -4163,22 +4195,28 @@ fn test_issue_455() {
         70, 255, 255,
     ];
 
-    assert_eq!(
-        assert_eq_rs_ng!(unsafe {
-            let mut output = [0u8; 32];
-            let mut length = 32;
+    let result = assert_eq_rs_ng!({
+        // The advertised C output is 32 bytes; the additional 16 bytes must
+        // remain untouched even though the backing buffer is larger.
+        let mut output = [0xa5u8; 48];
+        let mut length: c_ulong = 32;
+        // SAFETY: a live read-only source and the writable first 32 bytes
+        // of output are disjoint; length is a writable C unsigned long.
+        let status = unsafe {
             compress(
                 output.as_mut_ptr(),
                 &raw mut length,
                 data.as_ptr(),
-                data.len() as _,
+                test_c_ulong_len(data.len()),
             )
-        }),
-        ReturnCode::BufError as _
-    );
+        };
+        assert!(output[32..].iter().all(|&byte| byte == 0xa5));
+        status
+    });
+    assert_eq!(result, ReturnCode::BufError as c_int);
 }
 
-/// See https://github.com/trifectatechfoundation/zlib-rs/issues/459.
+/// See <https://github.com/trifectatechfoundation/zlib-rs/issues/459>.
 mod deflate_reset_deterministic {
     use super::{test_c_stream_size, test_c_uint_len};
     use core::mem::MaybeUninit;
