@@ -206,7 +206,6 @@ pub fn compress_slices_batch_gpu(
     let Some(max_dist) = configured_max_dist(config) else {
         return Ok(compress_synchronously(jobs, config));
     };
-    let max_dist = u32::try_from(max_dist).expect("DEFLATE max distance fits u32");
     let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
     let tables = searcher.search_batch_with_max_dist(&inputs, search_budget, max_dist)?;
     let mut resolver = WholeInputTableResolver { tables: &tables };
@@ -227,7 +226,7 @@ const fn uses_match_search(algorithm: Algorithm) -> bool {
 }
 
 #[cfg(feature = "gpu")]
-fn configured_max_dist(config: DeflateConfig) -> Option<usize> {
+fn configured_max_dist(config: DeflateConfig) -> Option<u32> {
     let mut window_bits = config.window_bits;
     let zlib_wrapper = if window_bits < 0 {
         if window_bits < -MAX_WBITS {
@@ -248,9 +247,11 @@ fn configured_max_dist(config: DeflateConfig) -> Option<usize> {
     let effective_bits = if window_bits == 8 {
         9
     } else {
-        window_bits as usize
+        u32::try_from(window_bits).ok()?
     };
-    Some((1usize << effective_bits) - super::MIN_LOOKAHEAD)
+    // The GPU uses u32 positions; compute the exact zlib distance bound in
+    // that representation, or decline GPU acceleration if it cannot fit.
+    (1u32.checked_shl(effective_bits)?).checked_sub(u32::try_from(super::MIN_LOOKAHEAD).ok()?)
 }
 
 trait MatchResolver {
@@ -559,16 +560,20 @@ impl<'a> BatchRuntime<'a> {
         work.request(&self.stream.state)
     }
 
+    /// Absolute index in the full input slice of the next token to resolve.
+    /// The raw zlib total can wrap (notably 32-bit C long on Windows), while
+    /// the issued-slice budget retains the full position without changing the
+    /// C stream representation.
+    #[cfg(feature = "gpu")]
+    fn absolute_match_position(&self) -> Option<usize> {
+        self.input_budget
+            .processed(self.stream.avail_in)
+            .checked_sub(self.stream.state.lookahead)
+    }
+
     #[cfg(feature = "gpu")]
     fn match_from_table(&self, table: &GpuMatchTable) -> MatchSearchResult {
-        let stream = &self.stream;
-        let state = &*stream.state;
-        let total_in =
-            usize::try_from(stream.total_in).expect("batch whole-input position must fit usize");
-        let absolute_position = total_in
-            .checked_sub(state.lookahead)
-            .expect("lookahead cannot exceed total batch input consumed");
-
+        let state = &*self.stream.state;
         let incumbent_length = if state.prev_length == 0 {
             STD_MIN_MATCH - 1
         } else {
@@ -577,18 +582,23 @@ impl<'a> BatchRuntime<'a> {
         .min(state.lookahead);
         let incumbent = MatchSearchResult::new(incumbent_length, state.match_start);
 
+        let Some(absolute_position) = self.absolute_match_position() else {
+            return incumbent;
+        };
         let Some(candidate) = table.get(absolute_position) else {
             return incumbent;
         };
-        let candidate_length = usize::try_from(candidate.length)
-            .expect("GPU match length fits usize")
-            .min(state.lookahead);
+        let Ok(candidate_length) = usize::try_from(candidate.length) else {
+            return incumbent;
+        };
+        let candidate_length = candidate_length.min(state.lookahead);
         if candidate_length <= incumbent_length {
             return incumbent;
         }
 
-        let candidate_start =
-            usize::try_from(candidate.start).expect("GPU absolute match position fits usize");
+        let Ok(candidate_start) = usize::try_from(candidate.start) else {
+            return incumbent;
+        };
         let Some(distance) = absolute_position.checked_sub(candidate_start) else {
             return incumbent;
         };
@@ -741,13 +751,15 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
-    fn gpu_window_distance_matches_deflate_initialization() {
+    fn gpu_window_distance_matches_deflate_initialization() -> Result<(), &'static str> {
+        let lookahead = u32::try_from(super::super::MIN_LOOKAHEAD)
+            .map_err(|_| "DEFLATE lookahead must fit in u32")?;
         let cases = [
-            (8, (1usize << 9) - super::super::MIN_LOOKAHEAD),
-            (9, (1usize << 9) - super::super::MIN_LOOKAHEAD),
-            (15, (1usize << 15) - super::super::MIN_LOOKAHEAD),
-            (-15, (1usize << 15) - super::super::MIN_LOOKAHEAD),
-            (31, (1usize << 15) - super::super::MIN_LOOKAHEAD),
+            (8, (1u32 << 9) - lookahead),
+            (9, (1u32 << 9) - lookahead),
+            (15, (1u32 << 15) - lookahead),
+            (-15, (1u32 << 15) - lookahead),
+            (31, (1u32 << 15) - lookahead),
         ];
         for (window_bits, expected) in cases {
             let config = DeflateConfig {
@@ -764,6 +776,37 @@ mod tests {
             };
             assert_eq!(configured_max_dist(config), None);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_match_position_ignores_wrapping_c_total() -> Result<(), &'static str> {
+        let input = [0x43u8; 128];
+        let mut output = [0u8; 512];
+        let config = DeflateConfig::new(2);
+        let algorithm = configured_algorithm(config).ok_or("valid GPU test algorithm missing")?;
+        let mut runtime = BatchRuntime::new(
+            0,
+            &input,
+            &mut output,
+            config,
+            algorithm,
+            MatchSourceKind::HashChain,
+        )
+        .map_err(|_| "unable to initialize test compressor")?;
+        // The whole input is offered but no bytes consumed yet. The live C
+        // counter may have wrapped without affecting this absolute position.
+        runtime.stream.total_in = crate::c_api::z_size::MAX;
+        assert_eq!(runtime.absolute_match_position(), Some(0));
+
+        // Simulate 23 bytes consumed and 11 bytes retained in lookahead.
+        runtime.stream.avail_in -= 23;
+        runtime.stream.state.lookahead = 11;
+        assert_eq!(runtime.absolute_match_position(), Some(12));
+        runtime.stream.state.lookahead = 24;
+        assert_eq!(runtime.absolute_match_position(), None);
+        Ok(())
     }
 
     #[test]
@@ -798,27 +841,33 @@ mod tests {
     }
 
     #[test]
-    fn external_match_source_crosses_window_slides_without_hash_chain() {
+    fn external_match_source_crosses_window_slides_without_hash_chain() -> Result<(), &'static str>
+    {
         let input = (0..120_000)
-            .map(|index| ((index * 73 + index / 19) % 251) as u8)
-            .collect::<Vec<_>>();
+            .map(|index| {
+                u8::try_from((index * 73 + index / 19) % 251)
+                    .map_err(|_| "generated external-match input byte is out of range")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         for level in [2, 6, 9] {
             let config = DeflateConfig::new(level);
-            let algorithm = configured_algorithm(config).expect("valid standard algorithm");
+            let algorithm = configured_algorithm(config)
+                .ok_or("valid standard deflate algorithm is missing")?;
             assert!(uses_match_search(algorithm));
 
             let mut output = vec![0u8; compress_bound(input.len()) + 64];
-            let mut jobs = [BatchCompressJob::new(&input, &mut output)];
-            let mut resolver = NoMatchExternalResolver;
-            let results = compress_scheduled(
-                &mut jobs,
-                config,
-                algorithm,
-                MatchSourceKind::External,
-                &mut resolver,
-            );
-            drop(jobs);
+            let results = {
+                let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+                let mut resolver = NoMatchExternalResolver;
+                compress_scheduled(
+                    &mut jobs,
+                    config,
+                    algorithm,
+                    MatchSourceKind::External,
+                    &mut resolver,
+                )
+            };
 
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].code, ReturnCode::Ok, "level {level}");
@@ -832,13 +881,19 @@ mod tests {
             assert_eq!(code, ReturnCode::Ok, "level {level}");
             assert_eq!(decoded, input.as_slice(), "level {level}");
         }
+        Ok(())
     }
 
     #[test]
-    fn batch_matches_independent_standard_compression() {
+    fn batch_matches_independent_standard_compression() -> Result<(), &'static str> {
         let inputs = [
             b"batch-alpha/".repeat(7_000),
-            (0..90_000).map(|i| ((i * 37) % 251) as u8).collect(),
+            (0..90_000)
+                .map(|i| {
+                    u8::try_from((i * 37) % 251)
+                        .map_err(|_| "generated batch input byte is out of range")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".repeat(3_000),
             Vec::new(),
         ];
@@ -890,6 +945,7 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -929,13 +985,16 @@ mod tests {
     }
 
     #[test]
-    fn scoped_thread_backend_matches_scalar_batch_output() {
+    fn scoped_thread_backend_matches_scalar_batch_output() -> Result<(), &'static str> {
         let inputs = [
             b"threaded-search-alpha/".repeat(6_000),
             b"threaded-search-beta/beta/beta/".repeat(5_000),
             (0..140_000)
-                .map(|i| (((i / 17) * 31 + i % 7) % 251) as u8)
-                .collect(),
+                .map(|i| {
+                    u8::try_from(((i / 17) * 31 + i % 7) % 251)
+                        .map_err(|_| "generated threaded-search input byte is out of range")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             b"abcabcabcabcabcabcabcabcabcabcabcabc".repeat(4_500),
         ];
         let config = DeflateConfig {
@@ -989,6 +1048,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[cfg(feature = "parallel")]
@@ -1086,10 +1146,10 @@ mod tests {
         let config = DeflateConfig::new(6);
         let (reference, reference_code) = independent(&input, config, 4);
         let mut output = [0u8; 4];
-        let mut jobs = [BatchCompressJob::new(&input, &mut output)];
-
-        let results = compress_slices_batch(&mut jobs, config);
-        drop(jobs);
+        let results = {
+            let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+            compress_slices_batch(&mut jobs, config)
+        };
 
         assert_eq!(results[0].code, reference_code);
         assert_eq!(results[0].written, reference.len());
