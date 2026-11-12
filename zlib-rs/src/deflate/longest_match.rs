@@ -82,6 +82,8 @@ pub enum MatchSearchRequestError {
     UninitializedWindow,
     /// The advertised history index cannot be represented by the allocated table.
     InvalidHashHistory,
+    /// A token producer was asked to advance before its prior search completed.
+    OutstandingSearch,
 }
 
 impl MatchSearchWork {

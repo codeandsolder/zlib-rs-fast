@@ -23,18 +23,18 @@ pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState
     }
 
     loop {
-        if pending_needs_drain(stream.state) {
-            if drain_pending_output(stream.state, stream.output) == DrainOutcome::OutputFull {
-                return if last
-                    && stream.input.avail_in == 0
-                    && stream.state.bit_writer.bits_valid == 0
-                    && stream.state.block_open == 0
-                {
-                    BlockState::FinishStarted
-                } else {
-                    BlockState::NeedMore
-                };
-            }
+        if pending_needs_drain(stream.state)
+            && drain_pending_output(stream.state, stream.output) == DrainOutcome::OutputFull
+        {
+            return if last
+                && stream.input.avail_in == 0
+                && stream.state.bit_writer.bits_valid == 0
+                && stream.state.block_open == 0
+            {
+                BlockState::FinishStarted
+            } else {
+                BlockState::NeedMore
+            };
         }
 
         match ensure_input(stream, MIN_LOOKAHEAD, flush) {
@@ -68,7 +68,8 @@ pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState
 fn start_block(state: &mut State<'_>, last: bool) {
     state.bit_writer.emit_tree(BlockType::StaticTrees, last);
     state.block_open = 1 + u8::from(last);
-    state.block_start = state.strstart as isize;
+    // DEFLATE window positions fit in isize; retain the existing signed conversion.
+    state.block_start = state.strstart.cast_signed();
 }
 
 fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> {
@@ -77,12 +78,12 @@ fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> 
     }
 
     {
-        let state = &mut stream.state;
+        let state = &mut *stream.state;
         state
             .bit_writer
             .emit_end_block_and_align(StaticTreeDesc::L.static_tree, last);
         state.block_open = 0;
-        state.block_start = state.strstart as isize;
+        state.block_start = state.strstart.cast_signed();
     }
 
     (drain_pending_output(stream.state, stream.output) == DrainOutcome::OutputFull).then_some(
@@ -116,9 +117,11 @@ fn emit_next(state: &mut State<'_>) {
                     );
 
                 if match_len >= WANT_MIN_MATCH {
+                    // The static writer accepts a host-width length code.
+                    // The matched span already bounds this to 0..=255.
                     state
                         .bit_writer
-                        .emit_dist_static((match_len - STD_MIN_MATCH) as u8, distance);
+                        .emit_dist_static(match_len - STD_MIN_MATCH, distance);
                     state.lookahead -= match_len;
                     state.strstart += match_len;
                     return;

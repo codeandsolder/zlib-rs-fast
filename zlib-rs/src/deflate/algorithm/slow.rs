@@ -2,7 +2,9 @@
 
 use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::HashCalcVariant;
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
+use crate::deflate::longest_match::{
+    MatchSearchKind, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+};
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,14 +38,18 @@ impl SlowProducer {
 
 impl TokenProducer for SlowProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        // The detached search result already carries a bounded u16 length.
+        // Keep that type through the lazy-match state machine.
+        const NO_MATCH_LENGTH: u16 = 2;
+        const _: () = assert!(STD_MIN_MATCH == 3);
         loop {
             let match_len = match self.phase {
                 SlowPhase::SearchReady(result) => {
                     self.phase = SlowPhase::Ready;
                     state.match_start = result.start;
-                    let mut length = usize::from(result.length);
+                    let mut length = result.length;
                     if length <= 5 && state.strategy == Strategy::Filtered {
-                        length = STD_MIN_MATCH - 1;
+                        length = NO_MATCH_LENGTH;
                     }
                     length
                 }
@@ -84,16 +90,16 @@ impl TokenProducer for SlowProducer {
                         }
                     }
 
-                    STD_MIN_MATCH - 1
+                    NO_MATCH_LENGTH
                 }
                 SlowPhase::AwaitingSearch => {
-                    panic!("slow producer cannot advance while match search is outstanding")
+                    return ProduceStatus::MatchSearchError(
+                        MatchSearchRequestError::OutstandingSearch,
+                    );
                 }
             };
 
-            if usize::from(state.prev_length) >= STD_MIN_MATCH
-                && match_len <= usize::from(state.prev_length)
-            {
+            if usize::from(state.prev_length) >= STD_MIN_MATCH && match_len <= state.prev_length {
                 let max_insert = state.strstart + state.lookahead - STD_MIN_MATCH;
                 let block_ready = state.tally_dist(
                     state.strstart - 1 - usize::from(state.prev_match),
@@ -123,15 +129,15 @@ impl TokenProducer for SlowProducer {
                     // zlib encodes this full block before advancing the lazy-match cursor. Keep that
                     // ordering explicit so stored-block length/accounting remains bit-for-bit stable.
                     return ProduceStatus::BlockReady(BlockContinuation::AdvanceLazyMatch {
-                        match_len: match_len as u16,
+                        match_len,
                     });
                 }
 
-                state.prev_length = match_len as u16;
+                state.prev_length = match_len;
                 state.strstart += 1;
                 state.lookahead -= 1;
             } else {
-                state.prev_length = match_len as u16;
+                state.prev_length = match_len;
                 state.match_available = true;
                 self.match_available = true;
                 state.strstart += 1;
@@ -170,6 +176,18 @@ mod tests {
     use super::*;
     use crate::deflate::{end, tune, DeflateConfig, DeflateStream};
     use crate::ReturnCode;
+
+    #[test]
+    fn advancing_an_unfinished_match_returns_a_typed_error() -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(7))?;
+        let mut producer = SlowProducer::new(&stream.state, MatchSourceKind::HashChain);
+        producer.phase = SlowPhase::AwaitingSearch;
+        assert!(matches!(
+            producer.produce(&mut stream.state, false),
+            ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn specialized_search_requires_rolling_hash_history() -> Result<(), crate::ReturnCode> {

@@ -4,7 +4,9 @@ use super::{
     BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN,
 };
 use crate::deflate::hash_calc::StandardHashCalc;
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
+use crate::deflate::longest_match::{
+    MatchSearchKind, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+};
 use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,11 +89,9 @@ impl TokenProducer for FastProducer {
                 continue;
             }
 
-            assert_eq!(
-                self.phase,
-                FastPhase::Ready,
-                "fast producer cannot advance while match search is outstanding"
-            );
+            if self.phase != FastPhase::Ready {
+                return ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch);
+            }
 
             if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
                 return ProduceStatus::NeedInput;
@@ -152,5 +152,24 @@ impl TokenProducer for FastProducer {
             "fast producer cannot finish while match search is outstanding"
         );
         state.strstart.min(STD_MIN_MATCH - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_match_search_is_a_typed_error() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(2))?;
+        let mut producer = FastProducer::new(MatchSourceKind::HashChain);
+        producer.phase = FastPhase::AwaitingSearch { literal: b'a' };
+        assert!(matches!(
+            producer.produce(&mut stream.state, false),
+            ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch)
+        ));
+        Ok(())
     }
 }

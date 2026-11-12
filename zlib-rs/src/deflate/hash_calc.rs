@@ -8,7 +8,7 @@ use crate::deflate::{State, HASH_SIZE, STD_MIN_MATCH};
 // The source bytes are laid out in little-endian order irrespective of the
 // target's native endianness, and this compiles to a truncation instruction.
 #[inline]
-const fn hash_chain_position(position: usize) -> u16 {
+pub(super) const fn hash_chain_position(position: usize) -> u16 {
     let bytes = position.to_le_bytes();
     u16::from_le_bytes([bytes[0], bytes[1]])
 }

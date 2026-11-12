@@ -3,8 +3,10 @@
 use super::{
     BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN,
 };
-use crate::deflate::hash_calc::StandardHashCalc;
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
+use crate::deflate::hash_calc::{hash_chain_position, StandardHashCalc};
+use crate::deflate::longest_match::{
+    MatchSearchKind, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+};
 use crate::deflate::{MatchCandidate, State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 type Match = MatchCandidate;
@@ -104,7 +106,7 @@ impl MediumProducer {
                     0
                 };
 
-                current_match.strstart = state.strstart as u16;
+                current_match.strstart = hash_chain_position(state.strstart);
                 current_match.orgstart = current_match.strstart;
 
                 if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
@@ -143,7 +145,7 @@ impl MediumProducer {
                 state.lookahead = future_lookahead;
                 let hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
 
-                next_match.strstart = state.strstart as u16;
+                next_match.strstart = hash_chain_position(state.strstart);
                 next_match.orgstart = next_match.strstart;
 
                 if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
@@ -218,7 +220,7 @@ impl TokenProducer for MediumProducer {
                         continue;
                     }
 
-                    self.current_match.strstart = state.strstart as u16;
+                    self.current_match.strstart = hash_chain_position(state.strstart);
                     self.current_match.orgstart = self.current_match.strstart;
 
                     if self.match_source == MatchSourceKind::External {
@@ -252,10 +254,10 @@ impl TokenProducer for MediumProducer {
                     self.current_match.match_length = 1;
                     self.phase = MediumPhase::AfterCurrentSearch;
                 }
-                MediumPhase::AwaitingCurrentSearch => {
-                    panic!(
-                        "medium producer cannot advance while current match search is outstanding"
-                    )
+                MediumPhase::AwaitingCurrentSearch | MediumPhase::AwaitingFutureSearch { .. } => {
+                    return ProduceStatus::MatchSearchError(
+                        MatchSearchRequestError::OutstandingSearch,
+                    );
                 }
                 MediumPhase::AfterCurrentSearch => {
                     insert_match(state, self.current_match, self.match_source);
@@ -273,7 +275,7 @@ impl TokenProducer for MediumProducer {
                         let current_lookahead = state.lookahead;
                         state.strstart = future_start;
                         state.lookahead = future_lookahead;
-                        self.next_match.strstart = state.strstart as u16;
+                        self.next_match.strstart = hash_chain_position(state.strstart);
                         self.next_match.orgstart = self.next_match.strstart;
 
                         if self.match_source == MatchSourceKind::External {
@@ -308,11 +310,6 @@ impl TokenProducer for MediumProducer {
                         self.next_match.match_length = 0;
                     }
                     self.phase = MediumPhase::AfterFutureSearch;
-                }
-                MediumPhase::AwaitingFutureSearch { .. } => {
-                    panic!(
-                        "medium producer cannot advance while future match search is outstanding"
-                    )
                 }
                 MediumPhase::AfterFutureSearch => {
                     let block_ready = emit_match(state, self.current_match);
@@ -386,7 +383,7 @@ fn emit_match(state: &mut State, m: Match) -> bool {
     bflush
 }
 
-#[inline(always)]
+#[inline]
 fn insert_match(state: &mut State, mut m: Match, match_source: MatchSourceKind) {
     if match_source == MatchSourceKind::External {
         return;
@@ -526,6 +523,29 @@ fn fizzle_matches(window: &[u8], max_dist: usize, current: &mut Match, next: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producing_with_unfinished_search_returns_typed_error() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let state = &mut *stream.state;
+        let mut producer = MediumProducer::new(state, MatchSourceKind::HashChain);
+
+        for phase in [
+            MediumPhase::AwaitingCurrentSearch,
+            MediumPhase::AwaitingFutureSearch {
+                current_lookahead: 11,
+            },
+        ] {
+            producer.phase = phase;
+            assert!(matches!(
+                producer.produce(state, false),
+                ProduceStatus::MatchSearchError(MatchSearchRequestError::OutstandingSearch)
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn fizzle_uses_valid_history_indices_and_preserves_match_distance() {

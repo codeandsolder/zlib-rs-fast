@@ -1635,8 +1635,8 @@ impl<'a> BitWriter<'a> {
         usize::from(bits.len)
     }
 
-    pub(crate) fn emit_dist_static(&mut self, lc: u8, dist: u16) -> usize {
-        let mut bits = PackedBits::code(trees_tbl::STATIC_LTREE_ENCODINGS[usize::from(lc)]);
+    pub(crate) fn emit_dist_static(&mut self, lc: usize, dist: u16) -> usize {
+        let mut bits = PackedBits::code(trees_tbl::STATIC_LTREE_ENCODINGS[lc]);
         bits.append(encode_dist(&trees_tbl::STATIC_DTREE, dist));
         self.send_bits(bits.value, bits.len);
         usize::from(bits.len)
@@ -2126,7 +2126,7 @@ impl<'a> State<'a> {
         for (dist, lc) in self.sym_buf.iter() {
             match dist {
                 0 => self.bit_writer.emit_lit(ltree, lc) as usize,
-                _ => self.bit_writer.emit_dist_static(lc, dist),
+                _ => self.bit_writer.emit_dist_static(usize::from(lc), dist),
             };
         }
 
