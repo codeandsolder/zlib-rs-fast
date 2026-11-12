@@ -1,8 +1,5 @@
-use core::ffi::{c_char, c_int, c_uint, c_ulong, CStr};
+use core::ffi::{c_char, c_int, c_uint, c_ulong};
 use std::{ffi::CString, mem::MaybeUninit};
-
-// we use the libz_sys but configure zlib-ng in zlib compat mode
-use libz_sys as libz_ng_sys;
 
 use libz_rs_sys::{
     deflate, deflateEnd, deflateInit2_, inflate, inflateEnd, inflateInit2_, Z_DEFLATED, Z_FILTERED,
@@ -1721,137 +1718,215 @@ fn small_window() {
     );
 }
 
+/// The optional pending-byte and pending-bit outputs must agree regardless
+/// of which of the two output pointers is omitted.
+fn assert_pending_query_variants(stream: &mut libz_rs_sys::z_stream) {
+    let mut pending_bytes: c_uint = 0;
+    let mut pending_bits: c_int = -1;
+    // SAFETY: the initialized stream is live and both optional outputs
+    // are null, an accepted query form.
+    let null_query = unsafe {
+        libz_rs_sys::deflatePending(stream, core::ptr::null_mut(), core::ptr::null_mut())
+    };
+    assert_eq!(null_query, Z_OK);
+    // SAFETY: pending_bytes is a live writable C unsigned integer.
+    let byte_query = unsafe {
+        libz_rs_sys::deflatePending(stream, &raw mut pending_bytes, core::ptr::null_mut())
+    };
+    assert_eq!(byte_query, Z_OK);
+    let byte_only = pending_bytes;
+    // SAFETY: pending_bits is a live writable C signed integer.
+    let bit_query = unsafe {
+        libz_rs_sys::deflatePending(stream, core::ptr::null_mut(), &raw mut pending_bits)
+    };
+    assert_eq!(bit_query, Z_OK);
+    let bit_only = pending_bits;
+    // SAFETY: both independent output integers are live and writable.
+    let both_query = unsafe {
+        libz_rs_sys::deflatePending(stream, &raw mut pending_bytes, &raw mut pending_bits)
+    };
+    assert_eq!(both_query, Z_OK);
+    assert_eq!(pending_bytes, byte_only);
+    assert_eq!(pending_bits, bit_only);
+    assert!((0..=7).contains(&pending_bits));
+}
+
 #[test]
 fn test_deflate_pending() {
-    const HELLO: &str = "hello, hello!\0";
-
+    const INPUT: &[u8] = b"hello, hello!\0";
     let config = DeflateConfig::default();
-
-    let mut strm = MaybeUninit::zeroed();
-
-    unsafe {
-        // first validate the config
-        let err = libz_rs_sys::deflateInit2_(
-            strm.as_mut_ptr(),
+    let mut raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: caller-owned C stream, valid zlib options and checked ABI metadata.
+    let init = unsafe {
+        libz_rs_sys::deflateInit2_(
+            raw.as_mut_ptr(),
             config.level,
-            config.method as i32,
+            config.method as c_int,
             config.window_bits,
             config.mem_level,
-            config.strategy as i32,
+            config.strategy as c_int,
             VERSION,
             test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
+        )
+    };
+    assert_eq!(init, Z_OK);
+    // SAFETY: successful initialization populated the C stream.
+    let stream = unsafe { raw.assume_init_mut() };
 
-        let strm = strm.assume_init_mut();
-
-        let mut compr = [0; 32];
-        strm.next_in = HELLO.as_ptr().cast_mut();
-        strm.next_out = compr.as_mut_ptr();
-
-        let it_in = HELLO.as_bytes().chunks(1);
-        let mut it_out = compr.chunks(1);
-
-        for (_, _) in it_in.zip(&mut it_out) {
-            strm.avail_in = 1;
-            strm.avail_out = 1;
-            let err = deflate(strm, DeflateFlush::NoFlush as i32);
-            assert_eq!(err, 0);
-        }
-
-        let mut ped = 0;
-        let mut bits = 0;
-
-        let err = libz_rs_sys::deflatePending(strm, std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(err, 0);
-
-        let err = libz_rs_sys::deflatePending(strm, &raw mut ped, std::ptr::null_mut());
-        assert_eq!(err, 0);
-
-        let err = libz_rs_sys::deflatePending(strm, std::ptr::null_mut(), &raw mut bits);
-        assert_eq!(err, 0);
-
-        let err = libz_rs_sys::deflatePending(strm, &raw mut ped, &raw mut bits);
-        assert_eq!(err, 0);
-
-        assert!(bits >= 0);
-        assert!(bits <= 7);
-
-        /* Finish the stream, still forcing small buffers: */
-        for _ in it_out {
-            strm.avail_out = 1;
-            let err = deflate(strm, libz_rs_sys::Z_FINISH);
-            if err == libz_rs_sys::Z_STREAM_END {
+    let mut compressed = [0xa5u8; 128];
+    stream.next_in = INPUT.as_ptr().cast_mut();
+    // Offer one new input byte at a time, preserving next_in/avail_in
+    // whenever the tiny output buffer prevents immediate consumption.
+    for consumed in 1..=INPUT.len() {
+        stream.avail_in = 1;
+        loop {
+            let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+            assert!(written < compressed.len(), "compressed output overflow");
+            stream.next_out = compressed[written..].as_mut_ptr();
+            stream.avail_out = 1;
+            let before = (stream.total_in, stream.total_out);
+            // SAFETY: one unread input byte and one writable output byte
+            // remain live and disjoint for this call.
+            let status = unsafe { deflate(stream, Z_NO_FLUSH) };
+            assert_eq!(status, Z_OK);
+            assert_ne!(
+                (stream.total_in, stream.total_out),
+                before,
+                "deflate stalled"
+            );
+            if stream.avail_in == 0 {
                 break;
-            };
-            assert_eq!(err, 0);
+            }
         }
-
-        let err = deflateEnd(strm);
-        assert_eq!(err, 0);
+        assert_eq!(usize::try_from(stream.total_in), Ok(consumed));
     }
+
+    assert_pending_query_variants(stream);
+
+    // Continue with one-byte output windows until the full stream ends,
+    // rather than assuming the remainder of a 32-byte scratch is enough.
+    loop {
+        let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+        assert!(written < compressed.len(), "compressed output overflow");
+        stream.next_out = compressed[written..].as_mut_ptr();
+        stream.avail_out = 1;
+        let before = (stream.total_in, stream.total_out);
+        // SAFETY: input is fully consumed, the live output suffix has one
+        // writable byte, and the encoder remains initialized.
+        let status = unsafe { deflate(stream, libz_rs_sys::Z_FINISH) };
+        if status == libz_rs_sys::Z_STREAM_END {
+            break;
+        }
+        assert_eq!(status, Z_OK);
+        assert_ne!(
+            (stream.total_in, stream.total_out),
+            before,
+            "finish stalled"
+        );
+    }
+    assert_eq!(stream.avail_in, 0);
+    assert_eq!(usize::try_from(stream.total_in), Ok(INPUT.len()));
+    let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert!(written <= compressed.len());
+    assert!(compressed[written..].iter().all(|&byte| byte == 0xa5));
+    // SAFETY: successful initialization is paired with one stream teardown.
+    assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+
+    let mut restored = [0xa5u8; INPUT.len() + 16];
+    let (decoded, status) = zlib_rs::decompress_slice(
+        &mut restored,
+        &compressed[..written],
+        InflateConfig::default(),
+    );
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, INPUT);
+    assert_eq!(&restored[INPUT.len()..], &[0xa5u8; 16]);
+}
+
+/// Exercise the zlib-rs extension that reports the occupied bits of the
+/// last compressed byte, including the whole finished stream and its payload.
+fn assert_deflate_used_round_trip(level: c_int, input: &[u8], expected_bits: c_int) {
+    let config = DeflateConfig {
+        level,
+        ..DeflateConfig::default()
+    };
+    let mut raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: writable stream and valid zlib compression options; C ABI
+    // version and structure width match the compiled implementation.
+    let init = unsafe {
+        libz_rs_sys::deflateInit2_(
+            raw.as_mut_ptr(),
+            config.level,
+            config.method as c_int,
+            config.window_bits,
+            config.mem_level,
+            config.strategy as c_int,
+            VERSION,
+            test_c_stream_size::<libz_rs_sys::z_stream>(),
+        )
+    };
+    assert_eq!(init, Z_OK);
+    // SAFETY: successful initialization filled the C stream.
+    let stream = unsafe { raw.assume_init_mut() };
+
+    // SAFETY: the live stream accepts an optional null bits pointer.
+    let null_status = unsafe { libz_rs_sys::deflateUsed(stream, core::ptr::null_mut()) };
+    assert_eq!(null_status, Z_OK);
+    let mut bits: c_int = -1;
+    // SAFETY: the writable bits output outlives this query.
+    let pre_finish_status = unsafe { libz_rs_sys::deflateUsed(stream, &raw mut bits) };
+    assert_eq!(pre_finish_status, Z_OK);
+    assert_eq!(bits, 0);
+
+    // SAFETY: the initialized encoder and checked input byte count are valid.
+    let bound = unsafe { libz_rs_sys::deflateBound(stream, test_c_ulong_len(input.len())) };
+    let capacity = usize::try_from(bound).unwrap_or(usize::MAX);
+    let total_capacity = capacity.checked_add(16).unwrap_or(0);
+    assert!(total_capacity >= capacity, "deflate bound overflow");
+    let mut encoded = vec![0xa5u8; total_capacity];
+    stream.next_in = input.as_ptr().cast_mut();
+    stream.avail_in = test_c_uint_len(input.len());
+    stream.next_out = encoded.as_mut_ptr();
+    stream.avail_out = test_c_uint_len(capacity);
+    // SAFETY: input is readable and a separate output buffer is writable
+    // for exactly the bounded span advertised to C.
+    let finish_status = unsafe { deflate(stream, libz_rs_sys::Z_FINISH) };
+    assert_eq!(finish_status, libz_rs_sys::Z_STREAM_END);
+    assert_eq!(stream.avail_in, 0);
+    assert_eq!(usize::try_from(stream.total_in), Ok(input.len()));
+    let written = usize::try_from(stream.total_out).unwrap_or(usize::MAX);
+    assert!(written <= capacity);
+    assert!(encoded[written..].iter().all(|&byte| byte == 0xa5));
+
+    bits = -1;
+    // SAFETY: deflateUsed only writes the live c_int output parameter.
+    let post_finish_status = unsafe { libz_rs_sys::deflateUsed(stream, &raw mut bits) };
+    assert_eq!(post_finish_status, Z_OK);
+    assert_eq!(bits, expected_bits);
+    // SAFETY: this initialized stream is closed once after Finish.
+    assert_eq!(unsafe { deflateEnd(stream) }, Z_OK);
+
+    let restored_capacity = input.len().checked_add(16).unwrap_or(0);
+    assert!(restored_capacity >= input.len(), "decoded bound overflow");
+    let mut restored = vec![0xa5u8; restored_capacity];
+    let (decoded, status) =
+        zlib_rs::decompress_slice(&mut restored, &encoded[..written], InflateConfig::default());
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, input);
+    assert!(restored[input.len()..].iter().all(|&byte| byte == 0xa5));
 }
 
 #[test]
 fn test_deflate_used() {
-    const HELLO: &str = "hello, hello!\0";
-
-    let config = DeflateConfig::default();
-
-    let mut strm = MaybeUninit::zeroed();
-
-    unsafe {
-        // a NULL stream is a stream error
-        assert_eq!(
-            libz_rs_sys::deflateUsed(core::ptr::null_mut(), &mut 0),
-            ReturnCode::StreamError as i32,
-        );
-
-        let err = libz_rs_sys::deflateInit2_(
-            strm.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
-
-        let strm = strm.assume_init_mut();
-
-        // A NULL `bits` pointer is tolerated (and just ignored), still Z_OK
-        let err = libz_rs_sys::deflateUsed(strm, std::ptr::null_mut());
-        assert_eq!(err, 0);
-
-        // Before any flush to a byte boundary, the value is 0
-        let mut bits = -1;
-        let err = libz_rs_sys::deflateUsed(strm, &raw mut bits);
-        assert_eq!(err, 0);
-        assert_eq!(bits, 0);
-
-        let mut compr = [0; 32];
-        strm.next_in = HELLO.as_ptr().cast_mut();
-        strm.next_out = compr.as_mut_ptr();
-        strm.avail_in = test_c_uint_len(HELLO.len());
-        strm.avail_out = test_c_uint_len(compr.len());
-
-        let err = deflate(strm, libz_rs_sys::Z_FINISH);
-        assert_eq!(err, libz_rs_sys::Z_STREAM_END);
-
-        // after flushing the final block to a byte boundary, the number of bits
-        // used in the last byte is in 1..=8.
-        let mut bits = -1;
-        let err = libz_rs_sys::deflateUsed(strm, &raw mut bits);
-        assert_eq!(err, 0);
-
-        // 7 bits is what stock zlib reports.
-        assert_eq!(bits, 7);
-
-        let err = deflateEnd(strm);
-        assert_eq!(err, 0);
-    }
+    let mut invalid_bits = -1;
+    // SAFETY: the extension must reject a null stream without dereferencing
+    // the otherwise writable bits output.
+    let null_stream_status =
+        unsafe { libz_rs_sys::deflateUsed(core::ptr::null_mut(), &raw mut invalid_bits) };
+    assert_eq!(null_stream_status, ReturnCode::StreamError as c_int);
+    assert_eq!(invalid_bits, -1);
+    // A normal compressed final block uses seven bits of its last byte.
+    assert_deflate_used_round_trip(-1, b"hello, hello!\0", 7);
 }
 
 /// The stored (level 0) implementation has some custom logic for `bits_used`.
@@ -1921,97 +1996,85 @@ fn stored_direct_copy_history_across_input_calls_matches_zlib_ng() {
 
 #[test]
 fn test_deflate_used_stored() {
-    let config = DeflateConfig {
-        level: 0,
-        ..DeflateConfig::default()
-    };
-
-    let mut strm = MaybeUninit::zeroed();
-
-    unsafe {
-        let err = libz_rs_sys::deflateInit2_(
-            strm.as_mut_ptr(),
-            config.level,
-            config.method as i32,
-            config.window_bits,
-            config.mem_level,
-            config.strategy as i32,
-            VERSION,
-            test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
-
-        let strm = strm.assume_init_mut();
-
-        let input = b"a stored block carries raw bytes\0";
-        let mut compr = [0; 128];
-        strm.next_in = input.as_ptr().cast_mut();
-        strm.next_out = compr.as_mut_ptr();
-        strm.avail_in = test_c_uint_len(input.len());
-        strm.avail_out = test_c_uint_len(compr.len());
-
-        let err = deflate(strm, libz_rs_sys::Z_FINISH);
-        assert_eq!(err, libz_rs_sys::Z_STREAM_END);
-
-        let mut bits = -1;
-        let err = libz_rs_sys::deflateUsed(strm, &raw mut bits);
-        assert_eq!(err, 0);
-
-        // Always a full byte.
-        assert_eq!(bits, 8);
-
-        let err = deflateEnd(strm);
-        assert_eq!(err, 0);
-    }
+    // Stored blocks end on a byte boundary; the implementation reports
+    // all eight bits of the last output byte as used.
+    assert_deflate_used_round_trip(0, b"a stored block carries raw bytes\0", 8);
 }
 
 #[test]
 fn test_deflate_used_copy() {
+    const INPUT: &[u8] = b"just some string...\0";
     let config = DeflateConfig::default();
-
-    let mut source = MaybeUninit::zeroed();
-
-    unsafe {
-        let err = libz_rs_sys::deflateInit2_(
-            source.as_mut_ptr(),
+    let mut source_raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: caller-owned writable stream, valid deflate options and
+    // matching C ABI metadata.
+    let init = unsafe {
+        libz_rs_sys::deflateInit2_(
+            source_raw.as_mut_ptr(),
             config.level,
-            config.method as i32,
+            config.method as c_int,
             config.window_bits,
             config.mem_level,
-            config.strategy as i32,
+            config.strategy as c_int,
             VERSION,
             test_c_stream_size::<libz_rs_sys::z_stream>(),
-        );
-        assert_eq!(err, 0);
+        )
+    };
+    assert_eq!(init, Z_OK);
+    // SAFETY: successful initialization populated the source C stream.
+    let source = unsafe { source_raw.assume_init_mut() };
 
-        let source = source.assume_init_mut();
+    let mut compressed = [0xa5u8; 128];
+    source.next_in = INPUT.as_ptr().cast_mut();
+    source.next_out = compressed.as_mut_ptr();
+    source.avail_in = test_c_uint_len(INPUT.len());
+    source.avail_out = test_c_uint_len(compressed.len());
+    // SAFETY: a live input slice and disjoint output allocation are
+    // readable/writable for their exact advertised C byte counts.
+    let finish_status = unsafe { deflate(source, libz_rs_sys::Z_FINISH) };
+    assert_eq!(finish_status, libz_rs_sys::Z_STREAM_END);
+    assert_eq!(source.avail_in, 0);
+    assert_eq!(usize::try_from(source.total_in), Ok(INPUT.len()));
+    let written = usize::try_from(source.total_out).unwrap_or(usize::MAX);
+    assert!(written <= compressed.len());
+    assert!(compressed[written..].iter().all(|&byte| byte == 0xa5));
 
-        let input = b"just some string...\0";
-        let mut compr = [0; 128];
-        source.next_in = input.as_ptr().cast_mut();
-        source.next_out = compr.as_mut_ptr();
-        source.avail_in = test_c_uint_len(input.len());
-        source.avail_out = test_c_uint_len(compr.len());
+    let mut source_bits: c_int = -1;
+    // SAFETY: deflateUsed writes one live integer in the finished stream.
+    let source_used_status = unsafe { libz_rs_sys::deflateUsed(source, &raw mut source_bits) };
+    assert_eq!(source_used_status, Z_OK);
+    assert!((1..=8).contains(&source_bits));
 
-        let err = deflate(source, libz_rs_sys::Z_FINISH);
-        assert_eq!(err, libz_rs_sys::Z_STREAM_END);
+    let mut dest_raw = MaybeUninit::<libz_rs_sys::z_stream>::zeroed();
+    // SAFETY: destination is writable uninitialized storage, source is a
+    // fully initialized and live compressor (not concurrently accessed).
+    let copy_status = unsafe { libz_rs_sys::deflateCopy(dest_raw.as_mut_ptr(), source) };
+    assert_eq!(copy_status, Z_OK);
+    // SAFETY: successful deflateCopy populated the independent destination.
+    let dest = unsafe { dest_raw.assume_init_mut() };
+    assert_eq!(dest.total_in, source.total_in);
+    assert_eq!(dest.total_out, source.total_out);
 
-        let mut src_bits = -1;
-        assert_eq!(libz_rs_sys::deflateUsed(source, &raw mut src_bits), Z_OK);
-        assert!((1..=8).contains(&src_bits));
+    let mut dest_bits: c_int = -1;
+    // SAFETY: the copied stream is initialized and dest_bits is writable.
+    let dest_used_status = unsafe { libz_rs_sys::deflateUsed(dest, &raw mut dest_bits) };
+    assert_eq!(dest_used_status, Z_OK);
+    assert_eq!(dest_bits, source_bits);
 
-        let mut dest = MaybeUninit::zeroed();
-        let err = libz_rs_sys::deflateCopy(dest.as_mut_ptr(), source);
-        assert_eq!(err, Z_OK);
-        let dest = dest.assume_init_mut();
+    // SAFETY: the two separately owned compression states are ended once.
+    assert_eq!(unsafe { deflateEnd(source) }, Z_OK);
+    // SAFETY: deflateCopy constructed an independent stream state.
+    assert_eq!(unsafe { deflateEnd(dest) }, Z_OK);
 
-        let mut dst_bits = -1;
-        assert_eq!(libz_rs_sys::deflateUsed(dest, &raw mut dst_bits), Z_OK);
-        assert_eq!(dst_bits, src_bits);
-
-        assert_eq!(deflateEnd(source), 0);
-        assert_eq!(deflateEnd(dest), 0);
-    }
+    let mut restored = [0xa5u8; INPUT.len() + 16];
+    let (decoded, status) = zlib_rs::decompress_slice(
+        &mut restored,
+        &compressed[..written],
+        InflateConfig::default(),
+    );
+    assert_eq!(status, ReturnCode::Ok);
+    assert_eq!(decoded, INPUT);
+    assert_eq!(&restored[INPUT.len()..], &[0xa5u8; 16]);
 }
 
 /// A full-flush marker must let inflateSync recover from a damaged
