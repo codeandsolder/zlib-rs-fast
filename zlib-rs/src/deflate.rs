@@ -739,6 +739,7 @@ impl quickcheck::Arbitrary for DeflateConfig {
 }
 
 impl DeflateConfig {
+    #[must_use]
     pub fn new(level: i32) -> Self {
         Self {
             level,
@@ -747,11 +748,13 @@ impl DeflateConfig {
     }
 
     /// Configure for the best compression (takes longer).
+    #[must_use]
     pub fn best_compression() -> Self {
         Self::new(crate::c_api::Z_BEST_COMPRESSION)
     }
 
     /// Configure for the fastest compression (compresses less well).
+    #[must_use]
     pub fn best_speed() -> Self {
         Self::new(crate::c_api::Z_BEST_SPEED)
     }
@@ -803,9 +806,9 @@ fn init_with_lit_bufsize(
         stream.configure_default_c_allocator();
     }
 
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
+    let (Some(zalloc), Some(zfree)) = (stream.zalloc, stream.zfree) else {
         return ReturnCode::StreamError;
-    }
+    };
 
     if level == crate::c_api::Z_DEFAULT_COMPRESSION {
         level = 6;
@@ -833,15 +836,16 @@ fn init_with_lit_bufsize(
         return ReturnCode::StreamError;
     }
 
-    let window_bits = if window_bits == 8 {
-        9 /* until 256-byte window bug fixed */
-    } else {
-        window_bits as usize
+    // Configuration validation above guarantees a positive 8..=15 bit
+    // window. Keep the host-address width conversion explicit anyway.
+    let Ok(window_bits) = usize::try_from(window_bits) else {
+        return ReturnCode::StreamError;
     };
+    let window_bits = window_bits.max(9); // zlib's 256-byte window workaround
 
     let alloc = Allocator {
-        zalloc: stream.zalloc.unwrap(),
-        zfree: stream.zfree.unwrap(),
+        zalloc,
+        zfree,
         opaque: stream.opaque,
         _marker: PhantomData,
     };
@@ -854,11 +858,15 @@ fn init_with_lit_bufsize(
     if lit_bufsize == 0 || lit_bufsize > (1 << 16) {
         return ReturnCode::StreamError;
     }
+    // The validated compression level is 0..=9, representable in i8.
+    let Ok(level) = i8::try_from(level) else {
+        return ReturnCode::StreamError;
+    };
     let allocs = DeflateAllocOffsets::new(window_bits, lit_bufsize);
     let Some(state_allocation) = allocs.allocate_state(
         &alloc,
         DeflateStateInit {
-            level: level as i8,
+            level,
             strategy,
             wrap,
         },
@@ -868,6 +876,8 @@ fn init_with_lit_bufsize(
 
     stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
+    // SAFETY: allocation succeeded and initialized stream.state; allocator
+    // callbacks were validated above and still belong to the live stream.
     let Some(stream) = (unsafe { DeflateStream::from_stream_mut(stream) }) else {
         if cfg!(debug_assertions) {
             unreachable!("we should have initialized the stream properly");
@@ -5815,6 +5825,41 @@ mod test {
 
     mod invalid_deflate_config {
         use super::*;
+
+        #[test]
+        fn extreme_signed_parameters_reject_without_allocated_state() {
+            let invalid = [
+                DeflateConfig {
+                    level: i32::MIN,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    level: i32::MAX,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    window_bits: i32::MIN,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    window_bits: i32::MAX,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    mem_level: i32::MIN,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    mem_level: i32::MAX,
+                    ..DeflateConfig::default()
+                },
+            ];
+            for config in invalid {
+                let mut stream = z_stream::default();
+                assert_eq!(init(&mut stream, config), ReturnCode::StreamError);
+                assert!(stream.state.is_null(), "invalid config allocated a state");
+            }
+        }
 
         #[test]
         fn sanity_check() {
