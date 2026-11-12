@@ -134,11 +134,14 @@ impl Inflate {
     /// `window_bits = 9` in most zlib implementations, and hence should be inflated using
     /// `window_bits = 9`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// This function may panic when the `window_bits` and `expect_header` have values not listed above.
-    #[must_use]
-    pub fn new(expect_header: bool, window_bits: u8) -> Self {
+    /// Reports invalid configuration or failed allocation.
+    pub fn new(expect_header: bool, window_bits: u8) -> Result<Self, InflateError> {
+        // A raw stream cannot infer its window width from a zlib header.
+        if !expect_header && window_bits == 0 {
+            return Err(InflateError::StreamError);
+        }
         let config = InflateConfig {
             window_bits: if expect_header {
                 i32::from(window_bits)
@@ -146,12 +149,25 @@ impl Inflate {
                 -i32::from(window_bits)
             },
         };
+        Self::new_with_config(config)
+    }
 
-        Self {
-            inner: crate::inflate::InflateStream::new(config),
+    /// Construct a decoder directly from a full inflate configuration.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid configuration or failed allocation.
+    pub fn new_with_config(config: InflateConfig) -> Result<Self, InflateError> {
+        let inner = crate::inflate::InflateStream::new(config).map_err(|status| match status {
+            ReturnCode::MemError => InflateError::MemError,
+            ReturnCode::DataError => InflateError::DataError,
+            _ => InflateError::StreamError,
+        })?;
+        Ok(Self {
+            inner,
             total_in: 0,
             total_out: 0,
-        }
+        })
     }
 
     /// Reset the state to allow handling a new stream.
@@ -623,7 +639,7 @@ mod tests {
             usize::try_from(encoder.total_out()).map_err(|_| "compressed size exceeds usize")?;
         compressed.truncate(compressed_bytes);
 
-        let mut decoder = Inflate::new(true, 15);
+        let mut decoder = Inflate::new(true, 15).map_err(|_| "inflate initialization failed")?;
         let mut recovered = vec![0u8; source.len()];
         let mut reached_end = false;
         for _ in 0..source.len() {
@@ -682,7 +698,7 @@ mod tests {
         let compressed_len = usize::try_from(encoder.total_out())
             .map_err(|_| "compressed_stream size exceeds usize")?;
 
-        let mut decoder = Inflate::new(true, 15);
+        let mut decoder = Inflate::new(true, 15).map_err(|_| "inflate initialization failed")?;
         let mut recovered = [0u8; 128];
         let first = decoder.decompress(
             &compressed_stream[..compressed_len],
@@ -711,11 +727,11 @@ mod tests {
     }
 
     #[test]
-    fn safe_inflate_drops_caller_buffer_pointers_between_calls() {
+    fn safe_inflate_drops_caller_buffer_pointers_between_calls() -> Result<(), &'static str> {
         // RFC1950 empty stream. A partial feed must not leave pointers to the
         // temporary caller slices alive while waiting for the next chunk.
         let compressed = [0x78u8, 0x9c, 0x03, 0, 0, 0, 0, 1];
-        let mut inflate = Inflate::new(true, 15);
+        let mut inflate = Inflate::new(true, 15).map_err(|_| "inflate initialization failed")?;
         let mut output = [0u8; 8];
 
         let partial = inflate.decompress(&compressed[..2], &mut output, InflateFlush::NoFlush);
@@ -738,5 +754,6 @@ mod tests {
             Err(InflateError::DataError),
         );
         assert_no_caller_buffers_attached(&inflate);
+        Ok(())
     }
 }

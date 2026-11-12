@@ -291,25 +291,34 @@ impl<'a> InflateStream<'a> {
         unsafe { &mut *core::ptr::from_mut(self).cast::<z_stream>() }
     }
 
-    pub fn new(config: InflateConfig) -> Self {
+    /// Allocate and initialize a regular inflate stream.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid configuration/allocator contracts or failed allocation.
+    pub fn new(config: InflateConfig) -> Result<Self, ReturnCode> {
         let mut inner = crate::c_api::z_stream::default();
+        match crate::inflate::init(&mut inner, config) {
+            ReturnCode::Ok => {}
+            error => return Err(error),
+        }
 
-        let ret = crate::inflate::init(&mut inner, config);
-        assert_eq!(ret, ReturnCode::Ok);
-
-        let state = inner.state.cast::<State<'a>>();
+        // A successful init has selected both allocator callbacks and
+        // installed a live, regular inflate state.
+        let (Some(zalloc), Some(zfree)) = (inner.zalloc, inner.zfree) else {
+            return Err(ReturnCode::StreamError);
+        };
+        let Some(state) = core::ptr::NonNull::new(inner.state.cast::<State<'a>>()) else {
+            return Err(ReturnCode::StreamError);
+        };
         let alloc = Allocator {
-            zalloc: inner
-                .zalloc
-                .expect("initialized inflate stream has an allocator"),
-            zfree: inner
-                .zfree
-                .expect("initialized inflate stream has a deallocator"),
+            zalloc,
+            zfree,
             opaque: inner.opaque,
             _marker: PhantomData,
         };
 
-        Self {
+        Ok(Self {
             next_in: inner.next_in.cast_mut(),
             avail_in: inner.avail_in,
             total_in: inner.total_in,
@@ -317,13 +326,13 @@ impl<'a> InflateStream<'a> {
             avail_out: inner.avail_out,
             total_out: inner.total_out,
             msg: inner.msg,
-            // SAFETY: successful `init` created a live regular-inflate State allocation.
-            state: unsafe { StatePtr::from_raw(state) },
+            // SAFETY: successful init created a live regular-inflate State.
+            state: unsafe { StatePtr::from_raw(state.as_ptr()) },
             alloc,
             data_type: inner.data_type,
             adler: inner.adler,
             reserved: inner.reserved,
-        }
+        })
     }
 }
 
@@ -2687,9 +2696,39 @@ impl Default for InflateConfig {
     }
 }
 
+/// Validated DEFLATE window selection, including the zlib wrapper mode.
+/// Four wrapper modes exist: raw (0), zlib (5), gzip (6),
+/// and zlib/gzip autodetection (7). The gzip and autodetect flag forms
+/// each encode their window size in the low four bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InflateWindowSelection {
+    wrap: u8,
+    wbits: u8,
+}
+
+fn parse_inflate_window_bits(bits: i32) -> Option<InflateWindowSelection> {
+    let (wrap, width) = match bits {
+        -15..=-8 => (0, -bits),
+        0 | 8..=15 => (5, bits),
+        24..=31 => (6, bits - 16),
+        // 32 is zlib's autodetect form with window size inferred from the header.
+        32 | 40..=47 => (7, bits - 32),
+        _ => return None,
+    };
+    Some(InflateWindowSelection {
+        wrap,
+        wbits: u8::try_from(width).ok()?,
+    })
+}
+
 /// Initialize the stream in an inflate state
 pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     stream.msg = core::ptr::null_mut();
+
+    // Reject invalid formats before selecting allocators or allocating state.
+    if parse_inflate_window_bits(config.window_bits).is_none() {
+        return ReturnCode::StreamError;
+    }
 
     // for safety we must really make sure that alloc and free are consistent
     // this is a (slight) deviation from stock zlib. In this crate we pick the rust
@@ -2737,35 +2776,14 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
 }
 
 pub fn reset_with_config(stream: &mut InflateStream, config: InflateConfig) -> ReturnCode {
-    let mut window_bits = config.window_bits;
-    let wrap;
-
-    if window_bits < 0 {
-        wrap = 0;
-
-        if window_bits < -MAX_WBITS {
-            return ReturnCode::StreamError;
-        }
-
-        window_bits = -window_bits;
-    } else {
-        wrap = (window_bits >> 4) + 5; // TODO wth?
-
-        if window_bits < 48 {
-            window_bits &= MAX_WBITS;
-        }
-    }
-
-    if window_bits != 0 && !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
-        traceln!("invalid windowBits");
-        return ReturnCode::StreamError;
-    }
-
-    let (Ok(wrap), Ok(window_bits)) = (u8::try_from(wrap), u8::try_from(window_bits)) else {
+    let Some(window) = parse_inflate_window_bits(config.window_bits) else {
         return ReturnCode::StreamError;
     };
-    stream.state.wrap = wrap;
-    stream.state.wbits = window_bits;
+
+    // Do not mutate either field until both the wrapper kind and its
+    // encoded history-window width have been fully validated.
+    stream.state.wrap = window.wrap;
+    stream.state.wbits = window.wbits;
 
     reset(stream)
 }
@@ -3290,6 +3308,91 @@ mod tests {
     }
 
     #[test]
+    fn inflate_window_selection_accepts_only_complete_format_encodings() {
+        for bits in -64..=100 {
+            let expected = matches!(bits, -15..=-8 | 0 | 8..=15 | 24..=31 | 32 | 40..=47);
+            assert_eq!(
+                parse_inflate_window_bits(bits).is_some(),
+                expected,
+                "window bits {bits}",
+            );
+
+            if !expected {
+                let mut raw = z_stream::default();
+                // z_stream::default may already select an allocator under
+                // rust-allocator/c-allocator features. Rejection must not
+                // replace that choice, or allocate a new state.
+                let alloc_before = (raw.zalloc.is_some(), raw.zfree.is_some(), raw.opaque);
+                assert_eq!(
+                    init(&mut raw, InflateConfig { window_bits: bits }),
+                    ReturnCode::StreamError,
+                );
+                assert!(raw.state.is_null());
+                assert_eq!(
+                    (raw.zalloc.is_some(), raw.zfree.is_some(), raw.opaque),
+                    alloc_before
+                );
+                assert!(matches!(
+                    InflateStream::new(InflateConfig { window_bits: bits }),
+                    Err(ReturnCode::StreamError)
+                ));
+            }
+        }
+
+        for (bits, wrap, wbits) in [
+            (-15, 0, 15),
+            (-8, 0, 8),
+            (0, 5, 0),
+            (8, 5, 8),
+            (15, 5, 15),
+            (24, 6, 8),
+            (31, 6, 15),
+            (32, 7, 0),
+            (40, 7, 8),
+            (47, 7, 15),
+        ] {
+            assert_eq!(
+                parse_inflate_window_bits(bits),
+                Some(InflateWindowSelection { wrap, wbits }),
+            );
+        }
+        assert!(parse_inflate_window_bits(i32::MIN).is_none());
+        assert!(parse_inflate_window_bits(i32::MAX).is_none());
+    }
+
+    #[test]
+    fn inflate_init_reports_allocator_failure_without_exposing_state() {
+        unsafe extern "C" fn reject(
+            _context: *mut c_void,
+            _count: core::ffi::c_uint,
+            _size: core::ffi::c_uint,
+        ) -> *mut c_void {
+            core::ptr::null_mut()
+        }
+        unsafe extern "C" fn unused_free(_context: *mut c_void, _ptr: *mut c_void) {}
+
+        let mut raw = z_stream {
+            zalloc: Some(reject),
+            zfree: Some(unused_free),
+            ..z_stream::default()
+        };
+
+        assert_eq!(
+            init(&mut raw, InflateConfig::default()),
+            ReturnCode::MemError
+        );
+        assert!(raw.state.is_null());
+        assert!(raw.msg.is_null());
+    }
+
+    #[test]
+    fn successful_fallible_inflate_stream_construction_can_be_ended() -> Result<(), ReturnCode> {
+        let mut stream = InflateStream::new(InflateConfig::default())?;
+        assert_eq!(end(&mut stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
     fn invalid_inflate_reconfiguration_preserves_existing_state() -> Result<(), &'static str> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
@@ -3300,7 +3403,22 @@ mod tests {
         let initial_window_bits = stream.state.wbits;
         let initial_buffer = stream.state.bit_buffer;
 
-        for window_bits in [-16, 1, 7, 17, 23, 33, 39, 48, 64, i32::MIN, i32::MAX] {
+        for window_bits in [
+            -16,
+            -7,
+            -1,
+            1,
+            7,
+            16,
+            17,
+            23,
+            33,
+            39,
+            48,
+            64,
+            i32::MIN,
+            i32::MAX,
+        ] {
             assert_eq!(
                 reset_with_config(stream, InflateConfig { window_bits }),
                 ReturnCode::StreamError,

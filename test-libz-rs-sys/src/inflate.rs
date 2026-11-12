@@ -4037,7 +4037,7 @@ mod stable_api {
         InflateError, ReturnCode, Status,
     };
 
-    fn with_window_bits(n: i32) {
+    fn with_window_bits(n: i32) -> Result<(), InflateError> {
         let config = DeflateConfig {
             window_bits: n,
             ..DeflateConfig::default()
@@ -4051,7 +4051,7 @@ mod stable_api {
         let mut decompressed = [0u8; 64];
         let window_bits = u8::try_from(n.unsigned_abs()).unwrap_or(0);
         assert_ne!(window_bits, 0, "invalid test window bits");
-        let mut decoder = zlib_rs::Inflate::new(n >= 0, window_bits);
+        let mut decoder = zlib_rs::Inflate::new(n >= 0, window_bits)?;
         assert_eq!(
             decoder.decompress(compressed, &mut decompressed, zlib_rs::InflateFlush::Finish),
             Ok(Status::StreamEnd),
@@ -4060,32 +4060,35 @@ mod stable_api {
         assert_eq!(usize::try_from(decoder.total_in()), Ok(compressed.len()));
         assert_eq!(usize::try_from(decoder.total_out()), Ok(input.len()));
         assert_eq!(&decompressed[..input.len()], input);
+        Ok(())
     }
 
     #[test]
-    fn raw() {
-        with_window_bits(-15);
+    fn raw() -> Result<(), InflateError> {
+        with_window_bits(-15)
     }
 
     #[test]
-    fn zlib_header() {
-        with_window_bits(15);
+    fn zlib_header() -> Result<(), InflateError> {
+        with_window_bits(15)
     }
 
     #[test]
-    fn gz_header() {
-        with_window_bits(16 + 15);
+    fn gz_header() -> Result<(), InflateError> {
+        with_window_bits(16 + 15)
     }
 
     #[test]
-    #[should_panic = "StreamError"]
     fn invalid_config() {
-        let _ = zlib_rs::Inflate::new(true, 123);
+        assert!(matches!(
+            zlib_rs::Inflate::new(true, 123),
+            Err(InflateError::StreamError)
+        ));
     }
 
     #[test]
-    fn invalid_data() {
-        let mut inflate = zlib_rs::Inflate::new(true, 15);
+    fn invalid_data() -> Result<(), InflateError> {
+        let mut inflate = zlib_rs::Inflate::new(true, 15)?;
 
         // Clearly invalid input.
         let compressed = [0xAA; 64];
@@ -4098,11 +4101,12 @@ mod stable_api {
         );
 
         assert_eq!(ret, Err(InflateError::DataError));
+        Ok(())
     }
 
     #[test]
-    fn need_dict() {
-        let mut inflate = zlib_rs::Inflate::new(true, 15);
+    fn need_dict() -> Result<(), InflateError> {
+        let mut inflate = zlib_rs::Inflate::new(true, 15)?;
 
         let compressed = [0x08, 0xb8, 0x0, 0x0, 0x0, 0x1];
         let mut decompressed = [0u8; 64];
@@ -4114,10 +4118,11 @@ mod stable_api {
         );
 
         assert_eq!(ret, Err(InflateError::NeedDict { dict_id: 1 }));
+        Ok(())
     }
 
     #[test]
-    fn reset_reuse() {
+    fn reset_reuse() -> Result<(), InflateError> {
         let wrapped_plaintext = b"Hello World!";
         let raw_plaintext = b"Goodbye World!";
 
@@ -4144,7 +4149,7 @@ mod stable_api {
         assert_eq!(status, ReturnCode::Ok);
 
         // First complete a wrapped zlib stream.
-        let mut decoder = zlib_rs::Inflate::new(true, 15);
+        let mut decoder = zlib_rs::Inflate::new(true, 15)?;
         let mut plaintext_buffer = [0xa5u8; 64];
         assert_eq!(
             decoder.decompress(
@@ -4211,6 +4216,7 @@ mod stable_api {
             &plaintext_buffer[..wrapped_plaintext.len()],
             wrapped_plaintext
         );
+        Ok(())
     }
 
     #[test]
@@ -4219,7 +4225,7 @@ mod stable_api {
         ignore = "test only works on 64-bit systems"
     )]
     #[cfg_attr(miri, ignore = "slow")]
-    fn buffer_overflows_c_uint() {
+    fn buffer_overflows_c_uint() -> Result<(), InflateError> {
         // "Hello World!" compressed at level 0
         let deflated = [
             0x78u8, 0x01, 0x01, 0x0d, 0x00, 0xf2, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57,
@@ -4247,11 +4253,12 @@ mod stable_api {
         assert!(usize::try_from(truncated).unwrap_or(usize::MAX) < deflated.len());
 
         let mut decompressed = [0u8; 64];
-        let mut inflate = zlib_rs::Inflate::new(true, 15);
+        let mut inflate = zlib_rs::Inflate::new(true, 15)?;
         let status = inflate.decompress(&v, &mut decompressed, zlib_rs::InflateFlush::Finish);
         assert_eq!(status, Ok(zlib_rs::Status::StreamEnd));
 
         assert_eq!(b"Hello World!", &decompressed[..12]);
+        Ok(())
     }
 }
 

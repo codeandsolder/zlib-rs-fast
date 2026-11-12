@@ -59,7 +59,7 @@ pub fn main() -> Result<(), &'static str> {
     assert_eq!(def.total_in(), TOTAL);
     let total_compressed = def.total_out();
 
-    let mut inf = Inflate::new(true, 15);
+    let mut inf = Inflate::new(true, 15).map_err(|_| "failed to initialize inflate")?;
     let mut off = 0usize;
 
     loop {
