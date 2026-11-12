@@ -471,7 +471,7 @@ fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
         0..=9 => i8::try_from(config.level).ok()?,
         _ => return None,
     };
-    Some(Algorithm::for_stream(level, config.strategy))
+    Algorithm::for_stream(level, config.strategy)
 }
 
 struct BatchRuntime<'a> {
@@ -608,6 +608,7 @@ impl<'a> BatchRuntime<'a> {
                 RuntimeStep::Done(self.finish_stream())
             }
             StandardTurnOutcome::MatchSearchError(_)
+            | StandardTurnOutcome::InvalidSegmentMode
             | StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
                 RuntimeStep::Done(self.finish_error(ReturnCode::StreamError))
             }

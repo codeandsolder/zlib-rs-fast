@@ -499,6 +499,7 @@ pub(super) enum StandardTurnOutcome {
     MatchSearchError(MatchSearchError),
     NeedMoreCallerInput,
     NeedMoreOutput { final_block: bool },
+    InvalidSegmentMode,
     SegmentDone(EndBlockKind),
 }
 
@@ -554,6 +555,12 @@ impl StandardDriver {
             EndOfInput(EndOfInputWork),
         }
 
+        // Once a segment has reached its final tail, the same driver cannot
+        // resume that segment as an open-ended input stream.
+        if mode == StandardSegmentMode::Continue && self.core.input_phase == InputPhase::FinalTail {
+            return StandardTurnOutcome::InvalidSegmentMode;
+        }
+
         if let Some(pending) = self.pending_drain.take() {
             return match self.core.drain_output(state, output, pending.work) {
                 PendingOutputOutcome::Ready => match pending.after {
@@ -605,9 +612,9 @@ impl StandardDriver {
                 StandardTurnOutcome::Progress
             }
             OwnedCoreEvent::EndOfInput(work) => {
-                let kind = mode
-                    .end_kind()
-                    .expect("end-of-input requires a segment-ending scheduler mode");
+                let Some(kind) = mode.end_kind() else {
+                    return StandardTurnOutcome::InvalidSegmentMode;
+                };
                 match self.core.encode_end_of_input(state, work, kind) {
                     Some(work) => {
                         self.pending_drain = Some(PendingDrain {
@@ -782,7 +789,7 @@ pub(super) fn drive_standard(
             StandardTurnOutcome::Progress => {}
             StandardTurnOutcome::MatchSearch(work) => {
                 let Ok(request) = work.request(state) else {
-                    return BlockState::InvalidMatchState;
+                    return BlockState::InvalidState;
                 };
                 let mut results = [MatchSearchResult {
                     length: 0,
@@ -790,10 +797,12 @@ pub(super) fn drive_standard(
                 }];
                 execute_match_search_batch(core::slice::from_ref(&request), &mut results);
                 if driver.complete_match_search(state, results[0]).is_err() {
-                    return BlockState::InvalidMatchState;
+                    return BlockState::InvalidState;
                 }
             }
-            StandardTurnOutcome::MatchSearchError(_) => return BlockState::InvalidMatchState,
+            StandardTurnOutcome::MatchSearchError(_) | StandardTurnOutcome::InvalidSegmentMode => {
+                return BlockState::InvalidState;
+            }
             StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
             StandardTurnOutcome::NeedMoreOutput { final_block: true } => {
                 return BlockState::FinishStarted;
@@ -823,18 +832,19 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    pub(super) const fn for_stream(level: i8, strategy: Strategy) -> Self {
-        if level == 0 {
-            return Self::Stored;
-        }
-
-        match strategy {
-            Strategy::HuffmanOnly => Self::Huffman,
-            Strategy::Rle => Self::Rle,
-            Strategy::Default | Strategy::Filtered | Strategy::Fixed => {
-                level_config(level).algorithm
+    pub(super) fn for_stream(level: i8, strategy: Strategy) -> Option<Self> {
+        // Validate the compression level even for strategies that do not use
+        // its normal hash-chain algorithm.
+        let config = level_config(level)?;
+        Some(if level == 0 {
+            Self::Stored
+        } else {
+            match strategy {
+                Strategy::HuffmanOnly => Self::Huffman,
+                Strategy::Rle => Self::Rle,
+                Strategy::Default | Strategy::Filtered | Strategy::Fixed => config.algorithm,
             }
-        }
+        })
     }
 
     fn run(self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> BlockState {
@@ -844,7 +854,7 @@ impl Algorithm {
             algorithm => {
                 let Some(mut driver) = StandardDriver::for_algorithm(algorithm, stream.state)
                 else {
-                    return BlockState::InvalidMatchState;
+                    return BlockState::InvalidState;
                 };
                 drive_standard(
                     stream.state,
@@ -860,7 +870,9 @@ impl Algorithm {
 }
 
 pub(super) fn run(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> BlockState {
-    let algorithm = Algorithm::for_stream(stream.state.level, stream.state.strategy);
+    let Some(algorithm) = Algorithm::for_stream(stream.state.level, stream.state.strategy) else {
+        return BlockState::InvalidState;
+    };
     algorithm.run(stream, flush)
 }
 
@@ -904,8 +916,9 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
 ];
 
-pub const fn level_config(level: i8) -> LevelConfig {
-    LEVEL_CONFIGS[level as usize]
+/// Resolve a compressor's signed level without permitting invalid table indices.
+pub fn level_config(level: i8) -> Option<LevelConfig> {
+    LEVEL_CONFIGS.get(usize::try_from(level).ok()?).copied()
 }
 
 pub fn change_requires_block_boundary(
@@ -913,9 +926,10 @@ pub fn change_requires_block_boundary(
     current_strategy: Strategy,
     next_level: i8,
     next_strategy: Strategy,
-) -> bool {
-    current_strategy != next_strategy
-        || level_config(current_level).algorithm != level_config(next_level).algorithm
+) -> Option<bool> {
+    let current = level_config(current_level)?;
+    let next = level_config(next_level)?;
+    Some(current_strategy != next_strategy || current.algorithm != next.algorithm)
 }
 
 #[cfg(test)]
@@ -956,6 +970,67 @@ mod tests {
     }
 
     #[test]
+    fn continue_mode_cannot_resume_an_already_finalized_input_segment(
+    ) -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(2))?;
+        let mut driver = StandardDriver::for_algorithm(Algorithm::Fast, &stream.state)
+            .ok_or(crate::ReturnCode::StreamError)?;
+        driver.core.input_phase = InputPhase::FinalTail;
+
+        let mut input = InputCursor::from_stream(&stream);
+        let mut output = crate::deflate::OutputCursor::from_stream(&stream);
+        let mut checksum = StreamChecksum::from_stream(&stream);
+        let before_start = stream.state.strstart;
+        let before_lookahead = stream.state.lookahead;
+        let before_phase = driver.core.phase;
+        assert_eq!(
+            driver.step(
+                &mut stream.state,
+                &mut input,
+                &mut output,
+                &mut checksum,
+                StandardSegmentMode::Continue,
+            ),
+            StandardTurnOutcome::InvalidSegmentMode,
+        );
+        assert_eq!(stream.state.strstart, before_start);
+        assert_eq!(stream.state.lookahead, before_lookahead);
+        assert_eq!(driver.core.phase, before_phase);
+        assert_eq!(driver.core.input_phase, InputPhase::FinalTail);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_signed_levels_are_rejected_for_all_strategies_and_transition_pairs() {
+        for raw in i8::MIN..=i8::MAX {
+            let expected_valid = (0..=9).contains(&raw);
+            assert_eq!(level_config(raw).is_some(), expected_valid, "level {raw}");
+            for strategy in [
+                Strategy::Default,
+                Strategy::Filtered,
+                Strategy::Fixed,
+                Strategy::Rle,
+                Strategy::HuffmanOnly,
+            ] {
+                assert_eq!(
+                    Algorithm::for_stream(raw, strategy).is_some(),
+                    expected_valid,
+                    "level {raw}, strategy {strategy:?}"
+                );
+                assert_eq!(
+                    change_requires_block_boundary(raw, strategy, 6, Strategy::Default).is_some(),
+                    expected_valid,
+                );
+                assert_eq!(
+                    change_requires_block_boundary(6, Strategy::Default, raw, strategy).is_some(),
+                    expected_valid,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compression_levels_have_explicit_algorithm_families() {
         let expected = [
             Algorithm::Stored,
@@ -971,7 +1046,10 @@ mod tests {
         ];
 
         for (level, expected) in (0i8..).zip(expected) {
-            assert_eq!(level_config(level).algorithm, expected);
+            assert_eq!(
+                level_config(level).map(|config| config.algorithm),
+                Some(expected)
+            );
         }
     }
 
@@ -979,50 +1057,51 @@ mod tests {
     fn strategies_select_specialized_algorithms() {
         assert_eq!(
             Algorithm::for_stream(6, Strategy::Default),
-            Algorithm::Medium
+            Some(Algorithm::Medium)
         );
         assert_eq!(
             Algorithm::for_stream(6, Strategy::Filtered),
-            Algorithm::Medium
+            Some(Algorithm::Medium)
         );
-        assert_eq!(Algorithm::for_stream(6, Strategy::Fixed), Algorithm::Medium);
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::Fixed),
+            Some(Algorithm::Medium)
+        );
         assert_eq!(
             Algorithm::for_stream(6, Strategy::HuffmanOnly),
-            Algorithm::Huffman
+            Some(Algorithm::Huffman)
         );
-        assert_eq!(Algorithm::for_stream(6, Strategy::Rle), Algorithm::Rle);
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::Rle),
+            Some(Algorithm::Rle)
+        );
         assert_eq!(
             Algorithm::for_stream(0, Strategy::HuffmanOnly),
-            Algorithm::Stored
+            Some(Algorithm::Stored)
         );
-        assert_eq!(Algorithm::for_stream(0, Strategy::Rle), Algorithm::Stored);
+        assert_eq!(
+            Algorithm::for_stream(0, Strategy::Rle),
+            Some(Algorithm::Stored)
+        );
     }
 
     #[test]
     fn parameter_changes_flush_only_across_algorithm_or_strategy_boundaries() {
-        assert!(!change_requires_block_boundary(
-            3,
-            Strategy::Default,
-            6,
-            Strategy::Default
-        ));
-        assert!(!change_requires_block_boundary(
-            7,
-            Strategy::Default,
-            9,
-            Strategy::Default
-        ));
-        assert!(change_requires_block_boundary(
-            6,
-            Strategy::Default,
-            7,
-            Strategy::Default
-        ));
-        assert!(change_requires_block_boundary(
-            6,
-            Strategy::Default,
-            6,
-            Strategy::Fixed
-        ));
+        assert_eq!(
+            change_requires_block_boundary(3, Strategy::Default, 6, Strategy::Default),
+            Some(false)
+        );
+        assert_eq!(
+            change_requires_block_boundary(7, Strategy::Default, 9, Strategy::Default),
+            Some(false)
+        );
+        assert_eq!(
+            change_requires_block_boundary(6, Strategy::Default, 7, Strategy::Default),
+            Some(true)
+        );
+        assert_eq!(
+            change_requires_block_boundary(6, Strategy::Default, 6, Strategy::Fixed),
+            Some(true)
+        );
     }
 }

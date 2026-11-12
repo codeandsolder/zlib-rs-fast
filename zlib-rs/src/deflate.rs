@@ -955,9 +955,15 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 
     let state = &mut *stream.state;
 
-    if change_requires_block_boundary(state.level, state.strategy, level, strategy)
-        && state.last_flush != -2
-    {
+    let Some(next_config) = level_config(level) else {
+        return ReturnCode::StreamError;
+    };
+    let Some(requires_boundary) =
+        change_requires_block_boundary(state.level, state.strategy, level, strategy)
+    else {
+        return ReturnCode::StreamError;
+    };
+    if requires_boundary && state.last_flush != -2 {
         // Flush the last buffer.
         let err = deflate(stream, DeflateFlush::Block);
         if err == ReturnCode::StreamError {
@@ -986,7 +992,7 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
             state.matches = 0;
         }
 
-        lm_set_level(state, level);
+        lm_set_level(state, level, next_config);
     }
 
     state.strategy = strategy;
@@ -1173,10 +1179,15 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
 }
 
 pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
+    // A damaged or stale state must fail before reset_keep mutates any
+    // buffered output, checksums, or the live hash history.
+    let Some(config) = level_config(stream.state.level) else {
+        return ReturnCode::StreamError;
+    };
     let ret = reset_keep(stream);
 
     if ret == ReturnCode::Ok {
-        lm_init(&mut stream.state);
+        lm_init(&mut stream.state, config);
     }
 
     ret
@@ -1217,7 +1228,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
-fn lm_init(state: &mut State) {
+fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
     state.window_size = 2 * state.w_size;
     state.window.clear();
 
@@ -1226,7 +1237,7 @@ fn lm_init(state: &mut State) {
 
     // Hashes are a property of the live history representation, not a tunable
     // search budget. Choose the representation only while the history is empty.
-    lm_set_level(state, state.level);
+    lm_set_level(state, state.level, config);
     state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
 
     state.strstart = 0;
@@ -1239,8 +1250,7 @@ fn lm_init(state: &mut State) {
     state.ins_h = 0;
 }
 
-const fn lm_set_level(state: &mut State, level: i8) {
-    let config = level_config(level);
+fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConfig) {
     state.medium_next_match = MatchCandidate::EMPTY;
     state.max_insert_length = config.max_lazy;
     state.max_lazy_match = config.max_lazy;
@@ -2247,8 +2257,8 @@ pub enum BlockState {
     FinishStarted = 2,
     /// finish done, accept no more input or output
     FinishDone = 3,
-    /// A detached match-search request could not be constructed from the live state.
-    InvalidMatchState = 4,
+    /// The compressor or scheduler encountered an invalid internal state.
+    InvalidState = 4,
 }
 
 // Maximum stored block length in deflate format (not including header).
@@ -3364,7 +3374,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         }
 
         match bstate {
-            BlockState::InvalidMatchState => return ReturnCode::StreamError,
+            BlockState::InvalidState => return ReturnCode::StreamError,
             BlockState::NeedMore | BlockState::FinishStarted => {
                 if stream.output.avail_out == 0 {
                     state.last_flush = -1; /* avoid BUF_ERROR next call, see above */
@@ -5006,6 +5016,27 @@ mod test {
     }
 
     #[test]
+    fn resetting_a_state_with_invalid_compression_level_preserves_live_cursors(
+    ) -> Result<(), ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let original_level = stream.state.level;
+        let original_total_in = stream.total_in;
+        let original_total_out = stream.total_out;
+        let original_start = stream.state.strstart;
+        for invalid in [i8::MIN, -1, 10, i8::MAX] {
+            stream.state.level = invalid;
+            assert_eq!(reset(&mut stream), ReturnCode::StreamError);
+            assert_eq!(stream.total_in, original_total_in);
+            assert_eq!(stream.total_out, original_total_out);
+            assert_eq!(stream.state.strstart, original_start);
+        }
+        stream.state.level = original_level;
+        assert_eq!(reset(&mut stream), ReturnCode::Ok);
+        let _ = end(&mut stream);
+        Ok(())
+    }
+
+    #[test]
     fn level_change_flushes_block_with_origin_outside_window() -> Result<(), &'static str> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
         for (initial_level, next_level) in [(1, 6), (6, 9), (9, 1)] {
@@ -6418,6 +6449,11 @@ mod test {
                     return Ok(Some(work));
                 }
                 algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error),
+                algorithm::StandardTurnOutcome::InvalidSegmentMode => {
+                    return Err(
+                        crate::deflate::longest_match::MatchSearchError::InvalidSegmentMode,
+                    );
+                }
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("Final mode with all input supplied unexpectedly requested more input")
                 }
@@ -6498,7 +6534,8 @@ mod test {
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
         assert!(stream.state.bit_writer.pending.is_empty());
 
-        let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy);
+        let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy)
+            .ok_or(crate::deflate::longest_match::MatchSearchError::InvalidCompressionLevel)?;
         let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &stream.state)
             .expect("proof only covers the five standard token-producing algorithms");
 
@@ -6542,6 +6579,11 @@ mod test {
                     driver.complete_match_search(&mut stream.state, results[0])?;
                 }
                 algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error),
+                algorithm::StandardTurnOutcome::InvalidSegmentMode => {
+                    return Err(
+                        crate::deflate::longest_match::MatchSearchError::InvalidSegmentMode,
+                    );
+                }
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("final proof supplied the complete caller input")
                 }

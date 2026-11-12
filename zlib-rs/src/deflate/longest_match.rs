@@ -86,6 +86,12 @@ pub enum MatchSearchError {
     OutstandingSearch,
     /// A match result was delivered without a pending request.
     UnexpectedMatchResult,
+    /// Test harness: the scheduler resumed a finalized segment as open-ended.
+    #[cfg(test)]
+    InvalidSegmentMode,
+    /// Test harness: a compressor supplied a level outside the valid 0..=9 range.
+    #[cfg(test)]
+    InvalidCompressionLevel,
 }
 
 impl MatchSearchWork {
