@@ -4337,18 +4337,20 @@ mod stable_api {
     };
 
     #[test]
-    #[should_panic = "StreamError"]
     fn invalid_config() {
-        let _ = zlib_rs::Deflate::new(9000, true, 15);
+        assert_eq!(
+            zlib_rs::Deflate::new(9000, true, 15).err(),
+            Some(zlib_rs::DeflateError::StreamError)
+        );
     }
 
-    fn with_window_bits(window_bits: i32) {
+    fn with_window_bits(window_bits: i32) -> Result<(), zlib_rs::DeflateError> {
         let input = b"Hello World!";
         let absolute_window = window_bits.unsigned_abs();
         let bits = u8::try_from(absolute_window).unwrap_or(u8::MAX);
         assert_eq!(u32::from(bits), absolute_window);
 
-        let mut deflater = zlib_rs::Deflate::new(9, window_bits >= 0, bits);
+        let mut deflater = zlib_rs::Deflate::new(9, window_bits >= 0, bits)?;
         let mut compressed = [0xa5u8; 64];
         assert_eq!(
             deflater.compress(input, &mut compressed, DeflateFlush::Finish),
@@ -4368,29 +4370,30 @@ mod stable_api {
         assert_eq!(status, ReturnCode::Ok);
         assert_eq!(decoded, input);
         assert!(restored[input.len()..].iter().all(|&b| b == 0xa5));
+        Ok(())
     }
 
     #[test]
-    fn raw() {
-        with_window_bits(-15);
+    fn raw() -> Result<(), zlib_rs::DeflateError> {
+        with_window_bits(-15)
     }
 
     #[test]
-    fn zlib_header() {
-        with_window_bits(15);
+    fn zlib_header() -> Result<(), zlib_rs::DeflateError> {
+        with_window_bits(15)
     }
 
     #[test]
-    fn gz_header() {
-        with_window_bits(16 + 15);
+    fn gz_header() -> Result<(), zlib_rs::DeflateError> {
+        with_window_bits(16 + 15)
     }
 
     #[test]
-    fn reset_reuse_stream() {
+    fn reset_reuse_stream() -> Result<(), zlib_rs::DeflateError> {
         let input1 = b"Hello World!";
         let input2 = b"Goodbye World!";
 
-        let mut deflater = zlib_rs::Deflate::new(9, true, 15);
+        let mut deflater = zlib_rs::Deflate::new(9, true, 15)?;
         let mut compressed1 = [0xa5u8; 64];
         assert_eq!(
             deflater.compress(input1, &mut compressed1, DeflateFlush::Finish),
@@ -4427,11 +4430,12 @@ mod stable_api {
             assert_eq!(decoded, input);
             assert!(restored[input.len()..].iter().all(|&b| b == 0xa5));
         }
+        Ok(())
     }
 
     #[test]
-    fn set_level_no_flush() {
-        let mut d = zlib_rs::Deflate::new(1, true, 15);
+    fn set_level_no_flush() -> Result<(), zlib_rs::DeflateError> {
+        let mut d = zlib_rs::Deflate::new(1, true, 15)?;
 
         let input = vec![b'a'; 128];
 
@@ -4444,12 +4448,13 @@ mod stable_api {
 
         // Due to NoFlush there is data to write, but no buffer to write it into.
         assert_eq!(d.set_level(9), Err(zlib_rs::DeflateError::StreamError));
+        Ok(())
     }
 
     /// Test that the Deflate state does not retain the dictionary.
     #[test]
-    fn set_dictionary_drop_dictionary() {
-        let mut d = zlib_rs::Deflate::new(1, true, 15);
+    fn set_dictionary_drop_dictionary() -> Result<(), zlib_rs::DeflateError> {
+        let mut d = zlib_rs::Deflate::new(1, true, 15)?;
 
         {
             let dict = vec![b'a'; 128];
@@ -4461,5 +4466,6 @@ mod stable_api {
         assert!(d
             .compress_uninit(&input, &mut output, DeflateFlush::NoFlush)
             .is_ok());
+        Ok(())
     }
 }

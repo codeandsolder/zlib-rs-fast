@@ -172,14 +172,14 @@ mod tests {
     use crate::ReturnCode;
 
     #[test]
-    fn specialized_search_requires_rolling_hash_history() {
+    fn specialized_search_requires_rolling_hash_history() -> Result<(), crate::ReturnCode> {
         for (level, chain, expected_specialized) in [
             (7, 4_096, false), // tune a Standard-hash stream above the usual chain limit
             (7, 128, false),
             (9, 4_096, true),
             (9, 128, false),
         ] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))?;
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             assert_eq!(
                 SlowProducer::new(&stream.state, MatchSourceKind::HashChain).use_longest_match_slow,
@@ -188,5 +188,6 @@ mod tests {
             );
             assert!(end(&mut stream).is_ok());
         }
+        Ok(())
     }
 }

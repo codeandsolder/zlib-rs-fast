@@ -624,25 +624,35 @@ impl<'a> DeflateStream<'a> {
         self.state.bit_writer.bits_used
     }
 
-    pub fn new(config: DeflateConfig) -> Self {
+    /// Construct an owned compressor whose allocation is released on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the initialization status for invalid configuration or
+    /// allocation failure, without constructing a partially initialized state.
+    pub fn new(config: DeflateConfig) -> Result<Self, ReturnCode> {
         let mut inner = crate::c_api::z_stream::default();
+        let status = crate::deflate::init(&mut inner, config);
+        if status != ReturnCode::Ok {
+            return Err(status);
+        }
 
-        let ret = crate::deflate::init(&mut inner, config);
-        assert_eq!(ret, ReturnCode::Ok);
+        // init guarantees callbacks and a live State on success.
+        let (Some(zalloc), Some(zfree)) = (inner.zalloc, inner.zfree) else {
+            return Err(ReturnCode::StreamError);
+        };
+        if inner.state.is_null() {
+            return Err(ReturnCode::StreamError);
+        }
 
         let state = inner.state.cast::<State<'a>>();
         let alloc = Allocator {
-            zalloc: inner
-                .zalloc
-                .expect("initialized deflate stream has an allocator"),
-            zfree: inner
-                .zfree
-                .expect("initialized deflate stream has a deallocator"),
+            zalloc,
+            zfree,
             opaque: inner.opaque,
             _marker: PhantomData,
         };
-
-        Self {
+        Ok(Self {
             next_in: inner.next_in.cast_mut(),
             avail_in: inner.avail_in,
             total_in: inner.total_in,
@@ -650,12 +660,22 @@ impl<'a> DeflateStream<'a> {
             avail_out: inner.avail_out,
             total_out: inner.total_out,
             msg: inner.msg.cast_const(),
-            // SAFETY: successful `init` created a live deflate State allocation owned by this stream.
+            // SAFETY: successful initialization created the exclusively owned State.
             state: unsafe { StatePtr::from_raw(state) },
             alloc,
             data_type: inner.data_type,
             adler: inner.adler,
             reserved: inner.reserved,
+        })
+    }
+}
+
+impl Drop for DeflateStream<'_> {
+    fn drop(&mut self) {
+        // End nulls the State pointer before releasing it, so an explicit
+        // deflateEnd and this owner cleanup cannot free the same state twice.
+        if !self.state.as_ptr().is_null() {
+            let _ = end(self);
         }
     }
 }
@@ -4455,6 +4475,27 @@ mod test {
     use core::{ffi::CStr, sync::atomic::AtomicUsize};
 
     #[test]
+    fn owned_stream_rejects_invalid_config_and_does_not_double_free_after_end(
+    ) -> Result<(), ReturnCode> {
+        let invalid = DeflateConfig {
+            level: i32::MAX,
+            ..DeflateConfig::default()
+        };
+        assert!(matches!(
+            DeflateStream::new(invalid),
+            Err(ReturnCode::StreamError)
+        ));
+
+        let mut owned = DeflateStream::new(DeflateConfig::default())?;
+        assert!(!owned.state.as_ptr().is_null());
+        assert!(end(&mut owned).is_ok());
+        assert!(owned.state.as_ptr().is_null());
+        // Drop must not release state a second time after explicit deflateEnd.
+        drop(owned);
+        Ok(())
+    }
+
+    #[test]
     fn gzip_header_and_checksum_preserve_low_wire_bits() {
         let mut header = gz_header {
             time: crate::c_api::z_checksum::MAX,
@@ -4647,7 +4688,8 @@ mod test {
     }
 
     #[test]
-    fn huffman_heap_initialization_has_explicit_empty_and_sparse_origins() {
+    fn huffman_heap_initialization_has_explicit_empty_and_sparse_origins(
+    ) -> Result<(), crate::ReturnCode> {
         for active in [None, Some(0usize), Some(1), Some(D_CODES - 1)] {
             let mut leaves = [Value::new(0, 0); D_CODES];
             if let Some(code) = active {
@@ -4661,7 +4703,7 @@ mod test {
                 assert_eq!(heap.nodes[Heap::SMALLEST], code);
             }
 
-            let mut stream = DeflateStream::new(DeflateConfig::new(6));
+            let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
             let mut desc = TreeDesc::<{ 2 * D_CODES + 1 }>::new(&StaticTreeDesc::D);
             if let Some(code) = active {
                 *desc.dyn_tree[code].freq_mut() = 1;
@@ -4690,6 +4732,7 @@ mod test {
             }
             assert!(end(&mut stream).is_ok());
         }
+        Ok(())
     }
 
     #[test]
@@ -4722,8 +4765,9 @@ mod test {
     }
 
     #[test]
-    fn bit_writer_matches_independent_lsb_first_stream_across_reservoir_boundaries() {
-        let mut stream = DeflateStream::new(DeflateConfig::new(6));
+    fn bit_writer_matches_independent_lsb_first_stream_across_reservoir_boundaries(
+    ) -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
         let writer = &mut stream.state.bit_writer;
         let mut expected_bits = Vec::new();
         for len in [0u8, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 1, 64, 8, 0, 7, 63] {
@@ -4749,6 +4793,7 @@ mod test {
             usize::from(writer.bits_used),
             if last_bits == 0 { 8 } else { last_bits }
         );
+        Ok(())
     }
 
     #[test]
@@ -4916,7 +4961,8 @@ mod test {
         // outside the current window and its length must not narrow or wrap.
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
         for level in [1, 6, 9] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))
+                .map_err(|_| "valid deflate initialization failed")?;
             let mut output = vec![0u8; compress_bound(source.len()) + 64];
             stream.next_in = source.as_ptr().cast_mut();
             stream.avail_in = crate::c_api::uInt::try_from(source.len())
@@ -4960,7 +5006,8 @@ mod test {
     fn level_change_flushes_block_with_origin_outside_window() -> Result<(), &'static str> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
         for (initial_level, next_level) in [(1, 6), (6, 9), (9, 1)] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level));
+            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))
+                .map_err(|_| "valid deflate initialization failed")?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
             stream.next_in = source.as_ptr().cast_mut();
             stream.avail_in = crate::c_api::uInt::try_from(source.len())
@@ -5008,9 +5055,10 @@ mod test {
     }
 
     #[test]
-    fn stored_header_emits_real_length_without_payload_or_rewrite() {
+    fn stored_header_emits_real_length_without_payload_or_rewrite() -> Result<(), crate::ReturnCode>
+    {
         for len in [0usize, 1, 255, 256, 32_768, MAX_STORED] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(0));
+            let mut stream = DeflateStream::new(DeflateConfig::new(0))?;
             emit_stored_block_header(&mut stream.state, len, true);
             let fields = stored_block_length_fields(len);
             let pending = stream.state.bit_writer.pending.pending();
@@ -5022,6 +5070,7 @@ mod test {
             }
             assert!(end(&mut stream).is_ok());
         }
+        Ok(())
     }
 
     #[test]
@@ -5131,8 +5180,8 @@ mod test {
     }
 
     #[test]
-    fn stored_mode_never_reads_a_slid_out_block_start() {
-        let mut stream = DeflateStream::new(DeflateConfig::new(0));
+    fn stored_mode_never_reads_a_slid_out_block_start() -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(0))?;
         stream.state.block_start = -1;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_compressor(&mut stream, |compressor| {
@@ -5145,10 +5194,12 @@ mod test {
         );
         stream.state.block_start = 0;
         assert!(end(&mut stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn stored_block_large_lengths_preserve_bytes_and_debug_bit_counts() {
+    fn stored_block_large_lengths_preserve_bytes_and_debug_bit_counts(
+    ) -> Result<(), crate::ReturnCode> {
         for len in [8_191usize, 8_192, 16_384, 32_768, usize::from(u16::MAX)] {
             let source: Vec<u8> = (0..len)
                 .map(|i| (i * 29 + i / 13).to_le_bytes()[0])
@@ -5157,7 +5208,7 @@ mod test {
             let mut stream = DeflateStream::new(DeflateConfig {
                 mem_level: 9,
                 ..DeflateConfig::new(0)
-            });
+            })?;
             // SAFETY: source is an initialized, non-overlapping buffer and its bytes
             // remain live while the stream copies the complete window prefix.
             unsafe {
@@ -5190,6 +5241,7 @@ mod test {
             }
             assert!(end(&mut stream).is_ok());
         }
+        Ok(())
     }
 
     #[test]
@@ -5204,7 +5256,8 @@ mod test {
             (9, 128, rolling_seed),
             (9, 4_096, rolling_seed),
         ] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(level));
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))
+                .map_err(|_| "valid deflate initialization failed")?;
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             let mut input = InputCursor::from_slice(&source, stream.total_in)
                 .ok_or("test source length must fit zlib uInt")?;
@@ -5222,13 +5275,13 @@ mod test {
     }
 
     #[test]
-    fn level_changes_preserve_live_hash_table_representation() {
+    fn level_changes_preserve_live_hash_table_representation() -> Result<(), crate::ReturnCode> {
         let dictionary: Vec<u8> = (0..4_096usize)
             .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
             .collect();
 
         for (old_level, new_level, expected_roll) in [(7, 9, false), (9, 7, true), (6, 9, false)] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(old_level));
+            let mut stream = DeflateStream::new(DeflateConfig::new(old_level))?;
             assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
             assert!(stream.state.strstart > 0);
             assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
@@ -5244,6 +5297,7 @@ mod test {
             );
             assert!(end(&mut stream).is_ok());
         }
+        Ok(())
     }
 
     #[test]
@@ -5275,10 +5329,11 @@ mod test {
     }
 
     #[test]
-    fn call_cursors_commit_all_abi_fields_and_rebind_history_per_turn() {
+    fn call_cursors_commit_all_abi_fields_and_rebind_history_per_turn(
+    ) -> Result<(), crate::ReturnCode> {
         let source = *b"cursorruntime";
         let mut destination = [0u8; 16];
-        let mut stream = DeflateStream::new(DeflateConfig::new(6));
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
         stream.next_in = source.as_ptr().cast_mut();
         stream.avail_in = 8;
         stream.total_in = crate::c_api::z_size::MAX - 2;
@@ -5336,6 +5391,7 @@ mod test {
         assert_eq!(&destination[..3], &source[..3]);
         assert_eq!(&destination[3..5], &source[5..7]);
         assert!(end(&mut stream).is_ok());
+        Ok(())
     }
 
     #[test]

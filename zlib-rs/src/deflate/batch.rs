@@ -10,14 +10,14 @@ use super::{
         Algorithm, EndBlockKind, MatchSourceKind, StandardDriver, StandardSegmentMode,
         StandardTurnOutcome,
     },
-    compress_slice, deflate, end, init,
+    compress_slice, deflate,
     longest_match::{
         execute_match_search_batch_with_backend, MatchSearchRequest, MatchSearchResult,
         MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     CallCursors, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode, Status,
 };
-use crate::{abi_cursor::SliceBudget, c_api::z_stream};
+use crate::abi_cursor::SliceBudget;
 #[cfg(feature = "gpu")]
 use crate::{MAX_WBITS, MIN_WBITS};
 
@@ -418,7 +418,7 @@ fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
 
 struct BatchRuntime<'a> {
     job_index: usize,
-    raw: z_stream,
+    stream: DeflateStream<'static>,
     driver: StandardDriver,
     input_budget: SliceBudget,
     output_budget: SliceBudget,
@@ -441,26 +441,24 @@ impl<'a> BatchRuntime<'a> {
         algorithm: Algorithm,
         match_source: MatchSourceKind,
     ) -> Result<Self, BatchCompressResult> {
-        let mut raw = z_stream::default();
-        let code = init(&mut raw, config);
-        if code != ReturnCode::Ok {
-            return Err(BatchCompressResult { written: 0, code });
-        }
+        let mut stream =
+            DeflateStream::new(config).map_err(|code| BatchCompressResult { written: 0, code })?;
+        stream.next_out = output.as_mut_ptr();
+        // The temporary Rust owner releases its State if construction of a
+        // compatible token driver fails; no partially initialized C shell.
+        let Some(driver) =
+            StandardDriver::for_algorithm_with_match_source(algorithm, &stream.state, match_source)
+        else {
+            return Err(BatchCompressResult {
+                written: 0,
+                code: ReturnCode::StreamError,
+            });
+        };
 
-        raw.next_out = output.as_mut_ptr();
         let mut runtime = Self {
             job_index,
-            raw,
-            driver: {
-                let stream = unsafe { DeflateStream::from_stream_ref(&raw const raw) }
-                    .expect("successful init creates a typed deflate stream");
-                StandardDriver::for_algorithm_with_match_source(
-                    algorithm,
-                    &stream.state,
-                    match_source,
-                )
-                .expect("batch runtime requires a standard token producer")
-            },
+            stream,
+            driver,
             input_budget: SliceBudget::new(input.len()),
             output_budget: SliceBudget::new(output.len()),
             done: false,
@@ -474,7 +472,7 @@ impl<'a> BatchRuntime<'a> {
         // Emit raw/zlib/gzip framing through the ordinary compatibility state machine. No input is
         // attached yet, so the algorithm body cannot run in this phase.
         loop {
-            let stream = runtime.stream_mut();
+            let stream = &mut runtime.stream;
             stream.next_in = core::ptr::null_mut();
             stream.avail_in = 0;
             let code = deflate(stream, DeflateFlush::NoFlush);
@@ -491,36 +489,26 @@ impl<'a> BatchRuntime<'a> {
             }
         }
 
-        runtime.raw.next_in = input.as_ptr().cast_mut();
+        runtime.stream.next_in = input.as_ptr().cast_mut();
         runtime.offer_input();
         Ok(runtime)
     }
 
-    fn stream_mut(&mut self) -> &mut DeflateStream<'_> {
-        unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }
-            .expect("live batch runtime has initialized state")
-    }
-
-    fn stream_ref(&self) -> &DeflateStream<'_> {
-        unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }
-            .expect("live batch runtime has initialized state")
-    }
-
     fn offer_input(&mut self) -> bool {
-        self.input_budget.refill(&mut self.raw.avail_in);
-        self.raw.avail_in != 0
+        self.input_budget.refill(&mut self.stream.avail_in);
+        self.stream.avail_in != 0
     }
 
     fn offer_output(&mut self) -> bool {
-        self.output_budget.refill(&mut self.raw.avail_out);
-        self.raw.avail_out != 0
+        self.output_budget.refill(&mut self.stream.avail_out);
+        self.stream.avail_out != 0
     }
 
     fn step(&mut self) -> RuntimeStep {
-        if self.raw.avail_in == 0 {
+        if self.stream.avail_in == 0 {
             self.offer_input();
         }
-        if self.raw.avail_out == 0 && !self.offer_output() {
+        if self.stream.avail_out == 0 && !self.offer_output() {
             return RuntimeStep::Done(self.finish_error(ReturnCode::BufError));
         }
 
@@ -530,9 +518,7 @@ impl<'a> BatchRuntime<'a> {
             StandardSegmentMode::Continue
         };
 
-        let Self { raw, driver, .. } = self;
-        let stream = unsafe { DeflateStream::from_stream_mut(raw) }
-            .expect("live batch runtime has initialized state");
+        let Self { stream, driver, .. } = self;
         let outcome = CallCursors::with_state(stream, |state, cursors| {
             driver.step(
                 state,
@@ -570,12 +556,12 @@ impl<'a> BatchRuntime<'a> {
     }
 
     fn match_request(&self, work: MatchSearchWork) -> MatchSearchRequest<'_> {
-        work.request(&self.stream_ref().state)
+        work.request(&self.stream.state)
     }
 
     #[cfg(feature = "gpu")]
     fn match_from_table(&self, table: &GpuMatchTable) -> MatchSearchResult {
-        let stream = self.stream_ref();
+        let stream = &self.stream;
         let state = &*stream.state;
         let total_in =
             usize::try_from(stream.total_in).expect("batch whole-input position must fit usize");
@@ -620,15 +606,13 @@ impl<'a> BatchRuntime<'a> {
     }
 
     fn complete_match_search(&mut self, result: MatchSearchResult) {
-        let Self { raw, driver, .. } = self;
-        let stream = unsafe { DeflateStream::from_stream_mut(raw) }
-            .expect("live batch runtime has initialized state");
+        let Self { stream, driver, .. } = self;
         driver.complete_match_search(&mut stream.state, result);
     }
 
     fn finish_stream(&mut self) -> BatchCompressResult {
         {
-            let stream = self.stream_mut();
+            let stream = &mut self.stream;
             debug_assert_eq!(stream.avail_in, 0);
             debug_assert!(stream.state.bit_writer.pending.is_empty());
             stream.state.status = Status::Finish;
@@ -637,17 +621,17 @@ impl<'a> BatchRuntime<'a> {
         }
 
         loop {
-            if self.raw.avail_out == 0 && !self.offer_output() {
+            if self.stream.avail_out == 0 && !self.offer_output() {
                 return self.finish_error(ReturnCode::BufError);
             }
 
-            match deflate(self.stream_mut(), DeflateFlush::Finish) {
+            match deflate(&mut self.stream, DeflateFlush::Finish) {
                 ReturnCode::StreamEnd => {
                     self.done = true;
                     return BatchCompressResult {
                         // The output slice budget remains full-width even
                         // when the C ABI's total_out counter wraps.
-                        written: self.output_budget.processed(self.raw.avail_out),
+                        written: self.output_budget.processed(self.stream.avail_out),
                         code: ReturnCode::Ok,
                     };
                 }
@@ -660,16 +644,8 @@ impl<'a> BatchRuntime<'a> {
     const fn finish_error(&mut self, code: ReturnCode) -> BatchCompressResult {
         self.done = true;
         BatchCompressResult {
-            written: self.output_budget.processed(self.raw.avail_out),
+            written: self.output_budget.processed(self.stream.avail_out),
             code,
-        }
-    }
-}
-
-impl Drop for BatchRuntime<'_> {
-    fn drop(&mut self) {
-        if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) } {
-            let _ = end(stream);
         }
     }
 }
@@ -686,6 +662,52 @@ mod tests {
         let len = written.len();
         output.truncate(len);
         (output, code)
+    }
+
+    #[test]
+    fn scheduled_runtime_reports_initialization_and_unsupported_driver_errors(
+    ) -> Result<(), &'static str> {
+        let input = b"batch setup failure";
+        let mut output = [0u8; 128];
+
+        let invalid = DeflateConfig {
+            level: i32::MAX,
+            ..DeflateConfig::default()
+        };
+        let algorithm = configured_algorithm(DeflateConfig::new(6))
+            .ok_or("standard compressor must have an algorithm")?;
+        assert!(matches!(
+            BatchRuntime::new(
+                0,
+                input,
+                &mut output,
+                invalid,
+                algorithm,
+                MatchSourceKind::HashChain,
+            ),
+            Err(BatchCompressResult {
+                code: ReturnCode::StreamError,
+                written: 0
+            })
+        ));
+
+        let stored = configured_algorithm(DeflateConfig::new(0))
+            .ok_or("stored compressor must have an algorithm")?;
+        assert!(matches!(
+            BatchRuntime::new(
+                0,
+                input,
+                &mut output,
+                DeflateConfig::new(0),
+                stored,
+                MatchSourceKind::HashChain,
+            ),
+            Err(BatchCompressResult {
+                code: ReturnCode::StreamError,
+                written: 0
+            })
+        ));
+        Ok(())
     }
 
     #[test]
@@ -706,11 +728,11 @@ mod tests {
         )
         .map_err(|_| "batch runtime failed initialization")?;
 
-        let actual = runtime.output_budget.processed(runtime.raw.avail_out);
+        let actual = runtime.output_budget.processed(runtime.stream.avail_out);
         assert!(actual <= output_capacity);
         // C z_size may wrap at the ABI width; a batch job still reports the
         // exact number of bytes initialized in the caller-owned output slice.
-        runtime.raw.total_out = crate::c_api::z_size::MAX;
+        runtime.stream.total_out = crate::c_api::z_size::MAX;
         let failure = runtime.finish_error(ReturnCode::BufError);
         assert_eq!(failure.code, ReturnCode::BufError);
         assert_eq!(failure.written, actual);

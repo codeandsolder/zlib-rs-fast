@@ -2907,7 +2907,7 @@ mod boundary_tests {
     use super::*;
 
     #[test]
-    fn boundary_reparse_keeps_exact_model_of_selected_tokens() {
+    fn boundary_reparse_keeps_exact_model_of_selected_tokens() -> Result<(), crate::ReturnCode> {
         // Test both a warm previous model and no previous model. A reparse
         // may retain the original path, select an improved path, or converge
         // after a worse intermediate iteration; in all cases the retained
@@ -2921,7 +2921,7 @@ mod boundary_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9));
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9))?;
         let state = &mut *stream.state;
         for passes in [1, 2, 4] {
             let mut block =
@@ -2939,11 +2939,12 @@ mod boundary_tests {
                 assert_eq!(block.block.token_input_len(), block.block.range.len());
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn exact_score_with_and_without_learned_costs_agree() {
-        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9));
+    fn exact_score_with_and_without_learned_costs_agree() -> Result<(), crate::ReturnCode> {
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9))?;
         let state = &mut *stream.state;
         let samples = [
             vec![ParseToken::Literal(b'a'); 96],
@@ -2989,6 +2990,7 @@ mod boundary_tests {
             assert_eq!(without_costs, with_costs);
             assert_eq!(filtered_costs, expected_costs);
         }
+        Ok(())
     }
 
     #[test]

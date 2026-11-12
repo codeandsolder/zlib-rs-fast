@@ -358,8 +358,10 @@ impl Deflate {
     /// Create a new instance - this allocates so should be done with care.
     ///
     /// The `window_bits` must be in the range `8..=15`, with `15` being most common.
-    #[must_use]
-    pub fn new(level: i32, zlib_header: bool, window_bits: u8) -> Self {
+    /// # Errors
+    ///
+    /// Reports invalid configuration or failed state allocation.
+    pub fn new(level: i32, zlib_header: bool, window_bits: u8) -> Result<Self, DeflateError> {
         let config = DeflateConfig {
             window_bits: if zlib_header {
                 i32::from(window_bits)
@@ -379,13 +381,20 @@ impl Deflate {
     /// tweaking `mem_level` or `strategy` is desired.
     ///
     /// This allocates, so should be done with care.
-    #[must_use]
-    pub fn new_with_config(config: DeflateConfig) -> Self {
-        Self {
-            inner: crate::deflate::DeflateStream::new(config),
+    /// # Errors
+    ///
+    /// Reports invalid configuration or failed state allocation.
+    pub fn new_with_config(config: DeflateConfig) -> Result<Self, DeflateError> {
+        let inner = crate::deflate::DeflateStream::new(config).map_err(|status| match status {
+            ReturnCode::MemError => DeflateError::MemError,
+            ReturnCode::DataError => DeflateError::DataError,
+            _ => DeflateError::StreamError,
+        })?;
+        Ok(Self {
+            inner,
             total_in: 0,
             total_out: 0,
-        }
+        })
     }
 
     /// Prepare the instance for a new stream.
@@ -517,12 +526,6 @@ impl Deflate {
     }
 }
 
-impl Drop for Deflate {
-    fn drop(&mut self) {
-        let _ = crate::deflate::end(&mut self.inner);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,7 +549,8 @@ mod tests {
     fn streaming_deflate_accounts_for_partial_output_and_detaches_caller_buffers(
     ) -> Result<(), &'static str> {
         let source = b"chunked stream input; ".repeat(137);
-        let mut encoder = Deflate::new(6, true, 15);
+        let mut encoder =
+            Deflate::new(6, true, 15).map_err(|_| "valid deflate initialization failed")?;
         let mut compressed = Vec::new();
         let mut finished = false;
 
@@ -608,7 +612,8 @@ mod tests {
     #[test]
     fn safe_inflate_detaches_buffers_with_bounded_output() -> Result<(), &'static str> {
         let source = b"quick brown fox jumps over the lazy dog; ".repeat(36);
-        let mut encoder = Deflate::new(6, true, 15);
+        let mut encoder =
+            Deflate::new(6, true, 15).map_err(|_| "valid deflate initialization failed")?;
         let mut compressed = vec![0u8; source.len() + 128];
         assert_eq!(
             encoder.compress(&source, &mut compressed, DeflateFlush::Finish),
@@ -666,7 +671,8 @@ mod tests {
     fn safe_inflate_dictionary_resume_after_detaching_buffers() -> Result<(), &'static str> {
         let dictionary = b"recurring input history - useful to decoder";
         let source = b"recurring input history - useful to decoder, again";
-        let mut encoder = Deflate::new(6, true, 15);
+        let mut encoder =
+            Deflate::new(6, true, 15).map_err(|_| "valid deflate initialization failed")?;
         assert!(encoder.set_dictionary(dictionary).is_ok());
         let mut compressed_stream = [0u8; 256];
         assert_eq!(

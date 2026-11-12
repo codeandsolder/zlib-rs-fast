@@ -3,14 +3,15 @@
 //! than `u32::MAX`.
 use zlib_rs::{Deflate, DeflateFlush, Inflate, InflateFlush, Status};
 
-pub fn main() {
+pub fn main() -> Result<(), &'static str> {
     const TOTAL: u64 = 5 * 1024 * 1024 * 1024;
     const IN_CHUNK: usize = 1 << 20;
     const OUT_CHUNK: usize = 1 << 20;
 
     let zeros = vec![0u8; IN_CHUNK];
 
-    let mut def = Deflate::new(1, true, 15);
+    let mut def =
+        Deflate::new(1, true, 15).map_err(|_| "failed to initialize deflate compressor")?;
     let mut compressed = Vec::new();
 
     let mut left = TOTAL;
@@ -92,4 +93,5 @@ pub fn main() {
 
     assert_eq!(inf.total_in(), total_compressed);
     assert_eq!(inf.total_out(), TOTAL);
+    Ok(())
 }

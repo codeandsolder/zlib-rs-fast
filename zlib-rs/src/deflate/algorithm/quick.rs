@@ -153,10 +153,11 @@ mod tests {
     }
 
     #[test]
-    fn hash_distance_checks_sentinels_underflow_and_window_boundary() {
+    fn hash_distance_checks_sentinels_underflow_and_window_boundary(
+    ) -> Result<(), crate::ReturnCode> {
         use crate::deflate::{end, DeflateConfig, DeflateStream};
 
-        let mut stream = DeflateStream::new(DeflateConfig::new(1));
+        let mut stream = DeflateStream::new(DeflateConfig::new(1))?;
         let state = &mut stream.state;
         let limit = state.max_dist();
         assert!(u16::try_from(limit).is_ok());
@@ -181,5 +182,6 @@ mod tests {
         state.w_size = original_w_size;
         state.strstart = 0;
         assert!(end(&mut stream).is_ok());
+        Ok(())
     }
 }
