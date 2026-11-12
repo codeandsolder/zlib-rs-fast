@@ -108,9 +108,12 @@ impl MediumProducer {
                 current_match.orgstart = current_match.strstart;
 
                 if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
-                    let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
+                    let result = match MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
                         .request(state)
-                        .execute();
+                    {
+                        Ok(request) => request.execute(),
+                        Err(error) => return ProduceStatus::MatchSearchError(error),
+                    };
                     state.match_start = result.start;
                     current_match.match_length = result.length;
                     current_match.match_start = result.start;
@@ -144,9 +147,12 @@ impl MediumProducer {
                 next_match.orgstart = next_match.strstart;
 
                 if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
-                    let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
+                    let result = match MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
                         .request(state)
-                        .execute();
+                    {
+                        Ok(request) => request.execute(),
+                        Err(error) => return ProduceStatus::MatchSearchError(error),
+                    };
                     state.match_start = result.start;
                     next_match.match_length = result.length;
                     next_match.match_start = result.start;
@@ -229,7 +235,10 @@ impl TokenProducer for MediumProducer {
                         if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                             let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                             if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
-                                let result = work.request(state).execute();
+                                let result = match work.request(state) {
+                                    Ok(request) => request.execute(),
+                                    Err(error) => return ProduceStatus::MatchSearchError(error),
+                                };
                                 self.apply_current_search(state, result);
                                 self.phase = MediumPhase::AfterCurrentSearch;
                                 continue;
@@ -277,7 +286,10 @@ impl TokenProducer for MediumProducer {
                         if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                             let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                             if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
-                                let result = work.request(state).execute();
+                                let result = match work.request(state) {
+                                    Ok(request) => request.execute(),
+                                    Err(error) => return ProduceStatus::MatchSearchError(error),
+                                };
                                 self.apply_future_search(state, result);
                                 state.lookahead = current_lookahead;
                                 state.strstart = usize::from(self.current_match.strstart);

@@ -2247,6 +2247,8 @@ pub enum BlockState {
     FinishStarted = 2,
     /// finish done, accept no more input or output
     FinishDone = 3,
+    /// A detached match-search request could not be constructed from the live state.
+    InvalidMatchState = 4,
 }
 
 // Maximum stored block length in deflate format (not including header).
@@ -3362,6 +3364,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         }
 
         match bstate {
+            BlockState::InvalidMatchState => return ReturnCode::StreamError,
             BlockState::NeedMore | BlockState::FinishStarted => {
                 if stream.output.avail_out == 0 {
                     state.last_flush = -1; /* avoid BUF_ERROR next call, see above */
@@ -6360,7 +6363,12 @@ mod test {
         }
 
         /// Perform exactly one production scheduler turn using the same driver as the zlib path.
-        fn step(&mut self) -> Option<crate::deflate::longest_match::MatchSearchWork> {
+        fn step(
+            &mut self,
+        ) -> Result<
+            Option<crate::deflate::longest_match::MatchSearchWork>,
+            crate::deflate::longest_match::MatchSearchRequestError,
+        > {
             assert!(!self.done);
             let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.unwrap();
 
@@ -6370,7 +6378,7 @@ mod test {
             if let Some(result) = self.pending_match_result.take() {
                 self.driver.complete_match_search(&mut stream.state, result);
                 self.match_result_turns += 1;
-                return None;
+                return Ok(None);
             }
 
             let mut chunk = [0u8; Self::OUTPUT_CHUNK];
@@ -6406,8 +6414,9 @@ mod test {
                 algorithm::StandardTurnOutcome::Progress => {}
                 algorithm::StandardTurnOutcome::MatchSearch(work) => {
                     self.match_search_turns += 1;
-                    return Some(work);
+                    return Ok(Some(work));
                 }
+                algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error),
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("Final mode with all input supplied unexpectedly requested more input")
                 }
@@ -6421,13 +6430,16 @@ mod test {
                     algorithm::EndBlockKind::FlushBoundary,
                 ) => panic!("final batch job ended as a non-final flush boundary"),
             }
-            None
+            Ok(None)
         }
 
         fn match_request(
             &self,
             work: crate::deflate::longest_match::MatchSearchWork,
-        ) -> crate::deflate::longest_match::MatchSearchRequest<'_> {
+        ) -> Result<
+            crate::deflate::longest_match::MatchSearchRequest<'_>,
+            crate::deflate::longest_match::MatchSearchRequestError,
+        > {
             let stream = unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }.unwrap();
             work.request(&stream.state)
         }
@@ -6466,7 +6478,10 @@ mod test {
         output
     }
 
-    fn framed_standard_driver_output(input: &[u8], config: DeflateConfig) -> Vec<u8> {
+    fn framed_standard_driver_output(
+        input: &[u8],
+        config: DeflateConfig,
+    ) -> Result<Vec<u8>, crate::deflate::longest_match::MatchSearchRequestError> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
         let mut output = vec![0u8; compress_bound(input.len()) + 64];
@@ -6514,7 +6529,7 @@ mod test {
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
                 algorithm::StandardTurnOutcome::MatchSearch(work) => {
-                    let request = work.request(&stream.state);
+                    let request = work.request(&stream.state)?;
                     let mut results = [crate::deflate::longest_match::MatchSearchResult {
                         length: 0,
                         start: 0,
@@ -6525,6 +6540,7 @@ mod test {
                     );
                     driver.complete_match_search(&mut stream.state, results[0]);
                 }
+                algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error),
                 algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
                     panic!("final proof supplied the complete caller input")
                 }
@@ -6553,11 +6569,12 @@ mod test {
         let len = stream.total_out as usize;
         assert!(end(stream).is_ok());
         output.truncate(len);
-        output
+        Ok(output)
     }
 
     #[test]
-    fn standard_driver_middle_preserves_full_stream_framing() {
+    fn standard_driver_middle_preserves_full_stream_framing(
+    ) -> Result<(), crate::deflate::longest_match::MatchSearchRequestError> {
         let mut input = Vec::with_capacity(120_000);
         for i in 0..3_000usize {
             input.extend_from_slice(b"framed-standard-driver/");
@@ -6587,17 +6604,19 @@ mod test {
                 let (reference, rc) = compress_slice(&mut reference_buf, &input, config);
                 assert_eq!(rc, ReturnCode::Ok);
 
-                let scheduled = framed_standard_driver_output(&input, config);
+                let scheduled = framed_standard_driver_output(&input, config)?;
                 assert_eq!(
                     scheduled, reference,
                     "framed StandardDriver changed output for level {level}, strategy {strategy:?}, window_bits {window_bits}"
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn standard_core_events_can_be_round_robin_scheduled_across_streams() {
+    fn standard_core_events_can_be_round_robin_scheduled_across_streams(
+    ) -> Result<(), crate::deflate::longest_match::MatchSearchRequestError> {
         let mut input = Vec::with_capacity(160_000);
         for i in 0..4_000usize {
             input.extend_from_slice(b"round-robin-standard-core/");
@@ -6636,7 +6655,7 @@ mod test {
             let mut match_work = Vec::new();
             for (index, job) in jobs.iter_mut().enumerate() {
                 if !job.done {
-                    if let Some(work) = job.step() {
+                    if let Some(work) = job.step()? {
                         match_work.push((index, work));
                     }
                     scheduler_turns += 1;
@@ -6647,7 +6666,7 @@ mod test {
                 let requests = match_work
                     .iter()
                     .map(|(index, work)| jobs[*index].match_request(*work))
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut results = vec![
                     crate::deflate::longest_match::MatchSearchResult {
                         length: 0,
@@ -6716,10 +6735,12 @@ mod test {
             );
             assert_eq!(job.into_output(), reference);
         }
+        Ok(())
     }
 
     #[test]
-    fn tuned_medium_long_chain_still_yields_detached_match_search() {
+    fn tuned_medium_long_chain_still_yields_detached_match_search(
+    ) -> Result<(), crate::deflate::longest_match::MatchSearchRequestError> {
         let input_bytes = b"tuned-medium-detached-search/".repeat(2_000);
         let config = DeflateConfig {
             level: 6,
@@ -6759,6 +6780,7 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error),
                 algorithm::CoreEvent::TokenBlockReady(_) => {
                     panic!("tuned Medium filled a token block before yielding match-search work")
                 }
@@ -6768,13 +6790,15 @@ mod test {
             }
         };
 
-        let result = search.request(&stream.state).execute();
+        let result = search.request(&stream.state)?.execute();
         core.complete_match_search(&mut stream.state, result);
         let _ = end(stream);
+        Ok(())
     }
 
     #[test]
-    fn standard_core_rejects_production_before_match_search_completes() {
+    fn standard_core_rejects_production_before_match_search_completes(
+    ) -> Result<(), crate::deflate::longest_match::MatchSearchRequestError> {
         let input_bytes = b"detached-match-search/".repeat(2_000);
         let config = DeflateConfig {
             level: 7,
@@ -6813,6 +6837,7 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error),
                 algorithm::CoreEvent::TokenBlockReady(_) => {
                     panic!("Slow filled a token block before yielding match-search work")
                 }
@@ -6830,7 +6855,7 @@ mod test {
             "production advanced with an outstanding match search"
         );
 
-        let result = search.request(&stream.state).execute();
+        let result = search.request(&stream.state)?.execute();
         core.complete_match_search(&mut stream.state, result);
         assert!(matches!(
             core.next_event(&mut stream.state),
@@ -6841,10 +6866,12 @@ mod test {
         ));
 
         let _ = end(stream);
+        Ok(())
     }
 
     #[test]
-    fn standard_core_rejects_production_before_pending_output_is_drained() {
+    fn standard_core_rejects_production_before_pending_output_is_drained(
+    ) -> Result<(), crate::deflate::longest_match::MatchSearchRequestError> {
         let mut input_bytes = Vec::with_capacity(40_000);
         for i in 0..2_000usize {
             input_bytes.extend_from_slice(b"must-drain-before-producing/");
@@ -6888,9 +6915,10 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => {
-                    let result = work.request(&stream.state).execute();
+                    let result = work.request(&stream.state)?.execute();
                     core.complete_match_search(&mut stream.state, result);
                 }
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error),
                 algorithm::CoreEvent::TokenBlockReady(work) => {
                     break core.encode_token_block(&mut stream.state, work);
                 }
@@ -6920,6 +6948,7 @@ mod test {
 
         // This test bypasses the outer zlib status machine; only ensure the allocation is released.
         let _ = end(stream);
+        Ok(())
     }
 
     #[test]

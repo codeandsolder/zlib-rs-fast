@@ -12,8 +12,8 @@ use super::{
     },
     compress_slice, deflate,
     longest_match::{
-        execute_match_search_batch_with_backend, MatchSearchRequest, MatchSearchResult,
-        MatchSearchWork, ScopedThreadMatchSearchBackend,
+        execute_match_search_batch_with_backend, MatchSearchRequest, MatchSearchRequestError,
+        MatchSearchResult, MatchSearchWork, ScopedThreadMatchSearchBackend,
     },
     CallCursors, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode, Status,
 };
@@ -176,7 +176,7 @@ pub fn compress_slices_batch_with_backend(
     let BatchMatchSearchBackend::ScopedThreads { workers } = backend else {
         unreachable!("scalar backends returned before scheduled compression")
     };
-    let mut resolver = ScopedThreadResolver { workers };
+    let mut resolver = ScopedThreadResolver::new(workers);
     compress_scheduled(
         jobs,
         config,
@@ -264,16 +264,32 @@ fn configured_max_dist(config: DeflateConfig) -> Option<u32> {
 }
 
 trait MatchResolver {
+    /// Return one outcome per job. A malformed request must not abort another
+    /// independent stream in the same batch.
     fn resolve(
         &mut self,
         runtimes: &[BatchRuntime<'_>],
         work: &[(usize, MatchSearchWork)],
-        results: &mut [MatchSearchResult],
+        results: &mut [Result<MatchSearchResult, MatchSearchRequestError>],
     );
 }
 
 struct ScopedThreadResolver {
     workers: usize,
+    // Reuse owned result/index buffers between scheduling turns. The borrowed
+    // request vector must be reconstructed for each live State snapshot.
+    request_indexes: Vec<usize>,
+    found: Vec<MatchSearchResult>,
+}
+
+impl ScopedThreadResolver {
+    fn new(workers: usize) -> Self {
+        Self {
+            workers,
+            request_indexes: Vec::new(),
+            found: Vec::new(),
+        }
+    }
 }
 
 impl MatchResolver for ScopedThreadResolver {
@@ -281,24 +297,51 @@ impl MatchResolver for ScopedThreadResolver {
         &mut self,
         runtimes: &[BatchRuntime<'_>],
         work: &[(usize, MatchSearchWork)],
-        results: &mut [MatchSearchResult],
+        results: &mut [Result<MatchSearchResult, MatchSearchRequestError>],
     ) {
-        debug_assert!(work.iter().all(|(_, search)| !search.is_external()));
         if work.len() == 1 {
             let (runtime_index, search) = work[0];
-            results[0] = runtimes[runtime_index].match_request(search).execute();
+            results[0] = runtimes[runtime_index]
+                .match_request(search)
+                .map(|request| request.execute());
             return;
         }
 
-        let requests = work
-            .iter()
-            .map(|(runtime_index, search)| runtimes[*runtime_index].match_request(*search))
-            .collect::<Vec<MatchSearchRequest<'_>>>();
+        self.request_indexes.clear();
+        let mut requests = Vec::<MatchSearchRequest<'_>>::with_capacity(work.len());
+        for (index, (runtime_index, search)) in work.iter().copied().enumerate() {
+            match runtimes[runtime_index].match_request(search) {
+                Ok(request) => {
+                    requests.push(request);
+                    self.request_indexes.push(index);
+                }
+                Err(error) => results[index] = Err(error),
+            }
+        }
+        if requests.is_empty() {
+            return;
+        }
+
+        self.found.resize(
+            requests.len(),
+            MatchSearchResult {
+                length: 0,
+                start: 0,
+            },
+        );
         execute_match_search_batch_with_backend(
             &ScopedThreadMatchSearchBackend::new(self.workers),
             &requests,
-            &mut results[..requests.len()],
+            &mut self.found,
         );
+        for (index, result) in self
+            .request_indexes
+            .iter()
+            .copied()
+            .zip(self.found.iter().copied())
+        {
+            results[index] = Ok(result);
+        }
     }
 }
 
@@ -313,12 +356,15 @@ impl MatchResolver for WholeInputTableResolver<'_> {
         &mut self,
         runtimes: &[BatchRuntime<'_>],
         work: &[(usize, MatchSearchWork)],
-        results: &mut [MatchSearchResult],
+        results: &mut [Result<MatchSearchResult, MatchSearchRequestError>],
     ) {
         for ((runtime_index, search), result) in work.iter().zip(results.iter_mut()) {
-            debug_assert!(search.is_external());
+            if !search.is_external() {
+                *result = Err(MatchSearchRequestError::WrongBackend);
+                continue;
+            }
             let runtime = &runtimes[*runtime_index];
-            *result = runtime.match_from_table(&self.tables[runtime.job_index]);
+            *result = Ok(runtime.match_from_table(&self.tables[runtime.job_index]));
         }
     }
 }
@@ -355,13 +401,8 @@ fn compress_scheduled(
 
     let mut active = runtimes.len();
     let mut match_work = Vec::<(usize, MatchSearchWork)>::with_capacity(runtimes.len());
-    let mut match_results = vec![
-        MatchSearchResult {
-            length: 0,
-            start: 0,
-        };
-        runtimes.len()
-    ];
+    // Every resolver must overwrite all slots for its dispatched request count.
+    let mut match_results = vec![Err(MatchSearchRequestError::InvalidHashHistory); runtimes.len()];
 
     while active != 0 {
         match_work.clear();
@@ -395,7 +436,13 @@ fn compress_scheduled(
             .copied()
             .zip(match_results.iter().copied())
         {
-            runtimes[runtime_index].complete_match_search(result);
+            if let Ok(match_result) = result {
+                runtimes[runtime_index].complete_match_search(match_result);
+            } else {
+                let runtime = &mut runtimes[runtime_index];
+                results[runtime.job_index] = runtime.finish_error(ReturnCode::StreamError);
+                active -= 1;
+            }
         }
     }
 
@@ -559,13 +606,17 @@ impl<'a> BatchRuntime<'a> {
             StandardTurnOutcome::SegmentDone(EndBlockKind::Final) => {
                 RuntimeStep::Done(self.finish_stream())
             }
-            StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
+            StandardTurnOutcome::MatchSearchError(_)
+            | StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
                 RuntimeStep::Done(self.finish_error(ReturnCode::StreamError))
             }
         }
     }
 
-    fn match_request(&self, work: MatchSearchWork) -> MatchSearchRequest<'_> {
+    fn match_request(
+        &self,
+        work: MatchSearchWork,
+    ) -> Result<MatchSearchRequest<'_>, MatchSearchRequestError> {
         work.request(&self.stream.state)
     }
 
@@ -760,6 +811,17 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
+    fn gpu_resolver_rejects_hash_chain_work_without_a_gpu_device() {
+        let mut resolver = WholeInputTableResolver { tables: &[] };
+        let mut outcomes = [Err(MatchSearchRequestError::InvalidHashHistory)];
+        let request =
+            MatchSearchWork::new(1, crate::deflate::longest_match::MatchSearchKind::Standard);
+        resolver.resolve(&[], &[(0, request)], &mut outcomes);
+        assert_eq!(outcomes[0], Err(MatchSearchRequestError::WrongBackend));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
     fn gpu_window_distance_matches_deflate_initialization() -> Result<(), &'static str> {
         let lookahead = u32::try_from(super::super::MIN_LOOKAHEAD)
             .map_err(|_| "DEFLATE lookahead must fit in u32")?;
@@ -836,17 +898,118 @@ mod tests {
             &mut self,
             _runtimes: &[BatchRuntime<'_>],
             work: &[(usize, MatchSearchWork)],
-            results: &mut [MatchSearchResult],
+            results: &mut [Result<MatchSearchResult, MatchSearchRequestError>],
         ) {
             assert_eq!(work.len(), results.len());
             for ((_, search), result) in work.iter().zip(results.iter_mut()) {
                 assert!(search.is_external());
-                *result = MatchSearchResult {
+                *result = Ok(MatchSearchResult {
                     length: 0,
                     start: 0,
+                });
+            }
+        }
+    }
+
+    struct RejectFirstExternalResolver;
+
+    impl MatchResolver for RejectFirstExternalResolver {
+        fn resolve(
+            &mut self,
+            runtimes: &[BatchRuntime<'_>],
+            work: &[(usize, MatchSearchWork)],
+            results: &mut [Result<MatchSearchResult, MatchSearchRequestError>],
+        ) {
+            for ((runtime_index, request), result) in work.iter().zip(results.iter_mut()) {
+                assert!(request.is_external());
+                *result = if runtimes[*runtime_index].job_index == 0 {
+                    Err(MatchSearchRequestError::UninitializedWindow)
+                } else {
+                    Ok(MatchSearchResult::new(0, 0))
                 };
             }
         }
+    }
+
+    #[test]
+    fn malformed_match_request_only_fails_its_own_batch_job() {
+        let inputs = [
+            b"first-stream-rejected/".repeat(600),
+            b"unaffected-second-stream/".repeat(600),
+        ];
+        let mut outputs = inputs
+            .iter()
+            .map(|input| vec![0u8; compress_bound(input.len()) + 64])
+            .collect::<Vec<_>>();
+        let results = {
+            let mut jobs = inputs
+                .iter()
+                .zip(outputs.iter_mut())
+                .map(|(input, output)| BatchCompressJob::new(input, output))
+                .collect::<Vec<_>>();
+            compress_scheduled(
+                &mut jobs,
+                DeflateConfig::new(2),
+                Algorithm::Fast,
+                MatchSourceKind::External,
+                &mut RejectFirstExternalResolver,
+            )
+        };
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].code, ReturnCode::StreamError);
+        assert_eq!(results[1].code, ReturnCode::Ok);
+        let mut decoded = vec![0u8; inputs[1].len()];
+        let (decoded, code) = decompress_slice(
+            &mut decoded,
+            &outputs[1][..results[1].written],
+            InflateConfig::default(),
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, inputs[1]);
+    }
+
+    #[test]
+    fn scoped_resolver_reports_invalid_state_per_job() -> Result<(), &'static str> {
+        let input = b"typed search window";
+        let mut first_output = [0u8; 256];
+        let mut second_output = [0u8; 256];
+        let config = DeflateConfig::new(2);
+        let mut first = BatchRuntime::new(
+            0,
+            input,
+            &mut first_output,
+            config,
+            Algorithm::Fast,
+            MatchSourceKind::HashChain,
+        )
+        .map_err(|_| "first runtime initialization failed")?;
+        let second = BatchRuntime::new(
+            1,
+            input,
+            &mut second_output,
+            config,
+            Algorithm::Fast,
+            MatchSourceKind::HashChain,
+        )
+        .map_err(|_| "second runtime initialization failed")?;
+        first.stream.state.strstart = 1;
+        first.stream.state.lookahead = usize::MAX;
+
+        let runtimes = [first, second];
+        let search =
+            MatchSearchWork::new(1, crate::deflate::longest_match::MatchSearchKind::Standard);
+        let mut results = [
+            Err(MatchSearchRequestError::InvalidHashHistory),
+            Err(MatchSearchRequestError::InvalidHashHistory),
+        ];
+        ScopedThreadResolver::new(2).resolve(&runtimes, &[(0, search), (1, search)], &mut results);
+        assert_eq!(
+            results[0],
+            Err(MatchSearchRequestError::WindowPositionOverflow)
+        );
+        assert!(results[1].is_ok());
+        Ok(())
     }
 
     #[test]

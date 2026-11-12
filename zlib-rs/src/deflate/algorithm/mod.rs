@@ -1,7 +1,9 @@
 use crate::{
     deflate::{
         drain_pending_output, fill_window_core, fill_window_core_with_hash_maintenance,
-        longest_match::{execute_match_search_batch, MatchSearchResult, MatchSearchWork},
+        longest_match::{
+            execute_match_search_batch, MatchSearchRequestError, MatchSearchResult, MatchSearchWork,
+        },
         BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, StreamChecksum,
         MIN_LOOKAHEAD,
     },
@@ -85,6 +87,7 @@ impl BlockContinuation {
 pub(super) enum ProduceStatus {
     NeedInput,
     MatchSearch(MatchSearchWork),
+    MatchSearchError(MatchSearchRequestError),
     BlockReady(BlockContinuation),
 }
 
@@ -485,6 +488,7 @@ struct PendingDrain {
 pub(super) enum StandardTurnOutcome {
     Progress,
     MatchSearch(MatchSearchWork),
+    MatchSearchError(MatchSearchRequestError),
     NeedMoreCallerInput,
     NeedMoreOutput { final_block: bool },
     SegmentDone(EndBlockKind),
@@ -562,6 +566,9 @@ impl StandardDriver {
 
         let event = match self.core.next_event(state) {
             CoreEvent::MatchSearch(request) => return StandardTurnOutcome::MatchSearch(request),
+            CoreEvent::MatchSearchError(error) => {
+                return StandardTurnOutcome::MatchSearchError(error)
+            }
             CoreEvent::NeedInput(demand) => OwnedCoreEvent::NeedInput(demand),
             CoreEvent::TokenBlockReady(work) => OwnedCoreEvent::TokenBlockReady(work),
             CoreEvent::EndOfInput(work) => OwnedCoreEvent::EndOfInput(work),
@@ -641,6 +648,8 @@ pub(super) enum CoreEvent {
     NeedInput(InputDemand),
     /// The producer has paused on immutable longest-match work that may execute elsewhere.
     MatchSearch(MatchSearchWork),
+    /// The producer saw an inconsistent hash-chain search snapshot.
+    MatchSearchError(MatchSearchRequestError),
     /// A complete resident token block is ready to run as one owned block-encoding action.
     TokenBlockReady(TokenBlockWork),
     /// No more input remains for this call; orchestration must close this input segment.
@@ -679,6 +688,7 @@ fn next_core_event(
 
     let status = match producer.produce(state, allow_short_tail) {
         ProduceStatus::MatchSearch(request) => return CoreEvent::MatchSearch(request),
+        ProduceStatus::MatchSearchError(error) => return CoreEvent::MatchSearchError(error),
         ProduceStatus::NeedInput => OwnedProduceStatus::NeedInput,
         ProduceStatus::BlockReady(continuation) => OwnedProduceStatus::BlockReady(continuation),
     };
@@ -763,7 +773,9 @@ pub(super) fn drive_standard(
         match driver.step_inner(state, input, output, checksum, mode) {
             StandardTurnOutcome::Progress => {}
             StandardTurnOutcome::MatchSearch(work) => {
-                let request = work.request(state);
+                let Ok(request) = work.request(state) else {
+                    return BlockState::InvalidMatchState;
+                };
                 let mut results = [MatchSearchResult {
                     length: 0,
                     start: 0,
@@ -771,6 +783,7 @@ pub(super) fn drive_standard(
                 execute_match_search_batch(core::slice::from_ref(&request), &mut results);
                 driver.complete_match_search(state, results[0]);
             }
+            StandardTurnOutcome::MatchSearchError(_) => return BlockState::InvalidMatchState,
             StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
             StandardTurnOutcome::NeedMoreOutput { final_block: true } => {
                 return BlockState::FinishStarted;

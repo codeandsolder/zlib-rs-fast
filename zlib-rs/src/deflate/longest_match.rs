@@ -68,6 +68,22 @@ pub enum MatchSearchWork {
     External,
 }
 
+/// Invalid detached match-search work or an inconsistent compressor snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchSearchRequestError {
+    /// An external/device match request cannot be run by the hash-chain backend.
+    ExternalWork,
+    /// Hash-chain work was routed to an external/device-only match backend.
+    #[cfg(feature = "gpu")]
+    WrongBackend,
+    /// The initialized window end cannot be represented in host index space.
+    WindowPositionOverflow,
+    /// The advertised lookahead includes bytes not initialized in the window.
+    UninitializedWindow,
+    /// The advertised history index cannot be represented by the allocated table.
+    InvalidHashHistory,
+}
+
 impl MatchSearchWork {
     pub(crate) const fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
         Self::HashChain { cur_match, kind }
@@ -77,13 +93,17 @@ impl MatchSearchWork {
         Self::External
     }
 
+    #[cfg(any(feature = "gpu", test))]
     pub(crate) const fn is_external(self) -> bool {
         matches!(self, Self::External)
     }
 
-    pub(crate) fn request<'a>(self, state: &'a State<'_>) -> MatchSearchRequest<'a> {
+    pub(crate) fn request<'a>(
+        self,
+        state: &'a State<'_>,
+    ) -> Result<MatchSearchRequest<'a>, MatchSearchRequestError> {
         let Self::HashChain { cur_match, kind } = self else {
-            panic!("external match work cannot materialize a hash-chain request");
+            return Err(MatchSearchRequestError::ExternalWork);
         };
         MatchSearchRequest::from_state(state, cur_match, kind)
     }
@@ -140,22 +160,31 @@ impl MatchSearchParams {
 }
 
 impl<'a> MatchSearchRequest<'a> {
-    pub(crate) fn from_state(state: &'a State<'_>, cur_match: Pos, kind: MatchSearchKind) -> Self {
+    pub(crate) fn from_state(
+        state: &'a State<'_>,
+        cur_match: Pos,
+        kind: MatchSearchKind,
+    ) -> Result<Self, MatchSearchRequestError> {
         let initialized_end = state
             .strstart
             .checked_add(state.lookahead)
-            .expect("deflate window position overflow");
+            .ok_or(MatchSearchRequestError::WindowPositionOverflow)?;
         let initialized = state
             .window
             .filled()
             .get(..initialized_end)
-            .expect("lookahead extends beyond the deflate window");
+            .ok_or(MatchSearchRequestError::UninitializedWindow)?;
         let wmask = state.w_mask();
+        let prev = state
+            .prev
+            .as_slice()
+            .get(..=wmask)
+            .ok_or(MatchSearchRequestError::InvalidHashHistory)?;
 
-        Self {
+        Ok(Self {
             resources: MatchSearchResources {
                 initialized,
-                prev: &state.prev.as_slice()[..=wmask],
+                prev,
                 head: state.head.as_slice(),
             },
             params: MatchSearchParams {
@@ -173,7 +202,7 @@ impl<'a> MatchSearchRequest<'a> {
                 hash_calc_variant: state.hash_calc_variant,
                 kind,
             },
-        }
+        })
     }
 
     #[inline]
@@ -632,6 +661,46 @@ mod tests {
                 kind: MatchSearchKind::Standard,
             },
         }
+    }
+
+    #[test]
+    fn external_work_has_an_explicit_request_error() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let stream = DeflateStream::new(DeflateConfig::new(6))?;
+        assert!(matches!(
+            MatchSearchWork::external().request(&stream.state),
+            Err(MatchSearchRequestError::ExternalWork)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_window_snapshots_are_rejected_before_search() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let state = &mut *stream.state;
+        let work = MatchSearchWork::new(1, MatchSearchKind::Standard);
+        state.strstart = 1;
+        state.lookahead = usize::MAX;
+        assert!(matches!(
+            work.request(state),
+            Err(MatchSearchRequestError::WindowPositionOverflow)
+        ));
+        state.lookahead = 2;
+        assert!(matches!(
+            work.request(state),
+            Err(MatchSearchRequestError::UninitializedWindow)
+        ));
+        state.strstart = 0;
+        state.lookahead = 0;
+        let window_size = state.w_size;
+        state.w_size = state.prev.as_slice().len() + 1;
+        assert!(matches!(
+            work.request(state),
+            Err(MatchSearchRequestError::InvalidHashHistory)
+        ));
+        state.w_size = window_size;
+        Ok(())
     }
 
     #[test]

@@ -114,7 +114,10 @@ impl TokenProducer for FastProducer {
                 if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                     let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                     if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
-                        let result = work.request(state).execute();
+                        let result = match work.request(state) {
+                            Ok(request) => request.execute(),
+                            Err(error) => return ProduceStatus::MatchSearchError(error),
+                        };
                         self.phase = FastPhase::SearchReady { literal, result };
                         continue;
                     }
