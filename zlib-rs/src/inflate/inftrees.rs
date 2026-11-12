@@ -130,6 +130,80 @@ pub fn inflate_table(
         }
     }
 
+    emit_decode_lookup(
+        codetype,
+        lens,
+        table,
+        work,
+        SortedCodeLengths {
+            count,
+            min,
+            max,
+            root,
+        },
+    )
+}
+
+/// Validated Huffman lengths, sorted into scratch before table entries are emitted.
+#[derive(Clone, Copy)]
+struct SortedCodeLengths {
+    count: [u16; MAX_BITS + 1],
+    min: usize,
+    max: usize,
+    root: usize,
+}
+
+/// Both the DEFLATE format's prescribed table limit and the actual caller
+/// allocation constrain the root lookup table and all of its subtables.
+const fn table_space_sufficient(codetype: CodeType, used: usize, capacity: usize) -> bool {
+    let format_limit = match codetype {
+        CodeType::Codes => capacity,
+        CodeType::Lens => ENOUGH_LENS,
+        CodeType::Dists => ENOUGH_DISTS,
+    };
+    used <= capacity && used <= format_limit
+}
+
+/// Translate one validated alphabet symbol into its DEFLATE lookup entry.
+/// The alphabet's base/extra tables are selected once by the caller.
+fn decode_symbol(symbol: u16, code_bits: u8, length_base: u16, base: &[u16], extra: &[u8]) -> Code {
+    if symbol >= length_base {
+        let index = usize::from(symbol - length_base);
+        Code {
+            bits: code_bits,
+            op: extra[index],
+            val: base[index],
+        }
+    } else if symbol + 1 < length_base {
+        Code {
+            bits: code_bits,
+            op: 0,
+            val: symbol,
+        }
+    } else {
+        Code {
+            bits: code_bits,
+            op: 0b0110_0000,
+            val: 0,
+        }
+    }
+}
+
+/// Expand sorted code lengths into root entries and any required subtables.
+/// This stage owns output-capacity checks; public validation handles inputs.
+fn emit_decode_lookup(
+    codetype: CodeType,
+    lens: &[u16],
+    table: &mut [Code],
+    work: &[u16],
+    sorted: SortedCodeLengths,
+) -> InflateTable {
+    let SortedCodeLengths {
+        mut count,
+        min,
+        max,
+        root,
+    } = sorted;
     let (base, extra, match_) = match codetype {
         CodeType::Codes => (&[] as &[_], &[] as &[_], 20),
         CodeType::Lens => (&LBASE[..], &LEXT[..], 257),
@@ -139,14 +213,7 @@ pub fn inflate_table(
     let mut used = 1 << root;
 
     /* check available table space */
-    if matches!(codetype, CodeType::Lens) && used > ENOUGH_LENS {
-        return InflateTable::EnoughIsNotEnough;
-    }
-
-    if matches!(codetype, CodeType::Dists) && used > ENOUGH_DISTS {
-        return InflateTable::EnoughIsNotEnough;
-    }
-    if used > table.len() {
+    if !table_space_sufficient(codetype, used, table.len()) {
         return InflateTable::EnoughIsNotEnough;
     }
 
@@ -167,26 +234,8 @@ pub fn inflate_table(
         let Ok(code_bits) = u8::try_from(len - drop_) else {
             return InflateTable::InvalidCode;
         };
-        // create table entry
-        let here = if work[sym] >= match_ {
-            Code {
-                bits: code_bits,
-                op: extra[usize::from(work[sym] - match_)],
-                val: base[usize::from(work[sym] - match_)],
-            }
-        } else if work[sym] + 1 < match_ {
-            Code {
-                bits: code_bits,
-                op: 0,
-                val: work[sym],
-            }
-        } else {
-            Code {
-                bits: code_bits,
-                op: 0b0110_0000,
-                val: 0,
-            }
-        };
+        // Decode an already-validated symbol independently of the table topology.
+        let here = decode_symbol(work[sym], code_bits, match_, base, extra);
 
         // replicate for those indices with low len bits equal to huff
         let incr = 1 << (len - drop_);
@@ -244,14 +293,7 @@ pub fn inflate_table(
             /* check for enough space */
             used += 1usize << curr;
 
-            if matches!(codetype, CodeType::Lens) && used > ENOUGH_LENS {
-                return InflateTable::EnoughIsNotEnough;
-            }
-
-            if matches!(codetype, CodeType::Dists) && used > ENOUGH_DISTS {
-                return InflateTable::EnoughIsNotEnough;
-            }
-            if used > table.len() {
+            if !table_space_sufficient(codetype, used, table.len()) {
                 return InflateTable::EnoughIsNotEnough;
             }
 
