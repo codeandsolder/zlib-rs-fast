@@ -66,7 +66,16 @@ const fn checksum_word(value: c_ulong) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// Signed C offsets are 32 or 64 bits depending on the target ABI.
+/// Extend the sign before reinterpreting the bits as an unsigned CRC length.
+#[inline]
+fn crc_combine_length<L: Into<i64>>(length: L) -> u64 {
+    let signed: i64 = length.into();
+    signed.cast_unsigned()
+}
+
 #[cfg(feature = "custom-prefix")]
+#[cfg(any(feature = "export-symbols", feature = "gz"))]
 macro_rules! prefix {
     ($name:expr) => {
         concat!(env!("LIBZ_RS_SYS_PREFIX"), stringify!($name))
@@ -78,6 +87,7 @@ macro_rules! prefix {
 const _PRE_ONE_DOT_O: () = assert!(env!("CARGO_PKG_VERSION_MAJOR").as_bytes()[0] == b'0');
 
 #[cfg(feature = "semver-prefix")]
+#[cfg(any(feature = "export-symbols", feature = "gz"))]
 macro_rules! prefix {
     ($name:expr) => {
         concat!(
@@ -96,6 +106,7 @@ macro_rules! prefix {
     not(feature = "semver-prefix"),
     not(any(test, feature = "testing-prefix"))
 ))]
+#[cfg(any(feature = "export-symbols", feature = "gz"))]
 macro_rules! prefix {
     ($name:expr) => {
         stringify!($name)
@@ -107,6 +118,7 @@ macro_rules! prefix {
     not(feature = "semver-prefix"),
     any(test, feature = "testing-prefix")
 ))]
+#[cfg(any(feature = "export-symbols", feature = "gz"))]
 macro_rules! prefix {
     ($name:expr) => {
         concat!("LIBZ_RS_SYS_TEST_", stringify!($name))
@@ -236,7 +248,7 @@ pub extern "C" fn crc32_combine(crc1: c_ulong, crc2: c_ulong, len2: z_off_t) -> 
     c_ulong::from(zlib_rs::crc32::crc32_combine(
         checksum_word(crc1),
         checksum_word(crc2),
-        i64::from(len2).cast_unsigned(),
+        crc_combine_length(len2),
     ))
 }
 
@@ -273,7 +285,7 @@ pub extern "C" fn crc32_combine64(crc1: c_ulong, crc2: c_ulong, len2: z_off64_t)
     c_ulong::from(zlib_rs::crc32::crc32_combine(
         checksum_word(crc1),
         checksum_word(crc2),
-        i64::from(len2).cast_unsigned(),
+        crc_combine_length(len2),
     ))
 }
 
@@ -290,9 +302,7 @@ pub extern "C" fn get_crc_table() -> *const [u32; 256] {
 #[must_use]
 pub extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> c_ulong {
     debug_assert!(len2 >= 0, "`len2` must be non-negative");
-    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(
-        i64::from(len2).cast_unsigned(),
-    ))
+    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
 }
 
 /// Return the operator corresponding to length `len2`, to be used with
@@ -301,9 +311,7 @@ pub extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> c_ulong {
 #[must_use]
 pub extern "C" fn crc32_combine_gen(len2: z_off_t) -> c_ulong {
     debug_assert!(len2 >= 0, "`len2` must be non-negative");
-    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(
-        i64::from(len2).cast_unsigned(),
-    ))
+    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
 }
 
 /// Give the same result as [`crc32_combine`], using `op` in place of `len2`.
@@ -666,14 +674,21 @@ pub unsafe extern "C" fn uncompress2(
         return ReturnCode::StreamError as _;
     };
 
-    let mut got = *destLen as usize;
-    let mut used = *sourceLen as usize;
+    // The C unsigned-long width is target-dependent. An advertised span
+    // larger than native address space cannot represent a valid Rust slice.
+    let (Ok(mut got), Ok(mut used)) = (usize::try_from(*destLen), usize::try_from(*sourceLen))
+    else {
+        return ReturnCode::StreamError as _;
+    };
 
-    // SAFETY: this wrapper forwards the documented source/destination spans and length output unchanged to the shared uncompress core.
+    // SAFETY: checked native lengths preserve both C buffer contracts.
     let err = unsafe { uncompress2_z(dest, &raw mut got, source, &raw mut used) };
 
-    *sourceLen = used as c_ulong;
-    *destLen = got as c_ulong;
+    let (Ok(consumed), Ok(produced)) = (c_ulong::try_from(used), c_ulong::try_from(got)) else {
+        return ReturnCode::StreamError as _;
+    };
+    *sourceLen = consumed;
+    *destLen = produced;
 
     err as c_int
 }
@@ -1677,10 +1692,17 @@ pub unsafe extern "C" fn compress2(
         return ReturnCode::StreamError as _;
     };
 
-    let mut got = *destLen as usize;
-    // SAFETY: this wrapper forwards the documented source/destination spans and length output unchanged to the shared compress core.
-    let ret = unsafe { compress2_z(dest, &raw mut got, source, sourceLen as usize, level) };
-    *destLen = got as c_ulong;
+    let (Ok(mut got), Ok(source_len)) = (usize::try_from(*destLen), usize::try_from(sourceLen))
+    else {
+        return ReturnCode::StreamError as _;
+    };
+    // SAFETY: both C byte lengths fit native address space and the caller
+    // supplies the documented readable/writable buffer spans.
+    let ret = unsafe { compress2_z(dest, &raw mut got, source, source_len, level) };
+    let Ok(produced) = c_ulong::try_from(got) else {
+        return ReturnCode::StreamError as _;
+    };
+    *destLen = produced;
 
     ret
 }
@@ -2575,6 +2597,17 @@ const unsafe fn slice_from_raw_parts_uninit_mut<'a, T>(
 #[cfg(test)]
 mod checksum_abi_tests {
     use super::*;
+
+    #[test]
+    fn crc_offset_length_preserves_signed_32_and_64_bit_representations() {
+        assert_eq!(crc_combine_length(0_i32), 0);
+        assert_eq!(crc_combine_length(-1_i32), u64::MAX);
+        assert_eq!(crc_combine_length(i32::MIN), 0xffff_ffff_8000_0000);
+        assert_eq!(crc_combine_length(i32::MAX), 0x7fff_ffff);
+        assert_eq!(crc_combine_length(-1_i64), u64::MAX);
+        assert_eq!(crc_combine_length(i64::MIN), 0x8000_0000_0000_0000);
+        assert_eq!(crc_combine_length(i64::MAX), 0x7fff_ffff_ffff_ffff);
+    }
 
     #[test]
     fn checksum_arguments_preserve_low_32_bits_across_c_ulong_widths() {
