@@ -301,6 +301,8 @@ struct GzState {
     // Error information
     err: c_int,             // last error (0 if no error)
     msg: Option<GzCString>, // error message from last error
+    // A nonblocking read that made no progress may be retried when more data arrives.
+    read_would_block: bool,
 
     // zlib inflate or deflate stream
     stream: z_stream,
@@ -335,8 +337,21 @@ impl GzState {
             seek: false,
             err: Z_OK,
             msg: None,
+            read_would_block: false,
             stream,
         }
+    }
+
+    // The only recoverable read error is a genuine nonblocking stall.
+    // Other I/O errors remain sticky until an explicit gzclearerr().
+    fn prepare_read(&mut self) -> bool {
+        if self.mode != GzMode::Read {
+            return false;
+        }
+        if self.read_would_block {
+            gz_error(self, None);
+        }
+        self.err == Z_OK || self.err == Z_BUF_ERROR
     }
 
     fn configure(&mut self, mode: &[u8]) -> Result<(bool, bool), ()> {
@@ -1038,6 +1053,7 @@ fn gz_reset(state: &mut GzState) {
 //   an owned C-string copy, so `msg` need not remain in scope after the call.
 fn gz_error(state: &mut GzState, err_msg: Option<(c_int, &str)>) {
     state.msg = None;
+    state.read_would_block = false;
 
     match err_msg {
         None => {
@@ -1434,6 +1450,9 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
     // direct status is determined lazily on the first read operation. If the first
     // read hasn't happened yet, we can look at the header now to determine if the
     // file is in gzip format.
+    if state.mode == GzMode::Read && state.read_would_block {
+        let _ = state.prepare_read();
+    }
     if state.mode == GzMode::Read && state.how == How::Look && state.have == 0 {
         let _ = gz_look(state);
     }
@@ -1463,7 +1482,12 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
 /// middle of a gzip stream.  Alternatively, `gzerror` can be used before `gzclose`
 /// to detect this case.
 ///
-/// If the unsigned value `len` is too large to fit in the signed return type
+/// For nonblocking file descriptors, a read that makes no progress and
+/// encounters `EAGAIN` or `EWOULDBLOCK` reports the I/O error for that
+/// call. A subsequent read automatically retries when input becomes available,
+/// without requiring `gzclearerr`. Other I/O failures remain sticky.
+///
+/// /// If the unsigned value `len` is too large to fit in the signed return type
 /// `c_int`, then nothing is read, `-1` is returned, and the error state is set to
 /// `Z_STREAM_ERROR`.
 ///
@@ -1491,7 +1515,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
     };
 
     // Check that we're reading and that there's no (serious) error.
-    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if !state.prepare_read() {
         return -1;
     }
 
@@ -1591,7 +1615,7 @@ pub unsafe extern "C" fn gzfread(
     };
 
     // Check that we're reading and that there's no (serious) error.
-    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if !state.prepare_read() {
         return 0;
     }
 
@@ -1664,8 +1688,8 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
             let target = &mut output[written..written + n];
             let (bytes_read, eof) = match load_from_fd(state.fd, target) {
                 Ok(result) => result,
-                Err(()) => {
-                    gz_error(state, Some((Z_ERRNO, "read error")));
+                Err(error) => {
+                    gz_read_io_error(state, error);
                     return 0;
                 }
             };
@@ -1876,8 +1900,8 @@ fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
         };
         let (got, eof) = match load_result {
             Ok(result) => result,
-            Err(()) => {
-                gz_error(state, Some((Z_ERRNO, "read error")));
+            Err(error) => {
+                gz_read_io_error(state, error);
                 return Err(());
             }
         };
@@ -1901,6 +1925,7 @@ fn gz_avail(state: &mut GzState) -> Result<usize, ()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IoAttemptError {
     Interrupted,
+    WouldBlock,
     Failed,
 }
 
@@ -1956,9 +1981,18 @@ fn last_io_attempt_error() -> IoAttemptError {
 
     if code == libc::EINTR {
         IoAttemptError::Interrupted
+    } else if code == libc::EAGAIN || code == libc::EWOULDBLOCK {
+        IoAttemptError::WouldBlock
     } else {
         IoAttemptError::Failed
     }
+}
+
+fn gz_read_io_error(state: &mut GzState, error: IoAttemptError) {
+    gz_error(state, Some((Z_ERRNO, "read error")));
+    // If recording the error itself ran out of memory, do not later clear
+    // the resulting Z_MEM_ERROR as though it were a transient I/O stall.
+    state.read_would_block = error == IoAttemptError::WouldBlock && state.err == Z_ERRNO;
 }
 
 fn write_all_with(
@@ -1968,7 +2002,9 @@ fn write_all_with(
     while !remaining.is_empty() {
         match write_some(remaining) {
             Err(IoAttemptError::Interrupted) => {}
-            Err(IoAttemptError::Failed) | Ok(0) => return Err(()),
+            Err(IoAttemptError::Failed | IoAttemptError::WouldBlock) | Ok(0) => {
+                return Err(());
+            }
             Ok(written) if written > remaining.len() => return Err(()),
             Ok(written) => remaining = &remaining[written..],
         }
@@ -1990,7 +2026,7 @@ fn write_all_to_fd(fd: c_int, input: &[u8]) -> Result<(), ()> {
 fn read_with(
     output: &mut [MaybeUninit<u8>],
     mut read_some: impl FnMut(&mut [MaybeUninit<u8>]) -> Result<usize, IoAttemptError>,
-) -> Result<(usize, bool), ()> {
+) -> Result<(usize, bool), IoAttemptError> {
     let mut have = 0usize;
     while have < output.len() {
         let remaining = &mut output[have..];
@@ -1999,17 +2035,22 @@ fn read_with(
             // A short successful read already consumed these bytes from the
             // underlying file. Publish that initialized prefix now; only a
             // subsequent operation with no progress reports the I/O error.
-            Err(IoAttemptError::Failed) if have != 0 => return Ok((have, false)),
-            Err(IoAttemptError::Failed) => return Err(()),
+            Err(IoAttemptError::Failed | IoAttemptError::WouldBlock) if have != 0 => {
+                return Ok((have, false));
+            }
+            Err(error) => return Err(error),
             Ok(0) => return Ok((have, true)),
-            Ok(n) if n > remaining.len() => return Err(()),
+            Ok(n) if n > remaining.len() => return Err(IoAttemptError::Failed),
             Ok(n) => have += n,
         }
     }
     Ok((have, false))
 }
 
-fn load_from_fd(fd: c_int, output: &mut [MaybeUninit<u8>]) -> Result<(usize, bool), ()> {
+fn load_from_fd(
+    fd: c_int,
+    output: &mut [MaybeUninit<u8>],
+) -> Result<(usize, bool), IoAttemptError> {
     read_with(output, |remaining| {
         let len = remaining.len().min(isize::MAX as usize);
         // SAFETY: the output is writable uninitialized storage for len
@@ -2048,8 +2089,8 @@ fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
                 };
                 let (bytes_read, eof) = match load_result {
                     Ok(result) => result,
-                    Err(()) => {
-                        gz_error(state, Some((Z_ERRNO, "read error")));
+                    Err(error) => {
+                        gz_read_io_error(state, error);
                         return Err(());
                     }
                 };
@@ -2859,7 +2900,7 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
     };
 
     // Check that we're reading and that there's no (serious) error.
-    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if !state.prepare_read() {
         return -1;
     }
 
@@ -2932,7 +2973,7 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     if c < 0 {
         return -1;
     }
-    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if !state.prepare_read() {
         return -1;
     }
 
@@ -3012,7 +3053,7 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
         return ptr::null_mut();
     };
-    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if !state.prepare_read() {
         return ptr::null_mut();
     }
 
@@ -3195,7 +3236,10 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
         return -1;
     }
 
-    // Check that there's no error.
+    // A stalled read is retryable; all other outstanding errors remain sticky.
+    if state.mode == GzMode::Read && !state.prepare_read() {
+        return -1;
+    }
     if state.err != Z_OK && state.err != Z_BUF_ERROR {
         return -1;
     }
@@ -3351,7 +3395,7 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
 
 fn gzrewind_help(state: &mut GzState) -> c_int {
     // Check that we're reading and that there's no error.
-    if state.mode != GzMode::Read || (state.err != Z_OK && state.err != Z_BUF_ERROR) {
+    if !state.prepare_read() {
         return -1;
     }
 
@@ -3642,6 +3686,126 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn nonblocking_reads_retry_when_input_arrives_without_clearerr() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ReadMethod {
+            Bulk,
+            Byte,
+            Line,
+            Items,
+        }
+
+        // A complete, valid gzip member containing six uncompressed bytes.
+        // The first two bytes are sent separately to exercise an incomplete
+        // header followed by EAGAIN before the rest of the member arrives.
+        const GZIP_HELLO: [u8; 26] = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 203, 72, 205, 201, 201, 231, 2, 0, 32, 48, 58, 54,
+            6, 0, 0, 0,
+        ];
+        for compressed in [false, true] {
+            for method in [
+                ReadMethod::Bulk,
+                ReadMethod::Byte,
+                ReadMethod::Line,
+                ReadMethod::Items,
+            ] {
+                let mut descriptors = [-1; 2];
+                // SAFETY: descriptors provides two writable C integer slots.
+                assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+                // SAFETY: pipe returned this unique live read descriptor.
+                let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+                // SAFETY: pipe returned this unique live write descriptor.
+                let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+                // SAFETY: reader is a live descriptor.
+                let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+                assert_ne!(flags, -1);
+                // SAFETY: the obtained flags are valid for this live descriptor.
+                let configured = unsafe {
+                    libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                };
+                assert_eq!(configured, 0);
+                let fd = reader.into_raw_fd();
+                // SAFETY: ownership of the live read descriptor is transferred.
+                let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+                if file.is_null() {
+                    // SAFETY: no ownership transfer occurred on failed open.
+                    unsafe { libc::close(fd) };
+                }
+                assert!(!file.is_null());
+
+                let mut data = [0xa5u8; 8];
+                let attempt = |data: &mut [u8; 8]| match method {
+                    ReadMethod::Bulk => {
+                        // SAFETY: file stays live and destination has six writable bytes.
+                        unsafe { gzread(file, data.as_mut_ptr().cast(), 6) }
+                    }
+                    ReadMethod::Byte => {
+                        // SAFETY: file stays live until gzclose below.
+                        unsafe { gzgetc(file) }
+                    }
+                    ReadMethod::Line => {
+                        // SAFETY: file stays live; data holds an eight-byte line.
+                        let result = unsafe { gzgets(file, data.as_mut_ptr().cast(), 8) };
+                        if result.is_null() {
+                            -1
+                        } else {
+                            6
+                        }
+                    }
+                    ReadMethod::Items => {
+                        // SAFETY: file stays live; data has three writable two-byte items.
+                        let count = unsafe { gzfread(data.as_mut_ptr().cast(), 2, 3, file) };
+                        if count == 0 {
+                            -1
+                        } else {
+                            6
+                        }
+                    }
+                };
+
+                assert_eq!(attempt(&mut data), -1);
+                let mut err = 0;
+                // SAFETY: file is live and err is an aligned writable C integer.
+                let message = unsafe { gzerror(file, &raw mut err) };
+                assert!(!message.is_null());
+                assert_eq!(err, Z_ERRNO);
+
+                let send = |bytes: &[u8]| {
+                    // SAFETY: writer is live and bytes is a readable slice.
+                    let written = unsafe {
+                        libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                    };
+                    assert_eq!(usize::try_from(written), Ok(bytes.len()));
+                };
+                if compressed {
+                    send(&GZIP_HELLO[..2]);
+                    // Two gzip magic bytes do not yet provide a complete member.
+                    assert_eq!(attempt(&mut data), -1);
+                    // SAFETY: file remains live and the error output is writable.
+                    let _ = unsafe { gzerror(file, &raw mut err) };
+                    assert_eq!(err, Z_ERRNO);
+                    send(&GZIP_HELLO[2..]);
+                } else {
+                    send(b"hello\n");
+                }
+
+                let result = attempt(&mut data);
+                if method == ReadMethod::Byte {
+                    assert_eq!(result, i32::from(b'h'));
+                } else {
+                    assert_eq!(result, 6);
+                    assert_eq!(&data[..6], b"hello\n");
+                }
+                // SAFETY: this closes the gzip handle and its owned read descriptor.
+                assert_eq!(unsafe { gzclose(file) }, Z_OK);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn nonblocking_gzip_pipe_preserves_bytes_read_before_would_block() {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
@@ -3715,7 +3879,8 @@ mod tests {
                 next += 1;
             }
             Ok(count)
-        })?;
+        })
+        .map_err(|_| ())?;
         assert_eq!(read, output.len());
         assert!(!eof);
         assert!(calls > 5);
@@ -3736,11 +3901,12 @@ mod tests {
             } else {
                 Ok(0)
             }
-        })?;
+        })
+        .map_err(|_| ())?;
         assert_eq!((read, eof), (1, true));
         assert_eq!(
             read_with(&mut partial, |_| Err(IoAttemptError::Failed)),
-            Err(())
+            Err(IoAttemptError::Failed)
         );
         // An I/O failure after a successful short read cannot revoke bytes
         // that the kernel already consumed from the input source.
@@ -3753,7 +3919,8 @@ mod tests {
             } else {
                 Err(IoAttemptError::Failed)
             }
-        })?;
+        })
+        .map_err(|_| ())?;
         assert_eq!((read, eof), (2, false));
         // SAFETY: the successful first call initialized exactly two bytes.
         assert_eq!(unsafe { partial[0].assume_init() }, b'x');
