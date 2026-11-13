@@ -546,19 +546,28 @@ impl GzState {
 
     /// Publish an initialized range in the owned read output buffer through the ABI prefix.
     ///
-    /// Callers must only use ranges they have just initialized through a typed output slice.
-    fn publish_buffered_output(&mut self, offset: usize, len: usize) {
-        debug_assert_eq!(self.mode, GzMode::Read);
-        let output = self
-            .output
-            .as_ref()
-            .expect("read output must be allocated before publishing bytes");
-        assert!(offset <= output.usable());
-        assert!(len <= output.usable() - offset);
-        let have = c_uint::try_from(len).expect("gzip buffered output length must fit in uInt");
-        // Safety: `offset` is in-bounds (or one-past when `len == 0`) for this allocation.
-        self.next = unsafe { output.as_ptr().add(offset) };
+    /// A bad range, missing owner, or unrepresentable ABI counter is a stream
+    /// error, never a panic escaping through a public gzip C ABI entry point.
+    fn publish_buffered_output(&mut self, offset: usize, len: usize) -> Result<(), ()> {
+        let binding = self.output.as_ref().and_then(|output| {
+            if self.mode != GzMode::Read
+                || offset > output.usable()
+                || len > output.usable() - offset
+            {
+                return None;
+            }
+            let have = c_uint::try_from(len).ok()?;
+            // SAFETY: offset is within or one-past the owned output allocation.
+            let next = unsafe { output.as_ptr().add(offset) };
+            Some((next, have))
+        });
+        let Some((next, have)) = binding else {
+            self.invalid_read_cursor();
+            return Err(());
+        };
+        self.next = next;
         self.have = have;
+        Ok(())
     }
 
     fn push_back_buffered_byte(&mut self, byte: u8) -> Result<(), PushBackError> {
@@ -601,8 +610,8 @@ impl GzState {
             return Err(PushBackError::InvalidCursor);
         };
         output.usable_uninit_mut()[new_offset].write(byte);
-        self.publish_buffered_output(new_offset, have + 1);
-        Ok(())
+        self.publish_buffered_output(new_offset, have + 1)
+            .map_err(|()| PushBackError::InvalidCursor)
     }
 
     fn read_input_range(&self) -> Option<core::ops::Range<usize>> {
@@ -1911,7 +1920,7 @@ fn gz_look(state: &mut GzState) -> Result<(), ()> {
         input.len()
     };
     state.output = Some(output);
-    state.publish_buffered_output(0, produced);
+    state.publish_buffered_output(0, produced)?;
     state.clear_read_input();
     state.how = How::Copy;
     state.direct = true;
@@ -2127,10 +2136,10 @@ fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
             }
             How::Copy => {
                 let load_result = {
-                    let output = state
-                        .output
-                        .as_mut()
-                        .expect("gzip read output must be allocated in copy mode");
+                    let Some(output) = state.output.as_mut() else {
+                        state.invalid_read_cursor();
+                        return Err(());
+                    };
                     load_from_fd(state.fd, output.usable_uninit_mut())
                 };
                 let (bytes_read, eof) = match load_result {
@@ -2143,20 +2152,20 @@ fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
                 if eof {
                     state.eof = true;
                 }
-                state.publish_buffered_output(0, bytes_read);
+                state.publish_buffered_output(0, bytes_read)?;
                 return Ok(());
             }
             How::Gzip => {
                 // Temporarily detach the output owner so the decompressor can borrow the
                 // rest of `state` without aliasing storage still reachable through it.
-                let mut output = state
-                    .output
-                    .take()
-                    .expect("gzip read output must be allocated in gzip mode");
+                let Some(mut output) = state.output.take() else {
+                    state.invalid_read_cursor();
+                    return Err(());
+                };
                 let result = gz_decomp_into(state, output.usable_uninit_mut());
                 state.output = Some(output);
                 let produced = result?;
-                state.publish_buffered_output(0, produced);
+                state.publish_buffered_output(0, produced)?;
             }
         }
 
@@ -2362,12 +2371,13 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
             };
             let capacity = state.in_size().saturating_sub(have);
             let copy = {
-                let owned = state
-                    .input
-                    .as_mut()
-                    .expect("write input must remain allocated")
-                    .usable_uninit_mut();
-                input.copy_to(&mut owned[have..have + Ord::min(capacity, input.len())])
+                let Some(owned) = state.input.as_mut() else {
+                    state.invalid_write_cursor();
+                    return 0;
+                };
+                input.copy_to(
+                    &mut owned.usable_uninit_mut()[have..have + Ord::min(capacity, input.len())],
+                )
             };
             if state.advance_position(copy).is_err() {
                 return 0;
@@ -2882,12 +2892,11 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
             return -1;
         };
         if have < state.in_size() {
-            state
-                .input
-                .as_mut()
-                .expect("write input must remain allocated")
-                .usable_uninit_mut()[have]
-                .write(c.to_le_bytes()[0]);
+            let Some(input) = state.input.as_mut() else {
+                state.invalid_write_cursor();
+                return -1;
+            };
+            input.usable_uninit_mut()[have].write(c.to_le_bytes()[0]);
             if state.advance_position(1).is_err() {
                 return -1;
             }
@@ -4665,14 +4674,14 @@ mod tests {
 
         // A huge positive logical seek can exceed usize on a 32-bit host.
         // It must consume the available bytes and stop at EOF, not wrap to zero.
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
         assert_eq!(gz_skip(&mut state, i64::MAX), Ok(()));
         assert_eq!(state.pos, 3);
         assert_eq!(state.have, 0);
 
         // A smaller skip only advances the owned read cursor by that amount.
         state.pos = 0;
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
         assert_eq!(gz_skip(&mut state, 2), Ok(()));
         assert_eq!(state.pos, 2);
         assert_eq!(state.have, 1);
@@ -4681,7 +4690,7 @@ mod tests {
         // Never consume a buffered prefix if it would overflow the signed
         // uncompressed stream position. Fatal errors hide the buffer from gzgetc.
         state.pos = i64::MAX - 1;
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
         let cursor = state.next;
         assert_eq!(gz_skip(&mut state, 3), Err(()));
         assert_eq!(state.pos, i64::MAX - 1);
@@ -4693,7 +4702,7 @@ mod tests {
         // or reinterpret its signed length as an enormous usize.
         state.err = Z_OK;
         state.pos = 0;
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
         let cursor = state.next;
         assert_eq!(gz_skip(&mut state, -1), Err(()));
         assert_eq!(state.pos, 0);
@@ -4708,7 +4717,7 @@ mod tests {
         state.how = How::Gzip;
         state.pos = 0;
         state.eof = true;
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
         assert_eq!(test_seek(&mut state, i64::MAX, SEEK_SET), i64::MAX);
         assert_eq!(state.pos, 3);
         assert!(state.seek);
@@ -4813,7 +4822,7 @@ mod tests {
         state.how = How::Gzip;
         state.output = state.allocate_output_buffer();
         state.output.as_mut().ok_or(())?.usable_uninit_mut()[0].write(67);
-        state.publish_buffered_output(0, 1);
+        assert_eq!(state.publish_buffered_output(0, 1), Ok(()));
         gz_error(&mut state, None);
         assert_eq!(test_getc(&mut state), -1);
         assert_eq!(state.have, 0);
@@ -4822,7 +4831,7 @@ mod tests {
 
         // Reenable the exposed byte and exercise the underflow path itself.
         gz_error(&mut state, None);
-        state.publish_buffered_output(0, 1);
+        assert_eq!(state.publish_buffered_output(0, 1), Ok(()));
         state.pos = i64::MIN;
         assert_eq!(test_ungetc(&mut state, 68), -1);
         assert_eq!(state.have, 0);
@@ -4832,7 +4841,7 @@ mod tests {
         // Pushback from position zero to -1 remains valid.
         state.pos = 0;
         gz_error(&mut state, None);
-        state.publish_buffered_output(0, 1);
+        assert_eq!(state.publish_buffered_output(0, 1), Ok(()));
         assert_eq!(test_ungetc(&mut state, 68), 68);
         assert_eq!(state.pos, -1);
         assert_eq!(test_getc(&mut state), 68);
@@ -4996,7 +5005,7 @@ mod tests {
         state.output = Some(state.allocate_output_buffer().ok_or(())?);
         let output = state.output.as_mut().ok_or(())?;
         output.usable_uninit_mut()[..3].write_copy_of_slice(b"abc");
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
 
         let mut line = [0xa5u8; 12];
         let got = test_gets(&mut state, &mut line);
@@ -5020,6 +5029,42 @@ mod tests {
         assert_eq!(line, [0xa5; 12]);
         assert_eq!(state.err, Z_ERRNO);
         Ok(())
+    }
+
+    #[test]
+    fn invalid_read_output_publication_reports_stream_error() -> Result<(), ()> {
+        let mut state = GzState::new();
+        state.mode = GzMode::Read;
+        state.want = 8;
+        assert_eq!(state.publish_buffered_output(0, 1), Err(()));
+        assert_eq!(state.err, Z_STREAM_ERROR);
+        assert_eq!(state.have, 0);
+
+        state.output = Some(state.allocate_output_buffer().ok_or(())?);
+        let capacity = state.output.as_ref().ok_or(())?.usable();
+        for (offset, len) in [(capacity, 1), (usize::MAX, 1), (0, usize::MAX)] {
+            gz_error(&mut state, None);
+            assert_eq!(state.publish_buffered_output(offset, len), Err(()));
+            assert_eq!(state.err, Z_STREAM_ERROR);
+            assert_eq!(state.have, 0);
+        }
+        gz_error(&mut state, None);
+        assert_eq!(state.publish_buffered_output(capacity, 0), Ok(()));
+        assert_eq!(state.err, Z_OK);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_read_output_owner_is_a_stream_error_not_a_panic() {
+        for how in [How::Copy, How::Gzip] {
+            let mut state = GzState::new();
+            state.mode = GzMode::Read;
+            state.how = how;
+            state.have = 0;
+            state.fd = -1;
+            assert_eq!(gz_fetch(&mut state), Err(()));
+            assert_eq!(state.err, Z_STREAM_ERROR);
+        }
     }
 
     #[test]
@@ -5110,7 +5155,7 @@ mod tests {
         state.output = state.allocate_output_buffer();
         let output = state.output.as_mut().ok_or(())?;
         output.usable_uninit_mut()[..3].write_copy_of_slice(b"abc");
-        state.publish_buffered_output(0, 3);
+        assert_eq!(state.publish_buffered_output(0, 3), Ok(()));
         assert_eq!(state.buffered_output(), Some(b"abc".as_slice()));
         assert!(state.consume_buffered_output(1));
         assert_eq!(state.buffered_output(), Some(b"bc".as_slice()));
@@ -5206,7 +5251,7 @@ mod tests {
         state.pos = i64::MAX;
         state.output = state.allocate_output_buffer();
         state.output.as_mut().ok_or(())?.usable_uninit_mut()[0].write(b'A');
-        state.publish_buffered_output(0, 1);
+        assert_eq!(state.publish_buffered_output(0, 1), Ok(()));
         assert!(test_gets(&mut state, &mut [0u8; 3]).is_null());
         assert_eq!(state.have, 0);
         assert_eq!(state.pos, i64::MAX);
