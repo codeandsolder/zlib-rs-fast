@@ -21,16 +21,21 @@ const fn reg(input: [u32; 4]) -> __m128i {
 /// instruction, and SSE2 and SSE4.1 instruction sets.
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_arch = "x86_64")]
-pub(crate) struct Accumulator {
+pub struct Accumulator {
     pub(super) fold: [__m128i; 4],
 }
 
 #[cfg(target_arch = "x86_64")]
 impl Accumulator {
-    const XMM_FOLD4: __m128i = reg([0xc6e41596u32, 0x00000001u32, 0x54442bd4u32, 0x00000001u32]);
+    const XMM_FOLD4: __m128i = reg([
+        0xc6e4_1596u32,
+        0x0000_0001u32,
+        0x5444_2bd4u32,
+        0x0000_0001u32,
+    ]);
 
     pub const fn new() -> Self {
-        let xmm_crc0 = reg([0x9db42487, 0, 0, 0]);
+        let xmm_crc0 = reg([0x9db4_2487, 0, 0, 0]);
         let xmm_zero = reg([0, 0, 0, 0]);
 
         Self {
@@ -38,31 +43,52 @@ impl Accumulator {
         }
     }
 
+    /// # Safety
+    ///
+    /// The caller must have verified PCLMULQDQ and SSE4.1 support on this CPU.
     pub unsafe fn fold(&mut self, src: &[u8], start: u32) {
+        // SAFETY: the caller guarantees the required CPU instructions.
         unsafe { self.fold_help(src, start) }
     }
 
+    /// # Safety
+    ///
+    /// The caller must have verified PCLMULQDQ and SSE4.1 support on this CPU.
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
     pub unsafe fn finish(self) -> u32 {
-        const CRC_MASK1: __m128i =
-            reg([0xFFFFFFFFu32, 0xFFFFFFFFu32, 0x00000000u32, 0x00000000u32]);
+        const CRC_MASK1: __m128i = reg([
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32,
+            0x0000_0000u32,
+            0x0000_0000u32,
+        ]);
 
-        const CRC_MASK2: __m128i =
-            reg([0x00000000u32, 0xFFFFFFFFu32, 0xFFFFFFFFu32, 0xFFFFFFFFu32]);
+        const CRC_MASK2: __m128i = reg([
+            0x0000_0000u32,
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32,
+        ]);
 
         const RK1_RK2: __m128i = reg([
-            0xccaa009e, 0x00000000, /* rk1 */
-            0x751997d0, 0x00000001, /* rk2 */
+            0xccaa_009e,
+            0x0000_0000, /* rk1 */
+            0x7519_97d0,
+            0x0000_0001, /* rk2 */
         ]);
 
         const RK5_RK6: __m128i = reg([
-            0xccaa009e, 0x00000000, /* rk5 */
-            0x63cd6124, 0x00000001, /* rk6 */
+            0xccaa_009e,
+            0x0000_0000, /* rk5 */
+            0x63cd_6124,
+            0x0000_0001, /* rk6 */
         ]);
 
         const RK7_RK8: __m128i = reg([
-            0xf7011640, 0x00000001, /* rk7 */
-            0xdb710640, 0x00000001, /* rk8 */
+            0xf701_1640,
+            0x0000_0001, /* rk7 */
+            0xdb71_0640,
+            0x0000_0001, /* rk8 */
         ]);
 
         let [mut xmm_crc0, mut xmm_crc1, mut xmm_crc2, mut xmm_crc3] = self.fold;
@@ -72,68 +98,77 @@ impl Accumulator {
          */
         let mut crc_fold = RK1_RK2;
 
-        #[allow(unused_unsafe)] // because target features 1.1
-        unsafe {
-            let x_tmp0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x10);
-            xmm_crc0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x01);
-            xmm_crc1 = _mm_xor_si128(xmm_crc1, x_tmp0);
-            xmm_crc1 = _mm_xor_si128(xmm_crc1, xmm_crc0);
+        let x_tmp0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x10);
+        xmm_crc0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x01);
+        xmm_crc1 = _mm_xor_si128(xmm_crc1, x_tmp0);
+        xmm_crc1 = _mm_xor_si128(xmm_crc1, xmm_crc0);
 
-            let x_tmp1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x10);
-            xmm_crc1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x01);
-            xmm_crc2 = _mm_xor_si128(xmm_crc2, x_tmp1);
-            xmm_crc2 = _mm_xor_si128(xmm_crc2, xmm_crc1);
+        let x_tmp1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x10);
+        xmm_crc1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x01);
+        xmm_crc2 = _mm_xor_si128(xmm_crc2, x_tmp1);
+        xmm_crc2 = _mm_xor_si128(xmm_crc2, xmm_crc1);
 
-            let x_tmp2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x10);
-            xmm_crc2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x01);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, x_tmp2);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
+        let x_tmp2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x10);
+        xmm_crc2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x01);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, x_tmp2);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
 
-            /*
-             * k5
-             */
-            crc_fold = RK5_RK6;
+        /*
+         * k5
+         */
+        crc_fold = RK5_RK6;
 
-            xmm_crc0 = xmm_crc3;
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
-            xmm_crc0 = _mm_srli_si128(xmm_crc0, 8);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
+        xmm_crc0 = xmm_crc3;
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
+        xmm_crc0 = _mm_srli_si128(xmm_crc0, 8);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
 
-            xmm_crc0 = xmm_crc3;
-            xmm_crc3 = _mm_slli_si128(xmm_crc3, 4);
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
-            xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK2);
+        xmm_crc0 = xmm_crc3;
+        xmm_crc3 = _mm_slli_si128(xmm_crc3, 4);
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
+        xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK2);
 
-            /*
-             * k7
-             */
-            xmm_crc1 = xmm_crc3;
-            xmm_crc2 = xmm_crc3;
-            crc_fold = RK7_RK8;
+        /*
+         * k7
+         */
+        xmm_crc1 = xmm_crc3;
+        xmm_crc2 = xmm_crc3;
+        crc_fold = RK7_RK8;
 
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-            xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK1);
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
+        xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK1);
 
-            xmm_crc2 = xmm_crc3;
-            xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-            xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc1);
+        xmm_crc2 = xmm_crc3;
+        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
+        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc1);
 
-            !(_mm_extract_epi32(xmm_crc3, 2) as u32)
-        }
+        !_mm_extract_epi32(xmm_crc3, 2).cast_unsigned()
     }
 
     unsafe fn fold_step<const N: usize>(&mut self) {
+        debug_assert!(
+            (1..=4).contains(&N),
+            "fold_step accepts only one to four vectors"
+        );
         self.fold = core::array::from_fn(|i| match self.fold.get(i + N) {
             Some(v) => *v,
-            None => unsafe { Self::step(self.fold[(i + N) - 4]) },
+            None => {
+                // SAFETY: fold_step is reached only under the PCLMULQDQ feature guard.
+                unsafe { Self::step(self.fold[(i + N) - 4]) }
+            }
         });
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "the PCLMUL reduction kernel is fused into its hot-loop caller"
+    )]
     #[inline(always)]
     unsafe fn step(input: __m128i) -> __m128i {
+        // SAFETY: the caller ensures PCLMULQDQ is available before invoking this kernel.
         unsafe {
             _mm_xor_si128(
                 _mm_clmulepi64_si128(input, Self::XMM_FOLD4, 0x01),
@@ -144,75 +179,95 @@ impl Accumulator {
 
     unsafe fn partial_fold(&mut self, xmm_crc_part: __m128i, len: usize) {
         const PSHUFB_SHF_TABLE: [__m128i; 15] = [
-            reg([0x84838281, 0x88878685, 0x8c8b8a89, 0x008f8e8d]), /* shl 15 (16 - 1)/shr1 */
-            reg([0x85848382, 0x89888786, 0x8d8c8b8a, 0x01008f8e]), /* shl 14 (16 - 3)/shr2 */
-            reg([0x86858483, 0x8a898887, 0x8e8d8c8b, 0x0201008f]), /* shl 13 (16 - 4)/shr3 */
-            reg([0x87868584, 0x8b8a8988, 0x8f8e8d8c, 0x03020100]), /* shl 12 (16 - 4)/shr4 */
-            reg([0x88878685, 0x8c8b8a89, 0x008f8e8d, 0x04030201]), /* shl 11 (16 - 5)/shr5 */
-            reg([0x89888786, 0x8d8c8b8a, 0x01008f8e, 0x05040302]), /* shl 10 (16 - 6)/shr6 */
-            reg([0x8a898887, 0x8e8d8c8b, 0x0201008f, 0x06050403]), /* shl  9 (16 - 7)/shr7 */
-            reg([0x8b8a8988, 0x8f8e8d8c, 0x03020100, 0x07060504]), /* shl  8 (16 - 8)/shr8 */
-            reg([0x8c8b8a89, 0x008f8e8d, 0x04030201, 0x08070605]), /* shl  7 (16 - 9)/shr9 */
-            reg([0x8d8c8b8a, 0x01008f8e, 0x05040302, 0x09080706]), /* shl  6 (16 -10)/shr10*/
-            reg([0x8e8d8c8b, 0x0201008f, 0x06050403, 0x0a090807]), /* shl  5 (16 -11)/shr11*/
-            reg([0x8f8e8d8c, 0x03020100, 0x07060504, 0x0b0a0908]), /* shl  4 (16 -12)/shr12*/
-            reg([0x008f8e8d, 0x04030201, 0x08070605, 0x0c0b0a09]), /* shl  3 (16 -13)/shr13*/
-            reg([0x01008f8e, 0x05040302, 0x09080706, 0x0d0c0b0a]), /* shl  2 (16 -14)/shr14*/
-            reg([0x0201008f, 0x06050403, 0x0a090807, 0x0e0d0c0b]), /* shl  1 (16 -15)/shr15*/
+            reg([0x8483_8281, 0x8887_8685, 0x8c8b_8a89, 0x008f_8e8d]), /* shl 15 (16 - 1)/shr1 */
+            reg([0x8584_8382, 0x8988_8786, 0x8d8c_8b8a, 0x0100_8f8e]), /* shl 14 (16 - 3)/shr2 */
+            reg([0x8685_8483, 0x8a89_8887, 0x8e8d_8c8b, 0x0201_008f]), /* shl 13 (16 - 4)/shr3 */
+            reg([0x8786_8584, 0x8b8a_8988, 0x8f8e_8d8c, 0x0302_0100]), /* shl 12 (16 - 4)/shr4 */
+            reg([0x8887_8685, 0x8c8b_8a89, 0x008f_8e8d, 0x0403_0201]), /* shl 11 (16 - 5)/shr5 */
+            reg([0x8988_8786, 0x8d8c_8b8a, 0x0100_8f8e, 0x0504_0302]), /* shl 10 (16 - 6)/shr6 */
+            reg([0x8a89_8887, 0x8e8d_8c8b, 0x0201_008f, 0x0605_0403]), /* shl  9 (16 - 7)/shr7 */
+            reg([0x8b8a_8988, 0x8f8e_8d8c, 0x0302_0100, 0x0706_0504]), /* shl  8 (16 - 8)/shr8 */
+            reg([0x8c8b_8a89, 0x008f_8e8d, 0x0403_0201, 0x0807_0605]), /* shl  7 (16 - 9)/shr9 */
+            reg([0x8d8c_8b8a, 0x0100_8f8e, 0x0504_0302, 0x0908_0706]), /* shl  6 (16 -10)/shr10*/
+            reg([0x8e8d_8c8b, 0x0201_008f, 0x0605_0403, 0x0a09_0807]), /* shl  5 (16 -11)/shr11*/
+            reg([0x8f8e_8d8c, 0x0302_0100, 0x0706_0504, 0x0b0a_0908]), /* shl  4 (16 -12)/shr12*/
+            reg([0x008f_8e8d, 0x0403_0201, 0x0807_0605, 0x0c0b_0a09]), /* shl  3 (16 -13)/shr13*/
+            reg([0x0100_8f8e, 0x0504_0302, 0x0908_0706, 0x0d0c_0b0a]), /* shl  2 (16 -14)/shr14*/
+            reg([0x0201_008f, 0x0605_0403, 0x0a09_0807, 0x0e0d_0c0b]), /* shl  1 (16 -15)/shr15*/
         ];
 
+        debug_assert!(
+            (1..=15).contains(&len),
+            "partial fold must contain 1..=15 bytes"
+        );
+        // SAFETY: the CPU feature guard includes SSSE3/SSE4.1 and PCLMULQDQ;
+        // the shuffle mask index is valid because len is in 1..=15.
         unsafe {
-            let xmm_shl = PSHUFB_SHF_TABLE[len - 1];
-            let xmm_shr = _mm_xor_si128(xmm_shl, reg([0x80808080u32; 4]));
+            let shift_left_mask = PSHUFB_SHF_TABLE[len - 1];
+            let shift_right_mask = _mm_xor_si128(shift_left_mask, reg([0x8080_8080u32; 4]));
 
-            let xmm_a0 = Self::step(_mm_shuffle_epi8(self.fold[0], xmm_shl));
+            let xmm_a0 = Self::step(_mm_shuffle_epi8(self.fold[0], shift_left_mask));
 
-            self.fold[0] = _mm_shuffle_epi8(self.fold[0], xmm_shr);
-            let xmm_tmp1 = _mm_shuffle_epi8(self.fold[1], xmm_shl);
+            self.fold[0] = _mm_shuffle_epi8(self.fold[0], shift_right_mask);
+            let xmm_tmp1 = _mm_shuffle_epi8(self.fold[1], shift_left_mask);
             self.fold[0] = _mm_or_si128(self.fold[0], xmm_tmp1);
 
-            self.fold[1] = _mm_shuffle_epi8(self.fold[1], xmm_shr);
-            let xmm_tmp2 = _mm_shuffle_epi8(self.fold[2], xmm_shl);
+            self.fold[1] = _mm_shuffle_epi8(self.fold[1], shift_right_mask);
+            let xmm_tmp2 = _mm_shuffle_epi8(self.fold[2], shift_left_mask);
             self.fold[1] = _mm_or_si128(self.fold[1], xmm_tmp2);
 
-            self.fold[2] = _mm_shuffle_epi8(self.fold[2], xmm_shr);
-            let xmm_tmp3 = _mm_shuffle_epi8(self.fold[3], xmm_shl);
+            self.fold[2] = _mm_shuffle_epi8(self.fold[2], shift_right_mask);
+            let xmm_tmp3 = _mm_shuffle_epi8(self.fold[3], shift_left_mask);
             self.fold[2] = _mm_or_si128(self.fold[2], xmm_tmp3);
 
-            self.fold[3] = _mm_shuffle_epi8(self.fold[3], xmm_shr);
-            let xmm_crc_part = _mm_shuffle_epi8(xmm_crc_part, xmm_shl);
+            self.fold[3] = _mm_shuffle_epi8(self.fold[3], shift_right_mask);
+            let xmm_crc_part = _mm_shuffle_epi8(xmm_crc_part, shift_left_mask);
             self.fold[3] = _mm_or_si128(self.fold[3], xmm_crc_part);
 
             // zlib-ng uses casts and a floating-point xor instruction here. There is a theory that
             // this breaks dependency chains on some CPUs and gives better throughput. Other sources
             // claim that casting between integer and float has a cost and should be avoided. We can't
             // measure the difference, and choose the shorter code.
-            self.fold[3] = _mm_xor_si128(self.fold[3], xmm_a0)
+            self.fold[3] = _mm_xor_si128(self.fold[3], xmm_a0);
         }
     }
 
-    #[allow(clippy::needless_range_loop)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "progress receives 16-byte-aligned input and uses an aligned SIMD load"
+    )]
     unsafe fn progress<const N: usize>(&mut self, src: &mut &[u8], init_crc: &mut u32) {
-        let mut it = src.chunks_exact(16);
-        let mut input: [_; N] = core::array::from_fn(|_| unsafe {
-            _mm_load_si128(it.next().unwrap().as_ptr() as *const __m128i)
+        let (chunks, _) = src.as_chunks::<16>();
+        debug_assert!(chunks.len() >= N);
+        debug_assert_eq!(src.as_ptr().align_offset(16), 0);
+        let mut input: [_; N] = core::array::from_fn(|i| {
+            // SAFETY: fold_help aligns src to 16 bytes before progress, and the
+            // caller supplies at least N whole vectors. Each chunk stays aligned.
+            unsafe { _mm_load_si128(chunks[i].as_ptr().cast::<__m128i>()) }
         });
 
         *src = &src[N * 16..];
 
         if *init_crc != CRC32_INITIAL_VALUE {
             let xmm_initial = reg([*init_crc, 0, 0, 0]);
+            // SAFETY: this kernel is reached only through the SSE2-capable x86_64 path.
             input[0] = unsafe { _mm_xor_si128(input[0], xmm_initial) };
             *init_crc = CRC32_INITIAL_VALUE;
         }
 
+        // SAFETY: the caller already checked PCLMULQDQ and N is in 1..=4.
         unsafe { self.fold_step::<N>() };
 
-        for i in 0..N {
-            self.fold[i + (4 - N)] = unsafe { _mm_xor_si128(self.fold[i + (4 - N)], input[i]) };
+        for (fold, value) in self.fold[(4 - N)..].iter_mut().zip(input) {
+            // SAFETY: the x86_64 path supports SSE2.
+            *fold = unsafe { _mm_xor_si128(*fold, value) };
         }
     }
 
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the SIMD load instructions validate alignment where required or explicitly support unaligned input"
+    )]
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
     unsafe fn fold_help(&mut self, mut src: &[u8], mut init_crc: u32) {
         let mut xmm_crc_part = reg([0; 4]);
@@ -235,33 +290,42 @@ impl Accumulator {
             }
 
             partial_buf.0[..src.len()].copy_from_slice(src);
-            xmm_crc_part = unsafe { _mm_load_si128(partial_buf.0.as_ptr() as *const __m128i) };
+            // SAFETY: Align16 guarantees a 16-byte-aligned stack buffer and all
+            // 16 bytes are initialized (with zero padding beyond src.len()).
+            xmm_crc_part = unsafe { _mm_load_si128(partial_buf.0.as_ptr().cast::<__m128i>()) };
         } else {
             // SAFETY: [u8; 16] can safely transmute into __m128i.
             let (before, _, _) = unsafe { src.align_to::<__m128i>() };
 
-            #[allow(unused_unsafe)] // because target features 1.1
             if !before.is_empty() {
-                xmm_crc_part = unsafe { _mm_loadu_si128(src.as_ptr() as *const __m128i) };
+                // SAFETY: src has at least 16 initialized bytes here; loadu
+                // explicitly permits the unaligned prefix before align_to.
+                xmm_crc_part = unsafe { _mm_loadu_si128(src.as_ptr().cast::<__m128i>()) };
                 let is_initial = init_crc == CRC32_INITIAL_VALUE;
 
                 if !is_initial {
                     let xmm_initial = reg([init_crc, 0, 0, 0]);
-                    xmm_crc_part = unsafe { _mm_xor_si128(xmm_crc_part, xmm_initial) };
+                    xmm_crc_part = _mm_xor_si128(xmm_crc_part, xmm_initial);
                     init_crc = CRC32_INITIAL_VALUE;
                 }
 
                 if before.len() < 4 && !is_initial {
                     let xmm_t0 = xmm_crc_part;
+                    // SAFETY: the non-default initial CRC requires at least
+                    // 64 input bytes, so reading 16 bytes at offset 16 is in-bounds.
+                    // loadu imposes no alignment precondition.
                     xmm_crc_part =
-                        unsafe { _mm_loadu_si128((src.as_ptr() as *const __m128i).add(1)) };
+                        unsafe { _mm_loadu_si128(src.as_ptr().add(16).cast::<__m128i>()) };
 
+                    // SAFETY: this method's CPU feature guard covers PCLMULQDQ.
                     unsafe { self.fold_step::<1>() };
 
-                    self.fold[3] = unsafe { _mm_xor_si128(self.fold[3], xmm_t0) };
+                    self.fold[3] = _mm_xor_si128(self.fold[3], xmm_t0);
                     src = &src[16..];
                 }
 
+                // SAFETY: the unaligned prefix is in 1..=15, and the CPU
+                // feature guard covers the shuffle and carry-less multiply.
                 unsafe { self.partial_fold(xmm_crc_part, before.len()) };
                 src = &src[before.len()..];
             }
@@ -269,30 +333,38 @@ impl Accumulator {
             #[cfg(feature = "vpclmulqdq")]
             #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
             if src.len() >= 256 {
+                // SAFETY: the conditional compilation enforces VPCLMULQDQ
+                // and AVX-512F; the 256-byte minimum covers all vector loads.
                 unsafe { self.fold_16_vpclmulqdq(&mut src, &mut init_crc) };
             }
 
             while src.len() >= 64 {
+                // SAFETY: src was advanced to a 16-byte boundary and contains
+                // four complete vectors; PCLMULQDQ is enabled for this method.
                 unsafe { self.progress::<4>(&mut src, &mut init_crc) };
             }
 
             if src.len() >= 48 {
+                // SAFETY: src is aligned and contains at least three vectors.
                 unsafe { self.progress::<3>(&mut src, &mut init_crc) };
             } else if src.len() >= 32 {
+                // SAFETY: src is aligned and contains at least two vectors.
                 unsafe { self.progress::<2>(&mut src, &mut init_crc) };
             } else if src.len() >= 16 {
+                // SAFETY: src is aligned and contains at least one full vector.
                 unsafe { self.progress::<1>(&mut src, &mut init_crc) };
             }
         }
 
         if !src.is_empty() {
-            debug_assert!(src.len() <= 16);
+            debug_assert!(src.len() < 16);
+            // SAFETY: src is a disjoint live input slice shorter than 16 bytes;
+            // xmm_crc_part is 16 writable initialized bytes, and the feature guard
+            // covers partial_fold. Its length precondition is 1..=15.
             unsafe {
-                // SAFETY: src and xmm_crc_part don't overlap. xmm_crc_part is statically
-                // guaranteed to be 16 bytes, and earlier code advanced src below 16 bytes.
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr(),
-                    &mut xmm_crc_part as *mut _ as *mut u8,
+                    (&raw mut xmm_crc_part).cast::<u8>(),
                     src.len(),
                 );
                 self.partial_fold(xmm_crc_part, src.len());

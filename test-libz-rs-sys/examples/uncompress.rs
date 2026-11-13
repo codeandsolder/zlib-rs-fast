@@ -23,18 +23,17 @@ fn main() {
             let source = input.as_ptr();
             let source_len = input.len() as _;
 
-            let err = unsafe { libz_ng_sys::uncompress(dest, &mut dest_len, source, source_len) };
+            let err =
+                unsafe { libz_ng_sys::uncompress(dest, &raw mut dest_len, source, source_len) };
 
-            if err != 0 {
-                panic!("error {err}");
-            }
+            assert!(err == 0, "error {err}");
 
             dest_vec.truncate(dest_len as usize);
 
             let path = PathBuf::from(path);
             std::fs::write(path.with_extension(""), &dest_vec).unwrap();
 
-            drop(dest_vec)
+            drop(dest_vec);
         }
         "rs" => {
             let path = it.next().unwrap();
@@ -48,18 +47,17 @@ fn main() {
             let source = input.as_ptr();
             let source_len = input.len() as _;
 
-            let err = unsafe { ::libz_rs_sys::uncompress(dest, &mut dest_len, source, source_len) };
+            let err =
+                unsafe { ::libz_rs_sys::uncompress(dest, &raw mut dest_len, source, source_len) };
 
-            if err != 0 {
-                panic!("error {err}");
-            }
+            assert!(err == 0, "error {err}");
 
             dest_vec.truncate(dest_len as usize);
 
             let path = PathBuf::from(path);
             std::fs::write(path.with_extension(""), &dest_vec).unwrap();
 
-            drop(dest_vec)
+            drop(dest_vec);
         }
         other => panic!("invalid option '{other}', expected one of 'rs' or 'ng'"),
     }

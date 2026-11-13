@@ -6,7 +6,7 @@
     feature(stdarch_loongarch)
 )]
 
-#[cfg(any(feature = "rust-allocator", feature = "c-allocator"))]
+#[cfg(any(test, feature = "rust-allocator", feature = "c-allocator"))]
 extern crate alloc;
 
 pub mod adler32;
@@ -33,6 +33,7 @@ cfg_select! {
     }
 }
 
+mod abi_cursor;
 mod cpu_features;
 mod output_buffer;
 mod stable;
@@ -107,16 +108,14 @@ use cfg_select;
 /// maximum bit length of a code.  "enough 286 10 15" for literal/length codes
 /// returns 1332, and "enough 30 9 15" for distance codes returns 592.
 /// The initial root table size (10 or 9) is found in the fifth argument of the
-/// inflate_table() calls in inflate.c and infback.c.  If the root table size is
+/// `inflate_table()` calls in inflate.c and infback.c.  If the root table size is
 /// changed, then these maximum sizes would be need to be recalculated and
 /// updated.
-#[allow(unused)]
-pub(crate) const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
 pub(crate) const ENOUGH_LENS: usize = 1332;
 pub(crate) const ENOUGH_DISTS: usize = 592;
 
 /// initial adler-32 hash value
-pub(crate) const ADLER32_INITIAL_VALUE: usize = 1;
+pub(crate) const ADLER32_INITIAL_VALUE: u32 = 1;
 /// initial crc-32 hash value
 pub(crate) const CRC32_INITIAL_VALUE: u32 = 0;
 
@@ -132,7 +131,7 @@ pub enum DeflateFlush {
 
     /// If flush is set to `PartialFlush`, all pending output is flushed to the
     /// output buffer, but the output is not aligned to a byte boundary.  All of the
-    /// input data so far will be available to the decompressor, as for Z_SYNC_FLUSH.
+    /// input data so far will be available to the decompressor, as for `Z_SYNC_FLUSH`.
     /// This completes the current deflate block and follows it with an empty fixed
     /// codes block that is 10 bits long.  This assures that enough bytes are output
     /// in order for the decompressor to finish the block before the empty fixed
@@ -142,7 +141,7 @@ pub enum DeflateFlush {
     /// If the parameter flush is set to `SyncFlush`, all pending output is
     /// flushed to the output buffer and the output is aligned on a byte boundary, so
     /// that the decompressor can get all input data available so far.  (In
-    /// particular avail_in is zero after the call if enough output space has been
+    /// particular `avail_in` is zero after the call if enough output space has been
     /// provided before the call.) Flushing may degrade compression for some
     /// compression algorithms and so it should be used only when necessary.  This
     /// completes the current deflate block and follows it with an empty stored block
@@ -151,7 +150,7 @@ pub enum DeflateFlush {
     SyncFlush = 2,
 
     /// If flush is set to `FullFlush`, all output is flushed as with
-    /// Z_SYNC_FLUSH, and the compression state is reset so that decompression can
+    /// `Z_SYNC_FLUSH`, and the compression state is reset so that decompression can
     /// restart from this point if previous compressed data has been damaged or if
     /// random access is desired.  Using `FullFlush` too often can seriously degrade
     /// compression.
@@ -161,13 +160,13 @@ pub enum DeflateFlush {
     /// pending output is flushed and deflate returns with `StreamEnd` if there was
     /// enough output space.  If deflate returns with `Ok` or `BufError`, this
     /// function must be called again with `Finish` and more output space (updated
-    /// avail_out) but no more input data, until it returns with `StreamEnd` or an
+    /// `avail_out`) but no more input data, until it returns with `StreamEnd` or an
     /// error.  After deflate has returned `StreamEnd`, the only possible operations
     /// on the stream are deflateReset or deflateEnd.
     ///
     /// `Finish` can be used in the first deflate call after deflateInit if all the
     /// compression is to be done in a single step.  In order to complete in one
-    /// call, avail_out must be at least the value returned by deflateBound (see
+    /// call, `avail_out` must be at least the value returned by deflateBound (see
     /// below).  Then deflate is guaranteed to return `StreamEnd`.  If not enough
     /// output space is provided, deflate will not return `StreamEnd`, and it must
     /// be called again as described above.
@@ -265,15 +264,15 @@ impl ReturnCode {
 
     const fn error_message_str_with_null(self) -> &'static str {
         match self {
-            ReturnCode::Ok => "\0",
-            ReturnCode::StreamEnd => "stream end\0",
-            ReturnCode::NeedDict => "need dictionary\0",
-            ReturnCode::ErrNo => "file error\0",
-            ReturnCode::StreamError => "stream error\0",
-            ReturnCode::DataError => "data error\0",
-            ReturnCode::MemError => "insufficient memory\0",
-            ReturnCode::BufError => "buffer error\0",
-            ReturnCode::VersionError => "incompatible version\0",
+            Self::Ok => "\0",
+            Self::StreamEnd => "stream end\0",
+            Self::NeedDict => "need dictionary\0",
+            Self::ErrNo => "file error\0",
+            Self::StreamError => "stream error\0",
+            Self::DataError => "data error\0",
+            Self::MemError => "insufficient memory\0",
+            Self::BufError => "buffer error\0",
+            Self::VersionError => "incompatible version\0",
         }
     }
 

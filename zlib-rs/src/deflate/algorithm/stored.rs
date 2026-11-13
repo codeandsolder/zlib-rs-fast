@@ -1,11 +1,124 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    deflate::{drain_pending_output, zng_tr_stored_block, BlockState, Compressor, MAX_STORED},
+    deflate::{
+        drain_pending_output, emit_stored_block_header, unflushed_block_span, zng_tr_stored_block,
+        BlockState, Compressor, State, MAX_STORED,
+    },
     DeflateFlush,
 };
 
+/// Stored output may reference only bytes still resident in the window.
+///
+/// A negative DEFLATE block origin is valid for an already-compressed block,
+/// but stored-mode copying must never reinterpret it as an unsigned offset.
+fn resident_origin(state: &State<'_>) -> usize {
+    let (origin, _) = unflushed_block_span(state.strstart, state.block_start);
+    let Some(origin) = origin else {
+        unreachable!("stored block start must be present in the sliding window");
+    };
+    origin
+}
+
+/// Convert only at the State boundary, after validating the next resident
+/// offset against the current initialized position.
+fn set_resident_origin(state: &mut State<'_>, next: usize) {
+    assert!(
+        next <= state.strstart,
+        "stored block origin moved beyond the window cursor"
+    );
+    let Ok(next) = isize::try_from(next) else {
+        unreachable!("stored block origin exceeds signed index range");
+    };
+    state.block_start = next;
+}
+
+fn advance_resident_origin(state: &mut State<'_>, count: usize) {
+    let Some(next) = resident_origin(state).checked_add(count) else {
+        unreachable!("stored block origin arithmetic overflow");
+    };
+    set_resident_origin(state, next);
+}
+
+/// Number of output bytes needed for a stored-block header, accounting for
+/// buffered prefix bits, the three-bit block marker, byte alignment and LEN/NLEN.
+fn stored_header_size(bits_valid: u8) -> usize {
+    assert!(bits_valid <= 64, "invalid bit reservoir occupancy");
+    (usize::from(bits_valid) + 42) / 8
+}
+
+/// Keep the directly copied bytes as usable history for a later level change.
+/// A full-window copy supersedes the history; a shorter copy appends or slides it.
+fn remember_direct_stored_history(stream: &mut Compressor<'_, '_>, used: usize) {
+    if used == 0 {
+        return;
+    }
+    if used >= stream.state.w_size {
+        // Supplant the previous history with the last full window of directly copied input.
+        let w_size = stream.state.w_size;
+        stream.state.matches = 2; // clear hash on a later compressed-level transition
+        stream.copy_recent_input_to_window(0..w_size, w_size);
+        stream.state.strstart = w_size;
+        stream.state.insert = w_size;
+    } else {
+        if stream.state.window_size - stream.state.strstart <= used {
+            // Slide the initialized portion of the history window down.
+            let state = &mut *stream.state;
+            state.strstart -= state.w_size;
+            state.window.slide_down(state.w_size);
+            state.matches = (state.matches + 1).min(2); // pending slide_hash
+            state.insert = state.insert.min(state.strstart);
+        }
+
+        let start = stream.state.strstart;
+        stream.copy_recent_input_to_window(start..start + used, used);
+        let state = &mut *stream.state;
+        state.strstart += used;
+        state.insert += used.min(state.w_size - state.insert);
+    }
+    set_resident_origin(stream.state, stream.state.strstart);
+}
+
+/// Refill the resident stored-block window after attempting direct output.
+/// Preserve the pending hash-slide count so switching compression level later works.
+fn refill_stored_history(stream: &mut Compressor<'_, '_>) {
+    // Fill the window with any remaining input
+    let mut have = stream.state.window_size - stream.state.strstart;
+    if stream.input.avail_in as usize > have && resident_origin(stream.state) >= stream.state.w_size
+    {
+        // slide the window down
+        let state = &mut *stream.state;
+        let next_origin = resident_origin(state) - state.w_size;
+        state.strstart -= state.w_size;
+        set_resident_origin(state, next_origin);
+
+        // Preserve only the logically initialized upper-half history.
+        state.window.slide_down(state.w_size);
+
+        if state.matches < 2 {
+            // add a pending slide_hash
+            state.matches += 1;
+        }
+
+        have += state.w_size; // more space now
+        state.insert = Ord::min(state.insert, state.strstart);
+    }
+
+    let have = Ord::min(have, stream.input.avail_in as usize);
+    if have > 0 {
+        stream.read_buf_window(stream.state.strstart, have);
+
+        let state = &mut *stream.state;
+        state.strstart += have;
+        state.insert += Ord::min(have, state.w_size - state.insert);
+    }
+}
+
 pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
+    // Stored-mode output must be backed by bytes still in the sliding window.
+    // The compressed-level transition path flushes before switching modes;
+    // negative block_start is only meaningful for already-flushed history.
+    let _ = resident_origin(stream.state);
     // Smallest worthy block size when not flushing or finishing. By default
     // this is 32K. This can be as small as 507 bytes for memLevel == 1. For
     // large input and output buffers, the stored block size will be larger.
@@ -27,21 +140,23 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         let mut len = MAX_STORED;
 
         // number of header bytes
-        have = ((stream.state.bit_writer.bits_valid + 42) / 8) as usize;
+        have = stored_header_size(stream.state.bit_writer.bits_valid);
 
         // we need room for at least the header
-        if stream.output.avail_out < have as u32 {
+        if (stream.output.avail_out as usize) < have {
             break;
         }
 
-        let left = stream.state.strstart as isize - stream.state.block_start;
-        let left = Ord::max(0, left) as usize;
+        let left = stream.state.strstart - resident_origin(stream.state);
+        // avail_in is a C uInt. On a 32-bit target its maximum can be
+        // usize::MAX, so adding buffered bytes must not wrap the total.
+        let available = left.saturating_add(stream.input.avail_in as usize);
 
         have = stream.output.avail_out as usize - have;
 
-        if len > left + stream.input.avail_in as usize {
+        if len > available {
             // limit len to the input
-            len = left + stream.input.avail_in as usize;
+            len = available;
         }
 
         len = Ord::min(len, have);
@@ -53,41 +168,31 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         if len < min_block
             && ((len == 0 && flush != DeflateFlush::Finish)
                 || flush == DeflateFlush::NoFlush
-                || len != left + stream.input.avail_in as usize)
+                || len != available)
         {
             break;
         }
 
-        // Make a dummy stored block in pending to get the header bytes,
-        // including any pending bits. This also updates the debugging counts.
-        last = flush == DeflateFlush::Finish && len == left + stream.input.avail_in as usize;
-        zng_tr_stored_block(stream.state, 0..0, last);
-
-        /* Replace the lengths in the dummy stored block with len. */
-        stream.state.bit_writer.pending.truncate_tail(4);
-        stream
-            .state
-            .bit_writer
-            .pending
-            .extend(&(len as u16).to_le_bytes());
-        stream
-            .state
-            .bit_writer
-            .pending
-            .extend(&(!len as u16).to_le_bytes());
+        // Emit the actual stored header directly, preserving pending bits
+        // and debug accounting without constructing and rewriting a dummy block.
+        last = flush == DeflateFlush::Finish && len == available;
+        emit_stored_block_header(stream.state, len, last);
 
         // Write the stored block header bytes.
-        let _ = drain_pending_output(stream.state, &mut stream.output);
+        let _ = drain_pending_output(stream.state, stream.output);
 
         // Update debugging counts for the data about to be copied.
-        stream.state.bit_writer.cmpr_bits_add(len << 3);
-        stream.state.bit_writer.sent_bits_add(len << 3);
+        #[cfg(feature = "ZLIB_DEBUG")]
+        {
+            stream.state.bit_writer.cmpr_bits_add(len << 3);
+            stream.state.bit_writer.sent_bits_add(len << 3);
+        }
 
         if left > 0 {
             let left = left.min(len);
-            let start = stream.state.block_start as usize;
+            let start = resident_origin(stream.state);
             stream.copy_window_to_output(start..start + left);
-            stream.state.block_start += left as isize;
+            advance_resident_origin(stream.state, left);
             len -= left;
         }
 
@@ -108,33 +213,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // a non-zero compression level.
     used -= stream.input.avail_in; /* number of input bytes directly copied */
 
-    if used > 0 {
-        let used = used as usize;
-        if used >= stream.state.w_size {
-            // Supplant the previous history with the last full window of directly copied input.
-            let w_size = stream.state.w_size;
-            stream.state.matches = 2; // clear hash on a later compressed-level transition
-            stream.copy_recent_input_to_window(0..w_size, w_size);
-            stream.state.strstart = w_size;
-            stream.state.insert = w_size;
-        } else {
-            if stream.state.window_size - stream.state.strstart <= used {
-                // Slide the initialized portion of the history window down.
-                let state = &mut stream.state;
-                state.strstart -= state.w_size;
-                state.window.slide_down(state.w_size);
-                state.matches = (state.matches + 1).min(2); // pending slide_hash
-                state.insert = state.insert.min(state.strstart);
-            }
-
-            let start = stream.state.strstart;
-            stream.copy_recent_input_to_window(start..start + used, used);
-            let state = &mut stream.state;
-            state.strstart += used;
-            state.insert += used.min(state.w_size - state.insert);
-        }
-        stream.state.block_start = stream.state.strstart as isize;
-    }
+    remember_direct_stored_history(stream, used as usize);
 
     // If the last block was written to next_out, then done.
     if last {
@@ -146,41 +225,12 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     if flush != DeflateFlush::NoFlush
         && flush != DeflateFlush::Finish
         && stream.input.avail_in == 0
-        && stream.state.strstart as isize == stream.state.block_start
+        && stream.state.strstart == resident_origin(stream.state)
     {
         return BlockState::BlockDone;
     }
 
-    // Fill the window with any remaining input
-    let mut have = stream.state.window_size - stream.state.strstart;
-    if stream.input.avail_in as usize > have
-        && stream.state.block_start >= stream.state.w_size as isize
-    {
-        // slide the window down
-        let state = &mut stream.state;
-        state.block_start -= state.w_size as isize;
-        state.strstart -= state.w_size;
-
-        // Preserve only the logically initialized upper-half history.
-        state.window.slide_down(state.w_size);
-
-        if state.matches < 2 {
-            // add a pending slide_hash
-            state.matches += 1;
-        }
-
-        have += state.w_size; // more space now
-        state.insert = Ord::min(state.insert, state.strstart);
-    }
-
-    let have = Ord::min(have, stream.input.avail_in as usize);
-    if have > 0 {
-        stream.read_buf_window(stream.state.strstart, have);
-
-        let state = &mut stream.state;
-        state.strstart += have;
-        state.insert += Ord::min(have, state.w_size - state.insert);
-    }
+    refill_stored_history(stream);
 
     // There was not enough avail_out to write a complete worthy or flushed
     // stored block to next_out. Write a stored block to pending instead, if we
@@ -188,33 +238,28 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
     // room for the remaining input as a stored block in the pending buffer.
 
     // number of header bytes
-    let state = &mut stream.state;
-    let have = ((state.bit_writer.bits_valid + 42) >> 3) as usize;
+    let state = &mut *stream.state;
+    let have = stored_header_size(state.bit_writer.bits_valid);
 
     // maximum stored block length that will fit in pending:
     let have = Ord::min(state.bit_writer.pending.capacity() - have, MAX_STORED);
     let min_block = Ord::min(have, state.w_size);
-    let left = state.strstart as isize - state.block_start;
+    let left = state.strstart - resident_origin(state);
 
-    if left >= min_block as isize
+    if left >= min_block
         || ((left > 0 || flush == DeflateFlush::Finish)
             && flush != DeflateFlush::NoFlush
             && stream.input.avail_in == 0
-            && left <= have as isize)
+            && left <= have)
     {
-        // The branch predicate above requires `left >= 0`: either it is at least
-        // `min_block`, or the flush arm requires `left > 0`. `deflateParams()`
-        // also flushes and resolves any algorithm transition before entering stored mode.
-        debug_assert!(left >= 0);
-        let len = Ord::min(left as usize, have);
-        last =
-            flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == (left as usize);
+        let len = left.min(have);
+        last = flush == DeflateFlush::Finish && stream.input.avail_in == 0 && len == left;
 
-        let range = state.block_start as usize..state.block_start as usize + len;
-        zng_tr_stored_block(state, range, last);
+        let start = resident_origin(state);
+        zng_tr_stored_block(state, start..start + len, last);
 
-        state.block_start += len as isize;
-        let _ = drain_pending_output(stream.state, &mut stream.output);
+        advance_resident_origin(state, len);
+        let _ = drain_pending_output(stream.state, stream.output);
     }
 
     // We've done all we can with the available input and output.

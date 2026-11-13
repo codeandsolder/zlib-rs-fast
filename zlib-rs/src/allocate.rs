@@ -1,5 +1,3 @@
-#![allow(unpredictable_function_pointer_comparisons)]
-
 #[cfg(unix)]
 use core::ffi::c_int;
 use core::{
@@ -10,34 +8,57 @@ use core::{
     ptr::NonNull,
 };
 
-#[allow(non_camel_case_types)]
+#[expect(
+    non_camel_case_types,
+    reason = "size_t is the standard C allocator ABI type"
+)]
 type size_t = usize;
 
-const ALIGN: u8 = 64;
+const ALIGN: usize = 64;
+
+/// One cache-line of typed allocation storage, shared by Deflate and Inflate.
+/// The allocator enforces this alignment even for custom C callbacks.
+#[repr(align(64))]
+pub struct AlignedAllocationBlock {
+    _bytes: [u8; ALIGN],
+}
+pub const ALLOCATION_BLOCK_BYTES: usize = mem::size_of::<AlignedAllocationBlock>();
+
+const _: () = assert!(mem::align_of::<AlignedAllocationBlock>() == ALIGN);
+const _: () = assert!(ALLOCATION_BLOCK_BYTES == ALIGN);
+
 // posix_memalign requires that the alignment be a power of two and a multiple of sizeof(void*).
-const _: () = assert!(ALIGN.count_ones() == 1);
-const _: () = assert!(ALIGN as usize % mem::size_of::<*mut c_void>() == 0);
+const _: () = assert!(ALIGN.is_power_of_two());
+const _: () = assert!(ALIGN.is_multiple_of(mem::size_of::<*mut c_void>()));
+
+/// Check the C callback's multiplication without wrapping to an undersized allocation.
+fn allocation_size(items: c_uint, size: c_uint) -> Option<usize> {
+    usize::try_from(items)
+        .ok()?
+        .checked_mul(usize::try_from(size).ok()?)
+}
 
 /// # Safety
 ///
 /// This function is safe, but must have this type signature to be used elsewhere in the library
 #[cfg(unix)]
 unsafe extern "C" fn zalloc_c(opaque: *mut c_void, items: c_uint, size: c_uint) -> *mut c_void {
-    let _ = opaque;
-
     extern "C" {
         fn posix_memalign(memptr: *mut *mut c_void, align: size_t, size: size_t) -> c_int;
     }
 
+    let _ = opaque;
     let mut ptr = core::ptr::null_mut();
-    let size = items as size_t * size as size_t;
+    let Some(size) = allocation_size(items, size) else {
+        return core::ptr::null_mut();
+    };
     if size == 0 {
         return ptr;
     }
     // SAFETY: ALIGN is a power of 2 and multiple of sizeof(void*), as required by posix_memalign.
     // In addition, since posix_memalign is allowed to return a unique but non-null pointer when
     // called with a size of zero, we returned above if the size was zero.
-    match unsafe { posix_memalign(&mut ptr, ALIGN.into(), size) } {
+    match unsafe { posix_memalign(&raw mut ptr, ALIGN, size) } {
         0 => ptr,
         _ => core::ptr::null_mut(),
     }
@@ -50,7 +71,9 @@ unsafe extern "C" fn zalloc_c(opaque: *mut c_void, items: c_uint, size: c_uint) 
 unsafe extern "C" fn zalloc_c(opaque: *mut c_void, items: c_uint, size: c_uint) -> *mut c_void {
     let _ = opaque;
 
-    let size = items as size_t * size as size_t;
+    let Some(size) = allocation_size(items, size) else {
+        return core::ptr::null_mut();
+    };
     if size == 0 {
         return core::ptr::null_mut();
     }
@@ -69,12 +92,11 @@ unsafe extern "C" fn zalloc_c(opaque: *mut c_void, items: c_uint, size: c_uint) 
 ///
 /// The `ptr` must be allocated with the allocator that is used internally by `zcfree`
 unsafe extern "C" fn zfree_c(opaque: *mut c_void, ptr: *mut c_void) {
-    let _ = opaque;
-
     extern "C" {
         fn free(p: *mut c_void);
     }
 
+    let _ = opaque;
     // SAFETY: The caller ensured that ptr was obtained from the same allocator. Also,
     // free properly handles the case where ptr == NULL.
     unsafe { free(ptr) }
@@ -85,19 +107,23 @@ unsafe extern "C" fn zfree_c(opaque: *mut c_void, ptr: *mut c_void) {
 /// This function is safe to call.
 #[cfg(feature = "rust-allocator")]
 unsafe extern "C" fn zalloc_rust(_opaque: *mut c_void, count: c_uint, size: c_uint) -> *mut c_void {
-    let size = count as usize * size as usize;
+    let Some(size) = allocation_size(count, size) else {
+        return core::ptr::null_mut();
+    };
     if size == 0 {
         return core::ptr::null_mut();
     }
 
     // internally, we want to align allocations to 64 bytes (in part for SIMD reasons)
-    let layout = Layout::from_size_align(size, ALIGN.into()).unwrap();
+    let Ok(layout) = Layout::from_size_align(size, ALIGN) else {
+        return core::ptr::null_mut();
+    };
 
     // SAFETY: alloc requires that the layout have a nonzero size, so we return null
     // above (and never reach this call) if the requested count * size is zero.
     let ptr = unsafe { alloc::alloc::alloc(layout) };
 
-    ptr as *mut c_void
+    ptr.cast()
 }
 
 /// # Safety
@@ -117,7 +143,7 @@ unsafe extern "C" fn zfree_rust(opaque: *mut c_void, ptr: *mut c_void) {
     }
 
     // SAFETY: The caller ensured that *opaque is valid to dereference.
-    let size = unsafe { *(opaque as *mut usize) };
+    let size = unsafe { *opaque.cast::<usize>() };
 
     // zalloc_rust bypasses the Rust allocator and just returns null when asked to
     // allocate something of zero size. So if a caller tries to
@@ -127,8 +153,9 @@ unsafe extern "C" fn zfree_rust(opaque: *mut c_void, ptr: *mut c_void) {
         return;
     }
 
-    let layout = Layout::from_size_align(size, ALIGN.into());
-    let layout = layout.unwrap();
+    let Ok(layout) = Layout::from_size_align(size, ALIGN) else {
+        return;
+    };
 
     // SAFETY: The caller ensured that ptr was allocated with the `alloc` allocator,
     // and the size check above ensures that we are not trying to use a zero-size layout
@@ -137,12 +164,12 @@ unsafe extern "C" fn zfree_rust(opaque: *mut c_void, ptr: *mut c_void) {
 }
 
 #[cfg(test)]
-unsafe extern "C" fn zalloc_fail(_: *mut c_void, _: c_uint, _: c_uint) -> *mut c_void {
+const unsafe extern "C" fn zalloc_fail(_: *mut c_void, _: c_uint, _: c_uint) -> *mut c_void {
     core::ptr::null_mut()
 }
 
 #[cfg(test)]
-unsafe extern "C" fn zfree_fail(_: *mut c_void, _: *mut c_void) {
+const unsafe extern "C" fn zfree_fail(_: *mut c_void, _: *mut c_void) {
     // do nothing
 }
 
@@ -155,10 +182,10 @@ pub struct Allocator<'a> {
     pub _marker: PhantomData<&'a ()>,
 }
 
-unsafe impl Sync for Allocator<'static> {}
-
+// These are copyable callback configurations, not globally shared mutable allocator objects.
+// Keeping them const avoids claiming that arbitrary user-supplied opaque callbacks are Sync.
 #[cfg(feature = "rust-allocator")]
-pub static RUST: Allocator<'static> = Allocator {
+pub const RUST: Allocator<'static> = Allocator {
     zalloc: zalloc_rust,
     zfree: zfree_rust,
     opaque: core::ptr::null_mut(),
@@ -166,7 +193,7 @@ pub static RUST: Allocator<'static> = Allocator {
 };
 
 #[cfg(feature = "c-allocator")]
-pub static C: Allocator<'static> = Allocator {
+pub const C: Allocator<'static> = Allocator {
     zalloc: zalloc_c,
     zfree: zfree_c,
     opaque: core::ptr::null_mut(),
@@ -174,7 +201,7 @@ pub static C: Allocator<'static> = Allocator {
 };
 
 #[cfg(test)]
-static FAIL: Allocator<'static> = Allocator {
+const FAIL: Allocator<'static> = Allocator {
     zalloc: zalloc_fail,
     zfree: zfree_fail,
     opaque: core::ptr::null_mut(),
@@ -182,99 +209,86 @@ static FAIL: Allocator<'static> = Allocator {
 };
 
 impl Allocator<'_> {
+    #[cfg(feature = "rust-allocator")]
+    fn uses_rust_allocator(&self) -> bool {
+        core::ptr::fn_addr_eq(self.zalloc, RUST.zalloc)
+            && core::ptr::fn_addr_eq(self.zfree, RUST.zfree)
+    }
+
     fn allocate_layout(&self, layout: Layout) -> *mut c_void {
-        assert!(layout.align() <= ALIGN.into());
-
-        // Special case for the Rust `alloc` backed allocator
+        // The built-in Rust allocator can honor the exact requested Layout,
+        // including alignments larger than the 64-byte C ABI callback alignment.
+        // Both callbacks must match: arbitrary C callback pairs use the same
+        // prefix-metadata layout for allocation and deallocation.
         #[cfg(feature = "rust-allocator")]
-        if self.zalloc == RUST.zalloc {
-            let ptr = unsafe { (RUST.zalloc)(self.opaque, layout.size() as _, 1) };
+        if self.uses_rust_allocator() {
+            // Keep the C allocator size limit despite bypassing its callback.
+            // A zero-sized Layout must never be passed to alloc::alloc::alloc.
+            if layout.size() == 0 || c_uint::try_from(layout.size()).is_err() {
+                return core::ptr::null_mut();
+            }
 
-            debug_assert_eq!(ptr as usize % layout.align(), 0);
-
-            return ptr;
+            // SAFETY: Layout was checked by the caller or Layout::array,
+            // and its size is nonzero; the caller takes ownership of this block.
+            return unsafe { alloc::alloc::alloc(layout).cast() };
         }
 
-        // General case for c-style allocation
-
-        // We cannot rely on the allocator giving properly aligned allocations and have to fix that ourselves.
+        // The C allocator may return any byte alignment. Reserve space for the original
+        // callback pointer immediately before an aligned payload pointer. The payload
+        // offset is exactly:
         //
-        // The general approach is to allocate a bit more than the layout needs, so that we can
-        // give the application a properly aligned address and also store the real allocation
-        // pointer in the allocation so that `free` can free the real allocation pointer.
+        //     size_of::<*mut c_void>() + padding_to_layout_alignment
         //
-        //
-        // Example: The layout represents `(u32, u32)`, with an alignment of 4 bytes and a
-        // total size of 8 bytes.
-        //
-        // Assume that the allocator will give us address `0x07`. We need that to be a multiple
-        // of the alignment, so that shifts the starting position to `0x08`. Then we also need
-        // to store the pointer to the start of the allocation so that `free` can free that
-        // pointer, bumping to `0x10`. The `0x10` pointer is then the pointer that the application
-        // deals with. When free'ing, the original allocation pointer can be read from `0x10 - size_of::<*const c_void>()`.
-        //
-        // Of course there does need to be enough space in the allocation such that when we
-        // shift the start forwards, the end is still within the allocation. Hence we allocate
-        // `extra_space` bytes: enough for a full alignment plus a pointer.
-
-        // we need at least
-        //
-        // - `align` extra space so that no matter what pointer we get from zalloc, we can shift the start of the
-        //      allocation by at most `align - 1` so that `ptr as usize % align == 0
-        // - `size_of::<*mut _>` extra space so that after aligning to `align`,
-        //      there is `size_of::<*mut _>` space to store the pointer to the allocation.
-        //      This pointer is then retrieved in `free`
-        let extra_space = core::mem::size_of::<*mut c_void>() + layout.align();
-
-        // Safety: we assume allocating works correctly in the safety assumptions on
-        // `DeflateStream` and `InflateStream`.
-        let Ok(allocation_size) = c_uint::try_from(layout.size() + extra_space) else {
+        // where padding is in 0..layout.align(). This also covers alignments smaller
+        // than a pointer without special cases. Keep the original allocation pointer
+        // in the prefix so deallocate can return precisely it to zfree.
+        let pointer_bytes = core::mem::size_of::<*mut c_void>();
+        let Some(extra_space) = pointer_bytes.checked_add(layout.align()) else {
             return core::ptr::null_mut();
         };
-        let ptr = unsafe { (self.zalloc)(self.opaque, allocation_size, 1) };
 
+        let Some(required_size) = layout.size().checked_add(extra_space) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(allocation_size) = c_uint::try_from(required_size) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: the custom C allocator promises a writable allocation of at least
+        // allocation_size bytes on success, valid until the matching zfree call.
+        let ptr = unsafe { (self.zalloc)(self.opaque, allocation_size, 1) };
         if ptr.is_null() {
             return ptr;
         }
 
-        // Calculate return pointer address with space enough to store original pointer
-        let align_diff = (ptr as usize).next_multiple_of(layout.align()) - (ptr as usize);
+        // SAFETY: extra_space includes the pointer prefix and an entire alignment
+        // unit, so these offsets and the eventual payload remain inside the C
+        // allocation. Compute padding from the pointer after the metadata prefix.
+        let after_prefix = unsafe { ptr.cast::<u8>().add(pointer_bytes) };
+        let remainder = (after_prefix as usize) % layout.align();
+        let padding = (layout.align() - remainder) % layout.align();
+        // SAFETY: padding is smaller than layout.align(), and extra_space reserved
+        // that entire alignment unit beyond the pointer metadata prefix.
+        let aligned = unsafe { after_prefix.add(padding) };
 
-        // Safety: offset is smaller than 64, and we allocated 64 extra bytes in the allocation
-        let mut return_ptr = unsafe { ptr.cast::<u8>().add(align_diff) };
-
-        // if there is not enough space to store a pointer we need to make more
-        if align_diff < core::mem::size_of::<*mut c_void>() {
-            // # Safety
-            //
-            // - `return_ptr` is well-aligned, therefore `return_ptr + align` is also well-aligned
-            // - we reserve `size_of::<*mut _> + align` extra space in the allocation, so
-            //      `ptr + align_diff + align` is still valid for (at least) `layout.size` bytes
-            let offset = Ord::max(core::mem::size_of::<*mut c_void>(), layout.align());
-            return_ptr = unsafe { return_ptr.add(offset) };
-        }
-
-        // Store the original pointer for free()
-        //
-        // Safety: `align >= size_of::<*mut _>`, so there is now space for a pointer before `return_ptr`
-        // in the allocation
+        // SAFETY: aligned is at least pointer_bytes past the allocation start;
+        // unaligned access is necessary because the C callback's pointer may not
+        // be aligned even for a raw pointer.
         unsafe {
-            let original_ptr = return_ptr.sub(core::mem::size_of::<*mut c_void>());
-            core::ptr::write_unaligned(original_ptr.cast::<*mut c_void>(), ptr);
-        };
-
-        // Return properly aligned pointer in allocation
-        let ptr = return_ptr.cast::<c_void>();
+            core::ptr::write_unaligned(aligned.sub(pointer_bytes).cast::<*mut c_void>(), ptr);
+        }
+        let ptr = aligned.cast::<c_void>();
 
         debug_assert_eq!(ptr as usize % layout.align(), 0);
 
         ptr
     }
 
+    #[must_use]
     pub fn allocate_raw<T>(&self) -> Option<NonNull<T>> {
         NonNull::new(self.allocate_layout(Layout::new::<T>()).cast())
     }
 
+    #[must_use]
     pub fn allocate_slice_raw<T>(&self, len: usize) -> Option<NonNull<T>> {
         NonNull::new(self.allocate_layout(Layout::array::<T>(len).ok()?).cast())
     }
@@ -287,17 +301,22 @@ impl Allocator<'_> {
     ///
     /// - `ptr` must be allocated with this allocator
     /// - `len` must be the number of `T`s that are in this allocation
-    #[allow(unused)] // Rust needs `len` for deallocation
     pub unsafe fn deallocate<T>(&self, ptr: *mut T, len: usize) {
+        #[cfg(not(feature = "rust-allocator"))]
+        let _ = len;
         if !ptr.is_null() {
-            // Special case for the Rust `alloc` backed allocator
+            // Use the exact original typed Layout for both allocation and free,
+            // rather than the fixed 64-byte Layout of the raw Rust C callback.
             #[cfg(feature = "rust-allocator")]
-            if self.zfree == RUST.zfree {
-                assert_ne!(len, 0, "invalid size for {ptr:?}");
-                let mut size = core::mem::size_of::<T>() * len;
-                // SAFETY: The caller ensured that ptr was allocated with this allocator, and
-                // we initialized size above.
-                return unsafe { (RUST.zfree)(&mut size as *mut usize as *mut c_void, ptr.cast()) };
+            if self.uses_rust_allocator() {
+                // SAFETY: deallocate requires the exact T and len from a previous
+                // successful typed allocation. That allocation could succeed only
+                // after Layout::array::<T>(len) returned Ok, so this is infallible.
+                let layout = unsafe { Layout::array::<T>(len).unwrap_unchecked() };
+                assert_ne!(layout.size(), 0, "invalid zero-sized allocation");
+                // SAFETY: the caller promises a live pointer allocated by this
+                // allocator with precisely T[len]. Both paths use this Layout.
+                return unsafe { alloc::alloc::dealloc(ptr.cast(), layout) };
             }
 
             // General case for c-style allocation
@@ -306,11 +325,78 @@ impl Allocator<'_> {
             // subtract size_of::<*const c_void> from pointer, dereference the resulting address,
             // and use that as the argument to the low-level free function.
             unsafe {
-                let original_ptr = (ptr as *mut u8).sub(core::mem::size_of::<*const c_void>());
-                let free_ptr = core::ptr::read_unaligned(original_ptr as *mut *mut c_void);
+                let original_ptr = ptr.cast::<u8>().sub(core::mem::size_of::<*const c_void>());
+                let free_ptr = core::ptr::read_unaligned(original_ptr.cast::<*mut c_void>());
 
-                (self.zfree)(self.opaque, free_ptr)
+                (self.zfree)(self.opaque, free_ptr);
             }
+        }
+    }
+}
+
+/// Reusable test-only C allocator simulating every raw pointer residue.
+/// The per-stream context avoids global callbacks and cross-test contention.
+#[cfg(test)]
+use std::{boxed::Box, vec, vec::Vec};
+
+#[cfg(test)]
+pub struct MisalignedAlloc {
+    pub(super) remainder: usize,
+    pub(super) modulus: usize,
+    pub(super) allocations: usize,
+    pub(super) frees: usize,
+    pub(super) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
+}
+
+/// # Safety
+///
+/// The opaque pointer must identify the live, exclusively accessible per-test
+/// `MisalignedAlloc` context supplied to the matching `z_stream`. Its lifetime
+/// extends across every zalloc callback until the corresponding frees.
+#[cfg(test)]
+pub unsafe extern "C" fn misaligned_alloc_callback(
+    opaque: *mut core::ffi::c_void,
+    items: crate::c_api::uInt,
+    size: crate::c_api::uInt,
+) -> *mut core::ffi::c_void {
+    // SAFETY: init and copy receive a live pointer to our stack-local allocator context.
+    let Some(ctx) = (unsafe { opaque.cast::<MisalignedAlloc>().as_mut() }) else {
+        return core::ptr::null_mut();
+    };
+    let Some(length) = usize::try_from(items)
+        .ok()
+        .and_then(|count| usize::try_from(size).ok()?.checked_mul(count))
+        .and_then(|size| size.checked_add(ctx.modulus))
+    else {
+        return core::ptr::null_mut();
+    };
+    let mut data = vec![0u8; length].into_boxed_slice();
+    let base = data.as_mut_ptr() as usize;
+    let delta = (ctx.remainder + ctx.modulus - base % ctx.modulus) % ctx.modulus;
+    // SAFETY: the allocation reserves one full alignment unit beyond the requested
+    // size, so the shifted pointer still has all requested bytes available.
+    let ptr = unsafe { data.as_mut_ptr().add(delta) }.cast();
+    ctx.buffers.push((ptr, data));
+    ctx.allocations += 1;
+    ptr
+}
+
+/// # Safety
+///
+/// The opaque pointer must identify the same live per-test allocator context
+/// used for allocation, and `ptr` must be null or a pointer returned by it.
+/// The context records unexpected releases as outstanding allocations.
+#[cfg(test)]
+pub unsafe extern "C" fn misaligned_free_callback(
+    opaque: *mut core::ffi::c_void,
+    ptr: *mut core::ffi::c_void,
+) {
+    // SAFETY: zfree is invoked before the stack-local context is destroyed, and
+    // receives the exact pointer previously returned by the matching allocator.
+    if let Some(ctx) = unsafe { opaque.cast::<MisalignedAlloc>().as_mut() } {
+        if let Some(index) = ctx.buffers.iter().position(|(address, _)| *address == ptr) {
+            ctx.buffers.swap_remove(index);
+            ctx.frees += 1;
         }
     }
 }
@@ -322,6 +408,45 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    // Nonzero-sized types used throughout the allocator alignment tests.
+    // The fields are intentionally not initialized or read.
+    #[repr(align(128))]
+    struct Align128 {
+        _byte: u8,
+    }
+    #[repr(align(256))]
+    struct Align256 {
+        _byte: u8,
+    }
+    #[repr(align(4096))]
+    struct Align4096 {
+        _byte: u8,
+    }
+
+    #[test]
+    fn allocation_size_rejects_unrepresentable_products() {
+        assert_eq!(allocation_size(0, c_uint::MAX), Some(0));
+        assert_eq!(allocation_size(17, 19), Some(323));
+        let max_product = u64::from(c_uint::MAX) * u64::from(c_uint::MAX);
+        assert_eq!(
+            allocation_size(c_uint::MAX, c_uint::MAX),
+            usize::try_from(max_product).ok()
+        );
+    }
+
+    #[cfg(all(feature = "rust-allocator", target_pointer_width = "64"))]
+    #[test]
+    fn rust_allocator_rejects_oversized_requests_before_narrowing() {
+        let beyond_c_uint = u64::from(c_uint::MAX) + 16;
+        assert!(usize::try_from(beyond_c_uint)
+            .is_ok_and(|len| RUST.allocate_slice_raw::<u8>(len).is_none()));
+
+        // A representable usize can still exceed Layout's ISIZE_MAX limit. The callback must
+        // reject it rather than panic across an extern "C" boundary.
+        // SAFETY: the callback ignores its opaque pointer.
+        assert!(unsafe { zalloc_rust(ptr::null_mut(), c_uint::MAX, c_uint::MAX) }.is_null());
+    }
 
     static PTR: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
     static MUTEX: Mutex<()> = Mutex::new(());
@@ -336,17 +461,17 @@ mod tests {
 
     unsafe extern "C" fn unaligned_free(_opaque: *mut c_void, ptr: *mut c_void) {
         let expected = PTR.load(Ordering::Relaxed);
-        assert_eq!(expected, ptr)
+        assert_eq!(expected, ptr);
     }
 
-    fn unaligned_allocator_help<T>() {
+    fn unaligned_allocator_help<T>() -> Result<(), &'static str> {
         let mut buf = [0u8; 1024];
 
-        // we don't want anyone else messing with the PTR static
-        let _guard = MUTEX.lock().unwrap();
+        // Only one test may install the global mock allocator callback at a time.
+        let _guard = MUTEX.lock().map_err(|_| "allocator test mutex poisoned")?;
 
         for i in 0..64 {
-            let ptr = unsafe { buf.as_mut_ptr().add(i).cast() };
+            let ptr = buf[i..].as_mut_ptr().cast();
             PTR.store(ptr, Ordering::Relaxed);
 
             let allocator = Allocator {
@@ -356,45 +481,54 @@ mod tests {
                 _marker: PhantomData,
             };
 
-            let ptr = allocator.allocate_raw::<T>().unwrap().as_ptr();
+            let ptr = allocator
+                .allocate_raw::<T>()
+                .ok_or("mock allocator failed to return an aligned object")?
+                .as_ptr();
             assert_eq!(ptr as usize % core::mem::align_of::<T>(), 0);
-            unsafe { allocator.deallocate(ptr, 1) }
+            // SAFETY: the allocation was obtained from allocator for exactly one T.
+            unsafe { allocator.deallocate(ptr, 1) };
 
-            let ptr = allocator.allocate_slice_raw::<T>(10).unwrap().as_ptr();
+            let ptr = allocator
+                .allocate_slice_raw::<T>(10)
+                .ok_or("mock allocator failed to return an aligned slice")?
+                .as_ptr();
             assert_eq!(ptr as usize % core::mem::align_of::<T>(), 0);
-            unsafe { allocator.deallocate(ptr, 10) }
+            // SAFETY: the allocation was obtained from allocator for ten Ts.
+            unsafe { allocator.deallocate(ptr, 10) };
         }
+        Ok(())
     }
 
     #[test]
-    fn unaligned_allocator_0() {
+    fn unaligned_allocator_0() -> Result<(), &'static str> {
         unaligned_allocator_help::<()>()
     }
 
     #[test]
-    fn unaligned_allocator_1() {
+    fn unaligned_allocator_1() -> Result<(), &'static str> {
         unaligned_allocator_help::<u8>()
     }
 
     #[test]
-    fn unaligned_allocator_2() {
+    fn unaligned_allocator_2() -> Result<(), &'static str> {
         unaligned_allocator_help::<u16>()
     }
     #[test]
-    fn unaligned_allocator_4() {
+    fn unaligned_allocator_4() -> Result<(), &'static str> {
         unaligned_allocator_help::<u32>()
     }
     #[test]
-    fn unaligned_allocator_8() {
+    fn unaligned_allocator_8() -> Result<(), &'static str> {
         unaligned_allocator_help::<u64>()
     }
     #[test]
-    fn unaligned_allocator_16() {
+    fn unaligned_allocator_16() -> Result<(), &'static str> {
         unaligned_allocator_help::<u128>()
     }
 
     #[test]
-    fn unaligned_allocator_32() {
+    fn unaligned_allocator_32() -> Result<(), &'static str> {
         #[repr(C, align(32))]
         struct Align32(u8);
 
@@ -402,35 +536,219 @@ mod tests {
     }
 
     #[test]
-    fn unaligned_allocator_64() {
+    fn unaligned_allocator_64() -> Result<(), &'static str> {
         #[repr(C, align(64))]
         struct Align64(u8);
 
         unaligned_allocator_help::<Align64>()
     }
 
-    fn test_allocate_raw_help(allocator: Allocator) {
-        #[repr(C, align(64))]
-        struct Align64(u8);
+    /// Test every possible C callback pointer residue for each requested
+    /// alignment, including alignments larger than the codec's cache-line unit.
+    fn check_custom_allocator_alignment<T>() -> Result<(), &'static str> {
+        let modulus = mem::align_of::<T>();
+        assert!(modulus > ALLOCATION_BLOCK_BYTES);
+        for remainder in 0..modulus {
+            let mut ctx = MisalignedAlloc {
+                remainder,
+                modulus,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let allocator = Allocator {
+                zalloc: misaligned_alloc_callback,
+                zfree: misaligned_free_callback,
+                opaque: (&raw mut ctx).cast(),
+                _marker: PhantomData,
+            };
+            let ptr = allocator
+                .allocate_raw::<T>()
+                .ok_or("overaligned C allocation failed")?;
+            assert_eq!(ptr.as_ptr() as usize % modulus, 0);
+            // SAFETY: the allocation was obtained for exactly one T.
+            unsafe { allocator.deallocate(ptr.as_ptr(), 1) };
 
-        let ptr = allocator.allocate_raw::<Align64>();
-        assert!(ptr.is_some());
-        unsafe { allocator.deallocate(ptr.unwrap().as_ptr(), 1) };
+            let ptr = allocator
+                .allocate_slice_raw::<T>(3)
+                .ok_or("overaligned C array allocation failed")?;
+            assert_eq!(ptr.as_ptr() as usize % modulus, 0);
+            let byte_len = mem::size_of::<T>() * 3;
+            // SAFETY: the fresh three-element allocation is writable for byte_len
+            // bytes; only raw u8 writes/reads are performed, including its last byte.
+            unsafe {
+                let bytes = ptr.as_ptr().cast::<u8>();
+                bytes.write(0xa5);
+                bytes.add(byte_len - 1).write(0x5a);
+                assert_eq!(bytes.read(), 0xa5);
+                assert_eq!(bytes.add(byte_len - 1).read(), 0x5a);
+            }
+            // SAFETY: the allocation was obtained for exactly three Ts.
+            unsafe { allocator.deallocate(ptr.as_ptr(), 3) };
+
+            assert_eq!(ctx.allocations, 2);
+            assert_eq!(ctx.frees, 2);
+            assert_eq!(ctx.buffers.len(), 0, "unreleased C allocator buffers");
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_allocate_raw() {
+    fn custom_allocator_supports_large_alignment() -> Result<(), &'static str> {
+        check_custom_allocator_alignment::<Align128>()?;
+        check_custom_allocator_alignment::<Align256>()?;
+        check_custom_allocator_alignment::<Align4096>()
+    }
+
+    #[cfg(feature = "rust-allocator")]
+    #[test]
+    fn rust_allocator_supports_large_alignment() -> Result<(), &'static str> {
+        fn check<T>(count: usize) -> Result<(), &'static str> {
+            let ptr = RUST
+                .allocate_slice_raw::<T>(count)
+                .ok_or("overaligned Rust allocation failed")?;
+            assert_eq!(ptr.as_ptr() as usize % mem::align_of::<T>(), 0);
+            let byte_len = mem::size_of::<T>() * count;
+            // SAFETY: the global allocator returned a writable byte_len-byte block.
+            unsafe {
+                let bytes = ptr.as_ptr().cast::<u8>();
+                bytes.write(0xa5);
+                bytes.add(byte_len - 1).write(0x5a);
+                assert_eq!(bytes.read(), 0xa5);
+                assert_eq!(bytes.add(byte_len - 1).read(), 0x5a);
+            }
+            // SAFETY: successful allocation used this type and exact element count.
+            unsafe { RUST.deallocate(ptr.as_ptr(), count) };
+            Ok(())
+        }
+        check::<Align128>(1)?;
+        check::<Align4096>(3)
+    }
+
+    #[cfg(feature = "c-allocator")]
+    #[test]
+    fn default_c_allocator_supports_large_alignment() -> Result<(), &'static str> {
+        let ptr = C
+            .allocate_slice_raw::<Align4096>(2)
+            .ok_or("default C allocator could not provide 4096-byte alignment")?;
+        assert_eq!(ptr.as_ptr() as usize % 4096, 0);
+        // SAFETY: C allocated two Align4096 objects through the generic
+        // alignment-prefix path; this returns the exact original C pointer.
+        unsafe { C.deallocate(ptr.as_ptr(), 2) };
+        Ok(())
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_c_alignment_is_rejected_before_callback() -> Result<(), &'static str> {
+        unsafe extern "C" fn count_calls(
+            opaque: *mut c_void,
+            _items: c_uint,
+            _size: c_uint,
+        ) -> *mut c_void {
+            // SAFETY: the test supplies a live exclusive counter throughout the call.
+            let count = unsafe { &mut *opaque.cast::<usize>() };
+            *count += 1;
+            core::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn no_free(_: *mut c_void, _: *mut c_void) {}
+
+        let mut calls = 0usize;
+        let allocator = Allocator {
+            zalloc: count_calls,
+            zfree: no_free,
+            opaque: (&raw mut calls).cast(),
+            _marker: PhantomData,
+        };
+        let layout = Layout::from_size_align(1, 1usize << 32)
+            .map_err(|_| "a 4-GiB alignment should form a valid Layout on 64-bit targets")?;
+        assert!(allocator.allocate_layout(layout).is_null());
+        assert_eq!(calls, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "rust-allocator")]
+    #[test]
+    fn native_rust_allocation_rejects_zero_sized_types() {
+        // The Rust global allocator must not receive zero-sized Layouts.
+        assert!(RUST.allocate_raw::<()>().is_none());
+        assert!(RUST.allocate_slice_raw::<u8>(0).is_none());
+    }
+
+    #[cfg(feature = "rust-allocator")]
+    #[test]
+    fn mixed_rust_callbacks_use_generic_pointer_metadata() -> Result<(), &'static str> {
+        struct Context {
+            allocated_bytes: usize,
+            frees: usize,
+        }
+
+        unsafe extern "C" fn wrapped_rust_free(opaque: *mut c_void, ptr: *mut c_void) {
+            // SAFETY: the test passes its live, uniquely borrowed Context via opaque,
+            // and this callback is invoked only for the matching Rust allocation.
+            let Some(ctx) = (unsafe { opaque.cast::<Context>().as_mut() }) else {
+                return;
+            };
+            let mut size = ctx.allocated_bytes;
+            // SAFETY: the built-in Rust callback allocated exactly size bytes at
+            // its fixed 64-byte alignment, and this is the original raw pointer.
+            unsafe { zfree_rust((&raw mut size).cast(), ptr) };
+            ctx.frees += 1;
+        }
+
+        let typed_layout = Layout::new::<Align4096>();
+        let mut ctx = Context {
+            allocated_bytes: typed_layout.size()
+                + mem::size_of::<*mut c_void>()
+                + typed_layout.align(),
+            frees: 0,
+        };
+        let allocator = Allocator {
+            zalloc: RUST.zalloc,
+            zfree: wrapped_rust_free,
+            opaque: (&raw mut ctx).cast(),
+            _marker: PhantomData,
+        };
+        let ptr = allocator
+            .allocate_raw::<Align4096>()
+            .ok_or("generic path with a mixed callback pair failed")?;
+        assert_eq!(ptr.as_ptr() as usize % typed_layout.align(), 0);
+        // SAFETY: this is the pointer returned by the mixed-pair allocator for
+        // precisely one Align4096; its free callback releases the original base.
+        unsafe { allocator.deallocate(ptr.as_ptr(), 1) };
+        assert_eq!(ctx.frees, 1);
+        Ok(())
+    }
+
+    fn test_allocate_raw_help(allocator: Allocator<'_>) -> Result<(), &'static str> {
+        #[repr(C, align(64))]
+        struct Align64(u8);
+
+        let ptr = allocator
+            .allocate_raw::<Align64>()
+            .ok_or("failed to allocate 64-byte aligned object")?;
+        // SAFETY: ptr was allocated by allocator for one Align64 and is owned by this test.
+        unsafe { allocator.deallocate(ptr.as_ptr(), 1) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocate_raw() -> Result<(), &'static str> {
         #[cfg(feature = "rust-allocator")]
-        test_allocate_raw_help(RUST);
+        test_allocate_raw_help(RUST)?;
 
         #[cfg(feature = "c-allocator")]
-        test_allocate_raw_help(C);
+        test_allocate_raw_help(C)?;
 
         assert!(FAIL.allocate_raw::<u128>().is_none());
+        Ok(())
     }
 
     #[test]
     fn test_deallocate_null() {
+        // SAFETY: all three allocator callback implementations accept a null pointer
+        // without consulting their opaque argument or releasing any allocation.
         unsafe {
             #[cfg(feature = "rust-allocator")]
             (RUST.zfree)(core::ptr::null_mut(), core::ptr::null_mut());
@@ -445,6 +763,8 @@ mod tests {
     #[test]
     fn test_allocate_zero_size() {
         // Verify that zero-size allocation requests return a null pointer.
+        // SAFETY: zero-sized requests are handled explicitly by these C callbacks;
+        // no caller memory or opaque state is read or written.
         unsafe {
             assert!(zalloc_c(ptr::null_mut(), 1, 0).is_null());
             assert!(zalloc_c(ptr::null_mut(), 0, 1).is_null());

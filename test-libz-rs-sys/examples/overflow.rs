@@ -1,16 +1,17 @@
 //! Test that internal counters do not overflow. This is an issue especially on windows, where the
-//! total_in and total_out fields are u32. Here we test specifically with an input length larget
-//! than u32::MAX.
+//! `total_in` and `total_out` fields are u32. Here we test specifically with an input length larget
+//! than `u32::MAX`.
 use zlib_rs::{Deflate, DeflateFlush, Inflate, InflateFlush, Status};
 
-pub fn main() {
+pub fn main() -> Result<(), &'static str> {
     const TOTAL: u64 = 5 * 1024 * 1024 * 1024;
     const IN_CHUNK: usize = 1 << 20;
     const OUT_CHUNK: usize = 1 << 20;
 
     let zeros = vec![0u8; IN_CHUNK];
 
-    let mut def = Deflate::new(1, true, 15);
+    let mut def =
+        Deflate::new(1, true, 15).map_err(|_| "failed to initialize deflate compressor")?;
     let mut compressed = Vec::new();
 
     let mut left = TOTAL;
@@ -29,9 +30,10 @@ pub fn main() {
             let consumed = (def.total_in() - in_before) as usize;
             let produced = (def.total_out() - out_before) as usize;
 
-            if consumed == 0 && produced == 0 {
-                panic!("deflate made no progress: {st:?}");
-            }
+            assert!(
+                !(consumed == 0 && produced == 0),
+                "deflate made no progress: {st:?}"
+            );
 
             in_pos += consumed;
             compressed.extend_from_slice(&out[..produced]);
@@ -48,15 +50,16 @@ pub fn main() {
         if matches!(st, Status::StreamEnd) {
             break;
         }
-        if produced == 0 && !matches!(st, Status::Ok | Status::BufError) {
-            panic!("deflate finish made no progress: {st:?}");
-        }
+        assert!(
+            !(produced == 0 && !matches!(st, Status::Ok | Status::BufError)),
+            "deflate finish made no progress: {st:?}"
+        );
     }
 
     assert_eq!(def.total_in(), TOTAL);
     let total_compressed = def.total_out();
 
-    let mut inf = Inflate::new(true, 15);
+    let mut inf = Inflate::new(true, 15).map_err(|_| "failed to initialize inflate")?;
     let mut off = 0usize;
 
     loop {
@@ -71,15 +74,17 @@ pub fn main() {
         let consumed = (inf.total_in() - in_before) as usize;
         let produced = (inf.total_out() - out_before) as usize;
 
-        if consumed == 0 && produced == 0 {
-            panic!("inflate made no progress: {st:?}");
-        }
+        assert!(
+            !(consumed == 0 && produced == 0),
+            "inflate made no progress: {st:?}"
+        );
 
         off += consumed;
 
-        if out[..produced].iter().any(|&b| b != 0) {
-            panic!("non-zero byte at offset {}", out_before);
-        }
+        assert!(
+            !out[..produced].iter().any(|&b| b != 0),
+            "non-zero byte at offset {out_before}"
+        );
 
         if matches!(st, Status::StreamEnd) {
             break;
@@ -88,4 +93,5 @@ pub fn main() {
 
     assert_eq!(inf.total_in(), total_compressed);
     assert_eq!(inf.total_out(), TOTAL);
+    Ok(())
 }

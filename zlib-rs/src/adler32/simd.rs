@@ -28,17 +28,16 @@ pub(super) fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
     let mut b = start_checksum >> 16;
 
     for block in data.chunks(NMAX as usize) {
-        let mut groups = block.chunks_exact(GROUP_BYTES);
-        for group in &mut groups {
+        let (groups, remainder) = block.as_chunks::<GROUP_BYTES>();
+        for group in groups {
             (a, b) = adler_group(a, b, group);
         }
 
-        let remainder = groups.remainder();
-        let full_len = remainder.len() / LANES * LANES;
-        if full_len != 0 {
-            (a, b) = adler_group(a, b, &remainder[..full_len]);
+        let (complete_vectors, tail) = remainder.as_chunks::<LANES>();
+        if !complete_vectors.is_empty() {
+            (a, b) = adler_group(a, b, &remainder[..complete_vectors.len() * LANES]);
         }
-        for &byte in &remainder[full_len..] {
+        for &byte in tail {
             a += u32::from(byte);
             b += a;
         }
@@ -52,25 +51,33 @@ pub(super) fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
 
 #[inline]
 fn adler_group(mut a: u32, b: u32, bytes: &[u8]) -> (u32, u32) {
-    debug_assert!(!bytes.is_empty());
+    debug_assert!(
+        !bytes.is_empty(),
+        "a group must contain at least one SIMD vector"
+    );
     debug_assert_eq!(bytes.len() % LANES, 0);
     debug_assert!(bytes.len() <= GROUP_BYTES);
 
     let mut lane_sums = ZERO;
     let mut prefix_sums = ZERO;
-    for chunk in bytes.chunks_exact(LANES) {
-        let values: Sums = Bytes::from_slice(chunk).cast();
+    for chunk in bytes.as_chunks::<LANES>().0 {
+        let values: Sums = Bytes::from_array(*chunk).cast();
         lane_sums += values;
         prefix_sums += lane_sums;
     }
 
     let byte_sum = lane_sums.cast::<u32>().reduce_sum();
-    let prefix_sum = prefix_sums.cast::<u32>().reduce_sum() as u64;
-    let lane_correction = (lane_sums.cast::<u32>() * LANE_INDEX).reduce_sum() as u64;
-    let weighted_sum = LANES as u64 * prefix_sum - lane_correction;
+    let prefix_sum = prefix_sums.cast::<u32>().reduce_sum();
+    let lane_correction = (lane_sums.cast::<u32>() * LANE_INDEX).reduce_sum();
+    // At most 352 bytes per group: all lane sums and this weighted sum fit u32.
+    let weighted_sum = 16 * prefix_sum - lane_correction;
 
-    let next_b = b as u64 + bytes.len() as u64 * a as u64 + weighted_sum;
-    debug_assert!(next_b <= u32::MAX as u64);
+    let next_b = u64::from(b) + bytes.len() as u64 * u64::from(a) + u64::from(weighted_sum);
+    // NMAX=5552 bounds the worst-case initial (a,b)=(65535,65535),
+    // all input bytes=255, to 4_294_773_495 (< u32::MAX). The groups
+    // partition one NMAX block, so every intermediate sum is smaller.
+    let next_b = u32::try_from(next_b)
+        .unwrap_or_else(|_| unreachable!("Adler-32 block sum exceeded its proven NMAX bound"));
     a += byte_sum;
-    (a, next_b as u32)
+    (a, next_b)
 }

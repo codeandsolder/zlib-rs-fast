@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
+use crate::deflate::hash_calc::HashCalcVariant;
+use crate::deflate::longest_match::{
+    MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
+};
 use crate::deflate::{State, Strategy, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,9 +22,13 @@ pub(super) struct SlowProducer {
 }
 
 impl SlowProducer {
-    pub(super) fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
+    pub(super) const fn new(state: &State<'_>, match_source: MatchSourceKind) -> Self {
         Self {
-            use_longest_match_slow: state.max_chain_length > 1024,
+            // The specialized search probes rolling-hash buckets for shifted matches.
+            // deflateTune may cross the chain threshold after hash history was built;
+            // never reinterpret a Standard-hash table as a rolling-hash table.
+            use_longest_match_slow: state.max_chain_length > 1024
+                && matches!(state.hash_calc_variant, HashCalcVariant::Roll),
             match_available: state.match_available,
             phase: SlowPhase::Ready,
             match_source,
@@ -31,6 +38,10 @@ impl SlowProducer {
 
 impl TokenProducer for SlowProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        // The detached search result already carries a bounded u16 length.
+        // Keep that type through the lazy-match state machine.
+        const NO_MATCH_LENGTH: u16 = 2;
+        const _: () = assert!(STD_MIN_MATCH == 3);
         loop {
             let match_len = match self.phase {
                 SlowPhase::SearchReady(result) => {
@@ -38,7 +49,7 @@ impl TokenProducer for SlowProducer {
                     state.match_start = result.start;
                     let mut length = result.length;
                     if length <= 5 && state.strategy == Strategy::Filtered {
-                        length = STD_MIN_MATCH - 1;
+                        length = NO_MATCH_LENGTH;
                     }
                     length
                 }
@@ -63,10 +74,9 @@ impl TokenProducer for SlowProducer {
                         } else {
                             0
                         };
-                        let distance = state.strstart as isize - hash_head as isize;
-                        if (1..=state.max_dist() as isize).contains(&distance)
+                        if hash_head != 0
+                            && state.recent_hash_distance(hash_head).is_some()
                             && state.prev_length < state.max_lazy_match
-                            && hash_head != 0
                         {
                             let kind = if self.use_longest_match_slow {
                                 MatchSearchKind::Slow
@@ -80,16 +90,14 @@ impl TokenProducer for SlowProducer {
                         }
                     }
 
-                    STD_MIN_MATCH - 1
+                    NO_MATCH_LENGTH
                 }
                 SlowPhase::AwaitingSearch => {
-                    panic!("slow producer cannot advance while match search is outstanding")
+                    return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
                 }
             };
 
-            if usize::from(state.prev_length) >= STD_MIN_MATCH
-                && match_len <= usize::from(state.prev_length)
-            {
+            if usize::from(state.prev_length) >= STD_MIN_MATCH && match_len <= state.prev_length {
                 let max_insert = state.strstart + state.lookahead - STD_MIN_MATCH;
                 let block_ready = state.tally_dist(
                     state.strstart - 1 - usize::from(state.prev_match),
@@ -119,15 +127,15 @@ impl TokenProducer for SlowProducer {
                     // zlib encodes this full block before advancing the lazy-match cursor. Keep that
                     // ordering explicit so stored-block length/accounting remains bit-for-bit stable.
                     return ProduceStatus::BlockReady(BlockContinuation::AdvanceLazyMatch {
-                        match_len: match_len as u16,
+                        match_len,
                     });
                 }
 
-                state.prev_length = match_len as u16;
+                state.prev_length = match_len;
                 state.strstart += 1;
                 state.lookahead -= 1;
             } else {
-                state.prev_length = match_len as u16;
+                state.prev_length = match_len;
                 state.match_available = true;
                 self.match_available = true;
                 state.strstart += 1;
@@ -136,13 +144,16 @@ impl TokenProducer for SlowProducer {
         }
     }
 
-    fn complete_match_search(&mut self, _state: &mut State<'_>, result: MatchSearchResult) {
-        assert_eq!(
-            self.phase,
-            SlowPhase::AwaitingSearch,
-            "slow producer received a match result without an outstanding search"
-        );
+    fn complete_match_search(
+        &mut self,
+        _state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
+        if self.phase != SlowPhase::AwaitingSearch {
+            return Err(MatchSearchError::UnexpectedMatchResult);
+        }
         self.phase = SlowPhase::SearchReady(result);
+        Ok(())
     }
 
     fn finish(&mut self, state: &mut State<'_>) -> usize {
@@ -158,5 +169,69 @@ impl TokenProducer for SlowProducer {
             self.match_available = false;
         }
         state.strstart.min(STD_MIN_MATCH - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deflate::{end, tune, DeflateConfig, DeflateStream};
+    use crate::ReturnCode;
+
+    #[test]
+    fn match_result_completion_rejects_unsolicited_and_duplicate_results(
+    ) -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(7))?;
+        let mut producer = SlowProducer::new(&stream.state, MatchSourceKind::HashChain);
+        let result = MatchSearchResult::new(4, 1);
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        assert_eq!(producer.phase, SlowPhase::Ready);
+
+        producer.phase = SlowPhase::AwaitingSearch;
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Ok(())
+        );
+        assert_eq!(producer.phase, SlowPhase::SearchReady(result));
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn advancing_an_unfinished_match_returns_a_typed_error() -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(7))?;
+        let mut producer = SlowProducer::new(&stream.state, MatchSourceKind::HashChain);
+        producer.phase = SlowPhase::AwaitingSearch;
+        assert!(matches!(
+            producer.produce(&mut stream.state, false),
+            ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn specialized_search_requires_rolling_hash_history() -> Result<(), crate::ReturnCode> {
+        for (level, chain, expected_specialized) in [
+            (7, 4_096, false), // tune a Standard-hash stream above the usual chain limit
+            (7, 128, false),
+            (9, 4_096, true),
+            (9, 128, false),
+        ] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))?;
+            assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
+            assert_eq!(
+                SlowProducer::new(&stream.state, MatchSourceKind::HashChain).use_longest_match_slow,
+                expected_specialized,
+                "level {level}, tuned chain {chain}",
+            );
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
     }
 }

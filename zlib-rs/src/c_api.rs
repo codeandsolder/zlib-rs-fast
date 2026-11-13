@@ -1,5 +1,7 @@
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
+#![expect(
+    non_camel_case_types,
+    reason = "C-facing zlib ABI type spellings must be preserved"
+)]
 
 use core::ffi::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
 
@@ -92,12 +94,12 @@ impl Default for z_stream {
 
         #[cfg(feature = "rust-allocator")]
         if stream.zalloc.is_none() || stream.zfree.is_none() {
-            stream.configure_default_rust_allocator()
+            stream.configure_default_rust_allocator();
         }
 
         #[cfg(feature = "c-allocator")]
         if stream.zalloc.is_none() || stream.zfree.is_none() {
-            stream.configure_default_c_allocator()
+            stream.configure_default_c_allocator();
         }
 
         stream
@@ -113,18 +115,18 @@ impl z_stream {
 
     #[cfg(feature = "rust-allocator")]
     pub fn configure_default_rust_allocator(&mut self) {
-        self.configure_allocator(crate::allocate::RUST)
+        self.configure_allocator(crate::allocate::RUST);
     }
 
     #[cfg(feature = "c-allocator")]
     pub fn configure_default_c_allocator(&mut self) {
-        self.configure_allocator(crate::allocate::C)
+        self.configure_allocator(crate::allocate::C);
     }
 }
 
 // // zlib stores Adler-32 and CRC-32 checksums in unsigned long; zlib-ng uses uint32_t.
-pub(crate) type z_size = c_ulong;
-pub(crate) type z_checksum = c_ulong;
+pub type z_size = c_ulong;
+pub type z_checksum = c_ulong;
 
 // opaque to the user
 pub enum internal_state {}
@@ -238,20 +240,17 @@ impl gz_header {
     //  12 - QDOS
     //  13 - Acorn RISCOS
     // 255 - unknown
-    #[allow(clippy::if_same_then_else)]
     pub const OS_CODE: u8 = {
         if cfg!(windows) {
             10
         } else if cfg!(target_os = "macos") {
             19
-        } else if cfg!(unix) {
-            3
         } else {
-            3 // assume unix
+            3 // assume Unix, matching zlib defaults
         }
     };
 
-    pub(crate) fn flags(&self) -> u8 {
+    pub(crate) const fn flags(&self) -> u8 {
         (if self.text != 0 { 1 } else { 0 })
             + (if self.hcrc != 0 { 2 } else { 0 })
             + (if self.extra.is_null() { 0 } else { 4 })

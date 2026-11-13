@@ -9,13 +9,41 @@ use super::{
     STD_MIN_MATCH,
 };
 
+/// Convert a validated DEFLATE match length into its compact token width.
+/// Match candidates and DP-selected tokens must obey the same 3..=258 limit.
+#[inline]
+fn compact_match_length(length: usize) -> u16 {
+    assert!(
+        (STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length),
+        "match exceeds DEFLATE length limit"
+    );
+    let Ok(length) = u16::try_from(length) else {
+        unreachable!("DEFLATE match lengths fit in u16");
+    };
+    length
+}
+
+/// Distance bounds are independent of the compact field's u16 capacity:
+/// DEFLATE uses 1..=32768 bytes of history.
+#[inline]
+fn compact_match_distance(distance: usize) -> u16 {
+    assert!(
+        (1..=1usize << crate::MAX_WBITS).contains(&distance),
+        "match exceeds DEFLATE distance limit"
+    );
+    let Ok(distance) = u16::try_from(distance) else {
+        unreachable!("DEFLATE distances fit in u16");
+    };
+    distance
+}
+
 /// One useful LZ77 alternative at an input position.
 ///
 /// Candidates are reduced losslessly by DEFLATE distance symbol: within one distance-code bucket,
 /// all distances have the same encoded bit length (the extra-bit *value* differs, but its width
 /// does not), so only the longest available match in that bucket can ever be useful to a parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidate {
+pub struct MatchCandidate {
     pub(crate) length: u16,
     pub(crate) distance: u16,
 }
@@ -25,6 +53,32 @@ impl MatchCandidate {
         length: 0,
         distance: 0,
     };
+
+    /// Update the best match for one distance-code bucket. Both discovery
+    /// strategies deliver byte positions as usize; they share the same compact
+    /// match-length encoder as DP tokens, and store the bounded distance in u16.
+    #[inline]
+    fn consider(&mut self, length: usize, distance: usize) {
+        if length < STD_MIN_MATCH {
+            return;
+        }
+        assert!(
+            length <= STD_MAX_MATCH,
+            "match exceeds DEFLATE length limit"
+        );
+        assert!(
+            (1..=1usize << crate::MAX_WBITS).contains(&distance),
+            "match exceeds DEFLATE distance limit"
+        );
+        if length > usize::from(self.length)
+            || (length == usize::from(self.length) && distance < usize::from(self.distance))
+        {
+            *self = Self {
+                length: compact_match_length(length),
+                distance: compact_match_distance(distance),
+            };
+        }
+    }
 }
 
 /// Sparse whole-input candidate table in CSR form.
@@ -34,20 +88,24 @@ impl MatchCandidate {
 /// symbols. This boundary is rich enough for arbitrary Huffman cost models without forcing ordinary
 /// Fast/Medium/Slow parsing to consume more than its current single-best projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidates {
-    offsets: Vec<u32>,
+pub struct MatchCandidates {
+    // CSR offsets count candidate *entries*, not input bytes. A position may
+    // contribute up to D_CODES entries, so an input fitting in a u32 index can
+    // still produce more than u32::MAX entries. Keep the offsets in the same
+    // index domain as the backing Vec instead of silently wrapping them.
+    offsets: Vec<usize>,
     entries: Vec<MatchCandidate>,
 }
 
 impl MatchCandidates {
     pub(crate) fn for_position(&self, position: usize) -> &[MatchCandidate] {
-        let start = self.offsets[position] as usize;
-        let end = self.offsets[position + 1] as usize;
+        let start = self.offsets[position];
+        let end = self.offsets[position + 1];
         &self.entries[start..end]
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 }
@@ -73,7 +131,7 @@ struct BlockObservations {
 }
 
 impl BlockObservations {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             counts: [0; SPLIT_OBSERVATION_TYPES],
             total: 0,
@@ -107,15 +165,15 @@ impl BlockObservations {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TokenCosts {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenCosts {
     literal: [u16; 256],
     length: [u16; LENGTH_CODES],
     distance: [u16; D_CODES],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ParseModel {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseModel {
     costs: TokenCosts,
     observations: BlockObservations,
 }
@@ -126,17 +184,17 @@ impl TokenCosts {
     pub(crate) fn fixed() -> Self {
         let mut literal = [0; 256];
         for (byte, cost) in literal.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_LTREE[byte].len() as u16 * COST_SCALE;
+            *cost = trees_tbl::STATIC_LTREE[byte].len() * COST_SCALE;
         }
 
         let mut length = [0; LENGTH_CODES];
         for (code, cost) in length.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_LTREE[257 + code].len() as u16 * COST_SCALE;
+            *cost = trees_tbl::STATIC_LTREE[257 + code].len() * COST_SCALE;
         }
 
         let mut distance = [0; D_CODES];
         for (code, cost) in distance.iter_mut().enumerate() {
-            *cost = trees_tbl::STATIC_DTREE[code].len() as u16 * COST_SCALE;
+            *cost = trees_tbl::STATIC_DTREE[code].len() * COST_SCALE;
         }
 
         Self {
@@ -146,23 +204,44 @@ impl TokenCosts {
         }
     }
 
-    fn literal_cost(self, byte: u8) -> u64 {
-        u64::from(self.literal[byte as usize])
+    /// Finite priors for symbols unseen by a trained Huffman tree.
+    const fn unseen() -> Self {
+        Self {
+            literal: [13 * COST_SCALE; 256],
+            length: [13 * COST_SCALE; LENGTH_CODES],
+            distance: [10 * COST_SCALE; D_CODES],
+        }
     }
 
-    fn match_cost(self, length: usize, distance: usize) -> u64 {
+    fn literal_cost(&self, byte: u8) -> u32 {
+        u32::from(self.literal[usize::from(byte)])
+    }
+
+    #[inline]
+    fn length_symbol_cost(&self, code: usize) -> u32 {
+        u32::from(self.length[code])
+            + u32::from(StaticTreeDesc::EXTRA_LBITS[code]) * u32::from(COST_SCALE)
+    }
+
+    #[inline]
+    fn distance_symbol_cost(&self, code: usize) -> u32 {
+        u32::from(self.distance[code])
+            + u32::from(StaticTreeDesc::EXTRA_DBITS[code]) * u32::from(COST_SCALE)
+    }
+
+    #[cfg(test)]
+    fn match_cost(&self, length: usize, distance: usize) -> u32 {
         debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&length));
-        debug_assert!(distance > 0);
+        debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&distance));
 
-        let length_code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
-        let distance_code = State::d_code(distance - 1) as usize;
-        u64::from(self.length[length_code])
-            + u64::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u64::from(COST_SCALE)
-            + u64::from(self.distance[distance_code])
-            + u64::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u64::from(COST_SCALE)
+        let length_code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
+        let distance_code = usize::from(State::d_code(distance - 1));
+        self.length_symbol_cost(length_code) + self.distance_symbol_cost(distance_code)
     }
 
-    fn token_cost(self, token: ParseToken) -> u64 {
+    /// One token fits u32; whole-parse dynamic-programming totals use u64.
+    #[cfg(test)]
+    fn token_cost(&self, token: ParseToken) -> u32 {
         match token {
             ParseToken::Literal(byte) => self.literal_cost(byte),
             ParseToken::Match { length, distance } => {
@@ -172,13 +251,58 @@ impl TokenCosts {
     }
 }
 
+/// Frozen token reassignment cost, computed once from both Huffman models.
+/// DEFLATE extra-bit counts are token-dependent and cancel in their difference.
+struct TokenCostDelta {
+    literal: [i32; 256],
+    length: [i32; LENGTH_CODES],
+    distance: [i32; D_CODES],
+}
+
+impl TokenCostDelta {
+    fn between(left: &TokenCosts, right: &TokenCosts) -> Self {
+        Self {
+            literal: core::array::from_fn(|i| {
+                i32::from(left.literal[i]) - i32::from(right.literal[i])
+            }),
+            length: core::array::from_fn(|i| {
+                i32::from(left.length[i]) - i32::from(right.length[i])
+            }),
+            distance: core::array::from_fn(|i| {
+                i32::from(left.distance[i]) - i32::from(right.distance[i])
+            }),
+        }
+    }
+
+    fn token_delta(&self, token: ParseToken) -> i64 {
+        match token {
+            ParseToken::Literal(byte) => i64::from(self.literal[usize::from(byte)]),
+            ParseToken::Match { length, distance } => {
+                let length_code =
+                    usize::from(trees_tbl::LENGTH_CODE[usize::from(length) - STD_MIN_MATCH]);
+                let distance_code = usize::from(State::d_code(usize::from(distance) - 1));
+                i64::from(self.length[length_code]) + i64::from(self.distance[distance_code])
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ParseToken {
+pub enum ParseToken {
     Literal(u8),
     Match { length: u16, distance: u16 },
 }
 
 impl ParseToken {
+    #[inline]
+    fn matching(length: usize, distance: u16) -> Self {
+        debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&usize::from(distance)));
+        Self::Match {
+            length: compact_match_length(length),
+            distance,
+        }
+    }
+
     fn input_len(self) -> usize {
         match self {
             Self::Literal(_) => 1,
@@ -188,7 +312,7 @@ impl ParseToken {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseResult {
+pub struct ParseResult {
     pub(crate) cost_x16: u64,
     pub(crate) tokens: Vec<ParseToken>,
 }
@@ -212,13 +336,14 @@ impl ParseStep {
     }
 
     #[inline]
-    fn token(self) -> ParseToken {
+    const fn token(self) -> ParseToken {
+        let packed = self.0.to_le_bytes();
         if self.0 & Self::MATCH_FLAG == 0 {
-            ParseToken::Literal(self.0 as u8)
+            ParseToken::Literal(packed[0])
         } else {
             ParseToken::Match {
                 length: ((self.0 >> 16) & 0x1ff) as u16,
-                distance: self.0 as u16,
+                distance: u16::from_le_bytes([packed[0], packed[1]]),
             }
         }
     }
@@ -231,13 +356,17 @@ impl ParseStep {
 /// symbol's distance interval. The lexicographic predecessor or successor of the current suffix
 /// maximizes LCP over that set, so two probes recover the longest match for the whole distance class.
 /// Retaining that one maximum per class is lossless for arbitrary DEFLATE Huffman code lengths.
-pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandidates {
-    assert!(max_distance <= u16::MAX as usize);
-    assert!(input.len() <= u32::MAX as usize);
-
+pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandidates {
+    const DIRECT_SCAN_MAX: usize = 8;
+    // The parser emits DEFLATE tokens, not arbitrary 16-bit offsets.
+    assert!(
+        max_distance <= 1usize << crate::MAX_WBITS,
+        "candidate history exceeds the DEFLATE window"
+    );
+    // SuffixRanks checks that its compact u32 backing can address the input.
+    // Candidate entry offsets remain usize because there may be D_CODES entries per byte.
     let suffixes = SuffixRanks::new(input);
     let ranges = distance_code_ranges(max_distance);
-    const DIRECT_SCAN_MAX: usize = 8;
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
         (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
@@ -248,7 +377,7 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
     offsets.push(0);
 
     for position in 0..input.len() {
-        let rank = suffixes.rank[position] as usize;
+        let rank = suffixes.rank_of(position);
         let available = STD_MAX_MATCH.min(input.len() - position);
 
         for (code, &(min_distance, max_distance)) in ranges.iter().enumerate() {
@@ -257,6 +386,19 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
             }
 
             let mut best = MatchCandidate::NONE;
+            // Both suffix-rank probes and direct scans use exactly the same
+            // comparison, distance-bucket tie-breaking and token conversion.
+            let mut consider_position = |candidate_position: usize| {
+                debug_assert!(candidate_position < position);
+                let distance = position - candidate_position;
+                debug_assert!((min_distance..=max_distance).contains(&distance));
+                let length = match_compare::common_prefix_len(
+                    &input[position..position + available],
+                    &input[candidate_position..candidate_position + available],
+                );
+                best.consider(length, distance);
+            };
+
             if let Some(active) = &mut active[code] {
                 if available < STD_MIN_MATCH {
                     continue;
@@ -264,54 +406,21 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                 let Some(add) = position.checked_sub(min_distance) else {
                     continue;
                 };
-                active.insert(suffixes.rank[add] as usize);
+                active.insert(suffixes.rank_of(add));
                 if let Some(remove) = position.checked_sub(max_distance + 1) {
-                    active.remove(suffixes.rank[remove] as usize);
+                    active.remove(suffixes.rank_of(remove));
                 }
 
                 let (predecessor, successor) = active.neighbors(rank);
-                let mut consider_rank = |candidate_rank: usize| {
-                    let candidate_position = suffixes.sa[candidate_rank] as usize;
-                    let distance = position - candidate_position;
-                    debug_assert!((min_distance..=max_distance).contains(&distance));
-                    let length = match_compare::common_prefix_len(
-                        &input[position..position + available],
-                        &input[candidate_position..candidate_position + available],
-                    );
-                    if length >= STD_MIN_MATCH
-                        && (length > usize::from(best.length)
-                            || (length == usize::from(best.length)
-                                && distance < usize::from(best.distance)))
-                    {
-                        best = MatchCandidate {
-                            length: length as u16,
-                            distance: distance as u16,
-                        };
-                    }
-                };
                 if let Some(candidate_rank) = predecessor {
-                    consider_rank(candidate_rank);
+                    consider_position(suffixes.position_at(candidate_rank));
                 }
                 if let Some(candidate_rank) = successor {
-                    consider_rank(candidate_rank);
+                    consider_position(suffixes.position_at(candidate_rank));
                 }
             } else if available >= STD_MIN_MATCH {
                 for distance in min_distance..=max_distance.min(position) {
-                    let candidate_position = position - distance;
-                    let length = match_compare::common_prefix_len(
-                        &input[position..position + available],
-                        &input[candidate_position..candidate_position + available],
-                    );
-                    if length >= STD_MIN_MATCH
-                        && (length > usize::from(best.length)
-                            || (length == usize::from(best.length)
-                                && distance < usize::from(best.distance)))
-                    {
-                        best = MatchCandidate {
-                            length: length as u16,
-                            distance: distance as u16,
-                        };
-                    }
+                    consider_position(position - distance);
                 }
             }
 
@@ -319,7 +428,7 @@ pub(crate) fn build_match_candidates(input: &[u8], max_distance: usize) -> Match
                 entries.push(best);
             }
         }
-        offsets.push(entries.len() as u32);
+        offsets.push(entries.len());
     }
 
     MatchCandidates { offsets, entries }
@@ -468,7 +577,7 @@ impl RankSet {
 }
 
 #[inline]
-fn low_bits(bits: usize) -> u64 {
+const fn low_bits(bits: usize) -> u64 {
     if bits == 0 {
         0
     } else if bits >= 64 {
@@ -479,7 +588,7 @@ fn low_bits(bits: usize) -> u64 {
 }
 
 #[inline]
-fn highest_bit(word: u64) -> usize {
+const fn highest_bit(word: u64) -> usize {
     63 - word.leading_zeros() as usize
 }
 
@@ -498,12 +607,36 @@ fn distance_code_ranges(max_distance: usize) -> [(usize, usize); D_CODES] {
     })
 }
 
+/// Convert an already-bounded suffix-array index to the platform slice index.
+///
+/// All values passed here index the input, its suffix permutation, or the
+/// associated counting-sort tables. Their backing arrays have already been
+/// allocated at a representable usize length, so even on a narrow-pointer
+/// target the index is bounded by a real allocation rather than arbitrary u32.
+#[inline]
+const fn suffix_index(value: u32) -> usize {
+    value as usize
+}
+
+/// A suffix permutation and its inverse. Both arrays remain packed u32; all
+/// consumers operate on ordinary slice indices through `rank_of/position_at`.
+/// This is the only boundary converting the compact rank/position storage.
 struct SuffixRanks {
     sa: Vec<u32>,
     rank: Vec<u32>,
 }
 
 impl SuffixRanks {
+    #[inline]
+    fn rank_of(&self, position: usize) -> usize {
+        suffix_index(self.rank[position])
+    }
+
+    #[inline]
+    fn position_at(&self, suffix_rank: usize) -> usize {
+        suffix_index(self.sa[suffix_rank])
+    }
+
     fn new(input: &[u8]) -> Self {
         if input.is_empty() {
             return Self {
@@ -511,9 +644,10 @@ impl SuffixRanks {
                 rank: Vec::new(),
             };
         }
-        assert!(input.len() <= u32::MAX as usize);
+        let length = u32::try_from(input.len())
+            .unwrap_or_else(|_| panic!("input exceeds the suffix-rank index range"));
 
-        let mut sa = (0..input.len() as u32).collect::<Vec<_>>();
+        let mut sa = (0..length).collect::<Vec<_>>();
         let mut scratch = vec![0u32; input.len()];
         let mut rank = input
             .iter()
@@ -528,25 +662,29 @@ impl SuffixRanks {
             // Prefix-doubling ranks are dense integers after the first round. Sort the pair
             // (rank[pos], rank[pos + span]) with two stable counting passes instead of doing a
             // comparison sort of all suffixes at every doubling step.
-            counting_sort_suffixes_by_second(&sa, &mut scratch, &rank, span, max_rank, &mut counts);
-            counting_sort_suffixes_by_first(&scratch, &mut sa, &rank, max_rank, &mut counts);
+            counting_sort_suffixes(&sa, &mut scratch, max_rank, &mut counts, |position| {
+                suffix_second_rank(&rank, position, span)
+            });
+            counting_sort_suffixes(&scratch, &mut sa, max_rank, &mut counts, |position| {
+                rank[suffix_index(position)]
+            });
 
             let mut class = 1u32;
-            next_rank[sa[0] as usize] = class;
+            next_rank[suffix_index(sa[0])] = class;
             for pair in sa.windows(2) {
                 let left = pair[0];
                 let right = pair[1];
-                if rank[left as usize] != rank[right as usize]
+                if rank[suffix_index(left)] != rank[suffix_index(right)]
                     || suffix_second_rank(&rank, left, span)
                         != suffix_second_rank(&rank, right, span)
                 {
                     class += 1;
                 }
-                next_rank[right as usize] = class;
+                next_rank[suffix_index(right)] = class;
             }
 
             core::mem::swap(&mut rank, &mut next_rank);
-            if class as usize == input.len() {
+            if class == length {
                 break;
             }
             max_rank = class;
@@ -557,51 +695,35 @@ impl SuffixRanks {
 
         // The doubling ranks are 1-based equivalence classes. The parser wants direct indices into
         // `sa`, so materialize the exact inverse suffix-array permutation once.
-        for (suffix_rank, &position) in sa.iter().enumerate() {
-            rank[position as usize] = suffix_rank as u32;
+        for (suffix_rank, &position) in (0..length).zip(&sa) {
+            rank[suffix_index(position)] = suffix_rank;
         }
 
         Self { sa, rank }
     }
 }
 
-fn counting_sort_suffixes_by_second(
+/// Stable counting sort over compact suffix positions using a caller-selected
+/// rank key. Both radix passes must use identical offset/prefix accounting;
+/// the only difference is which half of the suffix-rank pair provides the key.
+fn counting_sort_suffixes(
     source: &[u32],
     target: &mut [u32],
-    rank: &[u32],
-    span: usize,
     max_rank: u32,
     counts: &mut [u32],
+    key_of: impl Fn(u32) -> u32,
 ) {
-    let counts = &mut counts[..=max_rank as usize];
+    debug_assert_eq!(source.len(), target.len());
+    let counts = &mut counts[..=suffix_index(max_rank)];
     counts.fill(0);
     for &position in source {
-        counts[suffix_second_rank(rank, position, span) as usize] += 1;
-    }
-    counts_to_offsets(counts);
-    for &position in source {
-        let key = suffix_second_rank(rank, position, span) as usize;
-        target[counts[key] as usize] = position;
+        let key = suffix_index(key_of(position));
         counts[key] += 1;
     }
-}
-
-fn counting_sort_suffixes_by_first(
-    source: &[u32],
-    target: &mut [u32],
-    rank: &[u32],
-    max_rank: u32,
-    counts: &mut [u32],
-) {
-    let counts = &mut counts[..=max_rank as usize];
-    counts.fill(0);
-    for &position in source {
-        counts[rank[position as usize] as usize] += 1;
-    }
     counts_to_offsets(counts);
     for &position in source {
-        let key = rank[position as usize] as usize;
-        target[counts[key] as usize] = position;
+        let key = suffix_index(key_of(position));
+        target[suffix_index(counts[key])] = position;
         counts[key] += 1;
     }
 }
@@ -616,8 +738,8 @@ fn counts_to_offsets(counts: &mut [u32]) {
 }
 
 #[inline]
-fn suffix_second_rank(rank: &[u32], position: u32, span: usize) -> u32 {
-    let position = position as usize;
+const fn suffix_second_rank(rank: &[u32], position: u32, span: usize) -> u32 {
+    let position = suffix_index(position);
     if position < rank.len().saturating_sub(span) {
         rank[position + span]
     } else {
@@ -630,14 +752,14 @@ const MIN_BLOCK_LENGTH: usize = 5_000;
 // beyond this; exact parsing then either proves the long Huffman block worthwhile and token-safe or
 // returns a split point before emission.
 const SOFT_MAX_BLOCK_LENGTH: usize = 60_000;
-pub(crate) const MAX_COARSE_BLOCK_INPUT: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1;
+pub const MAX_COARSE_BLOCK_INPUT: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1;
 const OBSERVATIONS_PER_CHECK: u32 = 512;
 const SPLIT_OBSERVATION_TYPES: usize = 10;
 // Match libdeflate level 12's near-optimal search budget for block-statistics gathering.
 const SPLIT_MATCH_SEARCH_DEPTH: usize = 300;
 
 #[inline]
-fn choose_min_match_len(used_literals: usize) -> usize {
+const fn choose_min_match_len(used_literals: usize) -> usize {
     match used_literals {
         0..=5 => 9,
         6..=7 => 8,
@@ -709,7 +831,7 @@ impl BlockSplitStats {
 
     /// Start a new block at the previous check while preserving the already-scanned recent chunk as
     /// the first statistics for that block.
-    fn keep_recent_as_new_block(&mut self) {
+    const fn keep_recent_as_new_block(&mut self) {
         self.old = self.recent;
         self.old_count = self.recent_count;
         self.recent = [0; SPLIT_OBSERVATION_TYPES];
@@ -750,12 +872,12 @@ impl BlockSplitStats {
 /// long-match observations and detect distribution changes. This is deliberately cheaper than the
 /// exact suffix-rank frontier; exact match discovery and dynamic programming happen only after a
 /// boundary has been selected.
-pub(crate) fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
+pub fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
+    const HASH_SIZE: usize = 1 << 16;
+
     if input.is_empty() {
         return core::iter::once(0..0).collect();
     }
-
-    const HASH_SIZE: usize = 1 << 16;
     let mut head = vec![usize::MAX; HASH_SIZE];
     // Keep one previous-link slot for every position in the legal distance window. Unlike storing a
     // link for the entire input, this stays bounded; a slot cannot be overwritten while its position
@@ -881,69 +1003,100 @@ fn split_hash3(input: &[u8], position: usize) -> usize {
 /// to matches before `block.start`, which is exactly what multi-block DEFLATE needs. The dynamic
 /// program itself is local to the selected block and never crosses its end.
 #[cfg(test)]
-pub(crate) fn parse_block(
-    input: &[u8],
-    candidates: &MatchCandidates,
-    costs: TokenCosts,
-) -> ParseResult {
+pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: &TokenCosts) -> ParseResult {
     parse_range(input, candidates, 0..input.len(), costs)
 }
 
-pub(crate) fn parse_range(
+/// Reuse the block-sized dynamic-programming arrays across cost-model passes;
+/// each completed parse still owns its token output independently.
+#[derive(Default)]
+struct ParseScratch {
+    best_cost: Vec<u64>,
+    steps: Vec<ParseStep>,
+}
+
+impl ParseScratch {
+    const INF: u64 = u64::MAX / 4;
+
+    fn reset(&mut self, block_len: usize) {
+        assert!(block_len < usize::MAX, "DP block has too many positions");
+        let slots = block_len + 1;
+        // clear() retains each Vec's allocation; resize() then initializes
+        // every slot exactly once, including after a shorter previous parse.
+        self.best_cost.clear();
+        self.best_cost.resize(slots, Self::INF);
+        self.best_cost[0] = 0;
+        self.steps.clear();
+        self.steps.resize(slots, ParseStep(0));
+    }
+}
+
+pub fn parse_range(
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
-    costs: TokenCosts,
+    costs: &TokenCosts,
 ) -> ParseResult {
-    assert_eq!(candidates.len_for_parse(), input.len());
-    assert!(block.start <= block.end && block.end <= input.len());
+    parse_range_with_scratch(
+        input,
+        candidates,
+        block,
+        costs,
+        &mut ParseScratch::default(),
+    )
+}
 
-    const INF: u64 = u64::MAX / 4;
-    let block_len = block.len();
-    let mut best_cost = vec![INF; block_len + 1];
-    let mut steps = vec![ParseStep(0); block_len + 1];
-    let mut length_costs = [0u16; STD_MAX_MATCH + 1];
-    for (length, cost) in length_costs
-        .iter_mut()
-        .enumerate()
-        .take(STD_MAX_MATCH + 1)
-        .skip(STD_MIN_MATCH)
-    {
-        let code = trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH] as usize;
-        *cost = costs.length[code] + u16::from(StaticTreeDesc::EXTRA_LBITS[code]) * COST_SCALE;
-    }
-    let mut distance_costs = vec![0u16; 32_768 + 1];
-    for (distance, cost) in distance_costs.iter_mut().enumerate().skip(1) {
-        let code = State::d_code(distance - 1) as usize;
-        *cost = costs.distance[code] + u16::from(StaticTreeDesc::EXTRA_DBITS[code]) * COST_SCALE;
-    }
-    // One candidate can become newly capable at each maximum match length. Keep the sparse values
-    // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
-    // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
+fn parse_range_with_scratch(
+    input: &[u8],
+    candidates: &MatchCandidates,
+    block: Range<usize>,
+    costs: &TokenCosts,
+    scratch: &mut ParseScratch,
+) -> ParseResult {
+    const INF: u64 = ParseScratch::INF;
+
     #[derive(Clone, Copy)]
     struct DistanceAtMax {
         generation: u32,
-        cost: u16,
+        cost: u32,
         distance: u16,
     }
+
+    assert_eq!(candidates.len_for_parse(), input.len());
+    assert!(block.start <= block.end && block.end <= input.len());
+
+    let block_len = block.len();
+    scratch.reset(block_len);
+    let (best_cost, steps) = (&mut scratch.best_cost, &mut scratch.steps);
+    let mut length_costs = [0u32; STD_MAX_MATCH + 1];
+    for (length, cost) in length_costs.iter_mut().enumerate().skip(STD_MIN_MATCH) {
+        let code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
+        *cost = costs.length_symbol_cost(code);
+    }
+    // DEFLATE distance cost depends on the Huffman distance symbol, not the
+    // numeric distance. Build 30 entries rather than allocating and filling
+    // one entry per possible byte offset in the 32 KiB window.
+    let distance_costs: [u32; D_CODES] =
+        core::array::from_fn(|code| costs.distance_symbol_cost(code));
+    // One candidate can become newly capable at each maximum match length. Keep the sparse values
+    // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
+    // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
     assert!(block_len <= u32::MAX as usize);
     let mut distance_cost_at_max = [DistanceAtMax {
         generation: 0,
         cost: 0,
         distance: 0,
     }; STD_MAX_MATCH + 1];
-    best_cost[0] = 0;
-
     for local_position in 0..block_len {
         let position = block.start + local_position;
         let prefix_cost = best_cost[local_position];
         debug_assert_ne!(prefix_cost, INF);
 
         relax(
-            &mut best_cost,
-            &mut steps,
+            best_cost.as_mut_slice(),
+            steps.as_mut_slice(),
             local_position + 1,
-            prefix_cost + costs.literal_cost(input[position]),
+            prefix_cost + u64::from(costs.literal_cost(input[position])),
             ParseToken::Literal(input[position]),
         );
 
@@ -952,12 +1105,14 @@ pub(crate) fn parse_range(
             continue;
         }
 
-        let generation = (local_position + 1) as u32;
+        let generation = u32::try_from(local_position + 1)
+            .unwrap_or_else(|_| unreachable!("the block-length limit was checked"));
         let mut longest_match = 0usize;
         for candidate in candidates.for_position(position) {
             let max_len = usize::from(candidate.length).min(available);
             longest_match = longest_match.max(max_len);
-            let cost = distance_costs[usize::from(candidate.distance)];
+            let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
+            let cost = distance_costs[code];
             let slot = &mut distance_cost_at_max[max_len];
             if slot.generation != generation || cost < slot.cost {
                 *slot = DistanceAtMax {
@@ -971,7 +1126,7 @@ pub(crate) fn parse_range(
         if longest_match < STD_MIN_MATCH {
             continue;
         }
-        let mut cheapest_capable = None::<(u16, u16)>;
+        let mut cheapest_capable = None::<(u32, u16)>;
         for length in (STD_MIN_MATCH..=longest_match).rev() {
             let candidate = distance_cost_at_max[length];
             if candidate.generation == generation
@@ -984,14 +1139,11 @@ pub(crate) fn parse_range(
             };
             let token_cost = u64::from(length_costs[length]) + u64::from(distance_cost);
             relax(
-                &mut best_cost,
-                &mut steps,
+                best_cost.as_mut_slice(),
+                steps.as_mut_slice(),
                 local_position + length,
                 prefix_cost + token_cost,
-                ParseToken::Match {
-                    length: length as u16,
-                    distance,
-                },
+                ParseToken::matching(length, distance),
             );
         }
     }
@@ -1016,7 +1168,7 @@ pub(crate) fn parse_range(
 }
 
 impl MatchCandidates {
-    fn len_for_parse(&self) -> usize {
+    const fn len_for_parse(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 }
@@ -1105,6 +1257,34 @@ mod tests {
     }
 
     #[test]
+    fn iteration_history_checks_full_tokens_across_best_and_worse_paths() {
+        let best = vec![ParseToken::Literal(b'a'), ParseToken::Literal(b'b')];
+        let worse = vec![ParseToken::Literal(b'a'), ParseToken::Literal(b'c')];
+        let improvement = vec![ParseToken::Literal(b'z')];
+
+        let mut history = PreviousParse::None;
+        assert!(!history.converged(Some(&best), &best));
+
+        history = PreviousParse::Best;
+        assert!(history.converged(Some(&best), &best));
+        assert!(!history.converged(Some(&best), &worse));
+
+        history = PreviousParse::Other(worse);
+        assert!(history.converged(
+            Some(&best),
+            &[ParseToken::Literal(b'a'), ParseToken::Literal(b'c')]
+        ));
+        assert!(!history.converged(Some(&best), &best));
+        assert!(!history.converged(Some(&best), &improvement));
+
+        // A later better path becomes the previous path by reference to the
+        // selected result, without maintaining a separate copy of its tokens.
+        history = PreviousParse::Best;
+        assert!(history.converged(Some(&improvement), &improvement));
+        assert!(!history.converged(Some(&best), &improvement));
+    }
+
+    #[test]
     fn suffix_ranks_preserve_lexicographic_order() {
         let mut state = 0x243f_6a88_85a3_08d3u64;
         let mut input = vec![0u8; 32 * 1024];
@@ -1112,15 +1292,69 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = ((state >> 32) as u8) & 0x1f;
+            *byte = state.to_le_bytes()[4] & 0x1f;
         }
 
         let suffixes = SuffixRanks::new(&input);
-        for (rank, &position) in suffixes.sa.iter().enumerate() {
-            assert_eq!(suffixes.rank[position as usize], rank as u32);
+        for rank in 0..input.len() {
+            let position = suffixes.position_at(rank);
+            assert_eq!(suffixes.rank_of(position), rank);
         }
         for pair in suffixes.sa.windows(2) {
-            assert!(input[pair[0] as usize..] < input[pair[1] as usize..]);
+            assert!(input[suffix_index(pair[0])..] < input[suffix_index(pair[1])..]);
+        }
+    }
+
+    #[test]
+    fn suffix_counting_sort_preserves_order_with_equal_keys() {
+        let source = [5u32, 2, 4, 1, 3, 0];
+        let keys = [1u32, 2, 0, 2, 1, 0];
+        let mut target = [0u32; 6];
+        let mut counts = [0u32; 3];
+        counting_sort_suffixes(&source, &mut target, 2, &mut counts, |position| {
+            keys[suffix_index(position)]
+        });
+        // The suffix index is the payload. Equal-key order must be stable for
+        // the two-pass LSD radix sort to preserve the lexicographic tie break.
+        assert_eq!(target, [5, 2, 4, 0, 1, 3]);
+        assert_eq!(counts, [2, 4, 6]);
+    }
+
+    #[test]
+    fn suffix_ranks_invert_repetitive_and_boundary_length_inputs() {
+        for length in [
+            0usize, 1, 2, 3, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1_023, 1_024, 1_025, 4_095,
+            4_096, 4_097,
+        ] {
+            for pattern in 0..3 {
+                let input: Vec<u8> = (0..length)
+                    .map(|position| match pattern {
+                        0 => b'a',
+                        1 => b'a' + u8::try_from(position % 3).unwrap_or_default(),
+                        _ => u8::try_from((position * 73 + position / 7) % 251).unwrap_or_default(),
+                    })
+                    .collect();
+
+                let suffixes = SuffixRanks::new(&input);
+                assert_eq!(suffixes.sa.len(), length);
+                assert_eq!(suffixes.rank.len(), length);
+                for rank in 0..length {
+                    let position = suffixes.position_at(rank);
+                    assert!(position < length);
+                    assert_eq!(
+                        suffixes.rank_of(position),
+                        rank,
+                        "length={length} pattern={pattern} rank={rank}"
+                    );
+                }
+                for rank in 1..length {
+                    assert!(
+                        input[suffixes.position_at(rank - 1)..]
+                            < input[suffixes.position_at(rank)..],
+                        "suffix order: length={length} pattern={pattern} rank={rank}"
+                    );
+                }
+            }
         }
     }
 
@@ -1130,11 +1364,11 @@ mod tests {
             ParseToken::Literal(0),
             ParseToken::Literal(u8::MAX),
             ParseToken::Match {
-                length: STD_MIN_MATCH as u16,
+                length: compact_match_length(STD_MIN_MATCH),
                 distance: 1,
             },
             ParseToken::Match {
-                length: STD_MAX_MATCH as u16,
+                length: compact_match_length(STD_MAX_MATCH),
                 distance: 32_768,
             },
         ] {
@@ -1194,6 +1428,63 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "candidate history exceeds the DEFLATE window")]
+    fn exact_frontier_rejects_distances_outside_deflate_window() {
+        // A u16 can encode more than the 32 KiB permitted by DEFLATE.
+        // Reject that input at the candidate boundary, not when the token
+        // eventually reaches the Huffman writer.
+        let _ = build_match_candidates(b"aaaaaaa", (1usize << crate::MAX_WBITS) + 1);
+    }
+
+    #[test]
+    fn compact_match_candidate_selects_longest_then_nearest() {
+        let mut best = MatchCandidate::NONE;
+        best.consider(STD_MIN_MATCH - 1, 1);
+        assert_eq!(best, MatchCandidate::NONE);
+
+        best.consider(STD_MIN_MATCH, 2);
+        assert_eq!(
+            best,
+            MatchCandidate {
+                length: 3,
+                distance: 2
+            }
+        );
+        best.consider(STD_MIN_MATCH, 32_768);
+        assert_eq!(best.distance, 2, "equal-length matches prefer the nearest");
+        best.consider(STD_MIN_MATCH, 1);
+        assert_eq!(best.distance, 1);
+        best.consider(STD_MAX_MATCH, 32_768);
+        assert_eq!(
+            best,
+            MatchCandidate {
+                length: 258,
+                distance: 32_768,
+            }
+        );
+        best.consider(STD_MAX_MATCH - 1, 1);
+        assert_eq!(
+            best.distance, 32_768,
+            "a shorter match must not replace a longer one"
+        );
+        assert_eq!(core::mem::size_of::<MatchCandidate>(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "match exceeds DEFLATE length limit")]
+    fn compact_match_candidate_rejects_overlength() {
+        let mut candidate = MatchCandidate::NONE;
+        candidate.consider(STD_MAX_MATCH + 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "match exceeds DEFLATE distance limit")]
+    fn compact_match_candidate_rejects_out_of_window_distance() {
+        let mut candidate = MatchCandidate::NONE;
+        candidate.consider(STD_MIN_MATCH, (1usize << crate::MAX_WBITS) + 1);
+    }
+
+    #[test]
     fn exact_frontier_reaches_full_deflate_window() {
         let mut state = 0x94d0_49bb_1331_11ebu64;
         let mut input = vec![0u8; 32_768];
@@ -1201,7 +1492,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 32) as u8;
+            *byte = state.to_le_bytes()[4];
         }
         let repeated = input[..STD_MAX_MATCH].to_vec();
         input.extend_from_slice(&repeated);
@@ -1221,7 +1512,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 32) as u8;
+            *byte = state.to_le_bytes()[4];
         }
         let repeated = input[..STD_MAX_MATCH].to_vec();
         assert_ne!(&input[1..=STD_MAX_MATCH], repeated.as_slice());
@@ -1252,8 +1543,8 @@ mod tests {
             let code = State::d_code(distance - 1) as usize;
             if length > usize::from(best[code].length) {
                 best[code] = MatchCandidate {
-                    length: length as u16,
-                    distance: distance as u16,
+                    length: compact_match_length(length),
+                    distance: compact_match_distance(distance),
                 };
             }
         }
@@ -1291,13 +1582,13 @@ mod tests {
         output
     }
 
-    fn brute_cost(input: &[u8], costs: TokenCosts, max_distance: usize) -> u64 {
+    fn brute_cost(input: &[u8], costs: &TokenCosts, max_distance: usize) -> u64 {
         const INF: u64 = u64::MAX / 4;
         let mut best = vec![INF; input.len() + 1];
         best[0] = 0;
         for position in 0..input.len() {
-            best[position + 1] =
-                best[position + 1].min(best[position] + costs.literal_cost(input[position]));
+            best[position + 1] = best[position + 1]
+                .min(best[position] + u64::from(costs.literal_cost(input[position])));
             let max_len = STD_MAX_MATCH.min(input.len() - position);
             for candidate in position.saturating_sub(max_distance)..position {
                 let matched = common_prefix(
@@ -1307,7 +1598,7 @@ mod tests {
                 for length in STD_MIN_MATCH..=matched {
                     let distance = position - candidate;
                     best[position + length] = best[position + length]
-                        .min(best[position] + costs.match_cost(length, distance));
+                        .min(best[position] + u64::from(costs.match_cost(length, distance)));
                 }
             }
         }
@@ -1345,7 +1636,7 @@ mod tests {
                     state = state
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    *byte = (state >> 32) as u8 % alphabet;
+                    *byte = state.to_le_bytes()[4] % alphabet;
                 }
                 for max_distance in [1usize, 2, 3, 7, 16, 31, 50, 64] {
                     let max_distance = max_distance.min(32_506);
@@ -1369,13 +1660,13 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            input.push(b'a' + ((state >> 32) as u8 % 26));
+            input.push(b'a' + (state.to_le_bytes()[4] % 26));
         }
         for _ in 0..12_000 {
             state = state
                 .wrapping_mul(2_862_933_555_777_941_757)
                 .wrapping_add(3_037_000_493);
-            input.push(0x80 | ((state >> 32) as u8 & 0x7f));
+            input.push(0x80 | (state.to_le_bytes()[4] & 0x7f));
         }
         input
     }
@@ -1443,12 +1734,12 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 24) as u8;
+            *byte = state.to_le_bytes()[3];
         }
         let mut input = history.clone();
         input.extend_from_slice(&history);
         let table = build_match_candidates(&input, 32_506);
-        let parsed = parse_range(&input, &table, 6_000..12_000, TokenCosts::fixed());
+        let parsed = parse_range(&input, &table, 6_000..12_000, &TokenCosts::fixed());
         assert!(matches!(
             parsed.tokens.first(),
             Some(ParseToken::Match { length, distance })
@@ -1472,9 +1763,77 @@ mod tests {
         let input = b"abcabcabcxabcaabcabcabc---abcabc";
         let table = build_match_candidates(input, 32);
         let fixed = TokenCosts::fixed();
-        let parsed = parse_block(input, &table, fixed);
-        assert_eq!(parsed.cost_x16, brute_cost(input, fixed, 32));
+        let parsed = parse_block(input, &table, &fixed);
+        assert_eq!(parsed.cost_x16, brute_cost(input, &fixed, 32));
         assert_eq!(expand(&parsed.tokens), input);
+    }
+
+    #[test]
+    fn maximal_symbol_weights_keep_dp_exact_without_u16_overflow() {
+        // A cost model may assign u16::MAX to a Huffman symbol. Extra-bit
+        // costs are then added before DP comparison and must not wrap u16,
+        // including for distance symbols spanning the full DEFLATE window.
+        let input = vec![b'a'; 96];
+        let candidates = build_match_candidates(&input, 64);
+        let mut costs = TokenCosts::fixed();
+        costs.literal.fill(u16::MAX);
+        costs.length.fill(u16::MAX);
+        costs.distance.fill(u16::MAX);
+
+        let parsed = parse_block(&input, &candidates, &costs);
+        assert_eq!(parsed.cost_x16, brute_cost(&input, &costs, 64));
+        assert_eq!(expand(&parsed.tokens), input);
+        assert!(parsed
+            .tokens
+            .iter()
+            .any(|token| matches!(token, ParseToken::Match { .. })));
+
+        let length_code = usize::from(trees_tbl::LENGTH_CODE[STD_MAX_MATCH - STD_MIN_MATCH]);
+        let expected_length = u32::from(costs.length[length_code])
+            + u32::from(StaticTreeDesc::EXTRA_LBITS[length_code]) * u32::from(COST_SCALE);
+        for distance in 1..=1usize << crate::MAX_WBITS {
+            let distance_code = usize::from(State::d_code(distance - 1));
+            let expected_distance = u32::from(costs.distance[distance_code])
+                + u32::from(StaticTreeDesc::EXTRA_DBITS[distance_code]) * u32::from(COST_SCALE);
+            assert_eq!(
+                costs.match_cost(STD_MAX_MATCH, distance),
+                expected_length + expected_distance,
+                "distance={distance}",
+            );
+        }
+    }
+
+    #[test]
+    fn reused_parse_scratch_resets_across_ranges_and_cost_models() {
+        let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
+        let candidates = build_match_candidates(input, 32);
+        let fixed = TokenCosts::fixed();
+        let mut varied = fixed.clone();
+        varied.literal[b'a' as usize] = 2 * COST_SCALE;
+        varied.distance.fill(5 * COST_SCALE);
+
+        let mut scratch = ParseScratch::default();
+        let mut capacity = None;
+        for (range, costs) in [
+            (0..input.len(), &fixed),
+            (12..36, &varied),
+            (24..24, &fixed),
+            (4..input.len(), &varied),
+            (0..input.len(), &fixed),
+        ] {
+            let expected = parse_range(input, &candidates, range.clone(), costs);
+            let actual =
+                parse_range_with_scratch(input, &candidates, range.clone(), costs, &mut scratch);
+            assert_eq!(actual, expected, "range={range:?}");
+            assert_eq!(scratch.best_cost.len(), range.len() + 1);
+            assert_eq!(scratch.steps.len(), range.len() + 1);
+            if let Some((cost_capacity, step_capacity)) = capacity {
+                assert_eq!(scratch.best_cost.capacity(), cost_capacity);
+                assert_eq!(scratch.steps.capacity(), step_capacity);
+            } else {
+                capacity = Some((scratch.best_cost.capacity(), scratch.steps.capacity()));
+            }
+        }
     }
 
     #[test]
@@ -1485,14 +1844,16 @@ mod tests {
         // Deliberately make farther distance symbols cheaper than nearby ones. Keeping the longest
         // match per distance *symbol* must remain exact even when distance costs are non-monotone.
         for (code, cost) in costs.distance.iter_mut().enumerate() {
-            *cost = (15 - (code % 15) as u16) * COST_SCALE;
+            let remainder = u16::try_from(code % 15).unwrap_or_else(|_| unreachable!());
+            *cost = (15 - remainder) * COST_SCALE;
         }
         for (byte, cost) in costs.literal.iter_mut().enumerate() {
-            *cost = (3 + (byte % 11) as u16) * COST_SCALE;
+            let remainder = u16::try_from(byte % 11).unwrap_or_else(|_| unreachable!());
+            *cost = (3 + remainder) * COST_SCALE;
         }
 
-        let parsed = parse_block(input, &table, costs);
-        assert_eq!(parsed.cost_x16, brute_cost(input, costs, 32));
+        let parsed = parse_block(input, &table, &costs);
+        assert_eq!(parsed.cost_x16, brute_cost(input, &costs, 32));
         assert_eq!(expand(&parsed.tokens), input);
     }
 }
@@ -1503,10 +1864,10 @@ mod tests {
 /// tree without overflowing a 16-bit internal frequency sum. Input byte length is independent: a
 /// match token can represent up to 258 bytes, so compressible blocks may legally span well beyond
 /// the 65,535-byte stored-block cap.
-pub(crate) const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
-pub(crate) const MAX_BLOCK_TOKENS: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 2;
+pub const NEAR_OPTIMAL_LIT_BUFSIZE: usize = 1 << 16;
+pub const MAX_BLOCK_TOKENS: usize = NEAR_OPTIMAL_LIT_BUFSIZE - 2;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlockScore {
     bits: usize,
     encoded_bytes: usize,
@@ -1519,7 +1880,7 @@ struct TokenHistogram {
 }
 
 impl TokenHistogram {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         let mut literal_length = [0; L_CODES];
         literal_length[256] = 1;
         Self {
@@ -1610,7 +1971,7 @@ impl TokenHistogram {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlannedBlock {
+pub struct PlannedBlock {
     pub(crate) range: Range<usize>,
     pub(crate) tokens: Vec<ParseToken>,
 }
@@ -1625,12 +1986,34 @@ impl PlannedBlock {
     }
 }
 
-pub(crate) struct PlannedBlockSource {
+pub struct PlannedBlockSource {
     pub(crate) block: PlannedBlock,
     model: ParseModel,
     context_start: usize,
     context_end: usize,
     candidates: MatchCandidates,
+}
+
+/// The last optimization iteration is either the selected best path or an
+/// independently owned worse path. Refer to the best path when the two coincide
+/// instead of duplicating its potentially large token vector just to detect
+/// convergence on the next pass.
+#[derive(Default)]
+enum PreviousParse {
+    #[default]
+    None,
+    Best,
+    Other(Vec<ParseToken>),
+}
+
+impl PreviousParse {
+    fn converged(&self, best: Option<&[ParseToken]>, next: &[ParseToken]) -> bool {
+        match self {
+            Self::None => false,
+            Self::Best => best.is_some_and(|best| best == next),
+            Self::Other(previous) => previous == next,
+        }
+    }
 }
 
 impl PlannedBlockSource {
@@ -1650,7 +2033,7 @@ impl PlannedBlockSource {
         state: &mut super::State<'_>,
         input: &[u8],
         optimization_passes: usize,
-        previous_model: Option<ParseModel>,
+        previous_model: Option<&ParseModel>,
     ) -> bool {
         if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
             self.refresh_model(state);
@@ -1664,29 +2047,46 @@ impl PlannedBlockSource {
 
         let context = &input[self.context_start..self.context_end];
         let local_range = (self.block.range.start - self.context_start)..context.len();
-        let (_, mut best_score) = costs_and_block_score(state, &self.block.tokens);
+        // The original block is one of the possible winners. Learn its costs
+        // now so the final model can be retained without rebuilding the same
+        // Huffman trees after the optimization loop.
+        let (mut best_costs, mut best_score) = costs_and_block_score(state, &self.block.tokens);
         let (default_costs, observations) =
             initial_statistical_costs(context, &self.candidates, local_range.clone());
         let mut costs = previous_model
-            .map(|previous| blend_previous_model(default_costs, observations, previous))
+            .map(|previous| blend_previous_model(&default_costs, observations, previous))
             .unwrap_or(default_costs);
-        let mut current_tokens = None;
-        let mut best_tokens = None;
+        let mut previous = PreviousParse::None;
+        let mut best_tokens: Option<Vec<ParseToken>> = None;
+        let mut scratch = ParseScratch::default();
 
         for _ in 0..optimization_passes {
-            let reparsed = parse_range(context, &self.candidates, local_range.clone(), costs);
+            let reparsed = parse_range_with_scratch(
+                context,
+                &self.candidates,
+                local_range.clone(),
+                &costs,
+                &mut scratch,
+            );
             if reparsed.tokens.len() > MAX_BLOCK_TOKENS {
+                break;
+            }
+            // A repeated token sequence has the same histogram, exact
+            // Huffman score and learned model as the preceding iteration.
+            // That preceding result was already evaluated, even if worse
+            // than the best parse, so there is no reason to build its trees.
+            if previous.converged(best_tokens.as_deref(), &reparsed.tokens) {
                 break;
             }
             let (next_costs, reparsed_score) = costs_and_block_score(state, &reparsed.tokens);
             if reparsed_score.bits < best_score.bits {
                 best_score = reparsed_score;
-                best_tokens = Some(reparsed.tokens.clone());
+                best_costs = next_costs.clone();
+                best_tokens = Some(reparsed.tokens);
+                previous = PreviousParse::Best;
+            } else {
+                previous = PreviousParse::Other(reparsed.tokens);
             }
-            if current_tokens.as_ref() == Some(&reparsed.tokens) {
-                break;
-            }
-            current_tokens = Some(reparsed.tokens);
             costs = next_costs;
         }
 
@@ -1696,7 +2096,12 @@ impl PlannedBlockSource {
         } else {
             false
         };
-        self.refresh_model(state);
+        // The exact-score winner's cost model was captured with its tree;
+        // only its observations depend on which token vector was selected.
+        self.model = ParseModel {
+            costs: best_costs,
+            observations: BlockObservations::from_tokens(&self.block.tokens),
+        };
         debug_assert_eq!(self.block.token_input_len(), self.block.range.len());
         changed
     }
@@ -1719,16 +2124,19 @@ fn log2_x16(value: usize) -> u16 {
             fraction |= 1 << bit;
         }
     }
-    integer as u16 * COST_SCALE + fraction
+    u16::try_from(integer).unwrap_or_else(|_| unreachable!("log2 exponent is bounded to 31"))
+        * COST_SCALE
+        + fraction
 }
 
 #[inline]
 fn log2_ratio_x16(numerator: usize, denominator: usize) -> u16 {
+    const Q_BITS: u32 = 48;
+
     debug_assert!(numerator >= denominator && denominator != 0);
     // Represent the rational with 48 fractional bits before extracting four binary log2 fraction
     // bits. The inputs here are tiny DEFLATE alphabet sizes; Q48 makes the approximation error far
     // below a 1/16-bit boundary while preserving exact powers of two.
-    const Q_BITS: u32 = 48;
     let q = ((numerator as u128) << Q_BITS) / denominator as u128;
     let integer = u128::BITS - 1 - q.leading_zeros();
     debug_assert!((Q_BITS..=63).contains(&integer));
@@ -1741,7 +2149,9 @@ fn log2_ratio_x16(numerator: usize, denominator: usize) -> u16 {
             fraction |= 1 << bit;
         }
     }
-    ((integer - Q_BITS) as u16) * COST_SCALE + fraction
+    u16::try_from(integer - Q_BITS).unwrap_or_else(|_| unreachable!("bounded Q48 log2 exponent"))
+        * COST_SCALE
+        + fraction
 }
 
 fn initial_statistical_costs(
@@ -1824,20 +2234,21 @@ fn blend_cost(previous: u16, default: u16, change_amount: u8) -> u16 {
     let default = u32::from(default);
     let blended = match change_amount {
         0 => (default + 3 * previous) / 4,
-        1 => (default + previous) / 2,
+        1 => u32::midpoint(default, previous),
         2 => (5 * default + 3 * previous) / 8,
         _ => (3 * default + previous) / 4,
     };
-    blended as u16
+    u16::try_from(blended)
+        .unwrap_or_else(|_| unreachable!("a convex combination of u16 costs fits u16"))
 }
 
 fn blend_previous_model(
-    default: TokenCosts,
+    default: &TokenCosts,
     current: BlockObservations,
-    previous: ParseModel,
+    previous: &ParseModel,
 ) -> TokenCosts {
     if current.total == 0 || previous.observations.total == 0 {
-        return default;
+        return default.clone();
     }
 
     let mut total_delta = 0u64;
@@ -1850,19 +2261,17 @@ fn blend_previous_model(
     }
     let cutoff = u64::from(previous.observations.total) * u64::from(current.total) * 200 / 512;
     if total_delta > 3 * cutoff {
-        return default;
+        return default.clone();
     }
     let change_amount = if 4 * total_delta > 9 * cutoff {
         3
     } else if 2 * total_delta > 3 * cutoff {
         2
-    } else if 2 * total_delta > cutoff {
-        1
     } else {
-        0
+        u8::from(2 * total_delta > cutoff)
     };
 
-    let mut blended = default;
+    let mut blended = default.clone();
     for index in 0..blended.literal.len() {
         blended.literal[index] = blend_cost(
             previous.costs.literal[index],
@@ -1896,16 +2305,16 @@ fn blend_previous_model(
 /// tree builder, including dynamic tree-description overhead, and the best exact score is retained.
 /// Stop early only when the token sequence itself converges: a temporarily worse iteration can still
 /// lead to a better next model, while an identical token sequence is a true fixed point.
-pub(crate) fn optimized_parse_range(
+pub fn optimized_parse_range(
     state: &mut super::State<'_>,
     input: &[u8],
     candidates: &MatchCandidates,
     block: Range<usize>,
     optimization_passes: usize,
-    previous_model: Option<ParseModel>,
+    previous_model: Option<&ParseModel>,
 ) -> (ParseResult, ParseModel) {
     if optimization_passes == 0 {
-        let parsed = parse_range(input, candidates, block, TokenCosts::fixed());
+        let parsed = parse_range(input, candidates, block, &TokenCosts::fixed());
         let (costs, _) = costs_and_block_score(state, &parsed.tokens);
         let model = ParseModel {
             costs,
@@ -1917,25 +2326,30 @@ pub(crate) fn optimized_parse_range(
     let (default_costs, initial_observations) =
         initial_statistical_costs(input, candidates, block.clone());
     let mut costs = previous_model
-        .map(|previous| blend_previous_model(default_costs, initial_observations, previous))
+        .map(|previous| blend_previous_model(&default_costs, initial_observations, previous))
         .unwrap_or(default_costs);
-    let mut previous_tokens = None;
-    let mut best = None;
+    let mut previous = PreviousParse::None;
+    let mut best: Option<ParseResult> = None;
     let mut best_costs = None;
     let mut best_score = usize::MAX;
+    let mut scratch = ParseScratch::default();
 
     for _ in 0..optimization_passes {
-        let next = parse_range(input, candidates, block.clone(), costs);
+        let next = parse_range_with_scratch(input, candidates, block.clone(), &costs, &mut scratch);
+        // Identical paths have identical learned trees and exact scores.
+        // Their prior evaluation has already recorded a possible winner.
+        if previous.converged(best.as_ref().map(|p| p.tokens.as_slice()), &next.tokens) {
+            break;
+        }
         let (next_costs, next_score) = costs_and_block_score(state, &next.tokens);
         if next_score.bits < best_score {
             best_score = next_score.bits;
-            best_costs = Some(next_costs);
-            best = Some(next.clone());
+            best_costs = Some(next_costs.clone());
+            best = Some(next);
+            previous = PreviousParse::Best;
+        } else {
+            previous = PreviousParse::Other(next.tokens);
         }
-        if previous_tokens.as_ref() == Some(&next.tokens) {
-            break;
-        }
-        previous_tokens = Some(next.tokens.clone());
         costs = next_costs;
     }
 
@@ -1947,7 +2361,7 @@ pub(crate) fn optimized_parse_range(
     (best, model)
 }
 
-pub(crate) fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) -> ParseModel {
+pub fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) -> ParseModel {
     let (costs, _) = costs_and_block_score(state, tokens);
     ParseModel {
         costs,
@@ -1955,7 +2369,7 @@ pub(crate) fn model_from_tokens(state: &mut super::State<'_>, tokens: &[ParseTok
     }
 }
 
-pub(crate) fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
+pub fn tally_tokens(state: &mut super::State<'_>, tokens: &[ParseToken]) {
     assert!(
         tokens.len() <= MAX_BLOCK_TOKENS,
         "near-optimal token block exceeds symbol-buffer capacity"
@@ -1980,63 +2394,43 @@ fn costs_and_block_score(
     tokens: &[ParseToken],
 ) -> (TokenCosts, BlockScore) {
     let histogram = TokenHistogram::from_tokens(tokens);
-    costs_and_block_score_from_histogram(state, &histogram)
+    let mut costs = TokenCosts::unseen();
+    let score = score_histogram(state, &histogram, Some(&mut costs));
+    (costs, score)
 }
 
-fn costs_and_block_score_from_histogram(
+/// Build the same production Huffman trees for scoring and cost-model learning.
+/// Most boundary alternatives need only the bit count, not all symbol costs.
+fn score_histogram(
     state: &mut super::State<'_>,
     histogram: &TokenHistogram,
-) -> (TokenCosts, BlockScore) {
+    learned_costs: Option<&mut TokenCosts>,
+) -> BlockScore {
     histogram.apply_to_state(state);
+    super::build_tree(&mut state.l_desc, &mut state.opt_len, &mut state.static_len);
+    super::build_tree(&mut state.d_desc, &mut state.opt_len, &mut state.static_len);
 
-    let literal_used =
-        core::array::from_fn::<_, 256, _>(|index| histogram.literal_length[index] != 0);
-    let length_used = core::array::from_fn::<_, LENGTH_CODES, _>(|index| {
-        histogram.literal_length[257 + index] != 0
-    });
-    let distance_used =
-        core::array::from_fn::<_, D_CODES, _>(|index| histogram.distance[index] != 0);
-
-    {
-        let mut tree = super::TreeDesc::EMPTY;
-        core::mem::swap(&mut tree, &mut state.l_desc);
-        super::build_tree(state, &mut tree);
-        core::mem::swap(&mut tree, &mut state.l_desc);
-    }
-    {
-        let mut tree = super::TreeDesc::EMPTY;
-        core::mem::swap(&mut tree, &mut state.d_desc);
-        super::build_tree(state, &mut tree);
-        core::mem::swap(&mut tree, &mut state.d_desc);
-    }
-
-    // Keep unseen symbols available to later passes, but price them high enough that a pass does not
-    // churn the tree merely because fixed-Huffman fallback made an absent symbol look cheap.
-    let mut costs = TokenCosts {
-        literal: [13 * COST_SCALE; 256],
-        length: [13 * COST_SCALE; LENGTH_CODES],
-        distance: [10 * COST_SCALE; D_CODES],
-    };
-    for (index, &used) in literal_used.iter().enumerate() {
-        if used {
-            costs.literal[index] = state.l_desc.dyn_tree[index].len() as u16 * COST_SCALE;
+    if let Some(costs) = learned_costs {
+        // The original histogram is required: build_tree replaces frequency
+        // storage with Huffman codes. Unseen symbols retain finite priors.
+        for (index, cost) in costs.literal.iter_mut().enumerate() {
+            if histogram.literal_length[index] != 0 {
+                *cost = state.l_desc.dyn_tree[index].len() * COST_SCALE;
+            }
         }
-    }
-    for (index, &used) in length_used.iter().enumerate() {
-        if used {
-            costs.length[index] = state.l_desc.dyn_tree[257 + index].len() as u16 * COST_SCALE;
+        for (index, cost) in costs.length.iter_mut().enumerate() {
+            if histogram.literal_length[257 + index] != 0 {
+                *cost = state.l_desc.dyn_tree[257 + index].len() * COST_SCALE;
+            }
         }
-    }
-    for (index, &used) in distance_used.iter().enumerate() {
-        if used {
-            costs.distance[index] = state.d_desc.dyn_tree[index].len() as u16 * COST_SCALE;
+        for (index, cost) in costs.distance.iter_mut().enumerate() {
+            if histogram.distance[index] != 0 {
+                *cost = state.d_desc.dyn_tree[index].len() * COST_SCALE;
+            }
         }
     }
 
-    // Add the exact dynamic-tree representation cost. Mirror the production block chooser: it
-    // rounds static/dynamic candidates to bytes first and prefers static on a rounded tie, then emits
-    // the selected representation without byte-aligning it. Stored-block choice is parse-independent
-    // and therefore cannot make a worse token parse preferable to a better one.
+    // Exact production tree chooser: prefer static on rounded encoded-byte ties.
     let _ = super::build_bl_tree(state);
     let dynamic_bytes = (state.opt_len + 3 + 7) >> 3;
     let static_bytes = (state.static_len + 3 + 7) >> 3;
@@ -2052,86 +2446,140 @@ fn costs_and_block_score_from_histogram(
         }
     };
     state.init_block();
-    (costs, score)
+    score
 }
 
 fn compressed_histogram_score(
     state: &mut super::State<'_>,
     histogram: &TokenHistogram,
     input_len: usize,
-) -> Option<(TokenCosts, BlockScore)> {
-    let (costs, score) = costs_and_block_score_from_histogram(state, histogram);
+    learned_costs: Option<&mut TokenCosts>,
+) -> Option<BlockScore> {
+    let score = score_histogram(state, histogram, learned_costs);
     // Stored blocks byte-align before their payload, so their exact cost depends on the preceding
     // block's residual bit count. Boundary optimization is intentionally limited to pairs for which
     // production would choose a Huffman-coded representation; stored-block regions keep the cheap
     // splitter's boundary unchanged.
-    (input_len > super::MAX_STORED || input_len + 4 > score.encoded_bytes).then_some((costs, score))
+    (input_len > super::MAX_STORED || input_len + 4 > score.encoded_bytes).then_some(score)
 }
 
 const EXACT_BOUNDARY_CANDIDATES: usize = 4;
 const BOUNDARY_CANDIDATE_SEPARATION: usize = 256;
 
-#[derive(Clone, Debug)]
-struct BoundaryCandidate {
-    delta: i64,
-    shift: isize,
-    left_histogram: TokenHistogram,
-    right_histogram: TokenHistogram,
+/// Shift a block boundary by an unsigned byte count. The direction is part
+/// of the type, so neither the input length nor the absolute input position
+/// ever needs conversion through isize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryShift {
+    Right(usize),
+    Left(usize),
 }
 
-fn consider_shift_candidate(
-    candidates: &mut Vec<BoundaryCandidate>,
-    delta: i64,
-    shift: isize,
-    left_histogram: &TokenHistogram,
-    right_histogram: &TokenHistogram,
-) {
-    if delta >= 0 || shift == 0 {
-        return;
-    }
-
-    if let Some(existing) = candidates.iter_mut().find(|candidate| {
-        candidate.shift.signum() == shift.signum()
-            && candidate.shift.abs_diff(shift) < BOUNDARY_CANDIDATE_SEPARATION
-    }) {
-        if delta < existing.delta {
-            *existing = BoundaryCandidate {
-                delta,
-                shift,
-                left_histogram: left_histogram.clone(),
-                right_histogram: right_histogram.clone(),
-            };
+impl BoundaryShift {
+    const fn is_near(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Right(a), Self::Right(b)) | (Self::Left(a), Self::Left(b)) => {
+                a.abs_diff(b) < BOUNDARY_CANDIDATE_SEPARATION
+            }
+            _ => false,
         }
-    } else {
-        candidates.push(BoundaryCandidate {
-            delta,
-            shift,
-            left_histogram: left_histogram.clone(),
-            right_histogram: right_histogram.clone(),
-        });
     }
 
-    candidates.sort_unstable_by_key(|candidate| candidate.delta);
-    candidates.truncate(EXACT_BOUNDARY_CANDIDATES);
+    fn lengths(self, left: usize, right: usize) -> Option<(usize, usize)> {
+        match self {
+            Self::Right(bytes) => Some((left.checked_add(bytes)?, right.checked_sub(bytes)?)),
+            Self::Left(bytes) => Some((left.checked_sub(bytes)?, right.checked_add(bytes)?)),
+        }
+    }
+
+    const fn boundary(self, offset: usize) -> Option<usize> {
+        match self {
+            Self::Right(bytes) => offset.checked_add(bytes),
+            Self::Left(bytes) => offset.checked_sub(bytes),
+        }
+    }
+}
+
+/// Only the frozen-cost change and the token boundary are needed to rank
+/// nominees. Build full histograms for at most four winners after the scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundaryCandidate {
+    delta: i64,
+    shift: BoundaryShift,
+}
+
+/// Small, sorted shortlist with one overflow slot to reproduce the existing
+/// sort-then-truncate tie behavior exactly. No allocation is needed while
+/// scanning boundary shifts, including when the fifth candidate is considered.
+#[derive(Clone, Debug)]
+struct BoundaryShortlist {
+    entries: [BoundaryCandidate; EXACT_BOUNDARY_CANDIDATES + 1],
+    len: usize,
+}
+
+impl Default for BoundaryShortlist {
+    fn default() -> Self {
+        Self {
+            entries: [BoundaryCandidate {
+                delta: 0,
+                shift: BoundaryShift::Right(0),
+            }; EXACT_BOUNDARY_CANDIDATES + 1],
+            len: 0,
+        }
+    }
+}
+
+impl BoundaryShortlist {
+    fn as_slice(&self) -> &[BoundaryCandidate] {
+        &self.entries[..self.len]
+    }
+
+    fn consider(&mut self, delta: i64, shift: BoundaryShift) {
+        if delta >= 0 {
+            return;
+        }
+
+        if let Some(index) = self
+            .as_slice()
+            .iter()
+            .position(|candidate| candidate.shift.is_near(shift))
+        {
+            if delta >= self.entries[index].delta {
+                // The shortlist is already sorted, so no sorting is needed
+                // when the existing nearby representative is still better.
+                return;
+            }
+            self.entries[index] = BoundaryCandidate { delta, shift };
+        } else {
+            if self.len == EXACT_BOUNDARY_CANDIDATES && delta > self.entries[self.len - 1].delta {
+                // Strictly worse than the weakest finalist. Equality must
+                // still go through the old five-item unstable sort because
+                // truncation could retain either tied representative.
+                return;
+            }
+            self.entries[self.len] = BoundaryCandidate { delta, shift };
+            self.len += 1;
+        }
+
+        self.entries[..self.len].sort_unstable_by_key(|candidate| candidate.delta);
+        self.len = self.len.min(EXACT_BOUNDARY_CANDIDATES);
+    }
 }
 
 fn fixed_cost_shift_candidates(
     left: &PlannedBlock,
     right: &PlannedBlock,
-    left_costs: TokenCosts,
-    right_costs: TokenCosts,
-    left_histogram: &TokenHistogram,
-    right_histogram: &TokenHistogram,
-) -> Vec<BoundaryCandidate> {
+    left_costs: &TokenCosts,
+    right_costs: &TokenCosts,
+) -> BoundaryShortlist {
     debug_assert_eq!(left.range.end, right.range.start);
-    let mut candidates = Vec::with_capacity(EXACT_BOUNDARY_CANDIDATES);
+    let mut candidates = BoundaryShortlist::default();
+    let token_deltas = TokenCostDelta::between(left_costs, right_costs);
 
     // Positive shift: move a prefix of the right block into the left block.
     let mut moved = 0usize;
     let mut moved_tokens = 0usize;
     let mut delta = 0i64;
-    let mut shifted_left = left_histogram.clone();
-    let mut shifted_right = right_histogram.clone();
     for &token in &right.tokens {
         moved += token.input_len();
         moved_tokens += 1;
@@ -2140,24 +2588,14 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += left_costs.token_cost(token) as i64 - right_costs.token_cost(token) as i64;
-        shifted_left.add_token(token);
-        shifted_right.remove_token(token);
-        consider_shift_candidate(
-            &mut candidates,
-            delta,
-            moved as isize,
-            &shifted_left,
-            &shifted_right,
-        );
+        delta += token_deltas.token_delta(token);
+        candidates.consider(delta, BoundaryShift::Right(moved));
     }
 
     // Negative shift: move a suffix of the left block into the right block.
     moved = 0;
     moved_tokens = 0;
     delta = 0;
-    shifted_left = left_histogram.clone();
-    shifted_right = right_histogram.clone();
     for &token in left.tokens.iter().rev() {
         moved += token.input_len();
         moved_tokens += 1;
@@ -2166,55 +2604,165 @@ fn fixed_cost_shift_candidates(
         {
             break;
         }
-        delta += right_costs.token_cost(token) as i64 - left_costs.token_cost(token) as i64;
-        shifted_left.remove_token(token);
-        shifted_right.add_token(token);
-        consider_shift_candidate(
-            &mut candidates,
-            delta,
-            -(moved as isize),
-            &shifted_left,
-            &shifted_right,
-        );
+        delta -= token_deltas.token_delta(token);
+        candidates.consider(delta, BoundaryShift::Left(moved));
     }
 
-    candidates.sort_unstable_by_key(|candidate| candidate.delta);
     candidates
 }
 
-fn shifted_tokens(
+/// Reconstruct exact Huffman frequencies only for shortlisted shifts. Each
+/// direction is replayed once up to its most distant nominee; snapshots retain
+/// the original delta-ranked order so exact-score tie handling does not change.
+fn shortlisted_shift_histograms(
     left: &PlannedBlock,
     right: &PlannedBlock,
-    shift: isize,
-) -> (Vec<ParseToken>, Vec<ParseToken>) {
-    if shift > 0 {
-        let mut bytes = 0usize;
-        let mut split = 0usize;
-        while split < right.tokens.len() && bytes < shift as usize {
-            bytes += right.tokens[split].input_len();
-            split += 1;
+    left_histogram: &TokenHistogram,
+    right_histogram: &TokenHistogram,
+    candidates: &[BoundaryCandidate],
+) -> [Option<(TokenHistogram, TokenHistogram)>; EXACT_BOUNDARY_CANDIDATES] {
+    assert!(candidates.len() <= EXACT_BOUNDARY_CANDIDATES);
+    let mut snapshots = core::array::from_fn(|_| None);
+
+    for moving_right in [true, false] {
+        let furthest = candidates
+            .iter()
+            .filter_map(|candidate| match (moving_right, candidate.shift) {
+                (true, BoundaryShift::Right(bytes)) | (false, BoundaryShift::Left(bytes)) => {
+                    Some(bytes)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if furthest == 0 {
+            continue;
         }
-        debug_assert_eq!(bytes, shift as usize);
-        let mut left_tokens = left.tokens.clone();
-        left_tokens.extend_from_slice(&right.tokens[..split]);
-        (left_tokens, right.tokens[split..].to_vec())
-    } else {
-        let wanted = (-shift) as usize;
-        let mut bytes = 0usize;
-        let mut split = left.tokens.len();
-        while split > 0 && bytes < wanted {
-            split -= 1;
-            bytes += left.tokens[split].input_len();
+
+        let mut left_counts = left_histogram.clone();
+        let mut right_counts = right_histogram.clone();
+        let mut moved = 0usize;
+        let token_count = if moving_right {
+            right.tokens.len()
+        } else {
+            left.tokens.len()
+        };
+        for index in 0..token_count {
+            let token = if moving_right {
+                right.tokens[index]
+            } else {
+                left.tokens[left.tokens.len() - 1 - index]
+            };
+            moved += token.input_len();
+            if moving_right {
+                left_counts.add_token(token);
+                right_counts.remove_token(token);
+            } else {
+                left_counts.remove_token(token);
+                right_counts.add_token(token);
+            }
+            let shift = if moving_right {
+                BoundaryShift::Right(moved)
+            } else {
+                BoundaryShift::Left(moved)
+            };
+            for (candidate, snapshot) in candidates.iter().zip(&mut snapshots) {
+                if candidate.shift == shift {
+                    *snapshot = Some((left_counts.clone(), right_counts.clone()));
+                }
+            }
+            if moved == furthest {
+                break;
+            }
         }
-        debug_assert_eq!(bytes, wanted);
-        let mut right_tokens = left.tokens[split..].to_vec();
-        right_tokens.extend_from_slice(&right.tokens);
-        (left.tokens[..split].to_vec(), right_tokens)
+    }
+
+    assert!(
+        snapshots.iter().take(candidates.len()).all(Option::is_some),
+        "every shortlisted shift must end at a token boundary"
+    );
+    snapshots
+}
+
+/// Exact-score the frozen-cost shortlist against the best unchanged/merged
+/// partition. Returning only strict improvements preserves the original tie
+/// preference and keeps partition application separate from candidate scoring.
+fn best_exact_boundary_shift(
+    state: &mut super::State<'_>,
+    left: &PlannedBlock,
+    right: &PlannedBlock,
+    left_histogram: &TokenHistogram,
+    right_histogram: &TokenHistogram,
+    candidates: &[BoundaryCandidate],
+    mut best_total_bits: usize,
+) -> Option<(BoundaryShift, usize)> {
+    let snapshots =
+        shortlisted_shift_histograms(left, right, left_histogram, right_histogram, candidates);
+    let mut best_shift = None;
+    for (candidate, snapshot) in candidates.iter().copied().zip(snapshots) {
+        // All nominees end at token boundaries, verified before scoring.
+        let Some((shifted_left, shifted_right)) = snapshot else {
+            continue;
+        };
+        let Some((new_left_len, new_right_len)) =
+            candidate.shift.lengths(left.input_len(), right.input_len())
+        else {
+            continue;
+        };
+        let Some(boundary) = candidate.shift.boundary(left.range.end) else {
+            continue;
+        };
+        let Some(new_left_score) =
+            compressed_histogram_score(state, &shifted_left, new_left_len, None)
+        else {
+            continue;
+        };
+        let Some(new_right_score) =
+            compressed_histogram_score(state, &shifted_right, new_right_len, None)
+        else {
+            continue;
+        };
+        let total_bits = new_left_score.bits + new_right_score.bits;
+        if total_bits < best_total_bits {
+            best_total_bits = total_bits;
+            best_shift = Some((candidate.shift, boundary));
+        }
+    }
+    best_shift
+}
+
+/// Apply a chosen shift directly to the owned token vectors. Partition scoring
+/// is complete before this is called, so copying both blocks to construct the
+/// new partition would add work without preserving anything useful.
+fn shift_tokens(left: &mut PlannedBlock, right: &mut PlannedBlock, shift: BoundaryShift) {
+    match shift {
+        BoundaryShift::Right(wanted) => {
+            let mut bytes = 0usize;
+            let mut split = 0usize;
+            while split < right.tokens.len() && bytes < wanted {
+                bytes += right.tokens[split].input_len();
+                split += 1;
+            }
+            assert_eq!(bytes, wanted, "boundary shift must end between tokens");
+            left.tokens.extend(right.tokens.drain(..split));
+        }
+        BoundaryShift::Left(wanted) => {
+            let mut bytes = 0usize;
+            let mut split = left.tokens.len();
+            while split > 0 && bytes < wanted {
+                split -= 1;
+                bytes += left.tokens[split].input_len();
+            }
+            assert_eq!(bytes, wanted, "boundary shift must end between tokens");
+            let mut moved = left.tokens.split_off(split);
+            moved.append(&mut right.tokens);
+            right.tokens = moved;
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BoundaryOptimization {
+pub enum BoundaryOptimization {
     Unchanged,
     Shifted,
     Merged(PlannedBlock),
@@ -2227,7 +2775,10 @@ pub(crate) enum BoundaryOptimization {
 /// single cheapest of unchanged / shifted / merged is applied. Match discovery and token parsing are
 /// deliberately not repeated here; a caller may use the retained right-hand candidate table for a
 /// follow-up DP-only reparse after the partition changes.
-pub(crate) fn optimize_token_partition(
+///
+/// A merged result takes ownership of both blocks' token vectors, leaving them empty.
+/// A shifted result edits the original vectors in place without cloning either one.
+pub fn optimize_token_partition(
     state: &mut super::State<'_>,
     left: &mut PlannedBlock,
     right: &mut PlannedBlock,
@@ -2236,26 +2787,33 @@ pub(crate) fn optimize_token_partition(
 
     let left_histogram = TokenHistogram::from_tokens(&left.tokens);
     let right_histogram = TokenHistogram::from_tokens(&right.tokens);
-    let Some((left_costs, left_score)) =
-        compressed_histogram_score(state, &left_histogram, left.input_len())
-    else {
+    let mut left_costs = TokenCosts::unseen();
+    let Some(left_score) = compressed_histogram_score(
+        state,
+        &left_histogram,
+        left.input_len(),
+        Some(&mut left_costs),
+    ) else {
         return BoundaryOptimization::Unchanged;
     };
-    let Some((right_costs, right_score)) =
-        compressed_histogram_score(state, &right_histogram, right.input_len())
-    else {
+    let mut right_costs = TokenCosts::unseen();
+    let Some(right_score) = compressed_histogram_score(
+        state,
+        &right_histogram,
+        right.input_len(),
+        Some(&mut right_costs),
+    ) else {
         return BoundaryOptimization::Unchanged;
     };
 
     let mut best_total_bits = left_score.bits + right_score.bits;
-    let mut best_shift = None;
     let mut merge_is_best = false;
 
     let merged_len = left.input_len() + right.input_len();
     if left.tokens.len() + right.tokens.len() <= MAX_BLOCK_TOKENS {
         let merged_histogram = TokenHistogram::merged(&left_histogram, &right_histogram);
-        if let Some((_, merged_score)) =
-            compressed_histogram_score(state, &merged_histogram, merged_len)
+        if let Some(merged_score) =
+            compressed_histogram_score(state, &merged_histogram, merged_len, None)
         {
             if merged_score.bits < best_total_bits {
                 best_total_bits = merged_score.bits;
@@ -2264,49 +2822,29 @@ pub(crate) fn optimize_token_partition(
         }
     }
 
-    for candidate in fixed_cost_shift_candidates(
+    let candidates = fixed_cost_shift_candidates(left, right, &left_costs, &right_costs);
+    let best_shift = best_exact_boundary_shift(
+        state,
         left,
         right,
-        left_costs,
-        right_costs,
         &left_histogram,
         &right_histogram,
-    ) {
-        let new_left_len = (left.input_len() as isize + candidate.shift) as usize;
-        let new_right_len = (right.input_len() as isize - candidate.shift) as usize;
-        let Some((_, new_left_score)) =
-            compressed_histogram_score(state, &candidate.left_histogram, new_left_len)
-        else {
-            continue;
-        };
-        let Some((_, new_right_score)) =
-            compressed_histogram_score(state, &candidate.right_histogram, new_right_len)
-        else {
-            continue;
-        };
-        let total_bits = new_left_score.bits + new_right_score.bits;
-        if total_bits < best_total_bits {
-            best_total_bits = total_bits;
-            best_shift = Some(candidate.shift);
-            merge_is_best = false;
-        }
-    }
+        candidates.as_slice(),
+        best_total_bits,
+    );
 
-    let outcome = if merge_is_best {
-        let mut tokens = left.tokens.clone();
-        tokens.extend_from_slice(&right.tokens);
+    let outcome = if let Some((shift, boundary)) = best_shift {
+        shift_tokens(left, right, shift);
+        left.range.end = boundary;
+        right.range.start = boundary;
+        BoundaryOptimization::Shifted
+    } else if merge_is_best {
+        let mut tokens = core::mem::take(&mut left.tokens);
+        tokens.append(&mut right.tokens);
         BoundaryOptimization::Merged(PlannedBlock {
             range: left.range.start..right.range.end,
             tokens,
         })
-    } else if let Some(shift) = best_shift {
-        let boundary = (left.range.end as isize + shift) as usize;
-        let (new_left, new_right) = shifted_tokens(left, right, shift);
-        left.range.end = boundary;
-        right.range.start = boundary;
-        left.tokens = new_left;
-        right.tokens = new_right;
-        BoundaryOptimization::Shifted
     } else {
         BoundaryOptimization::Unchanged
     };
@@ -2329,13 +2867,13 @@ pub(crate) fn optimize_token_partition(
 
 /// Parse one splitter range into a production-ready token block. A caller only needs to retain two
 /// adjacent blocks at a time to optimize their shared Huffman boundary.
-pub(crate) fn parse_planned_block_source(
+pub fn parse_planned_block_source(
     state: &mut super::State<'_>,
     input: &[u8],
     range: Range<usize>,
     max_distance: usize,
     optimization_passes: usize,
-    previous_model: Option<ParseModel>,
+    previous_model: Option<&ParseModel>,
 ) -> PlannedBlockSource {
     let history_start = range.start.saturating_sub(max_distance);
     let context_end = range.end;
@@ -2369,14 +2907,353 @@ mod boundary_tests {
     use super::*;
 
     #[test]
-    fn fixed_cost_boundary_shift_moves_whole_tokens_and_conserves_input() {
+    fn boundary_reparse_keeps_exact_model_of_selected_tokens() -> Result<(), crate::ReturnCode> {
+        // Test both a warm previous model and no previous model. A reparse
+        // may retain the original path, select an improved path, or converge
+        // after a worse intermediate iteration; in all cases the retained
+        // model must describe the exact final token histogram.
+        let input = (0..15_000)
+            .map(|index| {
+                if index % 257 < 220 {
+                    b"abcde"[index % 5]
+                } else {
+                    b"0123456789"[index % 10]
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9))?;
+        let state = &mut *stream.state;
+        for passes in [1, 2, 4] {
+            let mut block =
+                parse_planned_block_source(state, &input, 4_000..13_000, 32_768, passes, None);
+            let previous = model_from_tokens(state, &block.block.tokens);
+            for prior in [None, Some(&previous)] {
+                let _changed = block.reparse_with_existing_candidates(state, &input, passes, prior);
+                let independently_scored = model_from_tokens(state, &block.block.tokens);
+                assert_eq!(
+                    block.model,
+                    independently_scored,
+                    "passes={passes}, previous_model={}",
+                    prior.is_some()
+                );
+                assert_eq!(block.block.token_input_len(), block.block.range.len());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_score_with_and_without_learned_costs_agree() -> Result<(), crate::ReturnCode> {
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9))?;
+        let state = &mut *stream.state;
+        let samples = [
+            vec![ParseToken::Literal(b'a'); 96],
+            (0u8..=250)
+                .cycle()
+                .take(4_096)
+                .map(ParseToken::Literal)
+                .collect(),
+            vec![
+                ParseToken::Literal(b'a'),
+                ParseToken::Literal(b'b'),
+                ParseToken::Match {
+                    length: 3,
+                    distance: 1,
+                },
+                ParseToken::Match {
+                    length: 258,
+                    distance: 32_768,
+                },
+                ParseToken::Match {
+                    length: 25,
+                    distance: 2_048,
+                },
+            ],
+        ];
+        for tokens in samples {
+            let histogram = TokenHistogram::from_tokens(&tokens);
+            let (expected_costs, expected_score) = costs_and_block_score(state, &tokens);
+            assert_eq!(score_histogram(state, &histogram, None), expected_score);
+
+            let mut costs = TokenCosts::unseen();
+            assert_eq!(
+                score_histogram(state, &histogram, Some(&mut costs)),
+                expected_score
+            );
+            assert_eq!(costs, expected_costs);
+
+            let input_len = tokens.iter().map(|token| token.input_len()).sum();
+            let without_costs = compressed_histogram_score(state, &histogram, input_len, None);
+            let mut filtered_costs = TokenCosts::unseen();
+            let with_costs =
+                compressed_histogram_score(state, &histogram, input_len, Some(&mut filtered_costs));
+            assert_eq!(without_costs, with_costs);
+            assert_eq!(filtered_costs, expected_costs);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn relative_frozen_token_cost_matches_full_cost_difference() {
+        // Exercise all 256 length values, boundary distance symbols, and
+        // literal codes, with asymmetric and extreme valid u16 cost models.
+        let mut left = TokenCosts::unseen();
+        let mut right = TokenCosts::unseen();
+        for byte in u8::MIN..=u8::MAX {
+            let index = usize::from(byte);
+            left.literal[index] = u16::from(byte) * 199 + 13;
+            right.literal[index] = u16::from(byte) * 127 + 123;
+        }
+        for index in 0..LENGTH_CODES {
+            left.length[index] = if index % 2 == 0 { 0 } else { u16::MAX };
+            right.length[index] = if index % 2 == 0 { u16::MAX } else { 0 };
+        }
+        for index in 0..D_CODES {
+            left.distance[index] = if index % 3 == 0 { u16::MAX } else { 7 };
+            right.distance[index] = if index % 3 == 0 { 0 } else { u16::MAX };
+        }
+
+        let deltas = TokenCostDelta::between(&left, &right);
+        let reverse = TokenCostDelta::between(&right, &left);
+        for byte in u8::MIN..=u8::MAX {
+            let token = ParseToken::Literal(byte);
+            let expected = i64::from(left.token_cost(token)) - i64::from(right.token_cost(token));
+            assert_eq!(deltas.token_delta(token), expected);
+            assert_eq!(reverse.token_delta(token), -expected);
+        }
+
+        for length in 3_u16..=258 {
+            for distance in 1_u16..=32_768 {
+                // Every valid length/distance combination is representable
+                // by the DEFLATE coding tables; verify the exact cancellation.
+                let token = ParseToken::Match { length, distance };
+                let expected =
+                    i64::from(left.token_cost(token)) - i64::from(right.token_cost(token));
+                assert_eq!(deltas.token_delta(token), expected);
+                assert_eq!(reverse.token_delta(token), -expected);
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_capacity_shortlist_preserves_sort_and_tie_semantics() {
+        // Exact oracle: the previous allocation-backed candidate admission,
+        // unstable sort and truncation, including ties at the fourth slot.
+        fn reference_consider(
+            candidates: &mut Vec<BoundaryCandidate>,
+            delta: i64,
+            shift: BoundaryShift,
+        ) {
+            if delta >= 0 {
+                return;
+            }
+            if let Some(existing) = candidates
+                .iter_mut()
+                .find(|candidate| candidate.shift.is_near(shift))
+            {
+                if delta < existing.delta {
+                    *existing = BoundaryCandidate { delta, shift };
+                }
+            } else {
+                candidates.push(BoundaryCandidate { delta, shift });
+            }
+            candidates.sort_unstable_by_key(|candidate| candidate.delta);
+            candidates.truncate(EXACT_BOUNDARY_CANDIDATES);
+        }
+
+        let mut previous = Vec::new();
+        let mut shortlist = BoundaryShortlist::default();
+        let mut rng = 0x5b25_a65d_f197_20b3u64;
+        for iteration in 0..20_000 {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let delta = i64::try_from((rng >> 9) % 117).unwrap_or_default() - 90;
+            let distance = usize::try_from((rng >> 18) % 4_096).unwrap_or_default() + 1;
+            let shift = if (rng >> 49) & 1 == 0 {
+                BoundaryShift::Left(distance)
+            } else {
+                BoundaryShift::Right(distance)
+            };
+            reference_consider(&mut previous, delta, shift);
+            shortlist.consider(delta, shift);
+            assert_eq!(
+                shortlist.as_slice(),
+                previous.as_slice(),
+                "iteration={iteration}, delta={delta}, shift={shift:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_shift_supports_full_usize_positions_and_checks_lengths() {
+        let boundary = (isize::MAX as usize) + 16;
+        assert_eq!(
+            BoundaryShift::Right(7).boundary(boundary),
+            Some(boundary + 7)
+        );
+        assert_eq!(
+            BoundaryShift::Left(7).boundary(boundary),
+            Some(boundary - 7)
+        );
+        assert_eq!(BoundaryShift::Left(7).lengths(30, 40), Some((23, 47)));
+        assert_eq!(BoundaryShift::Right(7).lengths(30, 40), Some((37, 33)));
+        assert_eq!(BoundaryShift::Left(31).lengths(30, 40), None);
+        assert_eq!(BoundaryShift::Right(41).lengths(30, 40), None);
+        assert_eq!(BoundaryShift::Left(1).boundary(0), None);
+        assert_eq!(BoundaryShift::Right(1).boundary(usize::MAX), None);
+        assert!(BoundaryShift::Left(256).is_near(BoundaryShift::Left(257)));
+        assert!(!BoundaryShift::Left(256).is_near(BoundaryShift::Right(256)));
+        assert!(!BoundaryShift::Right(256).is_near(BoundaryShift::Right(512)));
+    }
+
+    #[test]
+    fn shortlisted_histograms_match_exact_mixed_token_repartitions() {
+        // Ranking is by frozen cost, not movement size or direction. Replaying
+        // both directions must preserve each nominee's original index while
+        // walking whole literal/match tokens with different DEFLATE codes.
+        let mut left_tokens = vec![ParseToken::Literal(b'a'); 512];
+        left_tokens.extend([
+            ParseToken::Match {
+                length: 7,
+                distance: 1,
+            },
+            ParseToken::Literal(b'c'),
+            ParseToken::Match {
+                length: 258,
+                distance: 32_768,
+            },
+            ParseToken::Literal(b'd'),
+        ]);
+        let mut right_tokens = vec![ParseToken::Literal(b'b'); 300];
+        right_tokens.extend([
+            ParseToken::Match {
+                length: 3,
+                distance: 12,
+            },
+            ParseToken::Literal(b'e'),
+            ParseToken::Match {
+                length: 258,
+                distance: 30_000,
+            },
+            ParseToken::Literal(b'f'),
+        ]);
         let left = PlannedBlock {
+            range: 0..779,
+            tokens: left_tokens,
+        };
+        let right = PlannedBlock {
+            range: 779..1342,
+            tokens: right_tokens,
+        };
+        assert_eq!(left.token_input_len(), left.range.len());
+        assert_eq!(right.token_input_len(), right.range.len());
+        let nominees = [
+            BoundaryCandidate {
+                delta: -50,
+                shift: BoundaryShift::Left(259),
+            },
+            BoundaryCandidate {
+                delta: -40,
+                shift: BoundaryShift::Right(303),
+            },
+            BoundaryCandidate {
+                delta: -30,
+                shift: BoundaryShift::Left(1),
+            },
+            BoundaryCandidate {
+                delta: -20,
+                shift: BoundaryShift::Right(300),
+            },
+        ];
+        let snapshots = shortlisted_shift_histograms(
+            &left,
+            &right,
+            &TokenHistogram::from_tokens(&left.tokens),
+            &TokenHistogram::from_tokens(&right.tokens),
+            &nominees,
+        );
+        assert!(snapshots.iter().all(Option::is_some));
+        for (nominee, (left_hist, right_hist)) in
+            nominees.into_iter().zip(snapshots.into_iter().flatten())
+        {
+            let mut moved_left = left.clone();
+            let mut moved_right = right.clone();
+            shift_tokens(&mut moved_left, &mut moved_right, nominee.shift);
+            assert_eq!(
+                left_hist,
+                TokenHistogram::from_tokens(&moved_left.tokens),
+                "{:?}",
+                nominee.shift
+            );
+            assert_eq!(
+                right_hist,
+                TokenHistogram::from_tokens(&moved_right.tokens),
+                "{:?}",
+                nominee.shift
+            );
+            assert_eq!(
+                moved_left.token_input_len() + moved_right.token_input_len(),
+                left.input_len() + right.input_len()
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_cost_boundary_shift_left_preserves_whole_tokens() {
+        let mut left_tokens = vec![ParseToken::Literal(b'a'); 5_500];
+        left_tokens.extend(core::iter::repeat_n(ParseToken::Literal(b'b'), 500));
+        let mut left = PlannedBlock {
+            range: 0..6_000,
+            tokens: left_tokens,
+        };
+        let mut right = PlannedBlock {
+            range: 6_000..12_000,
+            tokens: vec![ParseToken::Literal(b'b'); 6_000],
+        };
+        let mut left_costs = TokenCosts::fixed();
+        let mut right_costs = TokenCosts::fixed();
+        left_costs.literal[usize::from(b'a')] = COST_SCALE;
+        left_costs.literal[usize::from(b'b')] = 8 * COST_SCALE;
+        right_costs.literal[usize::from(b'a')] = 8 * COST_SCALE;
+        right_costs.literal[usize::from(b'b')] = COST_SCALE;
+        let left_histogram = TokenHistogram::from_tokens(&left.tokens);
+        let right_histogram = TokenHistogram::from_tokens(&right.tokens);
+        let shifts = fixed_cost_shift_candidates(&left, &right, &left_costs, &right_costs);
+        let snapshots = shortlisted_shift_histograms(
+            &left,
+            &right,
+            &left_histogram,
+            &right_histogram,
+            shifts.as_slice(),
+        );
+        let snapshot = &snapshots[0];
+        assert_eq!(shifts.as_slice()[0].shift, BoundaryShift::Left(500));
+        shift_tokens(&mut left, &mut right, shifts.as_slice()[0].shift);
+        let new_left = &left.tokens;
+        let new_right = &right.tokens;
+        assert_eq!(new_left.len(), 5_500);
+        assert_eq!(new_right.len(), 6_500);
+        assert_eq!(
+            snapshot.as_ref().map(|(left, _)| left),
+            Some(&TokenHistogram::from_tokens(new_left))
+        );
+        assert_eq!(
+            snapshot.as_ref().map(|(_, right)| right),
+            Some(&TokenHistogram::from_tokens(new_right))
+        );
+        assert!(new_right[..500]
+            .iter()
+            .all(|token| *token == ParseToken::Literal(b'b')));
+    }
+
+    #[test]
+    fn fixed_cost_boundary_shift_moves_whole_tokens_and_conserves_input() {
+        let mut left = PlannedBlock {
             range: 0..6_000,
             tokens: vec![ParseToken::Literal(b'a'); 6_000],
         };
         let mut right_tokens = vec![ParseToken::Literal(b'a'); 500];
         right_tokens.extend(core::iter::repeat_n(ParseToken::Literal(b'b'), 5_500));
-        let right = PlannedBlock {
+        let mut right = PlannedBlock {
             range: 6_000..12_000,
             tokens: right_tokens,
         };
@@ -2390,24 +3267,27 @@ mod boundary_tests {
 
         let left_histogram = TokenHistogram::from_tokens(&left.tokens);
         let right_histogram = TokenHistogram::from_tokens(&right.tokens);
-        let shifts = fixed_cost_shift_candidates(
+        let shifts = fixed_cost_shift_candidates(&left, &right, &left_costs, &right_costs);
+        let snapshots = shortlisted_shift_histograms(
             &left,
             &right,
-            left_costs,
-            right_costs,
             &left_histogram,
             &right_histogram,
+            shifts.as_slice(),
         );
-        assert_eq!(shifts[0].shift, 500);
-        let shift = shifts[0].shift;
-        let (shifted_left, shifted_right) = shifted_tokens(&left, &right, shift);
+        let snapshot = &snapshots[0];
+        assert_eq!(shifts.as_slice()[0].shift, BoundaryShift::Right(500));
+        let shift = shifts.as_slice()[0].shift;
+        shift_tokens(&mut left, &mut right, shift);
+        let shifted_left = &left.tokens;
+        let shifted_right = &right.tokens;
         assert_eq!(
-            shifts[0].left_histogram,
-            TokenHistogram::from_tokens(&shifted_left)
+            snapshot.as_ref().map(|(left, _)| left),
+            Some(&TokenHistogram::from_tokens(shifted_left))
         );
         assert_eq!(
-            shifts[0].right_histogram,
-            TokenHistogram::from_tokens(&shifted_right)
+            snapshot.as_ref().map(|(_, right)| right),
+            Some(&TokenHistogram::from_tokens(shifted_right))
         );
         assert_eq!(shifted_left.len(), 6_500);
         assert_eq!(shifted_right.len(), 5_500);
@@ -2481,15 +3361,19 @@ mod encoded_tests {
         let input = super::tests::two_distribution_input()[..8_000].to_vec();
         assert_eq!(choose_block_ranges(&input, 32_506), [0..input.len()]);
 
-        let mut one_buffer = vec![0u8; compress_bound(input.len())];
-        let (one, one_code) = super::super::compress_slice_near_optimal(&mut one_buffer, &input, 1);
-        assert_eq!(one_code, ReturnCode::Ok);
-        let one_len = one.len();
-
-        let mut two_buffer = vec![0u8; compress_bound(input.len())];
-        let (two, two_code) = super::super::compress_slice_near_optimal(&mut two_buffer, &input, 2);
-        assert_eq!(two_code, ReturnCode::Ok);
-        assert!(two.len() <= one_len, "{} > {one_len}", two.len());
+        let mut previous_len = usize::MAX;
+        for passes in 1..=4 {
+            let mut buffer = vec![0u8; compress_bound(input.len())];
+            let (encoded, code) =
+                super::super::compress_slice_near_optimal(&mut buffer, &input, passes);
+            assert_eq!(code, ReturnCode::Ok);
+            assert!(
+                encoded.len() <= previous_len,
+                "pass count {passes}: {} > {previous_len}",
+                encoded.len(),
+            );
+            previous_len = encoded.len();
+        }
     }
 
     #[test]
@@ -2516,6 +3400,7 @@ mod encoded_tests {
         );
 
         assert_round_trip(&input, 1);
+        assert_round_trip(&input, 3);
     }
 
     #[test]
@@ -2526,7 +3411,7 @@ mod encoded_tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            *byte = (state >> 32) as u8;
+            *byte = state.to_le_bytes()[4];
         }
         let repeated = input[..STD_MAX_MATCH].to_vec();
         input.extend_from_slice(&repeated);
@@ -2538,7 +3423,7 @@ mod encoded_tests {
     fn every_tiny_input_length_round_trips() {
         for len in 0..=STD_MAX_MATCH + 1 {
             let input = (0..len)
-                .map(|index| ((index.wrapping_mul(73) ^ (index >> 3)) & 0xff) as u8)
+                .map(|index| (index.wrapping_mul(73) ^ (index >> 3)).to_le_bytes()[0])
                 .collect::<Vec<_>>();
             assert_round_trip(&input, 0);
         }

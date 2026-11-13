@@ -17,22 +17,42 @@ struct SearchCursor {
 }
 
 impl SearchCursor {
-    fn candidate_start(self) -> Option<usize> {
-        usize::from(self.hash_pos).checked_sub(self.offset)
+    // Hash-chain positions have an exact 16-bit representation. Retaining
+    // that representation makes it impossible for a search to return a start
+    // that cannot be stored in the DEFLATE state.
+    fn candidate_start(self) -> Option<Pos> {
+        self.hash_pos.checked_sub(Pos::try_from(self.offset).ok()?)
     }
 }
 
 /// Which chain-walking heuristic to use for one immutable match search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchSearchKind {
+pub enum MatchSearchKind {
     Standard,
     Slow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchSearchResult {
-    pub(crate) length: usize,
+pub struct MatchSearchResult {
+    /// Length in the DEFLATE domain (0..=258), not the width of the host pointer.
+    pub(crate) length: u16,
     pub(crate) start: Pos,
+}
+
+impl MatchSearchResult {
+    /// Encode a backend result into the format's bounded match-length domain.
+    ///
+    /// A search backend may use host-width indexes or wider device counters,
+    /// but an individual DEFLATE match can cover at most 258 bytes. Truncating
+    /// the *search* to that prefix is valid; truncating its integer bits is not.
+    #[inline]
+    pub(crate) fn new(length: usize, start: Pos) -> Self {
+        const _: () = assert!(STD_MAX_MATCH <= u16::MAX as usize);
+        let bounded = length.min(STD_MAX_MATCH);
+        // Conversion cannot fail because STD_MAX_MATCH is at most u16::MAX.
+        let length = u16::try_from(bounded).unwrap_or(u16::MAX);
+        Self { length, start }
+    }
 }
 
 /// Owned scheduler token for one longest-match computation.
@@ -40,7 +60,7 @@ pub(crate) struct MatchSearchResult {
 /// It carries no stream borrow. The scheduler may queue this token while the producer is paused,
 /// then materialize an immutable request from that stream's State when the search is dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchSearchWork {
+pub enum MatchSearchWork {
     HashChain {
         cur_match: Pos,
         kind: MatchSearchKind,
@@ -48,22 +68,52 @@ pub(crate) enum MatchSearchWork {
     External,
 }
 
+/// An invalid detached match-search request, producer phase, or completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchSearchError {
+    /// An external/device match request cannot be run by the hash-chain backend.
+    ExternalWork,
+    /// Hash-chain work was routed to an external/device-only match backend.
+    #[cfg(feature = "gpu")]
+    WrongBackend,
+    /// The initialized window end cannot be represented in host index space.
+    WindowPositionOverflow,
+    /// The advertised lookahead includes bytes not initialized in the window.
+    UninitializedWindow,
+    /// The advertised history index cannot be represented by the allocated table.
+    InvalidHashHistory,
+    /// A token producer was asked to advance before its prior search completed.
+    OutstandingSearch,
+    /// A match result was delivered without a pending request.
+    UnexpectedMatchResult,
+    /// Test harness: the scheduler resumed a finalized segment as open-ended.
+    #[cfg(test)]
+    InvalidSegmentMode,
+    /// Test harness: a compressor supplied a level outside the valid 0..=9 range.
+    #[cfg(test)]
+    InvalidCompressionLevel,
+}
+
 impl MatchSearchWork {
-    pub(crate) fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
+    pub(crate) const fn new(cur_match: Pos, kind: MatchSearchKind) -> Self {
         Self::HashChain { cur_match, kind }
     }
 
-    pub(crate) fn external() -> Self {
+    pub(crate) const fn external() -> Self {
         Self::External
     }
 
-    pub(crate) fn is_external(self) -> bool {
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) const fn is_external(self) -> bool {
         matches!(self, Self::External)
     }
 
-    pub(crate) fn request<'a>(self, state: &'a State<'_>) -> MatchSearchRequest<'a> {
+    pub(crate) fn request<'a>(
+        self,
+        state: &'a State<'_>,
+    ) -> Result<MatchSearchRequest<'a>, MatchSearchError> {
         let Self::HashChain { cur_match, kind } = self else {
-            panic!("external match work cannot materialize a hash-chain request");
+            return Err(MatchSearchError::ExternalWork);
         };
         MatchSearchRequest::from_state(state, cur_match, kind)
     }
@@ -76,7 +126,7 @@ impl MatchSearchWork {
 /// expensive search a detachable unit for future scoped CPU batches or device submission.
 /// Borrowed immutable storage shared by one or more match-search descriptions.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MatchSearchResources<'a> {
+pub struct MatchSearchResources<'a> {
     initialized: &'a [u8],
     prev: &'a [Pos],
     head: &'a [Pos],
@@ -87,7 +137,7 @@ pub(crate) struct MatchSearchResources<'a> {
 /// Keep these in their native host types for now. A future device backend can define a checked
 /// packed representation at its own boundary instead of silently narrowing compressor indexes here.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MatchSearchParams {
+pub struct MatchSearchParams {
     cur_match: Pos,
     strstart: usize,
     lookahead: usize,
@@ -104,14 +154,14 @@ pub(crate) struct MatchSearchParams {
 }
 
 #[derive(Debug)]
-pub(crate) struct MatchSearchRequest<'a> {
+pub struct MatchSearchRequest<'a> {
     resources: MatchSearchResources<'a>,
     params: MatchSearchParams,
 }
 
 impl MatchSearchParams {
-    #[inline(always)]
-    fn update_hash(self, hash: u32, value: u32) -> u32 {
+    #[inline]
+    const fn update_hash(self, hash: u32, value: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(hash, value),
             HashCalcVariant::Roll => RollHashCalc::update_hash(hash, value),
@@ -120,22 +170,31 @@ impl MatchSearchParams {
 }
 
 impl<'a> MatchSearchRequest<'a> {
-    pub(crate) fn from_state(state: &'a State<'_>, cur_match: Pos, kind: MatchSearchKind) -> Self {
+    pub(crate) fn from_state(
+        state: &'a State<'_>,
+        cur_match: Pos,
+        kind: MatchSearchKind,
+    ) -> Result<Self, MatchSearchError> {
         let initialized_end = state
             .strstart
             .checked_add(state.lookahead)
-            .expect("deflate window position overflow");
+            .ok_or(MatchSearchError::WindowPositionOverflow)?;
         let initialized = state
             .window
             .filled()
             .get(..initialized_end)
-            .expect("lookahead extends beyond the deflate window");
+            .ok_or(MatchSearchError::UninitializedWindow)?;
         let wmask = state.w_mask();
+        let prev = state
+            .prev
+            .as_slice()
+            .get(..=wmask)
+            .ok_or(MatchSearchError::InvalidHashHistory)?;
 
-        Self {
+        Ok(Self {
             resources: MatchSearchResources {
                 initialized,
-                prev: &state.prev.as_slice()[..=wmask],
+                prev,
                 head: state.head.as_slice(),
             },
             params: MatchSearchParams {
@@ -153,7 +212,7 @@ impl<'a> MatchSearchRequest<'a> {
                 hash_calc_variant: state.hash_calc_variant,
                 kind,
             },
-        }
+        })
     }
 
     #[inline]
@@ -186,7 +245,7 @@ fn execute_slow(
 /// Backends may parallelize or offload execution, but must preserve request/result indexing and may
 /// not mutate compressor state. Request lifetimes bound any borrowed window/hash snapshot to the
 /// dispatch scope.
-pub(crate) trait MatchSearchBackend {
+pub trait MatchSearchBackend {
     fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]);
 }
 
@@ -207,7 +266,7 @@ pub(super) struct ScopedThreadMatchSearchBackend {
 
 #[cfg(feature = "std")]
 impl ScopedThreadMatchSearchBackend {
-    pub(super) fn new(workers: usize) -> Self {
+    pub(super) const fn new(workers: usize) -> Self {
         Self { workers }
     }
 }
@@ -226,20 +285,50 @@ impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
         }
 
         let chunk_len = requests.len().div_ceil(workers);
+        // Keep ownership of each mutable result chunk in a recoverable slot.
+        // If thread creation is unsupported or the OS refuses another thread,
+        // run the affected and remaining jobs synchronously. Scoped threads
+        // must finish before these borrowed slices leave the scope.
+        let jobs = requests
+            .chunks(chunk_len)
+            .zip(results.chunks_mut(chunk_len))
+            .map(|job| std::sync::Mutex::new(Some(job)))
+            .collect::<std::vec::Vec<_>>();
         std::thread::scope(|scope| {
-            for (request_chunk, result_chunk) in requests
-                .chunks(chunk_len)
-                .zip(results.chunks_mut(chunk_len))
-            {
-                scope.spawn(move || {
-                    ScalarMatchSearchBackend.execute(request_chunk, result_chunk);
-                });
+            let mut can_spawn = true;
+            for job in &jobs {
+                if can_spawn {
+                    let result = std::thread::Builder::new().spawn_scoped(scope, move || {
+                        let Some((requests, results)) = job
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        else {
+                            return;
+                        };
+                        ScalarMatchSearchBackend.execute(requests, results);
+                    });
+                    if result.is_ok() {
+                        continue;
+                    }
+                    can_spawn = false;
+                }
+
+                // This job was never started, so its mutable results remain
+                // exclusively owned by the main scope. Preserve input order.
+                let pending = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((requests, results)) = pending {
+                    ScalarMatchSearchBackend.execute(requests, results);
+                }
             }
         });
     }
 }
 
-pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
+pub fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
     backend: &B,
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
@@ -256,7 +345,7 @@ pub(crate) fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?S
 ///
 /// The default remains allocation-free and synchronous. Backend choice is deliberately outside the
 /// token producers so later CPU/device executors do not contaminate compression semantics.
-pub(crate) fn execute_match_search_batch(
+pub fn execute_match_search_batch(
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
 ) {
@@ -280,10 +369,7 @@ fn longest_match_help<const SLOW: bool>(
     // A previous lazy match can be longer than the input remaining at end of
     // stream. There is then no candidate that can improve it.
     if best_len >= params.lookahead {
-        return MatchSearchResult {
-            length: params.lookahead,
-            start: match_start,
-        };
+        return MatchSearchResult::new(params.lookahead, match_start);
     }
 
     let mut chain_remaining = params.max_chain_length;
@@ -309,10 +395,8 @@ fn longest_match_help<const SLOW: bool>(
 
     let early_exit = !SLOW && params.level < EARLY_EXIT_TRIGGER_LEVEL;
 
-    loop {
-        let Some(candidate_start) = cursor.candidate_start() else {
-            break;
-        };
+    while let Some(candidate_pos) = cursor.candidate_start() {
+        let candidate_start = usize::from(candidate_pos);
         if candidate_start >= params.strstart {
             break;
         }
@@ -346,21 +430,15 @@ fn longest_match_help<const SLOW: bool>(
         };
 
         if len > best_len {
-            match_start = candidate_start as Pos;
+            match_start = candidate_pos;
 
             if len >= params.lookahead {
-                return MatchSearchResult {
-                    length: params.lookahead,
-                    start: match_start,
-                };
+                return MatchSearchResult::new(params.lookahead, match_start);
             }
 
             best_len = len;
             if best_len >= usize::from(params.nice_match) {
-                return MatchSearchResult {
-                    length: best_len,
-                    start: match_start,
-                };
+                return MatchSearchResult::new(best_len, match_start);
             }
 
             if SLOW && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
@@ -368,7 +446,7 @@ fn longest_match_help<const SLOW: bool>(
                     resources,
                     params,
                     scan,
-                    candidate_start,
+                    candidate_pos,
                     len,
                     limit_base,
                     params.wmask,
@@ -394,10 +472,7 @@ fn longest_match_help<const SLOW: bool>(
         cursor = next;
     }
 
-    MatchSearchResult {
-        length: best_len,
-        start: match_start,
-    }
+    MatchSearchResult::new(best_len, match_start)
 }
 
 fn initial_slow_cursor(
@@ -434,16 +509,17 @@ fn next_slow_cursor(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
     scan: &[u8],
-    candidate_start: usize,
+    candidate_start: Pos,
     match_len: usize,
     limit_base: usize,
     wmask: usize,
 ) -> Option<SearchCursor> {
     let prev = resources.prev;
     let mut next = SearchCursor {
-        hash_pos: candidate_start as Pos,
+        hash_pos: candidate_start,
         offset: 0,
     };
+    let candidate_start = usize::from(candidate_start);
 
     for offset in 0..=match_len - STD_MIN_MATCH {
         let hash_pos = prev[(candidate_start + offset) & wmask];
@@ -500,7 +576,7 @@ enum CandidateProbe {
     CompareFrom(usize),
 }
 
-#[inline(always)]
+#[inline]
 fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateProbe {
     debug_assert_eq!(scan.len(), candidate.len());
     debug_assert!(best_len < scan.len());
@@ -542,13 +618,11 @@ fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateP
     CandidateProbe::CompareFrom(8)
 }
 
-#[inline(always)]
+#[inline]
 fn load_u64_le(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("candidate probe requires eight initialized bytes"),
-    )
+    // Callers have already established eight initialized bytes from offset.
+    // An array chunk retains that precondition without a fallible conversion.
+    u64::from_le_bytes(bytes[offset..].as_chunks::<8>().0[0])
 }
 
 #[inline]
@@ -563,15 +637,95 @@ fn break_matching(
     best_len: usize,
     match_start: Pos,
 ) -> MatchSearchResult {
-    MatchSearchResult {
-        length: best_len.min(params.lookahead),
-        start: match_start,
-    }
+    MatchSearchResult::new(best_len.min(params.lookahead), match_start)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_request<'a>(
+        initialized: &'a [u8],
+        prev: &'a [Pos],
+        head: &'a [Pos],
+    ) -> MatchSearchRequest<'a> {
+        MatchSearchRequest {
+            resources: MatchSearchResources {
+                initialized,
+                prev,
+                head,
+            },
+            params: MatchSearchParams {
+                cur_match: 0,
+                strstart: 16,
+                lookahead: 16,
+                wmask: 31,
+                max_dist: 16,
+                prev_length: 0,
+                match_start: 0,
+                max_chain_length: 1,
+                good_match: 4,
+                nice_match: 16,
+                level: 6,
+                hash_calc_variant: HashCalcVariant::Standard,
+                kind: MatchSearchKind::Standard,
+            },
+        }
+    }
+
+    #[test]
+    fn external_work_has_an_explicit_request_error() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let stream = DeflateStream::new(DeflateConfig::new(6))?;
+        assert!(matches!(
+            MatchSearchWork::external().request(&stream.state),
+            Err(MatchSearchError::ExternalWork)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_window_snapshots_are_rejected_before_search() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let state = &mut *stream.state;
+        let work = MatchSearchWork::new(1, MatchSearchKind::Standard);
+        state.strstart = 1;
+        state.lookahead = usize::MAX;
+        assert!(matches!(
+            work.request(state),
+            Err(MatchSearchError::WindowPositionOverflow)
+        ));
+        state.lookahead = 2;
+        assert!(matches!(
+            work.request(state),
+            Err(MatchSearchError::UninitializedWindow)
+        ));
+        state.strstart = 0;
+        state.lookahead = 0;
+        let window_size = state.w_size;
+        state.w_size = state.prev.as_slice().len() + 1;
+        assert!(matches!(
+            work.request(state),
+            Err(MatchSearchError::InvalidHashHistory)
+        ));
+        state.w_size = window_size;
+        Ok(())
+    }
+
+    #[test]
+    fn search_result_length_uses_deflate_domain_even_for_wide_backend_counters() {
+        for length in [0, 1, 3, STD_MAX_MATCH] {
+            let result = MatchSearchResult::new(length, 19);
+            assert_eq!(usize::from(result.length), length);
+            assert_eq!(result.start, 19);
+        }
+        for length in [STD_MAX_MATCH + 1, usize::from(u16::MAX), usize::MAX] {
+            let result = MatchSearchResult::new(length, 19);
+            assert_eq!(usize::from(result.length), STD_MAX_MATCH);
+            assert_eq!(result.start, 19);
+        }
+    }
 
     #[test]
     fn requests_are_worker_safe_and_batchable() {
@@ -584,38 +738,9 @@ mod tests {
         let prev = [0u16; 32];
         let head = [0u16; 1];
 
-        fn request<'a>(
-            initialized: &'a [u8],
-            prev: &'a [Pos],
-            head: &'a [Pos],
-        ) -> MatchSearchRequest<'a> {
-            MatchSearchRequest {
-                resources: MatchSearchResources {
-                    initialized,
-                    prev,
-                    head,
-                },
-                params: MatchSearchParams {
-                    cur_match: 0,
-                    strstart: 16,
-                    lookahead: 16,
-                    wmask: 31,
-                    max_dist: 16,
-                    prev_length: 0,
-                    match_start: 0,
-                    max_chain_length: 1,
-                    good_match: 4,
-                    nice_match: 16,
-                    level: 6,
-                    hash_calc_variant: HashCalcVariant::Standard,
-                    kind: MatchSearchKind::Standard,
-                },
-            }
-        }
-
         let requests = [
-            request(&initialized_a, &prev, &head),
-            request(&initialized_b, &prev, &head),
+            test_request(&initialized_a, &prev, &head),
+            test_request(&initialized_b, &prev, &head),
         ];
         // Independent requests can coexist and execute as one batch without borrowing mutable
         // compressor state.
@@ -650,6 +775,45 @@ mod tests {
                 start: 0
             }
         );
+    }
+
+    #[test]
+    fn search_cursor_rejects_offsets_beyond_the_16_bit_position_domain() {
+        let maximum = usize::from(Pos::MAX);
+        assert_eq!(
+            SearchCursor {
+                hash_pos: Pos::MAX,
+                offset: 0,
+            }
+            .candidate_start(),
+            Some(Pos::MAX)
+        );
+        assert_eq!(
+            SearchCursor {
+                hash_pos: Pos::MAX,
+                offset: maximum,
+            }
+            .candidate_start(),
+            Some(0)
+        );
+        assert_eq!(
+            SearchCursor {
+                hash_pos: Pos::MAX,
+                offset: maximum + 1,
+            }
+            .candidate_start(),
+            None
+        );
+    }
+
+    #[test]
+    fn word_probe_reads_exactly_the_initialized_eight_byte_array() {
+        let bytes = *b"0123456789abcdef";
+        assert_eq!(
+            load_u64_le(&bytes[..8], 0),
+            u64::from_le_bytes(*b"01234567")
+        );
+        assert_eq!(load_u64_le(&bytes, 8), u64::from_le_bytes(*b"89abcdef"));
     }
 
     #[test]

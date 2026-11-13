@@ -6,7 +6,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 publish.workspace = true
 
 [lints.rust]
@@ -66,4 +65,4 @@ required-features = ["gpu"]
 
 [[example]]
 name = "near_optimal_probe"
-required-features = ["__internal-api"]
+required-features = ["__internal-api", "rust-allocator"]

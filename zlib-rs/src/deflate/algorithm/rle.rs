@@ -19,7 +19,7 @@ impl TokenProducer for RleProducer {
                 let max_len = state.lookahead.min(STD_MAX_MATCH);
                 let scan = &state.window.filled()[state.strstart - 1..state.strstart + max_len];
                 if scan[0] == scan[1] && scan[1] == scan[2] {
-                    match_len = repeated_prefix_len(scan[0], &scan[3..max_len + 1]) + 2;
+                    match_len = repeated_prefix_len(scan[0], &scan[3..=max_len]) + 2;
                 }
                 assert!(
                     state.strstart - 1 + match_len < state.window_size,

@@ -52,11 +52,140 @@ struct Input {
 }
 
 fuzz_target!(|input: Input| {
-    let ng = compress_gz_ng(&input);
-    let rs = compress_gz_rs(&input);
+    let reference = compress_gz_ng(&input);
+    let candidate = compress_gz_rs(&input);
 
-    assert_eq!(ng, rs)
+    match (reference, candidate) {
+        (None, None) => {}
+        // Preserve the original byte-parity fast path: only independently
+        // decode streams when their otherwise-valid encodings actually differ.
+        (Some(reference), Some(candidate)) if reference == candidate => {}
+        (Some(reference), Some(candidate)) => {
+            // DEFLATE permits different, equally valid block boundaries and
+            // encodings for the same input. Gzip metadata and the integrity
+            // trailer must agree exactly; independently inflate *both*
+            // complete streams to verify the actual compression contract.
+            assert_eq!(
+                gzip_header(&reference),
+                gzip_header(&candidate),
+                "gzip metadata differs"
+            );
+            assert_eq!(
+                reference.get(reference.len().saturating_sub(8)..),
+                candidate.get(candidate.len().saturating_sub(8)..),
+                "gzip integrity trailer differs"
+            );
+            assert!(
+                reference.len() >= 18 && candidate.len() >= 18,
+                "incomplete gzip output"
+            );
+            assert!(
+                decompress_with_zlib_ng(&reference, &input.source),
+                "reference gzip output is not a complete stream"
+            );
+            assert!(
+                decompress_with_zlib_ng(&candidate, &input.source),
+                "Rust gzip output does not recover the input"
+            );
+        }
+        (reference, candidate) => {
+            panic!(
+                "gzip initialization/status disagreement: reference={reference:?}, Rust={candidate:?}"
+            );
+        }
+    }
 });
+
+/// Extract the complete gzip header, including optional fields and FHCRC.
+/// An incomplete/malformed header must never compare equal by accident.
+fn gzip_header(gzip: &[u8]) -> Option<&[u8]> {
+    if gzip.len() < 18 || gzip.get(..3)? != [0x1f, 0x8b, 8] {
+        return None;
+    }
+    let flags = gzip[3];
+    if flags & 0xe0 != 0 {
+        return None;
+    }
+    let mut end = 10usize;
+    if flags & 0x04 != 0 {
+        let length = u16::from_le_bytes([*gzip.get(end)?, *gzip.get(end + 1)?]);
+        end = end.checked_add(2 + usize::from(length))?;
+        gzip.get(..end)?;
+    }
+    for flag in [0x08, 0x10] {
+        if flags & flag != 0 {
+            let zero = gzip.get(end..)?.iter().position(|&byte| byte == 0)?;
+            end = end.checked_add(zero + 1)?;
+        }
+    }
+    if flags & 0x02 != 0 {
+        end = end.checked_add(2)?;
+    }
+    // At least the eight-byte trailer must remain beyond the header.
+    (gzip.len().checked_sub(end)? >= 8).then(|| &gzip[..end])
+}
+
+/// Reference-library validation of the entire stream, including gzip's
+/// CRC32 and uncompressed size; excess input is not a successful result.
+fn decompress_with_zlib_ng(gzip: &[u8], expected: &[u8]) -> bool {
+    use libz_ng_sys::*;
+
+    let mut stream = MaybeUninit::<z_stream>::zeroed();
+    // SAFETY: the z_stream buffer has the ABI-prescribed layout and size.
+    let init = unsafe {
+        inflateInit2_(
+            stream.as_mut_ptr(),
+            31, // gzip wrapper, 32 KiB LZ77 window
+            zlibVersion(),
+            size_of::<z_stream>() as c_int,
+        )
+    };
+    if init != Z_OK {
+        return false;
+    }
+    // SAFETY: successful inflateInit2_ initialized the stream.
+    let stream = unsafe { stream.assume_init_mut() };
+    let mut decoded = [0u8; 32 * 1024];
+    let mut input_offset = 0usize;
+    let mut output_offset = 0usize;
+    let valid = loop {
+        if stream.avail_in == 0 && input_offset < gzip.len() {
+            let pending = &gzip[input_offset..];
+            let amount = pending.len().min(decoded.len());
+            stream.next_in = pending.as_ptr().cast_mut();
+            stream.avail_in = amount as c_uint;
+            input_offset += amount;
+        }
+        let before_avail_in = stream.avail_in;
+        stream.next_out = decoded.as_mut_ptr();
+        stream.avail_out = decoded.len() as c_uint;
+
+        // SAFETY: pending compressed bytes and the bounded writable scratch
+        // buffer remain alive for the entire inflate call.
+        let result = unsafe { inflate(stream, Z_NO_FLUSH) };
+        let produced = decoded.len() - stream.avail_out as usize;
+        let Some(end) = output_offset.checked_add(produced) else {
+            break false;
+        };
+        if expected.get(output_offset..end) != Some(&decoded[..produced]) {
+            break false;
+        }
+        output_offset = end;
+        if result == Z_STREAM_END {
+            // Require the complete original input, valid CRC and ISIZE (zlib-ng
+            // checks them), and no silently ignored trailing compressed bytes.
+            break output_offset == expected.len()
+                && stream.avail_in == 0
+                && input_offset == gzip.len();
+        }
+        if result != Z_OK || (before_avail_in == stream.avail_in && produced == 0) {
+            break false;
+        }
+    };
+    // SAFETY: successful inflateInit2_ owns the current inflate state.
+    let ended = unsafe { inflateEnd(stream) };
+    valid && ended == Z_OK
+}
 
 fn compress_gz_rs(input: &Input) -> Option<Vec<u8>> {
     use libz_rs_sys::*;

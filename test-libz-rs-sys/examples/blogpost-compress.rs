@@ -50,7 +50,7 @@ fn compress_rs(
     use libz_rs_sys::{deflate, deflateEnd, deflateInit2_, z_stream, zlibVersion};
 
     let mut stream = z_stream {
-        next_in: source.as_ptr() as *mut u8,
+        next_in: source.as_ptr().cast_mut(),
         avail_in: 0, // for special logic in the first  iteration
         total_in: 0,
         next_out: dest.as_mut_ptr(),
@@ -67,7 +67,7 @@ fn compress_rs(
     };
 
     let err = {
-        let strm: *mut z_stream = &mut stream;
+        let strm: *mut z_stream = &raw mut stream;
         unsafe {
             deflateInit2_(
                 strm,
@@ -108,7 +108,7 @@ fn compress_rs(
             DeflateFlush::Finish
         };
 
-        let err = unsafe { deflate(&mut stream, flush as i32) };
+        let err = unsafe { deflate(&raw mut stream, flush as i32) };
         if ReturnCode::from(err) != ReturnCode::Ok {
             break;
         }
@@ -116,7 +116,7 @@ fn compress_rs(
 
     *dest_len = stream.total_out as _;
 
-    unsafe { deflateEnd(&mut stream) };
+    unsafe { deflateEnd(&raw mut stream) };
 
     ReturnCode::Ok
 }
@@ -131,7 +131,7 @@ fn compress_ng(
     use libz_ng_sys::{deflate, deflateEnd, deflateInit2_, z_stream, zlibVersion};
 
     let mut stream = z_stream {
-        next_in: source.as_ptr() as *mut u8,
+        next_in: source.as_ptr().cast_mut(),
         avail_in: 0, // for special logic in the first  iteration
         total_in: 0,
         next_out: dest.as_mut_ptr(),
@@ -148,7 +148,7 @@ fn compress_ng(
     };
 
     let err = {
-        let strm: *mut z_stream = &mut stream;
+        let strm: *mut z_stream = &raw mut stream;
         unsafe {
             deflateInit2_(
                 strm,
@@ -189,7 +189,7 @@ fn compress_ng(
             DeflateFlush::Finish
         };
 
-        let err = unsafe { deflate(&mut stream, flush as i32) };
+        let err = unsafe { deflate(&raw mut stream, flush as i32) };
         if ReturnCode::from(err) != ReturnCode::Ok {
             break;
         }
@@ -197,7 +197,7 @@ fn compress_ng(
 
     *dest_len = stream.total_out as _;
 
-    unsafe { deflateEnd(&mut stream) };
+    unsafe { deflateEnd(&raw mut stream) };
 
     ReturnCode::Ok
 }

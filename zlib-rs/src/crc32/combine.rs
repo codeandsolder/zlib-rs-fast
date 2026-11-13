@@ -1,29 +1,67 @@
 use super::braid::CRC32_LSB_POLY;
 
+#[must_use]
 pub const fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     crc32_combine_op(crc1, crc2, crc32_combine_gen(len2))
 }
 
-#[inline(always)]
+#[must_use]
+#[inline]
 pub const fn crc32_combine_gen(len2: u64) -> u32 {
     x2nmodp(len2, 3)
 }
 
-#[inline(always)]
+#[must_use]
+#[inline]
 pub const fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
     multmodp(op, crc1) ^ crc2
 }
 
 const X2N_TABLE: [u32; 32] = [
-    0x40000000, 0x20000000, 0x08000000, 0x00800000, 0x00008000, 0xedb88320, 0xb1e6b092, 0xa06a2517,
-    0xed627dae, 0x88d14467, 0xd7bbfe6a, 0xec447f11, 0x8e7ea170, 0x6427800e, 0x4d47bae0, 0x09fe548f,
-    0x83852d0f, 0x30362f1a, 0x7b5a9cc3, 0x31fec169, 0x9fec022a, 0x6c8dedc4, 0x15d6874d, 0x5fde7a4e,
-    0xbad90e37, 0x2e4e5eef, 0x4eaba214, 0xa8a472c0, 0x429a969e, 0x148d302a, 0xc40ba6d0, 0xc4e22c3c,
+    0x4000_0000,
+    0x2000_0000,
+    0x0800_0000,
+    0x0080_0000,
+    0x0000_8000,
+    0xedb8_8320,
+    0xb1e6_b092,
+    0xa06a_2517,
+    0xed62_7dae,
+    0x88d1_4467,
+    0xd7bb_fe6a,
+    0xec44_7f11,
+    0x8e7e_a170,
+    0x6427_800e,
+    0x4d47_bae0,
+    0x09fe_548f,
+    0x8385_2d0f,
+    0x3036_2f1a,
+    0x7b5a_9cc3,
+    0x31fe_c169,
+    0x9fec_022a,
+    0x6c8d_edc4,
+    0x15d6_874d,
+    0x5fde_7a4e,
+    0xbad9_0e37,
+    0x2e4e_5eef,
+    0x4eab_a214,
+    0xa8a4_72c0,
+    0x429a_969e,
+    0x148d_302a,
+    0xc40b_a6d0,
+    0xc4e2_2c3c,
 ];
 
 // Return a(x) multiplied by b(x) modulo p(x), where p(x) is the CRC polynomial,
-// reflected. For speed, this requires that a not be zero.
-pub(crate) const fn multmodp(a: u32, mut b: u32) -> u32 {
+// reflected. The normal nonzero path exits immediately after the last set bit.
+pub const fn multmodp(a: u32, mut b: u32) -> u32 {
+    // A zero polynomial has no contribution. Without this guard the bit scan
+    // shifts its mask down to zero and loops forever, even through the public
+    // crc32_combine_op() entry point when its operator argument is zero.
+    if a == 0 {
+        return 0;
+    }
+
     let mut m = 1 << 31;
     let mut p = 0;
 
@@ -36,7 +74,7 @@ pub(crate) const fn multmodp(a: u32, mut b: u32) -> u32 {
         }
         m >>= 1;
         b = if (b & 1) != 0 {
-            (b >> 1) ^ CRC32_LSB_POLY as u32
+            (b >> 1) ^ CRC32_LSB_POLY
         } else {
             b >> 1
         };
@@ -46,7 +84,7 @@ pub(crate) const fn multmodp(a: u32, mut b: u32) -> u32 {
 }
 
 // Return x^(n * 2^k) modulo p(x).
-pub(crate) const fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
+pub const fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
     let mut p: u32 = 1 << 31; /* x^0 == 1 */
 
     while n > 0 {
@@ -68,14 +106,14 @@ mod test {
 
     #[test]
     fn test_crc32_combine() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
-
-        fn test(data: Vec<u8>) -> bool {
+        // QuickCheck owns the generated Vec. The capture-free property uses
+        // only borrowed views, without a separate pass-by-value function.
+        let property: fn(Vec<u8>) -> bool = |data| {
             let Some(buf_len) = data.first().copied() else {
                 return true;
             };
 
-            let buf_size = Ord::max(buf_len, 1) as usize;
+            let buf_size = usize::from(Ord::max(buf_len, 1));
 
             let crc0 = 0;
             let mut crc1 = crc0;
@@ -110,6 +148,15 @@ mod test {
             assert_eq!(combine1, combine2);
 
             true
+        };
+        ::quickcheck::quickcheck(property);
+    }
+
+    #[test]
+    fn zero_multiplication_operator_is_the_additive_identity() {
+        for crc in [0, 1, 0xdead_beef, u32::MAX] {
+            assert_eq!(multmodp(0, crc), 0);
+            assert_eq!(crc32_combine_op(crc, 0x1234_5678, 0), 0x1234_5678);
         }
     }
 }
