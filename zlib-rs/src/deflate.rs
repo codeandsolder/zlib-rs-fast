@@ -2445,7 +2445,11 @@ pub(crate) fn flush_block_only(stream: &mut DeflateStream, is_last: bool) {
     flush_pending(stream)
 }
 
-fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
+fn flush_bytes(
+    stream: &mut DeflateStream,
+    mut bytes: &[u8],
+    update_header_crc: bool,
+) -> ControlFlow<ReturnCode> {
     let mut state = &mut stream.state;
 
     // we'll be using the pending buffer as temporary storage
@@ -2456,10 +2460,12 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 
         state.bit_writer.pending.extend(&bytes[..copy]);
 
-        stream.adler = crc32(
-            stream.adler as u32,
-            &state.bit_writer.pending.pending()[beg..],
-        ) as z_checksum;
+        if update_header_crc {
+            stream.adler = crc32(
+                stream.adler as u32,
+                &state.bit_writer.pending.pending()[beg..],
+            ) as z_checksum;
+        }
 
         state.gzindex += copy;
         flush_pending(stream);
@@ -2477,10 +2483,12 @@ fn flush_bytes(stream: &mut DeflateStream, mut bytes: &[u8]) -> ControlFlow<Retu
 
     state.bit_writer.pending.extend(bytes);
 
-    stream.adler = crc32(
-        stream.adler as u32,
-        &state.bit_writer.pending.pending()[beg..],
-    ) as z_checksum;
+    if update_header_crc {
+        stream.adler = crc32(
+            stream.adler as u32,
+            &state.bit_writer.pending.pending()[beg..],
+        ) as z_checksum;
+    }
     state.gzindex = 0;
 
     ControlFlow::Continue(())
@@ -2640,7 +2648,7 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                     )
                 };
 
-                if let ControlFlow::Break(err) = flush_bytes(stream, extra) {
+                if let ControlFlow::Break(err) = flush_bytes(stream, extra, true) {
                     return err;
                 }
             }
@@ -2654,7 +2662,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                 // SAFETY: user satisfies precondition that gzhead.name is a C string.
                 let gzhead_name = unsafe { CStr::from_ptr(gzhead.name.cast()) };
                 let bytes = gzhead_name.to_bytes_with_nul();
-                if let ControlFlow::Break(err) = flush_bytes(stream, bytes) {
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &bytes[stream.state.gzindex..], true)
+                {
                     return err;
                 }
             }
@@ -2668,7 +2678,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
                 // SAFETY: user satisfies precondition that gzhead.name is a C string.
                 let gzhead_comment = unsafe { CStr::from_ptr(gzhead.comment.cast()) };
                 let bytes = gzhead_comment.to_bytes_with_nul();
-                if let ControlFlow::Break(err) = flush_bytes(stream, bytes) {
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &bytes[stream.state.gzindex..], true)
+                {
                     return err;
                 }
             }
@@ -2680,7 +2692,9 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
         if let Some(gzhead) = stream.state.gzhead.as_ref() {
             if gzhead.hcrc != 0 {
                 let bytes = (stream.adler as u16).to_le_bytes();
-                if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &bytes[stream.state.gzindex..], false)
+                {
                     return err;
                 }
             }
@@ -3825,6 +3839,114 @@ mod test {
                 27, 27, 27, 27, 27, 27, 27, 27, 27, 9, 0, 60, 101, 156, 55, 18, 0, 0, 0,
             ],
         )
+    }
+
+    /// Emit the same member with different caller output capacities. A small
+    /// pending buffer forces resumptions inside FNAME, FCOMMENT and FHCRC.
+    fn encode_gzip_with_chunked_header(output_chunk: usize) -> (Vec<u8>, [bool; 3]) {
+        let extra = vec![b'x'; 701];
+        let mut name = vec![b'n'; 709];
+        name.push(0);
+        // Header through the comment ends one byte short of a 512-byte
+        // pending-buffer boundary, splitting the two-byte FHCRC.
+        let mut comment = vec![b'c'; 1_135];
+        comment.push(0);
+        let mut header = gz_header {
+            text: 1,
+            time: 0x1020_3040,
+            os: 3,
+            extra: extra.as_ptr().cast_mut(),
+            extra_len: u32::try_from(extra.len()).expect("small extra field"),
+            name: name.as_mut_ptr(),
+            comment: comment.as_mut_ptr(),
+            hcrc: 1,
+            ..gz_header::default()
+        };
+        let mut raw = z_stream::default();
+        assert_eq!(
+            init(
+                &mut raw,
+                DeflateConfig {
+                    window_bits: 31,
+                    mem_level: 1,
+                    ..Default::default()
+                },
+            ),
+            ReturnCode::Ok
+        );
+        // SAFETY: init succeeded, so raw has a live, exclusively borrowed state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }
+            .expect("initialized deflate stream");
+        // SAFETY: header, extra, name, and comment remain alive until end().
+        let header_status = unsafe { set_header(stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
+        assert_eq!(stream.state.bit_writer.pending.capacity(), 512);
+
+        let input = b"chunked gzip header then actual deflate payload".repeat(8);
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in = u32::try_from(input.len()).expect("small fixture");
+        let mut output = vec![0u8; bound(Some(stream), input.len())];
+        let mut written = 0;
+        let mut partial_modes = [false; 3];
+        let mut finished = false;
+        for _ in 0..output.len().saturating_add(8) {
+            let offered = output_chunk.min(output.len() - written);
+            if offered == 0 {
+                break;
+            }
+            stream.next_out = output[written..].as_mut_ptr();
+            stream.avail_out = u32::try_from(offered).expect("small output capacity");
+            let status = deflate(stream, DeflateFlush::Finish);
+            for (flag, mode) in
+                partial_modes
+                    .iter_mut()
+                    .zip([Status::Name, Status::Comment, Status::Hcrc])
+            {
+                *flag |= stream.state.status == mode && stream.state.gzindex != 0;
+            }
+            written += offered - usize::try_from(stream.avail_out).expect("small output count");
+            if status == ReturnCode::StreamEnd {
+                finished = true;
+                break;
+            }
+            assert_eq!(status, ReturnCode::Ok);
+        }
+        assert!(
+            finished,
+            "gzip stuck with output_chunk={output_chunk}, produced={written}, state={:?}, gzindex={}",
+            stream.state.status,
+            stream.state.gzindex,
+        );
+        assert_eq!(stream.avail_in, 0);
+        assert!(end(stream).is_ok());
+        output.truncate(written);
+        (output, partial_modes)
+    }
+
+    #[test]
+    fn gzip_header_fields_and_fhcrc_resume_across_tiny_output() {
+        let (baseline, _) = encode_gzip_with_chunked_header(16_384);
+        let crc_offset = 10 + 2 + 701 + 710 + 1_136;
+        let crc = crc32(0, &baseline[..crc_offset]).to_le_bytes();
+        assert_eq!(&baseline[crc_offset..crc_offset + 2], &crc[..2]);
+
+        let input = b"chunked gzip header then actual deflate payload".repeat(8);
+        let mut decoded = vec![0; input.len()];
+        let (restored, status) =
+            decompress_slice(&mut decoded, &baseline, InflateConfig { window_bits: 31 });
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(restored, input);
+
+        for chunk in [1, 2, 3, 7, 31, 127, 511] {
+            let (compressed, partial_modes) = encode_gzip_with_chunked_header(chunk);
+            assert_eq!(compressed, baseline, "output chunk size {chunk}");
+            if chunk == 1 {
+                assert!(
+                    partial_modes.into_iter().all(core::convert::identity),
+                    "one-byte output must interrupt FNAME, FCOMMENT, and FHCRC"
+                );
+            }
+        }
     }
 
     #[test]
