@@ -1776,7 +1776,9 @@ fn gz_skip(state: &mut GzState, len: i64) -> Result<(), ()> {
 // * `Ok` on success
 // * `Err` on failure
 //
-fn gz_look(state: &mut GzState) -> Result<(), ()> {
+// Lazily allocate the owned gzip read input/output and initialize inflate.
+// No input is consumed: header detection remains the responsibility of gz_look.
+fn gz_init_read(state: &mut GzState) -> Result<(), ()> {
     // Allocate buffers if needed.
     if state.input.is_none() {
         let Some(input) = state.allocate_input_buffer() else {
@@ -1812,6 +1814,14 @@ fn gz_look(state: &mut GzState) -> Result<(), ()> {
             return Err(());
         }
     }
+
+    Ok(())
+}
+
+fn gz_look(state: &mut GzState) -> Result<(), ()> {
+    // Initialize storage independently of header detection. The caller
+    // asking for a pushback byte must not cause a read from its descriptor.
+    gz_init_read(state)?;
 
     // Get at least the magic bytes in the input buffer.
     if state.stream.avail_in < 2 {
@@ -2987,7 +2997,9 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     }
 
     if state.how == How::Look && state.have == 0 {
-        if gz_look(state).is_err() {
+        // Pushback requires writable owned output, not compressed-file input.
+        // In particular, a pipe may be empty or nonblocking at this point.
+        if gz_init_read(state).is_err() {
             return -1;
         }
     }
@@ -3848,6 +3860,96 @@ mod tests {
         assert_eq!(unsafe { gzread(file, data.as_mut_ptr().cast(), 16) }, -1);
         // SAFETY: this consumes the live gzip handle and read descriptor.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gzip_pushback_before_first_pipe_byte_never_probes_input() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        const GZIP_ABC: [u8; 23] = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 75, 76, 74, 6, 0, 194, 65, 36, 53, 3, 0, 0, 0,
+        ];
+
+        for compressed in [false, true] {
+            let mut pair = [-1; 2];
+            // SAFETY: pair provides two writable descriptor slots.
+            assert_eq!(unsafe { libc::pipe(pair.as_mut_ptr()) }, 0);
+            // SAFETY: pipe returned two new, distinct live descriptors.
+            let reader = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+            // SAFETY: pipe returned this unique live write descriptor.
+            let writer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+
+            // SAFETY: reader is live and F_GETFL queries its descriptor flags.
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            // SAFETY: reader is live and F_SETFL accepts the original flags
+            // with O_NONBLOCK enabled.
+            let configured =
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(configured, 0);
+
+            let fd = reader.into_raw_fd();
+            // SAFETY: gzdopen takes ownership of fd on success; mode is NUL terminated.
+            let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+            if file.is_null() {
+                // SAFETY: ownership remains ours if open failed.
+                unsafe { libc::close(fd) };
+            }
+            assert!(!file.is_null());
+            // SAFETY: handle is live; buffer size must be set before first read.
+            let configured = unsafe { gzbuffer(file, 64) };
+            assert_eq!(configured, 0);
+
+            // There is deliberately *no input* in the pipe yet. Pushback must
+            // not block on or attempt a read from the underlying descriptor.
+            // SAFETY: handle remains exclusively live.
+            let pushed = unsafe { gzungetc(c_int::from(b'X'), file) };
+            assert_eq!(pushed, c_int::from(b'X'));
+            // SAFETY: handle remains live.
+            assert_eq!(unsafe { gztell64(file) }, -1);
+
+            // The documented pre-read pushback capacity must also remain
+            // available without looking ahead into the source stream.
+            let mut pushed = [0u8; 64];
+            pushed[0] = b'X';
+            for (slot, &byte) in pushed[1..]
+                .iter_mut()
+                .zip(b"abcdefghijklmnopqrstuvwxyz".iter().cycle())
+            {
+                *slot = byte;
+                // SAFETY: handle remains live and only the supplied byte is buffered.
+                let returned = unsafe { gzungetc(c_int::from(byte), file) };
+                assert_eq!(returned, c_int::from(byte));
+            }
+            // SAFETY: handle is live; observing position does not consume data.
+            assert_eq!(unsafe { gztell64(file) }, -64);
+
+            let mut out = [0xa5u8; 65];
+            // SAFETY: handle is live and out has at least 64 writable bytes.
+            let got = unsafe { gzread(file, out.as_mut_ptr().cast(), 64) };
+            assert_eq!(got, 64);
+            for (index, &expected) in pushed.iter().rev().enumerate() {
+                assert_eq!(out[index], expected);
+            }
+            assert_eq!(out[64], 0xa5);
+
+            let bytes: &[u8] = if compressed { &GZIP_ABC } else { b"abc" };
+            // SAFETY: writer is live and bytes is a valid initialized input span.
+            let wrote =
+                unsafe { libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(usize::try_from(wrote), Ok(bytes.len()));
+            drop(writer);
+
+            // SAFETY: handle remains live and out is a writable 65-byte buffer.
+            let got = unsafe { gzread(file, out.as_mut_ptr().cast(), 3) };
+            assert_eq!(got, 3);
+            assert_eq!(&out[..3], b"abc");
+            // SAFETY: handle remains live until consumed by gzclose.
+            assert_eq!(unsafe { gztell64(file) }, 3);
+            // SAFETY: gzclose consumes the handle and owned read descriptor.
+            assert_eq!(unsafe { gzclose(file) }, Z_OK);
+        }
     }
 
     #[cfg(unix)]
