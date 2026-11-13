@@ -5926,7 +5926,7 @@ mod tests {
             let expected_avail = BLOCK_SIZE - CONSUME + (FILE_SIZE - BLOCK_SIZE);
             assert_eq!(gz_avail(state), Ok(expected_avail));
             assert_eq!(state.stream.avail_in as usize, expected_avail);
-            let owned_input = state.input_ptr().ok_or(())?;
+            let owned_input = state.input_ptr()?;
             assert_eq!(state.stream.next_in, owned_input.cast_const());
             let buffered = state.buffered_read_input().ok_or(())?;
             assert_eq!(&buffered[..expected_suffix.len()], expected_suffix);
