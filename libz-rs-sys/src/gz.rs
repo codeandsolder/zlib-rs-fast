@@ -2346,8 +2346,13 @@ fn gz_zero_pending(state: &mut GzState) -> Result<(), ()> {
 }
 
 fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
-    if state.ensure_position_room(len).is_err() {
-        return Err(());
+    state.ensure_position_room(len)?;
+
+    // A pending write seek may be resolved by gzflush, gzsetparams, gzputc
+    // or gzclose before the first write. Every nonempty zero fill needs the
+    // owned compression input buffer, regardless of which caller got here.
+    if len != 0 && state.input.is_none() {
+        gz_init(state)?;
     }
 
     // Consume whatever is left in the input buffer.
@@ -2360,9 +2365,10 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
     while len != 0 {
         let n = Ord::min(state.in_size(), len);
         if first {
-            // `gz_comp` lazily initializes the owned input buffer when needed, and `n`
-            // is bounded by its usable compression prefix.
-            // SAFETY: gz_comp initialized the owned writable buffer, and n is bounded by its usable prefix, so this zero fill stays inside it.
+            // gz_zero initialized the owned input buffer before entering this
+            // loop, and n is bounded by its usable compression prefix.
+            // SAFETY: gz_zero initialized the owned writable input above, and
+            // n is bounded by its usable prefix, so the fill stays inside it.
             unsafe { state.input_ptr().write_bytes(0u8, n) };
             first = false;
         }
@@ -3900,6 +3906,116 @@ mod tests {
         assert_eq!(output[0], 67);
         assert_eq!(state.pos, i64::MAX);
         assert_eq!(state.err, Z_STREAM_ERROR);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_zero_fill_initializes_write_buffers_before_access() -> Result<(), &'static str> {
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        state.want = 64;
+        // Public gzip APIs clear the lazy seek flag before flushing zeroes.
+        state.seek = false;
+        state.skip = 12;
+        assert!(state.input.is_none());
+        assert_eq!(gz_zero_pending(&mut state), Ok(()));
+        assert_eq!(state.pos, 12);
+        assert!(state.input.is_some());
+        assert!(state.output.is_some());
+        // SAFETY: successful zero-fill initialized the live deflater. This
+        // fixture intentionally abandons the unfinished stream; deflateEnd
+        // frees it and reports Z_DATA_ERROR for the incomplete output.
+        assert_eq!(unsafe { deflateEnd(&raw mut state.stream) }, Z_DATA_ERROR);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_seek_before_first_write_survives_all_zero_fill_entrypoints(
+    ) -> Result<(), &'static str> {
+        #[derive(Clone, Copy)]
+        enum Trigger {
+            ChangeParams,
+            Flush,
+            Putc,
+            Close,
+        }
+        use Trigger::{ChangeParams, Close, Flush, Putc};
+
+        let write_mode = CString::new("wb").map_err(|_| "invalid write mode")?;
+        let direct_mode = CString::new("wT").map_err(|_| "invalid direct mode")?;
+        let read_mode = CString::new("rb").map_err(|_| "invalid read mode")?;
+        let cases = [
+            (ChangeParams, false),
+            (Flush, false),
+            (Putc, false),
+            (Close, false),
+            (Flush, true),
+            (Putc, true),
+            (Close, true),
+        ];
+        for (index, (operation, direct)) in cases.into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!(
+                "zlib-rs-fast-lazy-zero-{}-{index}.gz",
+                std::process::id()
+            ));
+            let path_c =
+                CString::new(path.to_string_lossy().as_bytes()).map_err(|_| "invalid test path")?;
+            // SAFETY: path and mode are live NUL-terminated strings.
+            let mode = if direct { &direct_mode } else { &write_mode };
+            let writer = unsafe { gzopen(path_c.as_ptr(), mode.as_ptr()) };
+            assert!(!writer.is_null());
+            // SAFETY: this exclusive handle is live; gzbuffer runs before any
+            // allocation, and gzseek only schedules the forward distance.
+            assert_eq!(unsafe { gzbuffer(writer, 64) }, 0);
+            assert_eq!(unsafe { gzseek64(writer, 12, SEEK_SET) }, 12);
+
+            match operation {
+                ChangeParams => {
+                    // SAFETY: the opened writer remains exclusive throughout.
+                    assert_eq!(
+                        unsafe { gzsetparams(writer, 9, Strategy::Default as c_int) },
+                        Z_OK
+                    );
+                }
+                Flush => {
+                    // SAFETY: the opened writer remains exclusive throughout.
+                    assert_eq!(unsafe { gzflush(writer, Z_SYNC_FLUSH) }, Z_OK);
+                }
+                Putc => {
+                    // SAFETY: the opened writer remains exclusive throughout.
+                    assert_eq!(
+                        unsafe { gzputc(writer, c_int::from(b'Z')) },
+                        c_int::from(b'Z')
+                    );
+                }
+                Close => {
+                    // Closing itself must materialize the pending zeroes.
+                }
+            }
+            if matches!(operation, ChangeParams | Flush) {
+                // SAFETY: writer is live and the source byte remains valid.
+                assert_eq!(unsafe { gzwrite(writer, b"Z".as_ptr().cast(), 1) }, 1);
+            }
+            // SAFETY: gzclose consumes the live writer handle.
+            assert_eq!(unsafe { gzclose(writer) }, Z_OK);
+
+            // SAFETY: test path and read mode are live C strings.
+            let reader = unsafe { gzopen(path_c.as_ptr(), read_mode.as_ptr()) };
+            assert!(!reader.is_null());
+            let mut bytes = [0u8; 14];
+            // SAFETY: the reader is live and the destination is an exclusive
+            // writable 14-byte buffer.
+            let got = unsafe { gzread(reader, bytes.as_mut_ptr().cast(), 14) };
+            let want = if matches!(operation, Close) { 12 } else { 13 };
+            assert_eq!(got, want);
+            assert_eq!(&bytes[..12], &[0u8; 12]);
+            if !matches!(operation, Close) {
+                assert_eq!(bytes[12], b'Z');
+            }
+            // SAFETY: gzclose consumes the live reader handle.
+            assert_eq!(unsafe { gzclose(reader) }, Z_OK);
+            std::fs::remove_file(path).map_err(|_| "failed to remove temporary gzip file")?;
+        }
         Ok(())
     }
 
