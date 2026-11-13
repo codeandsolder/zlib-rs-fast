@@ -2989,7 +2989,10 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
 /// # Returns
 ///
 /// - `buf`, which now is a null-terminated string, on success.
-/// - `null` on error. If there was an error, the contents at `buf` are indeterminate.
+/// - `null` if no characters were obtained (except when `len` is one),
+///   including on an initial read error. If an error occurs after some
+///   characters have been copied, a NUL-terminated partial line is returned;
+///   consult [`gzerror`] to detect the read failure.
 ///
 /// # Safety
 ///
@@ -3028,7 +3031,10 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
     let mut written = 0usize;
     while written < payload_capacity {
         if state.have == 0 && gz_fetch(state).is_err() {
-            return ptr::null_mut();
+            // Preserve a partial line if a later fetch fails. As in zlib,
+            // gzgets still returns NULL when no bytes were read; callers can
+            // inspect gzerror for the underlying failure in either case.
+            break;
         }
         if state.have == 0 {
             state.past = true;
@@ -4045,6 +4051,42 @@ mod tests {
         assert_eq!(gz_zero(&mut zeros, 2), Err(()));
         assert_eq!(zeros.pos, i64::MAX - 1);
         assert!(zeros.input.is_none());
+    }
+
+    #[test]
+    fn gzgets_returns_terminated_prefix_if_subsequent_fetch_fails() -> Result<(), ()> {
+        let mut state = GzState::new();
+        state.mode = GzMode::Read;
+        state.how = How::Copy;
+        state.want = 8;
+        state.fd = -2; // A later attempt to fetch from this descriptor fails with EBADF.
+        state.output = Some(state.allocate_output_buffer().ok_or(())?);
+        let output = state.output.as_mut().ok_or(())?;
+        output.usable_uninit_mut()[..3].write_copy_of_slice(b"abc");
+        state.publish_buffered_output(0, 3);
+
+        let mut line = [0xa5u8; 12];
+        let got = test_gets(&mut state, &mut line);
+        assert_eq!(
+            got,
+            line.as_mut_ptr().cast(),
+            "a partial line must be returned"
+        );
+        assert_eq!(&line[..4], b"abc\0");
+        assert_eq!(line[4], 0xa5);
+        assert_eq!(state.pos, 3);
+        assert_eq!(state.err, Z_ERRNO);
+
+        // By contrast, a failure without any data does return NULL, and does
+        // not even touch the caller's uninitialized line destination.
+        gz_error(&mut state, None);
+        state.pos = 0;
+        line.fill(0xa5);
+        let got = test_gets(&mut state, &mut line);
+        assert!(got.is_null());
+        assert_eq!(line, [0xa5; 12]);
+        assert_eq!(state.err, Z_ERRNO);
+        Ok(())
     }
 
     #[test]
