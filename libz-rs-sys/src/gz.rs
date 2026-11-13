@@ -1996,6 +1996,10 @@ fn read_with(
         let remaining = &mut output[have..];
         match read_some(remaining) {
             Err(IoAttemptError::Interrupted) => {}
+            // A short successful read already consumed these bytes from the
+            // underlying file. Publish that initialized prefix now; only a
+            // subsequent operation with no progress reports the I/O error.
+            Err(IoAttemptError::Failed) if have != 0 => return Ok((have, false)),
             Err(IoAttemptError::Failed) => return Err(()),
             Ok(0) => return Ok((have, true)),
             Ok(n) if n > remaining.len() => return Err(()),
@@ -3636,6 +3640,65 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_gzip_pipe_preserves_bytes_read_before_would_block() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors has exactly two writable C integer slots.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned two new descriptors, transferred into RAII owners.
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: pipe returned the second unique descriptor.
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        // SAFETY: reader is a live descriptor, and fcntl only inspects/modifies flags.
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        // SAFETY: flags are obtained from this descriptor and O_NONBLOCK is valid.
+        let set_flags =
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(set_flags, 0);
+
+        let payload = b"abc";
+        // SAFETY: writer is open, and payload is a live three-byte input.
+        let wrote =
+            unsafe { libc::write(writer.as_raw_fd(), payload.as_ptr().cast(), payload.len()) };
+        assert_eq!(usize::try_from(wrote), Ok(payload.len()));
+        // Ownership of the read descriptor passes to gzdopen on success.
+        let fd = reader.into_raw_fd();
+        // SAFETY: the live descriptor was just transferred; mode is a C string.
+        let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+        if file.is_null() {
+            // SAFETY: gzdopen did not take ownership on failure.
+            unsafe { libc::close(fd) };
+        }
+        assert!(
+            !file.is_null(),
+            "gzdopen failed for a live nonblocking pipe"
+        );
+
+        let mut data = [0xa5u8; 4];
+        // SAFETY: file is live and data provides three writable bytes.
+        let got = unsafe { gzread(file, data.as_mut_ptr().cast(), 3) };
+        assert_eq!(got, 3, "bytes already read from the pipe must not be lost");
+        assert_eq!(&data[..3], payload);
+        assert_eq!(data[3], 0xa5);
+
+        // The writer remains open. A fresh read with no new bytes must report
+        // the nonblocking syscall error; the earlier successful read did not.
+        // SAFETY: file remains live, and the output has one writable byte.
+        let got = unsafe { gzread(file, data.as_mut_ptr().cast(), 1) };
+        assert_eq!(got, -1);
+        let mut err = 0;
+        // SAFETY: file is live and err points to a writable C integer.
+        let msg = unsafe { gzerror(file, &raw mut err) };
+        assert!(!msg.is_null());
+        assert_eq!(err, Z_ERRNO);
+        // SAFETY: gzclose consumes and releases the file and its read descriptor.
+        assert_eq!(unsafe { gzclose(file) }, Z_OK);
+    }
+
     #[test]
     fn interrupted_partial_reads_preserve_initialized_prefix() -> Result<(), ()> {
         let mut output = [MaybeUninit::<u8>::uninit(); 19];
@@ -3679,6 +3742,23 @@ mod tests {
             read_with(&mut partial, |_| Err(IoAttemptError::Failed)),
             Err(())
         );
+        // An I/O failure after a successful short read cannot revoke bytes
+        // that the kernel already consumed from the input source.
+        let mut calls = 0;
+        let (read, eof) = read_with(&mut partial, |dst| {
+            calls += 1;
+            if calls == 1 {
+                dst[..2].write_copy_of_slice(b"xy");
+                Ok(2)
+            } else {
+                Err(IoAttemptError::Failed)
+            }
+        })?;
+        assert_eq!((read, eof), (2, false));
+        // SAFETY: the successful first call initialized exactly two bytes.
+        assert_eq!(unsafe { partial[0].assume_init() }, b'x');
+        // SAFETY: the second byte is within the successfully initialized prefix.
+        assert_eq!(unsafe { partial[1].assume_init() }, b'y');
         Ok(())
     }
 
