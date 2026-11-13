@@ -259,6 +259,8 @@ impl Allocator<'_> {
         let after_prefix = unsafe { ptr.cast::<u8>().add(pointer_bytes) };
         let remainder = (after_prefix as usize) % layout.align();
         let padding = (layout.align() - remainder) % layout.align();
+        // SAFETY: padding is smaller than layout.align(), and extra_space reserved
+        // that entire alignment unit beyond the pointer metadata prefix.
         let aligned = unsafe { after_prefix.add(padding) };
 
         // SAFETY: aligned is at least pointer_bytes past the allocation start;
@@ -337,7 +339,7 @@ pub struct MisalignedAlloc {
 /// # Safety
 ///
 /// The opaque pointer must identify the live, exclusively accessible per-test
-/// `MisalignedAlloc` context supplied to the matching z_stream. Its lifetime
+/// `MisalignedAlloc` context supplied to the matching `z_stream`. Its lifetime
 /// extends across every zalloc callback until the corresponding frees.
 #[cfg(test)]
 pub unsafe extern "C" fn misaligned_alloc_callback(
