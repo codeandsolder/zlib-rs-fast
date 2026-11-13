@@ -228,83 +228,46 @@ impl Allocator<'_> {
             return ptr;
         }
 
-        // General case for c-style allocation
+        // The C allocator may return any byte alignment. Reserve space for the original
+        // callback pointer immediately before an aligned payload pointer. The payload
+        // offset is exactly:
+        //
+        //     size_of::<*mut c_void>() + padding_to_layout_alignment
+        //
+        // where padding is in 0..layout.align(). This also covers alignments smaller
+        // than a pointer without special cases. Keep the original allocation pointer
+        // in the prefix so deallocate can return precisely it to zfree.
+        let pointer_bytes = core::mem::size_of::<*mut c_void>();
+        let extra_space = pointer_bytes + layout.align();
 
-        // We cannot rely on the allocator giving properly aligned allocations and have to fix that ourselves.
-        //
-        // The general approach is to allocate a bit more than the layout needs, so that we can
-        // give the application a properly aligned address and also store the real allocation
-        // pointer in the allocation so that `free` can free the real allocation pointer.
-        //
-        //
-        // Example: The layout represents `(u32, u32)`, with an alignment of 4 bytes and a
-        // total size of 8 bytes.
-        //
-        // Assume that the allocator will give us address `0x07`. We need that to be a multiple
-        // of the alignment, so that shifts the starting position to `0x08`. Then we also need
-        // to store the pointer to the start of the allocation so that `free` can free that
-        // pointer, bumping to `0x10`. The `0x10` pointer is then the pointer that the application
-        // deals with. When free'ing, the original allocation pointer can be read from `0x10 - size_of::<*const c_void>()`.
-        //
-        // Of course there does need to be enough space in the allocation such that when we
-        // shift the start forwards, the end is still within the allocation. Hence we allocate
-        // `extra_space` bytes: enough for a full alignment plus a pointer.
-
-        // we need at least
-        //
-        // - `align` extra space so that no matter what pointer we get from zalloc, we can shift the start of the
-        //      allocation by at most `align - 1` so that `ptr as usize % align == 0
-        // - `size_of::<*mut _>` extra space so that after aligning to `align`,
-        //      there is `size_of::<*mut _>` space to store the pointer to the allocation.
-        //      This pointer is then retrieved in `free`
-        let extra_space = core::mem::size_of::<*mut c_void>() + layout.align();
-
-        // Safety: we assume allocating works correctly in the safety assumptions on
-        // `DeflateStream` and `InflateStream`.
         let Some(required_size) = layout.size().checked_add(extra_space) else {
             return core::ptr::null_mut();
         };
         let Ok(allocation_size) = c_uint::try_from(required_size) else {
             return core::ptr::null_mut();
         };
-        // SAFETY: the C allocator callback contract promises a writable allocation of
-        // exactly allocation_size bytes on success. The caller owns its lifetime.
+        // SAFETY: the custom C allocator promises a writable allocation of at least
+        // allocation_size bytes on success, valid until the matching zfree call.
         let ptr = unsafe { (self.zalloc)(self.opaque, allocation_size, 1) };
-
         if ptr.is_null() {
             return ptr;
         }
 
-        // Calculate return pointer address with space enough to store original pointer
-        let align_diff = (ptr as usize).next_multiple_of(layout.align()) - (ptr as usize);
+        // SAFETY: extra_space includes the pointer prefix and an entire alignment
+        // unit, so these offsets and the eventual payload remain inside the C
+        // allocation. Compute padding from the pointer after the metadata prefix.
+        let after_prefix = unsafe { ptr.cast::<u8>().add(pointer_bytes) };
+        let remainder = (after_prefix as usize) % layout.align();
+        let padding = (layout.align() - remainder) % layout.align();
+        let aligned = unsafe { after_prefix.add(padding) };
 
-        // Safety: offset is smaller than 64, and we allocated 64 extra bytes in the allocation
-        let mut return_ptr = unsafe { ptr.cast::<u8>().add(align_diff) };
-
-        // if there is not enough space to store a pointer we need to make more
-        if align_diff < core::mem::size_of::<*mut c_void>() {
-            // # Safety
-            //
-            // - `return_ptr` is well-aligned, therefore `return_ptr + align` is also well-aligned
-            // - we reserve `size_of::<*mut _> + align` extra space in the allocation, so
-            //      `ptr + align_diff + align` is still valid for (at least) `layout.size` bytes
-            let offset = Ord::max(core::mem::size_of::<*mut c_void>(), layout.align());
-            // SAFETY: extra_space reserves alignment and pointer-metadata headroom;
-            // offset advances within the same allocation with the requested payload remaining.
-            return_ptr = unsafe { return_ptr.add(offset) };
-        }
-
-        // Store the original pointer for free()
-        //
-        // Safety: `align >= size_of::<*mut _>`, so there is now space for a pointer before `return_ptr`
-        // in the allocation
+        // SAFETY: aligned is at least pointer_bytes past the allocation start;
+        // unaligned access is necessary because the C callback's pointer may not
+        // be aligned even for a raw pointer.
         unsafe {
-            let original_ptr = return_ptr.sub(core::mem::size_of::<*mut c_void>());
-            core::ptr::write_unaligned(original_ptr.cast::<*mut c_void>(), ptr);
-        };
-
-        // Return properly aligned pointer in allocation
-        let ptr = return_ptr.cast::<c_void>();
+            core::ptr::write_unaligned(aligned.sub(pointer_bytes).cast::<*mut c_void>(), ptr);
+        }
+        let ptr = aligned.cast::<c_void>();
 
         debug_assert_eq!(ptr as usize % layout.align(), 0);
 
@@ -374,7 +337,7 @@ pub struct MisalignedAlloc {
 /// # Safety
 ///
 /// The opaque pointer must identify the live, exclusively accessible per-test
-/// MisalignedAlloc context supplied to the matching z_stream. Its lifetime
+/// `MisalignedAlloc` context supplied to the matching z_stream. Its lifetime
 /// extends across every zalloc callback until the corresponding frees.
 #[cfg(test)]
 pub unsafe extern "C" fn misaligned_alloc_callback(
@@ -408,7 +371,7 @@ pub unsafe extern "C" fn misaligned_alloc_callback(
 /// # Safety
 ///
 /// The opaque pointer must identify the same live per-test allocator context
-/// used for allocation, and ptr must be null or a pointer returned by it.
+/// used for allocation, and `ptr` must be null or a pointer returned by it.
 /// The context records unexpected releases as outstanding allocations.
 #[cfg(test)]
 pub unsafe extern "C" fn misaligned_free_callback(
