@@ -4257,12 +4257,12 @@ const _: () = {
 /// All raw region pointers derive from the same aligned allocation base.
 /// This is the sole place where byte offsets become typed deflate regions.
 struct DeflateAllocRegions<'a> {
-    state_ptr: *mut State<'a>,
-    window_ptr: *mut u8,
-    prev_ptr: *mut Pos,
-    head_ptr: *mut [Pos; HASH_SIZE],
-    pending_ptr: *mut u8,
-    sym_buf_ptr: *mut u8,
+    state: *mut State<'a>,
+    window: *mut u8,
+    prev: *mut Pos,
+    head: *mut [Pos; HASH_SIZE],
+    pending: *mut u8,
+    sym_buf: *mut u8,
 }
 
 #[derive(Clone, Copy)]
@@ -4449,12 +4449,12 @@ impl DeflateAllocOffsets {
         // alignment of every typed target.
         unsafe {
             DeflateAllocRegions {
-                state_ptr: base.add(self.state_pos).cast(),
-                window_ptr: base.add(self.window_pos),
-                prev_ptr: base.add(self.prev_pos).cast(),
-                head_ptr: base.add(self.head_pos).cast(),
-                pending_ptr: base.add(self.pending_pos).cast(),
-                sym_buf_ptr: base.add(self.sym_buf_pos),
+                state: base.add(self.state_pos).cast(),
+                window: base.add(self.window_pos),
+                prev: base.add(self.prev_pos).cast(),
+                head: base.add(self.head_pos).cast(),
+                pending: base.add(self.pending_pos).cast(),
+                sym_buf: base.add(self.sym_buf_pos),
             }
         }
     }
@@ -4470,12 +4470,12 @@ impl DeflateAllocOffsets {
         // SAFETY: the caller supplies the aligned base of an independent allocation described
         // by this layout; each returned region has the required alignment and valid extent.
         let DeflateAllocRegions {
-            state_ptr,
-            window_ptr,
-            prev_ptr,
-            head_ptr,
-            pending_ptr,
-            sym_buf_ptr,
+            state: state_ptr,
+            window: window_ptr,
+            prev: prev_ptr,
+            head: head_ptr,
+            pending: pending_ptr,
+            sym_buf: sym_buf_ptr,
         } = unsafe { self.regions(aligned) };
         let w_size = 1usize << self.window_bits;
 
@@ -4515,12 +4515,12 @@ impl DeflateAllocOffsets {
     ) -> DeflateAllocBuffers<'a> {
         // SAFETY: caller guarantees a fresh destination allocation disjoint from source.
         let DeflateAllocRegions {
-            state_ptr,
-            window_ptr,
-            prev_ptr,
-            head_ptr,
-            pending_ptr,
-            sym_buf_ptr,
+            state: state_ptr,
+            window: window_ptr,
+            prev: prev_ptr,
+            head: head_ptr,
+            pending: pending_ptr,
+            sym_buf: sym_buf_ptr,
         } = unsafe { self.regions(aligned) };
         let w_size = 1usize << self.window_bits;
         debug_assert_eq!(source.w_size, w_size);
