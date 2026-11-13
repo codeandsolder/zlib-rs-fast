@@ -1861,7 +1861,7 @@ impl State<'_> {
     }
 
     /// Complete the dynamic literal/length and distance alphabets. Input
-    /// starvation preserves the CodeLens mode and the partial symbol count.
+    /// starvation preserves the `CodeLens` mode and the partial symbol count.
     fn decode_code_lengths(&mut self, bit_reader: &mut BitReader<'_>) -> Result<(), DispatchExit> {
         while self.have < self.nlen + self.ndist {
             let here = loop {
@@ -3344,29 +3344,23 @@ mod tests {
         stream.next_in = prefix.as_mut_ptr();
         stream.avail_in = 1;
         // SAFETY: both input spans and output allocation stay live and disjoint.
-        assert_eq!(
-            unsafe { inflate(stream, InflateFlush::NoFlush) },
-            ReturnCode::Ok
-        );
+        let status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+        assert_eq!(status, ReturnCode::Ok);
         assert!(matches!(stream.state.mode, Mode::Stored));
         assert_eq!(stream.avail_in, 0);
 
         stream.next_in = payload.as_mut_ptr();
         stream.avail_in = 7;
         // SAFETY: payload and destination are live, disjoint, and lengths are exact.
-        assert_eq!(
-            unsafe { inflate(stream, InflateFlush::Trees) },
-            ReturnCode::Ok
-        );
+        let status = unsafe { inflate(stream, InflateFlush::Trees) };
+        assert_eq!(status, ReturnCode::Ok);
         assert!(matches!(stream.state.mode, Mode::CopyBlock));
         assert_eq!(stream.avail_in, 3);
         assert_eq!(stream.total_out, 0);
 
         // SAFETY: the ABI pointers now address the valid unconsumed payload suffix.
-        assert_eq!(
-            unsafe { inflate(stream, InflateFlush::NoFlush) },
-            ReturnCode::StreamEnd
-        );
+        let status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+        assert_eq!(status, ReturnCode::StreamEnd);
         assert_eq!(stream.avail_in, 0);
         assert_eq!(stream.total_out, 3);
         assert_eq!(&destination[..3], b"abc");
