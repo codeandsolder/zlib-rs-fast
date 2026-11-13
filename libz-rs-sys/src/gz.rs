@@ -1690,38 +1690,31 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
     written
 }
 
-// Given an unsigned value `x`, determine whether `x` is larger than the maximum
-// signed 64-bit offset value.
-// Note: This can happen only on targets where the C unsigned int is a 64-bit value.
-macro_rules! gt_off {
-    ($x:expr) => {
-        core::mem::size_of_val(&$x) == core::mem::size_of::<i64>()
-            && $x as usize > i64::MAX as usize
-    };
-}
-
 // Skip len uncompressed bytes of output.
 //
 // # Returns
 //
 // - `Ok` on success.
 // - `Err` on error.
-fn gz_skip(state: &mut GzState, mut len: i64) -> Result<(), ()> {
-    // Skip over len bytes or reach end-of-file, whichever comes first.
-    while len != 0 {
-        // Skip over whatever is in output buffer.
+fn gz_skip(state: &mut GzState, len: i64) -> Result<(), ()> {
+    // Public seek operations schedule only forward skips. Reject invalid internal
+    // requests before inspecting or consuming output or touching the file.
+    let Ok(mut remaining) = u64::try_from(len) else {
+        gz_error(state, Some((Z_STREAM_ERROR, "negative gzip skip distance")));
+        return Err(());
+    };
+    // Skip over the requested bytes or reach EOF, whichever comes first.
+    while remaining != 0 {
         if state.have != 0 {
-            // For consistency with zlib-ng, we use `gt_off` to check whether the value
-            // of `state.have` is too large to be represented as a signed 64-bit offset.
-            // This case can be triggered only if the platform has 64-bit C ints and
-            // `state.have` is >= 2^63.
-            let n = if gt_off!(state.have) || state.have as i64 > len {
-                len as usize
-            } else {
-                state.have as usize
+            // A C buffered byte count and a signed 64-bit seek are compared in
+            // one unsigned width, avoiding len-to-usize truncation on 32-bit hosts.
+            let amount = u64::from(state.have).min(remaining);
+            let Ok(n) = usize::try_from(amount) else {
+                state.invalid_read_cursor();
+                return Err(());
             };
-            // The byte-count is bounded by the current signed skip.
-            let Ok(take) = i64::try_from(n) else {
+            // amount <= the original nonnegative i64 skip, so it fits i64.
+            let Ok(take) = i64::try_from(amount) else {
                 state.fail_position_overflow();
                 return Err(());
             };
@@ -1734,7 +1727,7 @@ fn gz_skip(state: &mut GzState, mut len: i64) -> Result<(), ()> {
                 return Err(());
             }
             state.pos = next;
-            len -= take;
+            remaining -= amount;
         } else if state.eof && state.stream.avail_in == 0 {
             // Output buffer empty -- return if we're at the end of the input.
             break;
@@ -3712,6 +3705,73 @@ mod tests {
         assert_eq!(state.configure(b"x"), Ok((true, false)));
         assert_eq!(state.configure(b"e"), Ok((false, true)));
         assert_eq!(state.configure(b"xe"), Ok((true, true)));
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_skip_preserves_signed_position_and_buffered_cursor_bounds() -> Result<(), &'static str>
+    {
+        let mut state = GzState::new();
+        state.mode = GzMode::Read;
+        state.eof = true;
+        let mut output = GzBuffer::allocate(8, 8).ok_or("read output allocation failed")?;
+        output.usable_uninit_mut()[..3].write_copy_of_slice(b"abc");
+        state.output = Some(output);
+
+        // A huge positive logical seek can exceed usize on a 32-bit host.
+        // It must consume the available bytes and stop at EOF, not wrap to zero.
+        state.publish_buffered_output(0, 3);
+        assert_eq!(gz_skip(&mut state, i64::MAX), Ok(()));
+        assert_eq!(state.pos, 3);
+        assert_eq!(state.have, 0);
+
+        // A smaller skip only advances the owned read cursor by that amount.
+        state.pos = 0;
+        state.publish_buffered_output(0, 3);
+        assert_eq!(gz_skip(&mut state, 2), Ok(()));
+        assert_eq!(state.pos, 2);
+        assert_eq!(state.have, 1);
+        assert_eq!(state.buffered_output(), Some(&b"c"[..]));
+
+        // Never consume a buffered prefix if it would overflow the signed
+        // uncompressed stream position. Fatal errors hide the buffer from gzgetc.
+        state.pos = i64::MAX - 1;
+        state.publish_buffered_output(0, 3);
+        let cursor = state.next;
+        assert_eq!(gz_skip(&mut state, 3), Err(()));
+        assert_eq!(state.pos, i64::MAX - 1);
+        assert_eq!(state.next, cursor);
+        assert_eq!(state.have, 0);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+
+        // An invalid negative internal request must not start fetching data
+        // or reinterpret its signed length as an enormous usize.
+        state.err = Z_OK;
+        state.pos = 0;
+        state.publish_buffered_output(0, 3);
+        let cursor = state.next;
+        assert_eq!(gz_skip(&mut state, -1), Err(()));
+        assert_eq!(state.pos, 0);
+        assert_eq!(state.next, cursor);
+        assert_eq!(state.have, 0);
+        assert_eq!(state.err, Z_STREAM_ERROR);
+
+        // Exercise the same large skip from the public C entrypoints: a read
+        // seek is initially virtual, then the next read resolves it at EOF.
+        gz_error(&mut state, None);
+        state.mode = GzMode::Read;
+        state.how = How::Gzip;
+        state.pos = 0;
+        state.eof = true;
+        state.publish_buffered_output(0, 3);
+        assert_eq!(test_seek(&mut state, i64::MAX, SEEK_SET), i64::MAX);
+        assert_eq!(state.pos, 3);
+        assert!(state.seek);
+        let mut buf = [0u8; 1];
+        assert_eq!(test_read(&mut state, &mut buf), 0);
+        assert_eq!(state.pos, 3);
+        assert!(!state.seek);
+        assert_eq!(state.err, Z_OK);
         Ok(())
     }
 
