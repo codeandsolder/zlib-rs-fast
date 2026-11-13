@@ -3,7 +3,7 @@ use core::{ffi::CStr, marker::PhantomData, mem::MaybeUninit, ops::ControlFlow, p
 use crate::{
     abi_cursor::{advance_abi_bytes, SliceBudget},
     adler32::adler32,
-    allocate::Allocator,
+    allocate::{AlignedAllocationBlock, Allocator, ALLOCATION_BLOCK_BYTES},
     c_api::{gz_header, internal_state, z_checksum, z_stream},
     crc32::{crc32, Crc32Fold},
     output_buffer::{assume_init_prefix, WritableBytes},
@@ -1184,7 +1184,12 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
     // SAFETY: this stream exclusively owns the live State allocation from
     // init/copy; allocation_start and total_allocation_size came from that
     // allocation, and stream.state was detached immediately above.
-    unsafe { alloc.deallocate(allocation_start.as_ptr(), total_allocation_size) };
+    unsafe {
+        alloc.deallocate(
+            allocation_start.as_ptr(),
+            total_allocation_size / DEFLATE_ALLOC_ALIGN,
+        )
+    };
 
     match status {
         Status::Busy => Err(stream),
@@ -1859,9 +1864,9 @@ pub struct State<'a> {
 
     crc_fold: crate::crc32::Crc32Fold,
 
-    /// The (unaligned) address of the state allocation that can be passed to zfree.
-    allocation_start: NonNull<u8>,
-    /// Total size of the allocation in bytes.
+    /// Original aligned storage pointer, retained for matching typed deallocation.
+    allocation_start: NonNull<AlignedAllocationBlock>,
+    /// Total size of the aligned storage allocation in bytes.
     total_allocation_size: usize,
 
     l_desc: TreeDesc<HEAP_SIZE>,             /* literal and length tree */
@@ -1912,7 +1917,7 @@ impl<'a> State<'a> {
     fn clone_rebound(
         &self,
         buffers: DeflateAllocBuffers<'a>,
-        allocation_start: NonNull<u8>,
+        allocation_start: NonNull<AlignedAllocationBlock>,
         total_allocation_size: usize,
     ) -> Self {
         let DeflateAllocBuffers {
@@ -4241,13 +4246,15 @@ pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] 
         .recent_history(state.strstart + state.lookahead, state.w_size)
 }
 
-const DEFLATE_ALLOC_ALIGN: usize = 64;
+const DEFLATE_ALLOC_ALIGN: usize = ALLOCATION_BLOCK_BYTES;
 const LIT_BUFS: usize = 4;
 
 // Every typed view into the shared deflate allocation must fit within the
 // cache-line-aligned base and offsets established by DeflateAllocOffsets.
 const _: () = {
     assert!(DEFLATE_ALLOC_ALIGN.is_power_of_two());
+    assert!(core::mem::size_of::<AlignedAllocationBlock>() == DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<AlignedAllocationBlock>() == DEFLATE_ALLOC_ALIGN);
     assert!(core::mem::align_of::<State<'static>>() <= DEFLATE_ALLOC_ALIGN);
     assert!(core::mem::align_of::<Pos>() <= DEFLATE_ALLOC_ALIGN);
     assert!(core::mem::align_of::<[Pos; HASH_SIZE]>() <= DEFLATE_ALLOC_ALIGN);
@@ -4328,10 +4335,9 @@ impl DeflateAllocOffsets {
         let sym_buf_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = sym_buf_pos + sym_buf_size;
 
-        /* Leave enough leading slack to align the allocation base, then round the total allocation
-         * size to the same boundary. Region rebinding is centralized below. */
-        let total_size =
-            (curr_size + (DEFLATE_ALLOC_ALIGN - 1)).next_multiple_of(DEFLATE_ALLOC_ALIGN);
+        // The typed storage allocation is already 64-byte aligned; only trailing
+        // padding to a whole storage unit is necessary.
+        let total_size = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
 
         Self {
             window_bits,
@@ -4346,16 +4352,12 @@ impl DeflateAllocOffsets {
         }
     }
 
-    /// Allocate raw storage and resolve the 64-byte-aligned interior base used by this layout.
-    fn allocate_storage<'a>(&self, alloc: &Allocator<'a>) -> Option<(NonNull<u8>, NonNull<u8>)> {
-        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
-        let address = allocation_start.as_ptr() as usize;
-        let align_offset = address.next_multiple_of(DEFLATE_ALLOC_ALIGN) - address;
-        // SAFETY: `total_size` reserves `DEFLATE_ALLOC_ALIGN - 1` bytes of leading alignment
-        // headroom, and offsetting a non-null pointer within its allocation cannot produce null.
-        let aligned =
-            unsafe { NonNull::new_unchecked(allocation_start.as_ptr().add(align_offset)) };
-        Some((allocation_start, aligned))
+    /// Allocate cache-line-aligned typed storage through the common allocator.
+    ///
+    /// The allocator handles alignment even when custom C callbacks return
+    /// unaligned memory. No redundant adjustment or headroom is required.
+    fn allocate_storage(&self, alloc: &Allocator<'_>) -> Option<NonNull<AlignedAllocationBlock>> {
+        alloc.allocate_slice_raw::<AlignedAllocationBlock>(self.total_size / DEFLATE_ALLOC_ALIGN)
     }
 
     /// Allocate, initialize, and place one fresh deflate state using this layout.
@@ -4367,9 +4369,10 @@ impl DeflateAllocOffsets {
         alloc: &Allocator<'a>,
         init: DeflateStateInit,
     ) -> Option<NonNull<State<'a>>> {
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
-        // SAFETY: `aligned` is the fresh layout base returned by `allocate_storage` and remains
-        // owned by the state until `end` releases `allocation_start` through the same allocator.
+        let allocation_start = self.allocate_storage(alloc)?;
+        let aligned = allocation_start.cast();
+        // SAFETY: aligned is the fresh 64-byte-aligned typed storage allocation and
+        // remains owned by the state until matching typed deallocation in end().
         let DeflateAllocBuffers {
             state_ptr,
             window,
@@ -4439,8 +4442,8 @@ impl DeflateAllocOffsets {
     ///
     /// # Safety
     ///
-    /// The aligned pointer must designate the layout's 64-byte-aligned interior of a
-    /// writable allocation large enough for all six regions, and remain live while used.
+    /// The aligned pointer must designate the 64-byte-aligned start of a writable
+    /// typed allocation large enough for all six regions, and remain live while used.
     const unsafe fn regions<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocRegions<'a> {
         let base = aligned.as_ptr();
 
@@ -4568,7 +4571,8 @@ impl DeflateAllocOffsets {
         );
         assert_eq!(self.total_size, source.total_allocation_size);
 
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        let allocation_start = self.allocate_storage(alloc)?;
+        let aligned = allocation_start.cast();
 
         // SAFETY: `aligned` is a fresh layout base and the cloned buffer views below are the only
         // destination views over their respective allocation regions.
@@ -4593,6 +4597,9 @@ mod test {
     };
 
     use super::*;
+    use crate::allocate::test_support::{
+        misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc,
+    };
 
     use core::{ffi::CStr, sync::atomic::AtomicUsize};
 
@@ -6127,6 +6134,12 @@ mod test {
             );
             assert!(stream.state.sym_buf.is_empty());
             assert_eq!(stream.state.total_allocation_size, layout.total_size);
+            let logical_end = layout.sym_buf_pos + lit_bufsize * (LIT_BUFS - 1);
+            assert_eq!(
+                layout.total_size,
+                logical_end.next_multiple_of(DEFLATE_ALLOC_ALIGN),
+                "typed allocation has no redundant leading alignment slack"
+            );
             assert_eq!(
                 stream.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
                 0,
@@ -6134,55 +6147,6 @@ mod test {
             );
 
             assert!(end(stream).is_ok());
-        }
-    }
-
-    struct MisalignedAlloc {
-        remainder: usize,
-        allocations: usize,
-        frees: usize,
-        buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
-    }
-
-    unsafe extern "C" fn misaligned_alloc_callback(
-        opaque: *mut core::ffi::c_void,
-        items: crate::c_api::uInt,
-        size: crate::c_api::uInt,
-    ) -> *mut core::ffi::c_void {
-        // SAFETY: init and copy receive a live pointer to our stack-local allocator context.
-        let Some(ctx) = (unsafe { opaque.cast::<MisalignedAlloc>().as_mut() }) else {
-            return core::ptr::null_mut();
-        };
-        let Some(length) = usize::try_from(items)
-            .ok()
-            .and_then(|count| usize::try_from(size).ok()?.checked_mul(count))
-            .and_then(|size| size.checked_add(DEFLATE_ALLOC_ALIGN))
-        else {
-            return core::ptr::null_mut();
-        };
-        let mut data = vec![0u8; length].into_boxed_slice();
-        let base = data.as_mut_ptr() as usize;
-        let delta = (ctx.remainder + DEFLATE_ALLOC_ALIGN - base % DEFLATE_ALLOC_ALIGN)
-            % DEFLATE_ALLOC_ALIGN;
-        // SAFETY: the allocation reserves one full alignment unit beyond the requested
-        // size, so the shifted pointer still has all requested bytes available.
-        let ptr = unsafe { data.as_mut_ptr().add(delta) }.cast();
-        ctx.buffers.push((ptr, data));
-        ctx.allocations += 1;
-        ptr
-    }
-
-    unsafe extern "C" fn misaligned_free_callback(
-        opaque: *mut core::ffi::c_void,
-        ptr: *mut core::ffi::c_void,
-    ) {
-        // SAFETY: zfree is invoked before the stack-local context is destroyed, and
-        // receives the exact pointer previously returned by the matching allocator.
-        if let Some(ctx) = unsafe { opaque.cast::<MisalignedAlloc>().as_mut() } {
-            if let Some(index) = ctx.buffers.iter().position(|(address, _)| *address == ptr) {
-                ctx.buffers.swap_remove(index);
-                ctx.frees += 1;
-            }
         }
     }
 

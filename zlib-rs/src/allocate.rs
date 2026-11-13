@@ -15,6 +15,18 @@ use core::{
 type size_t = usize;
 
 const ALIGN: usize = 64;
+
+/// One cache-line of typed allocation storage, shared by Deflate and Inflate.
+/// The allocator enforces this alignment even for custom C callbacks.
+#[repr(align(64))]
+pub(crate) struct AlignedAllocationBlock {
+    _bytes: [u8; ALIGN],
+}
+pub(crate) const ALLOCATION_BLOCK_BYTES: usize = mem::size_of::<AlignedAllocationBlock>();
+
+const _: () = assert!(mem::align_of::<AlignedAllocationBlock>() == ALIGN);
+const _: () = assert!(ALLOCATION_BLOCK_BYTES == ALIGN);
+
 // posix_memalign requires that the alignment be a power of two and a multiple of sizeof(void*).
 const _: () = assert!(ALIGN.is_power_of_two());
 const _: () = assert!(ALIGN.is_multiple_of(mem::size_of::<*mut c_void>()));
@@ -341,6 +353,63 @@ impl Allocator<'_> {
                 let free_ptr = core::ptr::read_unaligned(original_ptr.cast::<*mut c_void>());
 
                 (self.zfree)(self.opaque, free_ptr);
+            }
+        }
+    }
+}
+
+/// Reusable test-only C allocator simulating every raw pointer residue.
+/// The per-stream context avoids global callbacks and cross-test contention.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ALLOCATION_BLOCK_BYTES;
+    use std::{boxed::Box, vec, vec::Vec};
+
+    pub(crate) struct MisalignedAlloc {
+        pub(crate) remainder: usize,
+        pub(crate) allocations: usize,
+        pub(crate) frees: usize,
+        pub(crate) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
+    }
+
+    pub(crate) unsafe extern "C" fn misaligned_alloc_callback(
+        opaque: *mut core::ffi::c_void,
+        items: crate::c_api::uInt,
+        size: crate::c_api::uInt,
+    ) -> *mut core::ffi::c_void {
+        // SAFETY: init and copy receive a live pointer to our stack-local allocator context.
+        let Some(ctx) = (unsafe { opaque.cast::<MisalignedAlloc>().as_mut() }) else {
+            return core::ptr::null_mut();
+        };
+        let Some(length) = usize::try_from(items)
+            .ok()
+            .and_then(|count| usize::try_from(size).ok()?.checked_mul(count))
+            .and_then(|size| size.checked_add(ALLOCATION_BLOCK_BYTES))
+        else {
+            return core::ptr::null_mut();
+        };
+        let mut data = vec![0u8; length].into_boxed_slice();
+        let base = data.as_mut_ptr() as usize;
+        let delta = (ctx.remainder + ALLOCATION_BLOCK_BYTES - base % ALLOCATION_BLOCK_BYTES)
+            % ALLOCATION_BLOCK_BYTES;
+        // SAFETY: the allocation reserves one full alignment unit beyond the requested
+        // size, so the shifted pointer still has all requested bytes available.
+        let ptr = unsafe { data.as_mut_ptr().add(delta) }.cast();
+        ctx.buffers.push((ptr, data));
+        ctx.allocations += 1;
+        ptr
+    }
+
+    pub(crate) unsafe extern "C" fn misaligned_free_callback(
+        opaque: *mut core::ffi::c_void,
+        ptr: *mut core::ffi::c_void,
+    ) {
+        // SAFETY: zfree is invoked before the stack-local context is destroyed, and
+        // receives the exact pointer previously returned by the matching allocator.
+        if let Some(ctx) = unsafe { opaque.cast::<MisalignedAlloc>().as_mut() } {
+            if let Some(index) = ctx.buffers.iter().position(|(address, _)| *address == ptr) {
+                ctx.buffers.swap_remove(index);
+                ctx.frees += 1;
             }
         }
     }

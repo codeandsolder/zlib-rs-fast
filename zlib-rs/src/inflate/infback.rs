@@ -61,8 +61,8 @@ pub(super) fn back_init_window(
     };
 
     let mut state = State::new(InflateStateKind::Back);
-    // inflateBack uses the caller-provided window directly, so the allocation contains only State
-    // plus alignment headroom.
+    // inflateBack uses the caller-provided window directly, so its typed aligned
+    // allocation contains only the State and trailing storage-unit padding.
     state.back_window = window;
     state.wbits = wbits;
     state.flags.update(Flags::SANE, true);

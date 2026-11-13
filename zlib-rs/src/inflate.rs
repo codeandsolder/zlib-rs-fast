@@ -13,7 +13,7 @@ mod window;
 mod writer;
 
 use crate::abi_cursor::{advance_abi_bytes, SliceBudget};
-use crate::allocate::Allocator;
+use crate::allocate::{AlignedAllocationBlock, Allocator, ALLOCATION_BLOCK_BYTES};
 use crate::c_api::{in_func, internal_state, out_func};
 use crate::output_buffer::{assume_init_prefix, WritableBytes};
 use crate::state_ptr::StatePtr;
@@ -784,7 +784,7 @@ pub struct State<'a> {
     /// work area for code table building
     work: [u16; 288],
 
-    allocation_start: *mut u8,
+    allocation_start: *mut AlignedAllocationBlock,
     total_allocation_size: usize,
 
     // Back-only state stays at the cold tail so regular decode field offsets do not move.
@@ -850,7 +850,7 @@ impl<'a> State<'a> {
     fn clone_rebound(
         &self,
         window: Window<'a>,
-        allocation_start: *mut u8,
+        allocation_start: *mut AlignedAllocationBlock,
         total_allocation_size: usize,
     ) -> Self {
         debug_assert!(self.back_window.is_empty());
@@ -2742,6 +2742,10 @@ pub fn prime(stream: &mut InflateStream, bits: i32, value: i32) -> ReturnCode {
     ReturnCode::Ok
 }
 
+// Future changes to Inflate State alignment must remain compatible with the
+// common typed allocation unit used for both regular and callback modes.
+const _: () = assert!(core::mem::align_of::<State<'static>>() <= ALLOCATION_BLOCK_BYTES);
+
 struct InflateAllocOffsets {
     total_size: usize,
     state_pos: usize,
@@ -2749,7 +2753,7 @@ struct InflateAllocOffsets {
 }
 
 impl InflateAllocOffsets {
-    const ALIGN_SIZE: usize = 64;
+    const ALIGN_SIZE: usize = ALLOCATION_BLOCK_BYTES;
 
     fn with_window() -> Self {
         Self::new(true)
@@ -2772,9 +2776,8 @@ impl InflateAllocOffsets {
             pos
         });
 
-        // Reserve enough headroom to align the allocation start to 64 bytes, then round the whole
-        // allocation up to the same granularity.
-        let total_size = (curr_size + (Self::ALIGN_SIZE - 1)).next_multiple_of(Self::ALIGN_SIZE);
+        // Typed storage supplies the required alignment; reserve no leading slack.
+        let total_size = curr_size.next_multiple_of(Self::ALIGN_SIZE);
 
         Self {
             total_size,
@@ -2788,17 +2791,10 @@ impl InflateAllocOffsets {
             .expect("inflate allocation layout includes an owned window")
     }
 
-    /// Allocate raw storage and return both the original allocation pointer (needed for freeing)
-    /// and its 64-byte-aligned interior base used by this layout.
-    fn allocate_storage<'a>(&self, alloc: &Allocator<'a>) -> Option<(NonNull<u8>, NonNull<u8>)> {
-        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
-        let address = allocation_start.as_ptr() as usize;
-        let align_offset = address.next_multiple_of(Self::ALIGN_SIZE) - address;
-        // SAFETY: `total_size` reserves `ALIGN_SIZE - 1` bytes of alignment headroom, and offsetting
-        // a non-null allocation pointer within that allocation cannot produce null.
-        let aligned =
-            unsafe { NonNull::new_unchecked(allocation_start.as_ptr().add(align_offset)) };
-        Some((allocation_start, aligned))
+    /// Allocate typed, cache-line-aligned storage using the common allocator.
+    /// Custom C allocators are aligned within the allocator itself.
+    fn allocate_storage(&self, alloc: &Allocator<'_>) -> Option<NonNull<AlignedAllocationBlock>> {
+        alloc.allocate_slice_raw::<AlignedAllocationBlock>(self.total_size / Self::ALIGN_SIZE)
     }
 
     /// Allocate and place one inflate state using this layout.
@@ -2811,7 +2807,8 @@ impl InflateAllocOffsets {
         alloc: &Allocator<'a>,
         mut state: State<'a>,
     ) -> Option<NonNull<State<'a>>> {
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        let allocation_start = self.allocate_storage(alloc)?;
+        let aligned = allocation_start.cast::<u8>();
 
         if let Some(window_pos) = self.window_pos {
             // SAFETY: `window_pos` is computed inside this allocation and leaves enough room for
@@ -2850,7 +2847,8 @@ impl InflateAllocOffsets {
             "regular inflate state owns the canonical history window"
         );
 
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        let allocation_start = self.allocate_storage(alloc)?;
+        let aligned = allocation_start.cast::<u8>();
         let window_pos = self.window_pos();
         // SAFETY: the ordinary layout reserves exactly the source window backing length at
         // `window_pos`, and the fresh destination allocation cannot overlap the source.
@@ -3363,7 +3361,14 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
     let stream = stream.as_z_stream_mut();
     let _ = core::mem::replace(&mut stream.state, core::ptr::null_mut());
 
-    unsafe { alloc.deallocate(allocation_start, total_allocation_size) };
+    // SAFETY: the state retains the original typed allocation and its exact byte
+    // count; it is detached before this matching deallocation.
+    unsafe {
+        alloc.deallocate(
+            allocation_start,
+            total_allocation_size / InflateAllocOffsets::ALIGN_SIZE,
+        )
+    };
 
     stream
 }
@@ -3408,6 +3413,9 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocate::test_support::{
+        misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc,
+    };
 
     #[test]
     fn fast_decoder_rejects_invalid_table_width_before_consuming_input_or_output() {
@@ -4298,6 +4306,76 @@ mod tests {
 
         assert!(end(stream).state.is_null());
         assert!(end(stream).state.is_null());
+    }
+
+    #[test]
+    fn aligned_inflate_storage_handles_custom_allocator_residues() -> Result<(), &'static str> {
+        for remainder in 0..ALLOCATION_BLOCK_BYTES {
+            let mut ctx = MisalignedAlloc {
+                remainder,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let mut raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut ctx).cast(),
+                ..z_stream::default()
+            };
+            assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+            // SAFETY: a successful init creates an exclusively owned inflate state.
+            let source = (unsafe { InflateStream::from_stream_mut(&raw mut raw) })
+                .ok_or("initialized inflate state missing")?;
+            assert_eq!(source.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(
+                source.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
+                0
+            );
+
+            let mut cloned_raw = MaybeUninit::<InflateStream>::uninit();
+            assert_eq!(copy(&mut cloned_raw, source), ReturnCode::Ok);
+            // SAFETY: the successful copy initialized all destination state fields.
+            let cloned = unsafe { cloned_raw.assume_init_mut() };
+            assert_eq!(cloned.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(
+                cloned.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
+                0
+            );
+            assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
+            assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
+            end(cloned);
+            end(source);
+
+            let mut back_raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut ctx).cast(),
+                ..z_stream::default()
+            };
+            let mut caller_window = vec![0u8; 1usize << MIN_WBITS];
+            let back_window = Window::from_initialized_slice(&mut caller_window);
+            assert_eq!(
+                back_init(
+                    &mut back_raw,
+                    InflateConfig {
+                        window_bits: MIN_WBITS,
+                    },
+                    back_window
+                ),
+                ReturnCode::Ok
+            );
+            // SAFETY: successful back_init created an exclusive inflater state; back_end
+            // detaches the caller-provided history window before releasing that state.
+            let back = (unsafe { InflateStream::from_back_stream_mut(&raw mut back_raw) })
+                .ok_or("callback inflater state missing")?;
+            assert_eq!(back.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            back_end(back);
+            assert_eq!(ctx.allocations, 3, "allocations at remainder {remainder}");
+            assert_eq!(ctx.frees, 3, "frees at remainder {remainder}");
+            assert!(ctx.buffers.is_empty(), "outstanding memory at {remainder}");
+        }
+        Ok(())
     }
 
     #[test]
