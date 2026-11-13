@@ -2414,12 +2414,13 @@ pub fn fill_window_core_with_hash_maintenance(
             // Shift only the logically initialized upper-half bytes down.
             state.window.slide_down(wsize);
 
-            if state.match_start >= wsize as u16 {
-                state.match_start -= wsize as u16;
-            } else {
-                state.match_start = 0;
+            // A match before the retained half of the window is no longer
+            // valid. Sliding itself uses a full-width displacement and
+            // saturates the 16-bit position, just like the hash chains.
+            if usize::from(state.match_start) < wsize {
                 state.prev_length = 0;
             }
+            state.match_start = self::slide_hash::slide_position(state.match_start, wsize);
 
             state.strstart -= wsize; /* we now have strstart >= MAX_DIST */
             let Some(slid_origin) = state.block_start.checked_sub_unsigned(wsize) else {
@@ -2707,13 +2708,13 @@ fn gen_bitlen<const N: usize>(
 
     /* Find the first bit length which could increase: */
     loop {
-        let mut bits = max_length as usize - 1;
+        let mut bits = usize::from(max_length) - 1;
         while bl_count[bits] == 0 {
             bits -= 1;
         }
         bl_count[bits] -= 1; /* move one leaf down the tree */
         bl_count[bits + 1] += 2; /* move one overflow item as its brother */
-        bl_count[max_length as usize] -= 1;
+        bl_count[usize::from(max_length)] -= 1;
         /* The brother of the overflow item also moves one step up,
          * but this does not affect bl_count[max_length]
          */
@@ -5151,6 +5152,58 @@ mod test {
             );
             assert_eq!(code, ReturnCode::Ok, "level {level} did not decode");
             assert_eq!(restored, source, "level {level} round-trip mismatch");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_valid_window_bits_slide_positions_and_round_trip() -> Result<(), &'static str> {
+        // Cross multiple window slides at every supported zlib window size.
+        // Exercising the encoder and inflater catches stale match positions
+        // that a direct hash-table test cannot observe.
+        let source = b"ABCDxyzXYZ01234abcdefghij".repeat(6_000);
+        for window_bits in 9..=crate::MAX_WBITS {
+            for level in [1, 6, 9] {
+                let config = DeflateConfig {
+                    level,
+                    window_bits,
+                    ..DeflateConfig::default()
+                };
+                let mut stream = DeflateStream::new(config)
+                    .map_err(|_| "valid window configuration failed to initialize")?;
+                let mut output = vec![0u8; compress_bound(source.len()) + 64];
+                stream.next_in = source.as_ptr().cast_mut();
+                stream.avail_in = crate::c_api::uInt::try_from(source.len())
+                    .map_err(|_| "test input exceeds ABI length")?;
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                    .map_err(|_| "test output exceeds ABI length")?;
+
+                assert_eq!(
+                    deflate(&mut stream, DeflateFlush::Finish),
+                    ReturnCode::StreamEnd,
+                    "window bits {window_bits}, level {level}"
+                );
+                assert_eq!(stream.avail_in, 0);
+                let written = usize::try_from(stream.total_out)
+                    .map_err(|_| "test output count exceeds host usize")?;
+                assert!(end(&mut stream).is_ok());
+                let mut decoded = vec![0u8; source.len()];
+                let (restored, status) = crate::decompress_slice(
+                    &mut decoded,
+                    &output[..written],
+                    crate::InflateConfig::default(),
+                );
+                assert_eq!(
+                    status,
+                    ReturnCode::Ok,
+                    "window bits {window_bits}, level {level}"
+                );
+                assert_eq!(
+                    restored, source,
+                    "round trip window bits {window_bits}, level {level}"
+                );
+            }
         }
         Ok(())
     }
