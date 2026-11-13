@@ -3910,7 +3910,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_zero_fill_initializes_write_buffers_before_access() -> Result<(), &'static str> {
+    fn pending_zero_fill_initializes_write_buffers_before_access() {
         let mut state = GzState::new();
         state.mode = GzMode::Write;
         state.want = 64;
@@ -3926,7 +3926,6 @@ mod tests {
         // fixture intentionally abandons the unfinished stream; deflateEnd
         // frees it and reports Z_DATA_ERROR for the incomplete output.
         assert_eq!(unsafe { deflateEnd(&raw mut state.stream) }, Z_DATA_ERROR);
-        Ok(())
     }
 
     #[test]
@@ -3960,22 +3959,21 @@ mod tests {
             ));
             let path_c =
                 CString::new(path.to_string_lossy().as_bytes()).map_err(|_| "invalid test path")?;
-            // SAFETY: path and mode are live NUL-terminated strings.
             let mode = if direct { &direct_mode } else { &write_mode };
+            // SAFETY: path and selected mode are live NUL-terminated strings.
             let writer = unsafe { gzopen(path_c.as_ptr(), mode.as_ptr()) };
             assert!(!writer.is_null());
             // SAFETY: this exclusive handle is live; gzbuffer runs before any
             // allocation, and gzseek only schedules the forward distance.
             assert_eq!(unsafe { gzbuffer(writer, 64) }, 0);
+            // SAFETY: writer remains a live exclusive gzip handle after gzbuffer.
             assert_eq!(unsafe { gzseek64(writer, 12, SEEK_SET) }, 12);
 
             match operation {
                 ChangeParams => {
                     // SAFETY: the opened writer remains exclusive throughout.
-                    assert_eq!(
-                        unsafe { gzsetparams(writer, 9, Strategy::Default as c_int) },
-                        Z_OK
-                    );
+                    let ret = unsafe { gzsetparams(writer, 9, Strategy::Default as c_int) };
+                    assert_eq!(ret, Z_OK);
                 }
                 Flush => {
                     // SAFETY: the opened writer remains exclusive throughout.
@@ -3983,10 +3981,8 @@ mod tests {
                 }
                 Putc => {
                     // SAFETY: the opened writer remains exclusive throughout.
-                    assert_eq!(
-                        unsafe { gzputc(writer, c_int::from(b'Z')) },
-                        c_int::from(b'Z')
-                    );
+                    let written = unsafe { gzputc(writer, c_int::from(b'Z')) };
+                    assert_eq!(written, c_int::from(b'Z'));
                 }
                 Close => {
                     // Closing itself must materialize the pending zeroes.
