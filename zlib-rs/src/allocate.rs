@@ -19,10 +19,10 @@ const ALIGN: usize = 64;
 /// One cache-line of typed allocation storage, shared by Deflate and Inflate.
 /// The allocator enforces this alignment even for custom C callbacks.
 #[repr(align(64))]
-pub(crate) struct AlignedAllocationBlock {
+pub struct AlignedAllocationBlock {
     _bytes: [u8; ALIGN],
 }
-pub(crate) const ALLOCATION_BLOCK_BYTES: usize = mem::size_of::<AlignedAllocationBlock>();
+pub const ALLOCATION_BLOCK_BYTES: usize = mem::size_of::<AlignedAllocationBlock>();
 
 const _: () = assert!(mem::align_of::<AlignedAllocationBlock>() == ALIGN);
 const _: () = assert!(ALLOCATION_BLOCK_BYTES == ALIGN);
@@ -364,7 +364,7 @@ impl Allocator<'_> {
 use std::{boxed::Box, vec, vec::Vec};
 
 #[cfg(test)]
-pub(super) struct MisalignedAlloc {
+pub struct MisalignedAlloc {
     pub(super) remainder: usize,
     pub(super) allocations: usize,
     pub(super) frees: usize,
@@ -372,7 +372,7 @@ pub(super) struct MisalignedAlloc {
 }
 
 #[cfg(test)]
-pub(super) unsafe extern "C" fn misaligned_alloc_callback(
+pub unsafe extern "C" fn misaligned_alloc_callback(
     opaque: *mut core::ffi::c_void,
     items: crate::c_api::uInt,
     size: crate::c_api::uInt,
@@ -401,7 +401,7 @@ pub(super) unsafe extern "C" fn misaligned_alloc_callback(
 }
 
 #[cfg(test)]
-pub(super) unsafe extern "C" fn misaligned_free_callback(
+pub unsafe extern "C" fn misaligned_free_callback(
     opaque: *mut core::ffi::c_void,
     ptr: *mut core::ffi::c_void,
 ) {
