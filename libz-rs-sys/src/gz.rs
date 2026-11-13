@@ -1643,11 +1643,8 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
     }
 
     // Process a skip request.
-    if state.seek {
-        state.seek = false;
-        if gz_skip(state, state.skip).is_err() {
-            return 0;
-        }
+    if gz_apply_pending_read_seek(state).is_err() {
+        return 0;
     }
 
     let mut written = 0usize;
@@ -1714,6 +1711,35 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
     }
 
     written
+}
+
+// Execute a deferred forward seek and retain any unconsumed distance on
+// failure. In particular, a nonblocking descriptor can temporarily run out
+// of input after some bytes have already been skipped. The next call must
+// resume at the same logical target instead of exposing data before it.
+fn gz_apply_pending_read_seek(state: &mut GzState) -> Result<(), ()> {
+    if !state.seek {
+        return Ok(());
+    }
+
+    let start = state.pos;
+    let result = gz_skip(state, state.skip);
+    // gz_skip advances pos for each byte it actually consumes, including
+    // progress made before a later I/O or decompression error.
+    let Some(consumed) = state.pos.checked_sub(start) else {
+        state.fail_position_overflow();
+        return Err(());
+    };
+    let Some(remaining) = state.skip.checked_sub(consumed) else {
+        state.fail_position_overflow();
+        return Err(());
+    };
+    state.skip = remaining;
+    if result.is_ok() {
+        state.seek = false;
+        state.skip = 0;
+    }
+    result
 }
 
 // Skip len uncompressed bytes of output.
@@ -3004,11 +3030,8 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
         }
     }
 
-    if state.seek {
-        state.seek = false;
-        if gz_skip(state, state.skip).is_err() {
-            return -1;
-        }
+    if gz_apply_pending_read_seek(state).is_err() {
+        return -1;
     }
 
     let Some(new_pos) = state.pos.checked_sub(1) else {
@@ -3078,11 +3101,8 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
         return ptr::null_mut();
     }
 
-    if state.seek {
-        state.seek = false;
-        if gz_skip(state, state.skip).is_err() {
-            return ptr::null_mut();
-        }
+    if gz_apply_pending_read_seek(state).is_err() {
+        return ptr::null_mut();
     }
 
     // Safety: `buf` is non-null and the public contract guarantees `len` writable bytes.
@@ -3859,6 +3879,199 @@ mod tests {
         // SAFETY: file remains live; the same writable destination is valid.
         assert_eq!(unsafe { gzread(file, data.as_mut_ptr().cast(), 16) }, -1);
         // SAFETY: this consumes the live gzip handle and read descriptor.
+        assert_eq!(unsafe { gzclose(file) }, Z_OK);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_compressed_seek_resumes_across_read_entrypoints() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        const GZIP_AB: [u8; 22] = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 75, 76, 2, 0, 109, 72, 131, 158, 2, 0, 0, 0,
+        ];
+        const GZIP_CDEFGH: [u8; 26] = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 75, 78, 73, 77, 75, 207, 0, 0, 115, 169, 103, 122,
+            6, 0, 0, 0,
+        ];
+        #[derive(Clone, Copy)]
+        enum Method {
+            Gets,
+            Items,
+            Ungetc,
+        }
+
+        for method in [Method::Gets, Method::Items, Method::Ungetc] {
+            let mut descriptors = [-1; 2];
+            // SAFETY: pipe initializes two writable descriptor slots.
+            assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+            // SAFETY: pipe returned a unique read descriptor.
+            let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+            // SAFETY: pipe returned a unique write descriptor.
+            let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+            // SAFETY: F_GETFL queries flags of a live descriptor.
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            // SAFETY: F_SETFL applies the existing flags plus nonblocking mode.
+            let configured =
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(configured, 0);
+
+            let send = |bytes: &[u8]| {
+                // SAFETY: writer is live and bytes points to initialized memory.
+                let n =
+                    unsafe { libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+                assert_eq!(usize::try_from(n), Ok(bytes.len()));
+            };
+            send(&GZIP_AB);
+            let fd = reader.into_raw_fd();
+            // SAFETY: ownership of the read descriptor is transferred to gzdopen.
+            let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+            if file.is_null() {
+                // SAFETY: ownership remains with the caller if gzdopen fails.
+                unsafe { libc::close(fd) };
+            }
+            assert!(!file.is_null());
+
+            // SAFETY: valid forward seek on an exclusive live gzip handle.
+            assert_eq!(unsafe { gzseek64(file, 4, SEEK_SET) }, 4);
+            let mut result = [0xa5u8; 3];
+            let attempt = |result: &mut [u8; 3]| match method {
+                Method::Gets => {
+                    // SAFETY: result holds three writable bytes and file is live.
+                    let ptr = unsafe { gzgets(file, result.as_mut_ptr().cast(), 2) };
+                    if ptr.is_null() {
+                        -1
+                    } else {
+                        1
+                    }
+                }
+                Method::Items => {
+                    // SAFETY: file remains live and result holds one writable item.
+                    let count = unsafe { gzfread(result.as_mut_ptr().cast(), 1, 1, file) };
+                    if count == 0 {
+                        -1
+                    } else {
+                        1
+                    }
+                }
+                Method::Ungetc => {
+                    // SAFETY: file is live; pushback mutates only its internal buffer.
+                    unsafe { gzungetc(c_int::from(b'X'), file) }
+                }
+            };
+
+            assert_eq!(attempt(&mut result), -1);
+            // SAFETY: the pending seek's logical destination does not change on EAGAIN.
+            assert_eq!(unsafe { gztell64(file) }, 4);
+            send(&GZIP_CDEFGH);
+            drop(writer);
+
+            let success = attempt(&mut result);
+            if matches!(method, Method::Ungetc) {
+                assert_eq!(success, c_int::from(b'X'));
+                // SAFETY: file remains live and result has a writable byte.
+                assert_eq!(unsafe { gzread(file, result.as_mut_ptr().cast(), 1) }, 1);
+                assert_eq!(result[0], b'X');
+            } else {
+                assert_eq!(success, 1);
+            }
+            if !matches!(method, Method::Ungetc) {
+                assert_eq!(result[0], b'e');
+            }
+            // SAFETY: file remains live and result has a writable byte.
+            assert_eq!(unsafe { gzread(file, result.as_mut_ptr().cast(), 1) }, 1);
+            assert_eq!(
+                result[0],
+                if matches!(method, Method::Ungetc) {
+                    b'e'
+                } else {
+                    b'f'
+                }
+            );
+            let expected_pos = if matches!(method, Method::Ungetc) {
+                5
+            } else {
+                6
+            };
+            // SAFETY: the gzip handle is live; gztell only observes its position.
+            let position = unsafe { gztell64(file) };
+            assert_eq!(position, expected_pos);
+            // SAFETY: gzclose releases the handle and owned descriptor.
+            assert_eq!(unsafe { gzclose(file) }, Z_OK);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_forward_seek_resumes_after_partial_nonblocking_input() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        let mut descriptors = [-1; 2];
+        // SAFETY: the pipe syscall initializes exactly two writable integers.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned an independent live read descriptor.
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: pipe returned an independent live write descriptor.
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        // SAFETY: reader is live and F_GETFL reads its existing flags.
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        // SAFETY: F_SETFL applies valid flags to the live reader.
+        let changed =
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(changed, 0);
+        let fd = reader.into_raw_fd();
+        // SAFETY: a live read fd is transferred and mode is a live C string.
+        let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+        if file.is_null() {
+            // SAFETY: failed gzdopen leaves the descriptor with the caller.
+            unsafe { libc::close(fd) };
+        }
+        assert!(!file.is_null());
+
+        // SAFETY: the file is live and the seek is a valid forward read seek.
+        assert_eq!(unsafe { gzseek64(file, 4, SEEK_SET) }, 4);
+        // SAFETY: the file is live; this is the logical pending seek target.
+        assert_eq!(unsafe { gztell64(file) }, 4);
+
+        let payload = b"ab";
+        // SAFETY: writer is live and payload contains two initialized bytes.
+        let written =
+            unsafe { libc::write(writer.as_raw_fd(), payload.as_ptr().cast(), payload.len()) };
+        assert_eq!(usize::try_from(written), Ok(payload.len()));
+
+        let mut result = [0xa5u8; 2];
+        // SAFETY: file is live and result has one writable byte.
+        assert_eq!(unsafe { gzread(file, result.as_mut_ptr().cast(), 1) }, -1);
+        let mut error = 0;
+        // SAFETY: file is live and error is an aligned writable C integer.
+        let msg = unsafe { gzerror(file, &raw mut error) };
+        assert!(!msg.is_null());
+        assert_eq!(error, Z_ERRNO);
+        // The remaining two bytes of the seek should still be scheduled.
+        // SAFETY: file is live and gztell does not change its state.
+        assert_eq!(unsafe { gztell64(file) }, 4);
+
+        let remaining = b"cdefgh";
+        // SAFETY: writer remains live and remaining holds initialized bytes.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                remaining.as_ptr().cast(),
+                remaining.len(),
+            )
+        };
+        assert_eq!(usize::try_from(written), Ok(remaining.len()));
+        drop(writer);
+
+        // SAFETY: file remains live; result has one writable byte.
+        assert_eq!(unsafe { gzread(file, result.as_mut_ptr().cast(), 1) }, 1);
+        assert_eq!(result[0], b'e');
+        assert_eq!(result[1], 0xa5);
+        // SAFETY: file remains live and its logical offset advanced by one.
+        assert_eq!(unsafe { gztell64(file) }, 5);
+        // SAFETY: gzclose consumes the owned handle and descriptor.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
     }
 
