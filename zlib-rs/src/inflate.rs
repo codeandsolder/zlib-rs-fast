@@ -4311,6 +4311,7 @@ mod tests {
         for remainder in 0..ALLOCATION_BLOCK_BYTES {
             let mut ctx = MisalignedAlloc {
                 remainder,
+                modulus: ALLOCATION_BLOCK_BYTES,
                 allocations: 0,
                 frees: 0,
                 buffers: Vec::new(),

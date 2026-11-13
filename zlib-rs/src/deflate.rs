@@ -6155,6 +6155,7 @@ mod test {
         for remainder in 0..DEFLATE_ALLOC_ALIGN {
             let mut ctx = MisalignedAlloc {
                 remainder,
+                modulus: ALLOCATION_BLOCK_BYTES,
                 allocations: 0,
                 frees: 0,
                 buffers: Vec::new(),
