@@ -2585,14 +2585,33 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
 
     // Check for a pending reset.
     if state.reset {
-        // Don't start a new gzip stream unless there is data to write.
+        // Avoid an additional empty gzip member after Z_FINISH.
         if state.stream.avail_in == 0 {
             return Ok(());
         }
-        // Safety: `state.reset` is set only in `gz_comp`, which first initializes
-        // `state.stream` using `deflateInit2_`.
-        let _ = unsafe { deflateReset(&raw mut state.stream) };
+        // SAFETY: gz_init initialized the live deflater; Z_FINISH completed
+        // the previous member before reset was scheduled.
+        let ret = unsafe { deflateReset(&raw mut state.stream) };
+        if ret != Z_OK {
+            gz_error(state, Some((Z_STREAM_ERROR, "failed to reset deflater")));
+            return Err(());
+        }
         state.reset = false;
+
+        // A parameter change made after Z_FINISH applies to the next member.
+        // Reconfigure the new stream only when there is input to encode.
+        // SAFETY: the live deflater was just successfully reset.
+        let ret = unsafe {
+            super::deflateParams(
+                &raw mut state.stream,
+                c_int::from(state.level),
+                state.strategy as c_int,
+            )
+        };
+        if ret != Z_OK {
+            gz_error(state, Some((ret, "failed to configure deflater")));
+            return Err(());
+        }
     }
 
     // Run deflate on the provided input until it produces no more output.
@@ -3231,19 +3250,47 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
         }
     }
 
-    // Change compression parameters for subsequent input.
-    if state.input.is_some() {
-        // Flush previous input with previous parameters before changing.
+    // A finished member records its next configuration without emitting an
+    // empty extra member. The next actual write applies that configuration.
+    if state.input.is_some() && !state.reset {
+        // Flush previous input using its existing compression configuration.
         if state.stream.avail_in != 0 && gz_comp(state, Z_BLOCK).is_err() {
             return state.err;
         }
-        // Safety: Because `state` is in write mode and owns an input buffer, `state.stream`
-        // was initialized using `deflateInit2` in `gz_init`.
-        // SAFETY: gz_init initialized this live stream; the state holds its
-        // compression input/output buffers throughout the parameter change.
-        let ret = unsafe { super::deflateParams(&raw mut state.stream, level, strategy as c_int) };
-        if ret != Z_OK {
-            return ret;
+
+        loop {
+            // SAFETY: gz_init initialized the live stream; owned output storage
+            // remains allocated throughout the parameter change.
+            let ret =
+                unsafe { super::deflateParams(&raw mut state.stream, level, strategy as c_int) };
+            if ret != Z_BUF_ERROR {
+                if ret != Z_OK {
+                    return ret;
+                }
+                break;
+            }
+
+            // deflateParams may have exhausted output while writing a block
+            // boundary. Drain that output and retry the same change.
+            let before = (
+                state.stream.total_in,
+                state.stream.total_out,
+                state.stream.avail_in,
+                state.stream.avail_out,
+            );
+            if gz_comp(state, Z_BLOCK).is_err() {
+                return state.err;
+            }
+            let after = (
+                state.stream.total_in,
+                state.stream.total_out,
+                state.stream.avail_in,
+                state.stream.avail_out,
+            );
+            if before == after {
+                // Avoid spinning when no forward progress is possible.
+                return Z_BUF_ERROR;
+            }
         }
     }
     state.level = level_storage;
@@ -3694,6 +3741,104 @@ mod tests {
         let mut path_buf = prefix.to_path_buf();
         path_buf.push(file);
         path_buf.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gzip_setparams_after_finish_does_not_emit_an_empty_member() {
+        use std::io::Read;
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        for append_new_data in [false, true] {
+            let mut descriptors = [-1; 2];
+            // SAFETY: pipe initializes the two writable C integer slots.
+            assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+            // SAFETY: pipe returned a unique live read descriptor.
+            let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+            let write_fd = descriptors[1];
+            // SAFETY: the live write descriptor is transferred to the gzip handle.
+            let file = unsafe { gzdopen(write_fd, c"wb".as_ptr()) };
+            if file.is_null() {
+                // SAFETY: on failed gzdopen the write descriptor is still owned.
+                unsafe { libc::close(write_fd) };
+            }
+            assert!(!file.is_null());
+
+            // SAFETY: file is a live writable gzip handle; data is initialized.
+            assert_eq!(unsafe { gzwrite(file, b"abc".as_ptr().cast(), 3) }, 3);
+            // SAFETY: Z_FINISH completes the first member on the live handle.
+            assert_eq!(unsafe { gzflush(file, Z_FINISH) }, Z_OK);
+            // SAFETY: file is live and new compression parameters are valid.
+            let changed = unsafe { gzsetparams(file, 9, Strategy::Default as c_int) };
+            assert_eq!(changed, Z_OK);
+            if append_new_data {
+                // SAFETY: file is live and additional input spans three bytes.
+                assert_eq!(unsafe { gzwrite(file, b"xyz".as_ptr().cast(), 3) }, 3);
+            }
+            // SAFETY: gzclose consumes file and closes its write descriptor.
+            assert_eq!(unsafe { gzclose(file) }, Z_OK);
+
+            // The writer is gone, so collecting the small encoded stream
+            // cannot block. The ordinary gzip framing has no extra member.
+            let mut compressed = Vec::new();
+            let mut readable = std::fs::File::from(reader);
+            assert!(readable.read_to_end(&mut compressed).is_ok());
+            let members = compressed.windows(3).filter(|b| *b == [31, 139, 8]).count();
+            assert_eq!(members, if append_new_data { 2 } else { 1 });
+            assert_eq!(compressed.len(), if append_new_data { 46 } else { 23 });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gzip_setparams_after_finished_member_starts_new_member() {
+        // /dev/null isolates compressor state transitions from filesystem I/O.
+        // SAFETY: static NUL-terminated path/mode strings remain alive.
+        let file = unsafe { gzopen(c"/dev/null".as_ptr(), c"wb".as_ptr()) };
+        assert!(!file.is_null());
+        // SAFETY: file is a live gzip write handle, and output buffer is sized before use.
+        assert_eq!(unsafe { gzbuffer(file, 64) }, 0);
+        // SAFETY: file is live; a Z_FINISH flush completes an empty gzip member.
+        assert_eq!(unsafe { gzflush(file, Z_FINISH) }, Z_OK);
+        // SAFETY: file remains live and the new compression parameters are valid.
+        let changed = unsafe { gzsetparams(file, 9, Strategy::Default as c_int) };
+        assert_eq!(changed, Z_OK);
+        // SAFETY: file is live and the payload contains initialized bytes.
+        assert_eq!(unsafe { gzwrite(file, b"ok".as_ptr().cast(), 2) }, 2);
+        // SAFETY: gzclose consumes and frees the live handle.
+        assert_eq!(unsafe { gzclose(file) }, Z_OK);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gzip_setparams_switches_strategy_after_buffered_compression() {
+        // SAFETY: static NUL-terminated path/mode strings remain alive.
+        let file = unsafe { gzopen(c"/dev/null".as_ptr(), c"wb".as_ptr()) };
+        assert!(!file.is_null());
+        // SAFETY: file is live and no compressed input has been written yet.
+        assert_eq!(unsafe { gzbuffer(file, 64) }, 0);
+        // SAFETY: file is live and compression parameters are valid.
+        let changed = unsafe { gzsetparams(file, 1, Strategy::Default as c_int) };
+        assert_eq!(changed, Z_OK);
+        let mut bytes = [0u8; 4096];
+        let mut rng = 0x7c55_493du32;
+        for byte in &mut bytes {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            *byte = rng.to_le_bytes()[0];
+        }
+        // SAFETY: live file; both payloads are readable for their complete lengths.
+        assert_eq!(unsafe { gzwrite(file, b"abc".as_ptr().cast(), 3) }, 3);
+        // SAFETY: file remains live and bytes contains 4096 initialized bytes.
+        assert_eq!(unsafe { gzwrite(file, bytes.as_ptr().cast(), 4096) }, 4096);
+        // SAFETY: file remains live and the requested level/strategy are supported.
+        let changed = unsafe { gzsetparams(file, 0, Strategy::Fixed as c_int) };
+        assert_eq!(changed, Z_OK);
+        // SAFETY: file is live and the next payload remains readable.
+        assert_eq!(unsafe { gzwrite(file, b"xyz".as_ptr().cast(), 3) }, 3);
+        // SAFETY: gzclose consumes the gzip handle.
+        assert_eq!(unsafe { gzclose(file) }, Z_OK);
     }
 
     #[test]
