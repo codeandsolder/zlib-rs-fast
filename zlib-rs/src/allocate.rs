@@ -361,56 +361,56 @@ impl Allocator<'_> {
 /// Reusable test-only C allocator simulating every raw pointer residue.
 /// The per-stream context avoids global callbacks and cross-test contention.
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::ALLOCATION_BLOCK_BYTES;
-    use std::{boxed::Box, vec, vec::Vec};
+use std::{boxed::Box, vec, vec::Vec};
 
-    pub(crate) struct MisalignedAlloc {
-        pub(crate) remainder: usize,
-        pub(crate) allocations: usize,
-        pub(crate) frees: usize,
-        pub(crate) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
-    }
+#[cfg(test)]
+pub(super) struct MisalignedAlloc {
+    pub(super) remainder: usize,
+    pub(super) allocations: usize,
+    pub(super) frees: usize,
+    pub(super) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
+}
 
-    pub(crate) unsafe extern "C" fn misaligned_alloc_callback(
-        opaque: *mut core::ffi::c_void,
-        items: crate::c_api::uInt,
-        size: crate::c_api::uInt,
-    ) -> *mut core::ffi::c_void {
-        // SAFETY: init and copy receive a live pointer to our stack-local allocator context.
-        let Some(ctx) = (unsafe { opaque.cast::<MisalignedAlloc>().as_mut() }) else {
-            return core::ptr::null_mut();
-        };
-        let Some(length) = usize::try_from(items)
-            .ok()
-            .and_then(|count| usize::try_from(size).ok()?.checked_mul(count))
-            .and_then(|size| size.checked_add(ALLOCATION_BLOCK_BYTES))
-        else {
-            return core::ptr::null_mut();
-        };
-        let mut data = vec![0u8; length].into_boxed_slice();
-        let base = data.as_mut_ptr() as usize;
-        let delta = (ctx.remainder + ALLOCATION_BLOCK_BYTES - base % ALLOCATION_BLOCK_BYTES)
-            % ALLOCATION_BLOCK_BYTES;
-        // SAFETY: the allocation reserves one full alignment unit beyond the requested
-        // size, so the shifted pointer still has all requested bytes available.
-        let ptr = unsafe { data.as_mut_ptr().add(delta) }.cast();
-        ctx.buffers.push((ptr, data));
-        ctx.allocations += 1;
-        ptr
-    }
+#[cfg(test)]
+pub(super) unsafe extern "C" fn misaligned_alloc_callback(
+    opaque: *mut core::ffi::c_void,
+    items: crate::c_api::uInt,
+    size: crate::c_api::uInt,
+) -> *mut core::ffi::c_void {
+    // SAFETY: init and copy receive a live pointer to our stack-local allocator context.
+    let Some(ctx) = (unsafe { opaque.cast::<MisalignedAlloc>().as_mut() }) else {
+        return core::ptr::null_mut();
+    };
+    let Some(length) = usize::try_from(items)
+        .ok()
+        .and_then(|count| usize::try_from(size).ok()?.checked_mul(count))
+        .and_then(|size| size.checked_add(ALLOCATION_BLOCK_BYTES))
+    else {
+        return core::ptr::null_mut();
+    };
+    let mut data = vec![0u8; length].into_boxed_slice();
+    let base = data.as_mut_ptr() as usize;
+    let delta = (ctx.remainder + ALLOCATION_BLOCK_BYTES - base % ALLOCATION_BLOCK_BYTES)
+        % ALLOCATION_BLOCK_BYTES;
+    // SAFETY: the allocation reserves one full alignment unit beyond the requested
+    // size, so the shifted pointer still has all requested bytes available.
+    let ptr = unsafe { data.as_mut_ptr().add(delta) }.cast();
+    ctx.buffers.push((ptr, data));
+    ctx.allocations += 1;
+    ptr
+}
 
-    pub(crate) unsafe extern "C" fn misaligned_free_callback(
-        opaque: *mut core::ffi::c_void,
-        ptr: *mut core::ffi::c_void,
-    ) {
-        // SAFETY: zfree is invoked before the stack-local context is destroyed, and
-        // receives the exact pointer previously returned by the matching allocator.
-        if let Some(ctx) = unsafe { opaque.cast::<MisalignedAlloc>().as_mut() } {
-            if let Some(index) = ctx.buffers.iter().position(|(address, _)| *address == ptr) {
-                ctx.buffers.swap_remove(index);
-                ctx.frees += 1;
-            }
+#[cfg(test)]
+pub(super) unsafe extern "C" fn misaligned_free_callback(
+    opaque: *mut core::ffi::c_void,
+    ptr: *mut core::ffi::c_void,
+) {
+    // SAFETY: zfree is invoked before the stack-local context is destroyed, and
+    // receives the exact pointer previously returned by the matching allocator.
+    if let Some(ctx) = unsafe { opaque.cast::<MisalignedAlloc>().as_mut() } {
+        if let Some(index) = ctx.buffers.iter().position(|(address, _)| *address == ptr) {
+            ctx.buffers.swap_remove(index);
+            ctx.frees += 1;
         }
     }
 }

@@ -3367,8 +3367,8 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
         alloc.deallocate(
             allocation_start,
             total_allocation_size / InflateAllocOffsets::ALIGN_SIZE,
-        )
-    };
+        );
+    }
 
     stream
 }
@@ -3413,9 +3413,7 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocate::test_support::{
-        misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc,
-    };
+    use crate::allocate::{misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc};
 
     #[test]
     fn fast_decoder_rejects_invalid_table_width_before_consuming_input_or_output() {

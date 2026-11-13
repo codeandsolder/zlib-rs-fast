@@ -1188,8 +1188,8 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
         alloc.deallocate(
             allocation_start.as_ptr(),
             total_allocation_size / DEFLATE_ALLOC_ALIGN,
-        )
-    };
+        );
+    }
 
     match status {
         Status::Busy => Err(stream),
@@ -4597,9 +4597,7 @@ mod test {
     };
 
     use super::*;
-    use crate::allocate::test_support::{
-        misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc,
-    };
+    use crate::allocate::{misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc};
 
     use core::{ffi::CStr, sync::atomic::AtomicUsize};
 
