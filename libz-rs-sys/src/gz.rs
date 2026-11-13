@@ -1859,13 +1859,21 @@ fn gz_look(state: &mut GzState) -> Result<(), ()> {
         }
     }
 
-    // Look for gzip magic bytes.
-    // Note: If we are reading a partially written gzip file, and all that is available to read is
-    // the first byte of the gzip magic number, we cannot tell whether what follows will be the
-    // rest of the gzip magic. For simplicity, we assume that the writer of a gzip file will
-    // write the header (or at least the magic number at the start of the header) atomically,
-    // so if our initial read found a single byte it is a sufficient indication that the file
-    // is not in gzip format.
+    // A single 0x1f could be the beginning of a gzip header. Preserve it
+    // until the second byte is available or the source reaches real EOF.
+    // In particular, EAGAIN on a nonblocking pipe must not turn a partially
+    // delivered gzip member into a permanently transparent stream.
+    if state.stream.avail_in == 1 && !state.eof {
+        let Some(first) = state.buffered_read_input().and_then(|input| input.first()) else {
+            state.invalid_read_cursor();
+            return Err(());
+        };
+        if *first == 31 {
+            gz_avail(state)?;
+        }
+    }
+
+    // Determine whether the buffered input starts with gzip magic bytes.
     let Some(input) = state.buffered_read_input() else {
         state.invalid_read_cursor();
         return Err(());
@@ -3778,7 +3786,10 @@ mod tests {
                 };
                 match scenario {
                     InputShape::Plain => send(b"abc"),
-                    InputShape::CompleteGzip => send(&ABC_GZ),
+                    InputShape::CompleteGzip => {
+                        send(&ABC_GZ);
+                        send(&XYZ_GZ[..1]); // Next member's first magic byte only.
+                    }
                     InputShape::SplitGzip => send(&ABC_GZ[..15]),
                 }
 
@@ -3821,7 +3832,11 @@ mod tests {
                     if scenario == InputShape::SplitGzip {
                         send(&ABC_GZ[15..]);
                     }
-                    send(&XYZ_GZ);
+                    if scenario == InputShape::CompleteGzip {
+                        send(&XYZ_GZ[1..]);
+                    } else {
+                        send(&XYZ_GZ);
+                    }
                 }
                 output.fill(0xa5);
                 let second = read(&mut output);
@@ -4167,6 +4182,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn gzip_magic_prefix_with_real_eof_is_transparent() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        let mut fds = [-1; 2];
+        // SAFETY: pipe writes exactly two descriptor values to the provided array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned a new live read descriptor.
+        let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: pipe returned an independent live write descriptor.
+        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let prefix = [31u8];
+        // SAFETY: writer is live; prefix is an initialized readable byte.
+        let sent = unsafe { libc::write(writer.as_raw_fd(), prefix.as_ptr().cast(), prefix.len()) };
+        assert_eq!(sent, 1);
+        drop(writer); // A real EOF permits a single unmatched magic byte.
+
+        let fd = reader.into_raw_fd();
+        // SAFETY: gzdopen accepts ownership of the live descriptor.
+        let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+        if file.is_null() {
+            // SAFETY: gzdopen did not acquire ownership on failure.
+            unsafe { libc::close(fd) };
+        }
+        assert!(!file.is_null());
+        let mut bytes = [0xa5u8; 2];
+        // SAFETY: file is live and bytes provides two writable bytes.
+        assert_eq!(unsafe { gzread(file, bytes.as_mut_ptr().cast(), 2) }, 1);
+        assert_eq!(bytes, [31, 0xa5]);
+        // SAFETY: file remains live and bytes still provides writable storage.
+        assert_eq!(unsafe { gzread(file, bytes.as_mut_ptr().cast(), 2) }, 0);
+        // SAFETY: this consumes and frees the gzip file and owned descriptor.
+        assert_eq!(unsafe { gzclose(file) }, Z_OK);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn nonblocking_reads_retry_when_input_arrives_without_clearerr() {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
@@ -4261,8 +4312,17 @@ mod tests {
                     assert_eq!(usize::try_from(written), Ok(bytes.len()));
                 };
                 if compressed {
-                    send(&GZIP_HELLO[..2]);
-                    // Two gzip magic bytes do not yet provide a complete member.
+                    // The magic bytes are not guaranteed to arrive atomically.
+                    // A lone first magic byte is insufficient to decide that
+                    // the stream is transparent instead of compressed.
+                    send(&GZIP_HELLO[..1]);
+                    assert_eq!(attempt(&mut data), -1);
+                    // SAFETY: file is live and err is writable.
+                    let _ = unsafe { gzerror(file, &raw mut err) };
+                    assert_eq!(err, Z_ERRNO);
+                    assert_eq!(data, [0xa5; 8]);
+                    send(&GZIP_HELLO[1..2]);
+                    // Even the complete magic number is not a whole member.
                     assert_eq!(attempt(&mut data), -1);
                     // SAFETY: file remains live and the error output is writable.
                     let _ = unsafe { gzerror(file, &raw mut err) };
