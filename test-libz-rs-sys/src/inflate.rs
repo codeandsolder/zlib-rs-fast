@@ -1328,6 +1328,48 @@ fn inflate_mark_reports_unfinished_stored_block_without_io_buffers() {
 }
 
 #[test]
+fn inflate_mark_counts_length_and_distance_huffman_bits() {
+    // Fixed-Huffman raw DEFLATE for six repetitions of "abc".
+    // A four-byte output limit pauses partway through the back-reference copy.
+    let observed = assert_eq_rs_ng!({
+        let mut raw = MaybeUninit::<z_stream>::zeroed();
+        // SAFETY: writable z_stream storage, ABI version and size are valid.
+        let init_status = unsafe {
+            inflateInit2_(
+                raw.as_mut_ptr(),
+                -15,
+                zlibVersion(),
+                test_c_stream_size::<z_stream>(),
+            )
+        };
+        assert_eq!(init_status, Z_OK);
+        // SAFETY: inflateInit2_ successfully initialized the stream.
+        let stream = unsafe { raw.assume_init_mut() };
+        let compressed = [0x4bu8, 0x4c, 0x4a, 0x4e, 0x44, 0x45, 0x00];
+        let mut output = [0xa5u8; 4];
+        stream.next_in = compressed.as_ptr().cast_mut();
+        stream.avail_in = c_uint::try_from(compressed.len()).unwrap_or(c_uint::MAX);
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = c_uint::try_from(output.len()).unwrap_or(c_uint::MAX);
+
+        // SAFETY: the input and output arrays are live and disjoint.
+        let status = unsafe { inflate(stream, Z_NO_FLUSH) };
+        // SAFETY: the initialized inflate state remains live during mark.
+        let mark = unsafe { inflateMark(stream) };
+        let consumed = stream.total_in;
+        let produced = stream.total_out;
+        // SAFETY: this stream is initialized and ended exactly once.
+        let end_status = unsafe { inflateEnd(stream) };
+        (status, mark, consumed, produced, output, end_status)
+    });
+    assert_eq!(observed.0, Z_OK);
+    assert_eq!(observed.3, 4);
+    assert_eq!(observed.4, *b"abca");
+    assert_eq!(observed.1 >> 16, 13, "length 8 bits + distance 5 bits");
+    assert_eq!(observed.5, Z_OK);
+}
+
+#[test]
 fn bad_gzip_method() {
     inf(
         &[0x1f, 0x8b, 0x00, 0x00],

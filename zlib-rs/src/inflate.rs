@@ -1153,13 +1153,16 @@ struct DecodedDistance {
     back_bits: usize,
 }
 
+/// Emit a DEFLATE literal only if the decoded code is a real byte.
+/// Malformed tables must not silently truncate a value above 255.
 #[inline]
-const fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
+fn emit_literal(output: &mut InflateOutput<'_>, value: usize) -> Result<bool, &'static str> {
+    let literal = u8::try_from(value).map_err(|_| "invalid literal/length code\0")?;
     if output.is_full() {
-        return false;
+        return Ok(false);
     }
     output.push(literal);
-    true
+    Ok(true)
 }
 
 #[inline]
@@ -1199,45 +1202,67 @@ const fn gzip_isize(total: usize) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// One complete Huffman symbol and the number of bits consumed to reach it.
+/// Length alphabets have literal entries with op=0; distance alphabets use
+/// op=0 for subtable links. All other lookup mechanics are identical.
+#[derive(Debug, Clone, Copy)]
+struct DecodedHuffmanCode {
+    entry: Code,
+    bits: usize,
+}
+
+#[inline]
+fn decode_huffman_code<const LITERAL_LENGTH: bool>(
+    reader: &mut BitReader<'_>,
+    table: &[Code],
+    table_bits: usize,
+) -> Result<DecodedHuffmanCode, ReturnCode> {
+    let mut here = loop {
+        let here = table[reader.bits_usize(table_bits)];
+        if here.bits <= reader.bits_in_buffer() {
+            break here;
+        }
+        reader.pull_byte()?;
+    };
+
+    let mut prefix_bits = 0;
+    if here.op & 0xf0 == 0 && (!LITERAL_LENGTH || here.op != 0) {
+        let last = here;
+        here = loop {
+            let bits = reader.bits_u16(usize::from(last.bits + last.op));
+            let here = table[usize::from(last.val) + usize::from(bits >> last.bits)];
+            if last.bits + here.bits <= reader.bits_in_buffer() {
+                break here;
+            }
+            reader.pull_byte()?;
+        };
+        reader.drop_bits(last.bits);
+        prefix_bits = usize::from(last.bits);
+    }
+
+    reader.drop_bits(here.bits);
+    Ok(DecodedHuffmanCode {
+        entry: here,
+        bits: prefix_bits + usize::from(here.bits),
+    })
+}
+
 #[inline]
 fn decode_distance_code(
     reader: &mut BitReader<'_>,
     table: &[Code],
     table_bits: usize,
 ) -> Result<DecodedDistance, DistanceDecodeError> {
-    let mut here;
-    loop {
-        here = table[reader.bits_usize(table_bits)];
-        if here.bits <= reader.bits_in_buffer() {
-            break;
-        }
-        reader.pull_byte().map_err(DistanceDecodeError::Input)?;
-    }
-
-    let mut back_bits = 0;
-    if here.op & 0xf0 == 0 {
-        let last = here;
-        loop {
-            let bits = reader.bits_usize(usize::from(last.bits + last.op));
-            here = table[usize::from(last.val) + (bits >> last.bits)];
-            if last.bits + here.bits <= reader.bits_in_buffer() {
-                break;
-            }
-            reader.pull_byte().map_err(DistanceDecodeError::Input)?;
-        }
-        reader.drop_bits(last.bits);
-        back_bits = last.bits as usize;
-    }
-
-    reader.drop_bits(here.bits);
-    if here.op & 64 != 0 {
+    let decoded = decode_huffman_code::<false>(reader, table, table_bits)
+        .map_err(DistanceDecodeError::Input)?;
+    if decoded.entry.op & 64 != 0 {
         return Err(DistanceDecodeError::InvalidCode);
     }
 
     Ok(DecodedDistance {
-        offset: here.val as usize,
-        extra: here.op & MAX_BITS,
-        back_bits,
+        offset: usize::from(decoded.entry.val),
+        extra: decoded.entry.op & MAX_BITS,
+        back_bits: decoded.bits,
     })
 }
 
@@ -1361,77 +1386,46 @@ impl State<'_> {
 
                         self.back = 0;
 
-                        // get a literal, length, or end-of-block code
-                        let mut here;
-                        loop {
-                            let bits = bit_reader.bits_usize(self.len_table.bits);
-                            here = len_table[bits];
-
-                            if here.bits <= bit_reader.bits_in_buffer() {
-                                break;
+                        // Decode a complete table entry before changing the
+                        // length/extra state. A short input returns in Len.
+                        let decoded = match decode_huffman_code::<true>(
+                            &mut bit_reader,
+                            len_table,
+                            self.len_table.bits,
+                        ) {
+                            Ok(decoded) => decoded,
+                            Err(code) => {
+                                return LenDecodeOutcome::break_with(Mode::Len, bit_reader, code);
                             }
+                        };
 
-                            if let Err(return_code) = bit_reader.pull_byte() {
-                                return LenDecodeOutcome::break_with(mode, bit_reader, return_code);
-                            };
-                        }
-
-                        if here.op != 0 && here.op & 0xf0 == 0 {
-                            let last = here;
-                            loop {
-                                let bits = bit_reader.bits_u16(usize::from(last.bits + last.op));
-                                here = len_table[usize::from(last.val + (bits >> last.bits))];
-                                if last.bits + here.bits <= bit_reader.bits_in_buffer() {
-                                    break;
-                                }
-
-                                if let Err(return_code) = bit_reader.pull_byte() {
-                                    return LenDecodeOutcome::break_with(
-                                        mode,
-                                        bit_reader,
-                                        return_code,
-                                    );
-                                };
-                            }
-
-                            bit_reader.drop_bits(last.bits);
-                            self.back += last.bits as usize;
-                        }
-
-                        bit_reader.drop_bits(here.bits);
-                        self.back += here.bits as usize;
-                        self.length = here.val as usize;
+                        self.back = decoded.bits;
+                        let here = decoded.entry;
+                        self.length = usize::from(here.val);
 
                         if here.op == 0 {
                             break 'top Mode::Lit;
-                        } else if here.op & 32 != 0 {
-                            // end of block
-
-                            traceln!("inflate:         end of block");
-
-                            self.back = usize::MAX;
-                            mode = Mode::Type;
-
-                            return LenDecodeOutcome::continue_with(mode, bit_reader);
-                        } else if here.op & 64 != 0 {
-                            mode = Mode::Bad;
-                            {
-                                let msg: &'static str = "invalid literal/length code\0";
-                                self.error_message = Some(msg);
-                                return LenDecodeOutcome::break_with(
-                                    mode,
-                                    bit_reader,
-                                    ReturnCode::DataError,
-                                );
-                            }
-                        } else {
-                            // length code
-                            self.extra = here.op & MAX_BITS;
-                            break 'top Mode::LenExt;
                         }
+                        if here.op & 32 != 0 {
+                            traceln!("inflate:         end of block");
+                            self.back = usize::MAX;
+                            return LenDecodeOutcome::continue_with(Mode::Type, bit_reader);
+                        }
+                        if here.op & 64 != 0 {
+                            self.error_message = Some("invalid literal/length code\0");
+                            return LenDecodeOutcome::break_with(
+                                Mode::Bad,
+                                bit_reader,
+                                ReturnCode::DataError,
+                            );
+                        }
+
+                        self.extra = here.op & MAX_BITS;
+                        break 'top Mode::LenExt;
                     }
-                    Mode::Lit => {
-                        if !emit_literal(output, self.length as u8) {
+                    Mode::Lit => match emit_literal(output, self.length) {
+                        Ok(true) => break 'top Mode::Len,
+                        Ok(false) => {
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
                             return LenDecodeOutcome::break_with(
                                 Mode::Lit,
@@ -1439,8 +1433,15 @@ impl State<'_> {
                                 ReturnCode::Ok,
                             );
                         }
-                        break 'top Mode::Len;
-                    }
+                        Err(msg) => {
+                            self.error_message = Some(msg);
+                            return LenDecodeOutcome::break_with(
+                                Mode::Bad,
+                                bit_reader,
+                                ReturnCode::DataError,
+                            );
+                        }
+                    },
                     Mode::LenExt => {
                         if let Err(code) = consume_extra_bits(
                             &mut bit_reader,
@@ -2047,13 +2048,17 @@ impl State<'_> {
                         self.was = self.length;
                         break 'blk Mode::Dist;
                     }
-                    Mode::Lit => {
-                        if !emit_literal(output, self.length as u8) {
+                    Mode::Lit => match emit_literal(output, self.length) {
+                        Ok(true) => break 'blk Mode::Len,
+                        Ok(false) => {
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
                             break 'label ReturnCode::Ok;
                         }
-                        break 'blk Mode::Len;
-                    }
+                        Err(msg) => {
+                            mode = Mode::Bad;
+                            break 'label self.bad(msg);
+                        }
+                    },
                     Mode::Dist => {
                         let decoded = {
                             let table = self.dist_table_ref();
@@ -3283,6 +3288,74 @@ mod tests {
             assert_eq!(reader.bits_in_buffer(), 0);
             assert_eq!(output.len(), 0);
         }
+    }
+
+    #[test]
+    fn slow_huffman_lookup_retains_prefix_on_partial_subtable_input() -> Result<(), ReturnCode> {
+        let invalid = Code {
+            op: 64,
+            bits: 1,
+            val: 0,
+        };
+        let mut table = [invalid; 4];
+        table[0] = Code {
+            op: 1,
+            bits: 1,
+            val: 2,
+        };
+        table[2] = Code {
+            op: 16,
+            bits: 8,
+            val: 1,
+        };
+
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &[0]);
+        assert_eq!(
+            decode_huffman_code::<false>(&mut first, &table, 1).err(),
+            Some(ReturnCode::Ok)
+        );
+        assert_eq!(first.bits_in_buffer(), 8);
+        assert_eq!(first.bytes_remaining(), 0);
+
+        let next_byte = [0u8];
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &next_byte);
+        let decoded = decode_huffman_code::<false>(&mut resumed, &table, 1)?;
+        assert_eq!(decoded.entry.val, 1);
+        assert_eq!(decoded.bits, 9);
+        assert_eq!(resumed.bits_in_buffer(), 7);
+        assert_eq!(resumed.bytes_remaining(), 0);
+
+        // In a literal/length alphabet, op=0 is a literal rather than
+        // a subtable pointer; it must consume only the root code bits.
+        let literals = [Code {
+            op: 0,
+            bits: 1,
+            val: 255,
+        }; 2];
+        let literal_input = [0u8];
+        let mut literal_reader = BitReader::from_buffer(BitBuffer::default(), &literal_input);
+        let literal = decode_huffman_code::<true>(&mut literal_reader, &literals, 1)?;
+        assert_eq!(literal.entry.val, 255);
+        assert_eq!(literal.bits, 1);
+        assert_eq!(literal_reader.bits_in_buffer(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_literal_value_cannot_truncate_to_a_byte() {
+        let mut bytes = [0xa5u8; 4];
+        // SAFETY: the stack array remains live, uniquely writable, and
+        // the output cursor tracks the initialized prefix.
+        let mut output = unsafe { InflateOutput::new_uninit(bytes.as_mut_ptr(), bytes.len()) };
+        assert_eq!(
+            emit_literal(&mut output, 256),
+            Err("invalid literal/length code\0")
+        );
+        assert_eq!(output.len(), 0);
+        assert_eq!(bytes, [0xa5; 4]);
+        assert_eq!(emit_literal(&mut output, 255), Ok(true));
+        assert_eq!(output.filled(), &[255]);
+        assert_eq!(&bytes[1..], &[0xa5; 3]);
     }
 
     #[test]
