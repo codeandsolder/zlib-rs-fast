@@ -2748,7 +2748,6 @@ const _: () = assert!(core::mem::align_of::<State<'static>>() <= ALLOCATION_BLOC
 
 struct InflateAllocOffsets {
     total_size: usize,
-    state_pos: usize,
     window_pos: Option<usize>,
 }
 
@@ -2766,9 +2765,9 @@ impl InflateAllocOffsets {
     fn new(with_window: bool) -> Self {
         use core::mem::size_of;
 
-        let mut curr_size = 0usize;
-        let state_pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
-        curr_size = state_pos + size_of::<State>();
+        // State occupies byte offset zero of the typed aligned allocation.
+        // The optional history window follows at the next aligned offset.
+        let mut curr_size = size_of::<State>();
 
         let window_pos = with_window.then(|| {
             let pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
@@ -2781,7 +2780,6 @@ impl InflateAllocOffsets {
 
         Self {
             total_size,
-            state_pos,
             window_pos,
         }
     }
@@ -2808,24 +2806,24 @@ impl InflateAllocOffsets {
         mut state: State<'a>,
     ) -> Option<NonNull<State<'a>>> {
         let allocation_start = self.allocate_storage(alloc)?;
-        let aligned = allocation_start.cast::<u8>();
 
         if let Some(window_pos) = self.window_pos {
             // SAFETY: `window_pos` is computed inside this allocation and leaves enough room for
             // the complete regular history window. The backing bytes begin uninitialized; Window
             // exposes only history proven initialized by `extend`.
-            let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
+            let window_allocation =
+                unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
             state.window = unsafe { Window::from_raw_parts(window_allocation, 1 << MAX_WBITS) };
         }
 
         state.allocation_start = allocation_start.as_ptr();
         state.total_allocation_size = self.total_size;
 
-        // SAFETY: `state_pos` is aligned for `State`, lies inside this fresh allocation, and no
-        // `State` has previously been materialized there.
-        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
-        unsafe { state_ptr.write(state) };
-        NonNull::new(state_ptr)
+        let state_ptr = allocation_start.cast::<State<'a>>();
+        // SAFETY: this fresh typed allocation starts at a valid State-aligned
+        // address and has room for the full State. No State has been placed here.
+        unsafe { state_ptr.as_ptr().write(state) };
+        Some(state_ptr)
     }
 
     /// Snapshot a live regular inflate state into independent state + window storage.
@@ -2848,20 +2846,20 @@ impl InflateAllocOffsets {
         );
 
         let allocation_start = self.allocate_storage(alloc)?;
-        let aligned = allocation_start.cast::<u8>();
+
         let window_pos = self.window_pos();
         // SAFETY: the ordinary layout reserves exactly the source window backing length at
         // `window_pos`, and the fresh destination allocation cannot overlap the source.
-        let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
+        let window_allocation = unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
         let window = unsafe { source.window.clone_to(window_allocation) };
 
         let state = source.clone_rebound(window, allocation_start.as_ptr(), self.total_size);
 
-        // SAFETY: `state_pos` is aligned and in-bounds in this fresh allocation, and no State has
-        // previously been materialized there.
-        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
-        unsafe { state_ptr.write(state) };
-        NonNull::new(state_ptr)
+        let state_ptr = allocation_start.cast::<State<'a>>();
+        // SAFETY: this fresh typed allocation starts at a valid State-aligned
+        // address and has room for the full State. No State has been placed here.
+        unsafe { state_ptr.as_ptr().write(state) };
+        Some(state_ptr)
     }
 }
 
@@ -4331,6 +4329,18 @@ mod tests {
                 source.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
                 0
             );
+            // Both layouts put State at the exact typed allocation start, and
+            // the ordinary owned window at its sole computed aligned offset.
+            let layout = InflateAllocOffsets::with_window();
+            assert_eq!(
+                source.state.as_ptr() as usize,
+                source.state.allocation_start as usize
+            );
+            assert_eq!(source.state.total_allocation_size, layout.total_size);
+            assert_eq!(
+                source.state.window.as_ptr() as usize,
+                source.state.allocation_start as usize + layout.window_pos()
+            );
 
             let mut cloned_raw = MaybeUninit::<InflateStream>::uninit();
             assert_eq!(copy(&mut cloned_raw, source), ReturnCode::Ok);
@@ -4343,6 +4353,14 @@ mod tests {
             );
             assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
             assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
+            assert_eq!(
+                cloned.state.as_ptr() as usize,
+                cloned.state.allocation_start as usize
+            );
+            assert_eq!(
+                cloned.state.window.as_ptr() as usize,
+                cloned.state.allocation_start as usize + layout.window_pos()
+            );
             end(cloned);
             end(source);
 
@@ -4369,6 +4387,14 @@ mod tests {
             let back = (unsafe { InflateStream::from_back_stream_mut(&raw mut back_raw) })
                 .ok_or("callback inflater state missing")?;
             assert_eq!(back.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(
+                back.state.as_ptr() as usize,
+                back.state.allocation_start as usize
+            );
+            assert_eq!(
+                back.state.total_allocation_size,
+                InflateAllocOffsets::state_only().total_size
+            );
             back_end(back);
             assert_eq!(ctx.allocations, 3, "allocations at remainder {remainder}");
             assert_eq!(ctx.frees, 3, "frees at remainder {remainder}");
