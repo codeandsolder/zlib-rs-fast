@@ -1097,6 +1097,14 @@ struct DispatchExit {
     code: ReturnCode,
 }
 
+/// Outcome of wrapper-only decoding. A paused header retains its exact
+/// submode without leaking a partial transition to the DEFLATE body.
+#[derive(Debug, Clone, Copy)]
+enum WrapperProgress {
+    Ready(Mode),
+    Paused(Mode),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LenDecodeOutcome<'input> {
     mode: Mode,
@@ -1303,6 +1311,21 @@ fn decode_distance_code(
         extra: decoded.entry.op & MAX_BITS,
         back_bits: decoded.bits,
     })
+}
+
+/// Commit a fully decoded distance symbol. The lookup's Huffman-table
+/// borrow has ended before these mutable state fields are updated.
+#[inline]
+const fn accept_distance_code(
+    decoded: DecodedDistance,
+    back: &mut usize,
+    offset: &mut usize,
+    extra: &mut u8,
+) -> Mode {
+    *back += decoded.back_bits;
+    *offset = decoded.offset;
+    *extra = decoded.extra;
+    Mode::DistExt
 }
 
 #[inline]
@@ -1548,10 +1571,12 @@ impl State<'_> {
                             self.dist_table.bits,
                         ) {
                             Ok(decoded) => {
-                                self.back += decoded.back_bits;
-                                self.offset = decoded.offset;
-                                self.extra = decoded.extra;
-                                break 'top Mode::DistExt;
+                                break 'top accept_distance_code(
+                                    decoded,
+                                    &mut self.back,
+                                    &mut self.offset,
+                                    &mut self.extra,
+                                )
                             }
                             Err(DistanceDecodeError::Input(code)) => {
                                 return LenDecodeOutcome::break_with(Mode::Dist, bit_reader, code);
@@ -2084,6 +2109,69 @@ impl State<'_> {
         Ok(())
     }
 
+    /// Read the RFC 1950 dictionary Adler-32 without exposing a partially
+    /// consumed identifier to callers. A short read retains `DictId`.
+    fn decode_dictionary_id(&mut self, reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(reader, 32, Mode::DictId)?;
+        self.checksum = zswap32(reader.bits_u32(32));
+        reader.init_bits();
+        Ok(Mode::Dict)
+    }
+
+    /// Verify a gzip ISIZE trailer only after its entire field is available.
+    /// RFC 1952 stores the decoded byte count modulo 2^32.
+    fn decode_output_length(&mut self, reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        if self.wrap != 0 && self.gzip_flags != 0 {
+            need_bits_for_mode(reader, 32, Mode::Length)?;
+            if self.wrap & 4 != 0 && reader.bits_u32(32) != gzip_isize(self.total) {
+                return Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: self.bad("incorrect length check\0"),
+                });
+            }
+            reader.init_bits();
+        }
+        Ok(Mode::Done)
+    }
+
+    /// Complete the RFC 1950/1952 header state machine before dispatching
+    /// payload blocks. A partially received gzip extra/name/comment field
+    /// remains in the same mode with its input position preserved.
+    fn decode_wrapper_states(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mut mode: Mode,
+    ) -> Result<WrapperProgress, DispatchExit> {
+        loop {
+            mode = match mode {
+                Mode::Head => self.decode_wrapper_head(reader)?,
+                Mode::Flags => self.decode_gzip_flags(reader)?,
+                Mode::Time => self.decode_gzip_time(reader)?,
+                Mode::Os => self.decode_gzip_os(reader)?,
+                Mode::ExLen => self.decode_gzip_extra_length(reader)?,
+                Mode::Extra => match self.decode_gzip_extra(reader)? {
+                    Some(next) => next,
+                    None => return Ok(WrapperProgress::Paused(Mode::Extra)),
+                },
+                Mode::Name => {
+                    let Some(next) = self.decode_gzip_string(reader, GzipStringField::Name) else {
+                        return Ok(WrapperProgress::Paused(Mode::Name));
+                    };
+                    next
+                }
+                Mode::Comment => {
+                    let Some(next) = self.decode_gzip_string(reader, GzipStringField::Comment)
+                    else {
+                        return Ok(WrapperProgress::Paused(Mode::Comment));
+                    };
+                    next
+                }
+                Mode::HCrc => self.decode_gzip_header_crc(reader)?,
+                next => return Ok(WrapperProgress::Ready(next)),
+            };
+        }
+    }
+
     fn dispatch_inner(
         &mut self,
         bit_reader: &mut BitReader<'_>,
@@ -2094,28 +2182,21 @@ impl State<'_> {
         let ret = 'label: loop {
             mode = 'blk: {
                 match mode {
-                    Mode::Head => break 'blk self.decode_wrapper_head(bit_reader)?,
-                    Mode::Flags => break 'blk self.decode_gzip_flags(bit_reader)?,
-                    Mode::Time => break 'blk self.decode_gzip_time(bit_reader)?,
-                    Mode::Os => break 'blk self.decode_gzip_os(bit_reader)?,
-                    Mode::ExLen => break 'blk self.decode_gzip_extra_length(bit_reader)?,
-                    Mode::Extra => match self.decode_gzip_extra(bit_reader)? {
-                        Some(next) => break 'blk next,
-                        None => break 'label ReturnCode::Ok,
+                    Mode::Head
+                    | Mode::Flags
+                    | Mode::Time
+                    | Mode::Os
+                    | Mode::ExLen
+                    | Mode::Extra
+                    | Mode::Name
+                    | Mode::Comment
+                    | Mode::HCrc => match self.decode_wrapper_states(bit_reader, mode)? {
+                        WrapperProgress::Ready(next) => break 'blk next,
+                        WrapperProgress::Paused(pending) => {
+                            mode = pending;
+                            break 'label ReturnCode::Ok;
+                        }
                     },
-                    Mode::Name => {
-                        match self.decode_gzip_string(bit_reader, GzipStringField::Name) {
-                            Some(next) => break 'blk next,
-                            None => break 'label ReturnCode::Ok,
-                        }
-                    }
-                    Mode::Comment => {
-                        match self.decode_gzip_string(bit_reader, GzipStringField::Comment) {
-                            Some(next) => break 'blk next,
-                            None => break 'label ReturnCode::Ok,
-                        }
-                    }
-                    Mode::HCrc => break 'blk self.decode_gzip_header_crc(bit_reader)?,
                     Mode::Type => {
                         use InflateFlush::*;
 
@@ -2194,10 +2275,12 @@ impl State<'_> {
                         };
                         match decoded {
                             Ok(decoded) => {
-                                self.back += decoded.back_bits;
-                                self.offset = decoded.offset;
-                                self.extra = decoded.extra;
-                                break 'blk Mode::DistExt;
+                                break 'blk accept_distance_code(
+                                    decoded,
+                                    &mut self.back,
+                                    &mut self.offset,
+                                    &mut self.extra,
+                                )
                             }
                             Err(DistanceDecodeError::Input(code)) => {
                                 return Err(DispatchExit {
@@ -2267,15 +2350,7 @@ impl State<'_> {
 
                         break 'blk Mode::Type;
                     }
-                    Mode::DictId => {
-                        need_bits_for_mode(bit_reader, 32, mode)?;
-
-                        self.checksum = zswap32(bit_reader.bits_u32(32));
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::Dict;
-                    }
+                    Mode::DictId => break 'blk self.decode_dictionary_id(bit_reader)?,
                     Mode::Done => {
                         // Inflate stream terminated properly.
                         break 'label ReturnCode::StreamEnd;
@@ -2293,21 +2368,7 @@ impl State<'_> {
                         break 'label ReturnCode::StreamError;
                     }
                     Mode::Length => {
-                        // for gzip, last bytes contain LENGTH
-                        if self.wrap != 0 && self.gzip_flags != 0 {
-                            need_bits_for_mode(bit_reader, 32, mode)?;
-                            if (self.wrap & 0b100) != 0
-                                && bit_reader.bits_u32(32) != gzip_isize(self.total)
-                            {
-                                mode = Mode::Bad;
-                                break 'label self.bad("incorrect length check\0");
-                            }
-
-                            bit_reader.init_bits();
-                        }
-
-                        mode = Mode::Done;
-                        // Inflate stream terminated properly.
+                        mode = self.decode_output_length(bit_reader)?;
                         break 'label ReturnCode::StreamEnd;
                     }
                 };
@@ -3536,6 +3597,114 @@ mod tests {
             state.error_message,
             Some("too many length or distance symbols\0")
         );
+    }
+
+    #[test]
+    fn wrapper_states_resume_incomplete_extra_name_and_comment_fields() {
+        for (mode, flag, remaining, first, second) in [
+            (Mode::Extra, 0x0400, 4usize, &b"ab"[..], &b"cd"[..]),
+            (Mode::Name, 0x0800, 0, &b"header"[..], &b"\0"[..]),
+            (Mode::Comment, 0x1000, 0, &b"comment"[..], &b"\0"[..]),
+        ] {
+            let mut state = State::new(InflateStateKind::Regular);
+            state.gzip_flags = flag;
+            state.length = remaining;
+            let mut first_reader = BitReader::from_buffer(BitBuffer::default(), first);
+            assert!(
+                matches!(
+                    state.decode_wrapper_states(&mut first_reader, mode),
+                    Ok(WrapperProgress::Paused(pending)) if core::mem::discriminant(&pending) == core::mem::discriminant(&mode)
+                ),
+                "incomplete field must retain its gzip header mode"
+            );
+            assert_eq!(first_reader.bytes_remaining(), 0);
+            if remaining != 0 {
+                assert_eq!(state.length, remaining - first.len());
+            }
+
+            let mut resumed = BitReader::from_buffer(first_reader.into_buffer(), second);
+            assert!(matches!(
+                state.decode_wrapper_states(&mut resumed, mode),
+                Ok(WrapperProgress::Ready(Mode::Type))
+            ));
+            assert_eq!(resumed.bytes_remaining(), 0);
+            assert_eq!(state.length, 0);
+        }
+    }
+
+    #[test]
+    fn dictionary_identifier_split_preserves_previous_checksum_until_complete() {
+        let mut state = State::new(InflateStateKind::Regular);
+        state.checksum = 0xfeed_cafe;
+        let first_bytes = [0x12, 0x34, 0x56];
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &first_bytes);
+        assert!(matches!(
+            state.decode_dictionary_id(&mut first),
+            Err(DispatchExit {
+                mode: Mode::DictId,
+                code: ReturnCode::Ok
+            })
+        ));
+        assert_eq!(state.checksum, 0xfeed_cafe);
+
+        let last_byte = [0x78];
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &last_byte);
+        assert!(matches!(
+            state.decode_dictionary_id(&mut resumed),
+            Ok(Mode::Dict)
+        ));
+        assert_eq!(state.checksum, 0x1234_5678);
+        assert_eq!(resumed.bits_in_buffer(), 0);
+        assert_eq!(resumed.bytes_remaining(), 0);
+    }
+
+    #[test]
+    fn gzip_size_trailer_handles_partial_input_mismatch_and_unchecked_mode() {
+        let total = 0x1234_5678usize;
+        let first_bytes = [0x78, 0x56];
+        let second_bytes = [0x34, 0x12];
+        let mut state = State::new(InflateStateKind::Regular);
+        state.wrap = 4;
+        state.gzip_flags = 1;
+        state.total = total;
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &first_bytes);
+        assert!(matches!(
+            state.decode_output_length(&mut first),
+            Err(DispatchExit {
+                mode: Mode::Length,
+                code: ReturnCode::Ok
+            })
+        ));
+        assert!(state.error_message.is_none());
+        assert_eq!(first.bits_in_buffer(), 16);
+
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &second_bytes);
+        assert!(matches!(
+            state.decode_output_length(&mut resumed),
+            Ok(Mode::Done)
+        ));
+        assert_eq!(resumed.bits_in_buffer(), 0);
+        assert_eq!(resumed.bytes_remaining(), 0);
+
+        let corrupt = [0x79, 0x56, 0x34, 0x12];
+        let mut invalid = BitReader::from_buffer(BitBuffer::default(), &corrupt);
+        assert!(matches!(
+            state.decode_output_length(&mut invalid),
+            Err(DispatchExit {
+                mode: Mode::Bad,
+                code: ReturnCode::DataError
+            })
+        ));
+        assert_eq!(state.error_message, Some("incorrect length check\0"));
+
+        state.wrap = 1;
+        state.error_message = None;
+        let mut unchecked = BitReader::from_buffer(BitBuffer::default(), &corrupt);
+        assert!(matches!(
+            state.decode_output_length(&mut unchecked),
+            Ok(Mode::Done)
+        ));
+        assert_eq!(unchecked.bits_in_buffer(), 0);
     }
 
     #[test]
