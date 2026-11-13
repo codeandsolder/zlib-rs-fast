@@ -434,9 +434,9 @@ impl GpuMatchSearcher {
         max_dist: u32,
     ) -> Result<GpuMatchTable, GpuMatchError> {
         let mut tables = self.search_batch_with_max_dist(&[input], search_budget, max_dist)?;
-        Ok(tables
-            .pop()
-            .expect("one GPU match-search input produces one table"))
+        tables.pop().ok_or_else(|| {
+            GpuMatchError("GPU search did not produce a result for its input".into())
+        })
     }
 
     pub(crate) fn search_batch_with_max_dist(
@@ -539,8 +539,10 @@ impl GpuMatchSearcher {
         if prepared.is_empty() {
             return Ok(tables
                 .into_iter()
-                .map(|table| table.expect("empty inputs receive empty match tables"))
-                .collect());
+                .map(|table| {
+                    table.ok_or_else(|| GpuMatchError("GPU empty-input result missing".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?);
         }
 
         let mut workspace = self
@@ -705,8 +707,11 @@ impl GpuMatchSearcher {
 
         Ok(tables
             .into_iter()
-            .map(|table| table.expect("every GPU input receives a match table"))
-            .collect())
+            .enumerate()
+            .map(|(index, table)| {
+                table.ok_or_else(|| GpuMatchError(format!("GPU result missing for input {index}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
