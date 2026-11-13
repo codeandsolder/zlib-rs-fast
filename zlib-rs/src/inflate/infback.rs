@@ -51,16 +51,25 @@ pub(super) fn back_init_window(
         return ReturnCode::StreamError;
     }
 
+    // Back-window geometry was validated before this conversion. Keep
+    // the state field native u8 and report failure instead of narrowing.
+    let Ok(wbits) = u8::try_from(config.window_bits) else {
+        return ReturnCode::StreamError;
+    };
+    let (Some(zalloc), Some(zfree)) = (stream.zalloc, stream.zfree) else {
+        return ReturnCode::StreamError;
+    };
+
     let mut state = State::new(InflateStateKind::Back);
     // inflateBack uses the caller-provided window directly, so the allocation contains only State
     // plus alignment headroom.
     state.back_window = window;
-    state.wbits = config.window_bits as u8;
+    state.wbits = wbits;
     state.flags.update(Flags::SANE, true);
 
     let alloc = Allocator {
-        zalloc: stream.zalloc.unwrap(),
-        zfree: stream.zfree.unwrap(),
+        zalloc,
+        zfree,
         opaque: stream.opaque,
         _marker: PhantomData,
     };
@@ -165,13 +174,13 @@ pub(super) fn decode_back(
                     break 'inf_leave;
                 }
 
-                if input.hold() as u16 != !((input.hold() >> 16) as u16) {
+                let Some(length) = super::stored_block_length(input.bits_u32(32)) else {
                     state.mode = Mode::Bad;
                     state.bad("invalid stored block lengths\0");
                     continue;
-                }
+                };
 
-                state.length = input.hold() as usize & 0xFFFF;
+                state.length = usize::from(length);
                 traceln!("inflate:     stored length {}", state.length);
 
                 input.init_bits();
@@ -537,8 +546,13 @@ pub(super) fn decode_back(
         ret = ReturnCode::BufError;
     }
 
+    let Ok(available) = u32::try_from(input.available()) else {
+        // Preserve the caller's history window on every exit path.
+        state.back_window = window;
+        return ReturnCode::StreamError;
+    };
     strm.next_in = input.next_ptr().cast_mut();
-    strm.avail_in = input.available() as u32;
+    strm.avail_in = available;
     state.back_window = window;
 
     ret
@@ -584,19 +598,21 @@ mod tests {
     }
 
     #[test]
-    fn back_writer_match_crosses_previous_window_into_current_output() {
+    fn back_writer_match_crosses_previous_window_into_current_output() -> Result<(), &'static str> {
         let mut storage = core::array::from_fn::<_, 32, _>(|i| i as u8);
         // The current callback window has already overwritten its first four bytes.
         storage[..4].copy_from_slice(&[100, 101, 102, 103]);
         let mut window = BackWindow::from_initialized_slice(&mut storage);
         window.mark_full_history();
 
-        let mut writer = BackWriter::new(&mut window, 4);
-        writer.copy_match(true, 6, 8).unwrap();
-        assert_eq!(writer.len(), 12);
-        drop(writer);
+        {
+            let mut writer = BackWriter::new(&mut window, 4);
+            writer.copy_match(true, 6, 8)?;
+            assert_eq!(writer.len(), 12);
+        }
 
         assert_eq!(&storage[4..12], &[30, 31, 100, 101, 102, 103, 30, 31]);
+        Ok(())
     }
 
     #[test]

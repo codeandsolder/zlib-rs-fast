@@ -3682,7 +3682,7 @@ pub fn compress_slice_near_optimal<'a>(
         }
 
         if ok {
-            let checksum = adler32(ADLER32_INITIAL_VALUE as u32, input);
+            let checksum = adler32(ADLER32_INITIAL_VALUE, input);
             state.bit_writer.pending.extend(&checksum.to_be_bytes());
             ok = drain_near_optimal_pending(state, output, &mut produced);
         }
@@ -5812,7 +5812,7 @@ mod test {
             state
                 .bit_writer
                 .pending
-                .extend(&adler32(ADLER32_INITIAL_VALUE as u32, &input).to_be_bytes());
+                .extend(&adler32(ADLER32_INITIAL_VALUE, &input).to_be_bytes());
             assert!(drain_near_optimal_pending(
                 state,
                 &mut output,
@@ -5896,7 +5896,7 @@ mod test {
         );
         assert_eq!(
             stream.adler as u32,
-            adler32(ADLER32_INITIAL_VALUE as u32, &dictionary),
+            adler32(ADLER32_INITIAL_VALUE, &dictionary),
             "zlib wrapper dictionary id still covers the entire supplied dictionary"
         );
 

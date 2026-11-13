@@ -115,7 +115,7 @@ pub(crate) const ENOUGH_LENS: usize = 1332;
 pub(crate) const ENOUGH_DISTS: usize = 592;
 
 /// initial adler-32 hash value
-pub(crate) const ADLER32_INITIAL_VALUE: usize = 1;
+pub(crate) const ADLER32_INITIAL_VALUE: u32 = 1;
 /// initial crc-32 hash value
 pub(crate) const CRC32_INITIAL_VALUE: u32 = 0;
 

@@ -1179,6 +1179,26 @@ fn consume_extra_bits(
     Ok(())
 }
 
+/// Validate the two little-endian 16-bit words that prefix a stored
+/// DEFLATE block. A failed complement check is a format error, not a
+/// truncated or partially accepted length.
+#[inline]
+pub(super) fn stored_block_length(header: u32) -> Option<u16> {
+    let bytes = header.to_le_bytes();
+    let len = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let complement = u16::from_le_bytes([bytes[2], bytes[3]]);
+    (len == !complement).then_some(len)
+}
+
+/// gzip's ISIZE trailer is defined modulo 2^32, even when a decompression
+/// has produced more than 4 GiB. Preserve the low four bytes explicitly on
+/// both 32- and 64-bit hosts rather than requiring a fallible cast.
+#[inline]
+const fn gzip_isize(total: usize) -> u32 {
+    let bytes = total.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 #[inline]
 fn decode_distance_code(
     reader: &mut BitReader<'_>,
@@ -1516,6 +1536,227 @@ impl State<'_> {
         }
     }
 
+    /// Header errors must publish the Bad mode on return, including when
+    /// parsing is resumed after a partial input chunk.
+    const fn invalid_header(&mut self, msg: &'static str) -> DispatchExit {
+        DispatchExit {
+            mode: Mode::Bad,
+            code: self.bad(msg),
+        }
+    }
+
+    /// Read the wrapper's leading two bytes, dispatching zlib or gzip without
+    /// touching payload input. Header-only work remains off the inflate hot path.
+    fn decode_wrapper_head(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        if self.wrap == 0 {
+            return Ok(Mode::TypeDo);
+        }
+        need_bits_for_mode(bit_reader, 16, Mode::Head)?;
+
+        if (self.wrap & 2) != 0 && bit_reader.hold() == 0x8b1f {
+            if self.wbits == 0 {
+                self.wbits = 15;
+            }
+            self.checksum = crc32(
+                crate::CRC32_INITIAL_VALUE,
+                &bit_reader.bits_u16(16).to_le_bytes(),
+            );
+            bit_reader.init_bits();
+            return Ok(Mode::Flags);
+        }
+
+        if let Some(mut header) = self.head {
+            header.set_done(-1);
+        }
+
+        if (self.wrap & 1) == 0 || ((bit_reader.bits(8) << 8) + (bit_reader.hold() >> 8)) % 31 != 0
+        {
+            return Err(self.invalid_header("incorrect header check\0"));
+        }
+        if i32::from(bit_reader.bits_u16(4)) != Z_DEFLATED {
+            return Err(self.invalid_header("unknown compression method\0"));
+        }
+
+        bit_reader.drop_bits(4);
+        let len = bit_reader.bits_u16(4).to_le_bytes()[0] + 8;
+        if self.wbits == 0 {
+            self.wbits = len;
+        }
+        if i32::from(len) > MAX_WBITS || len > self.wbits {
+            return Err(self.invalid_header("invalid window size\0"));
+        }
+
+        self.dmax = 1 << len;
+        self.gzip_flags = 0;
+        self.checksum = crate::ADLER32_INITIAL_VALUE;
+        let has_dictionary = bit_reader.hold() & 0x200 != 0;
+        bit_reader.init_bits();
+        Ok(if has_dictionary {
+            Mode::DictId
+        } else {
+            Mode::Type
+        })
+    }
+
+    fn decode_gzip_flags(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(bit_reader, 16, Mode::Flags)?;
+        let bytes = bit_reader.bits_u16(16).to_le_bytes();
+        self.gzip_flags = i32::from(u16::from_le_bytes(bytes));
+        if self.gzip_flags & 0xff != Z_DEFLATED {
+            return Err(self.invalid_header("unknown compression method\0"));
+        }
+        if self.gzip_flags & 0xe000 != 0 {
+            return Err(self.invalid_header("unknown header flags set\0"));
+        }
+
+        if let Some(mut head) = self.head {
+            head.set_text(i32::from(bytes[1] & 1));
+        }
+        if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+            self.checksum = crc32(self.checksum, &bytes);
+        }
+        bit_reader.init_bits();
+        Ok(Mode::Time)
+    }
+
+    fn decode_gzip_time(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(bit_reader, 32, Mode::Time)?;
+        let timestamp = bit_reader.bits_u32(32);
+        if let Some(mut head) = self.head {
+            head.set_time(z_size::from(timestamp));
+        }
+        if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+            self.checksum = crc32(self.checksum, &timestamp.to_le_bytes());
+        }
+        bit_reader.init_bits();
+        Ok(Mode::Os)
+    }
+
+    fn decode_gzip_os(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(bit_reader, 16, Mode::Os)?;
+        let bytes = bit_reader.bits_u16(16).to_le_bytes();
+        if let Some(mut head) = self.head {
+            head.set_os(i32::from(bytes[0]), i32::from(bytes[1]));
+        }
+        if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+            self.checksum = crc32(self.checksum, &bytes);
+        }
+        bit_reader.init_bits();
+        Ok(Mode::ExLen)
+    }
+
+    fn decode_gzip_extra_length(
+        &mut self,
+        reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        if self.gzip_flags & 0x0400 != 0 {
+            need_bits_for_mode(reader, 16, Mode::ExLen)?;
+            let extra_len = reader.bits_u16(16);
+            self.length = usize::from(extra_len);
+            if let Some(mut head) = self.head {
+                head.set_extra_len(extra_len);
+            }
+            if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+                self.checksum = crc32(self.checksum, &extra_len.to_le_bytes());
+            }
+            reader.init_bits();
+        } else if let Some(mut head) = self.head {
+            head.clear_extra();
+        }
+        Ok(Mode::Extra)
+    }
+
+    /// None means the field is still incomplete, so the caller must return
+    /// Ok without advancing the persistent gzip header mode.
+    fn decode_gzip_extra(
+        &mut self,
+        reader: &mut BitReader<'_>,
+    ) -> Result<Option<Mode>, DispatchExit> {
+        if self.gzip_flags & 0x0400 != 0 {
+            let available = self.length.min(reader.bytes_remaining());
+            if available > 0 {
+                let bytes = &reader.as_slice()[..available];
+                if let Some(mut head) = self.head {
+                    head.write_extra(self.length, bytes)
+                        .map_err(|code| DispatchExit {
+                            mode: Mode::Extra,
+                            code,
+                        })?;
+                }
+                if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+                    self.checksum = crc32(self.checksum, bytes);
+                }
+                reader.advance(available);
+                self.length -= available;
+            }
+            if self.length != 0 {
+                return Ok(None);
+            }
+        }
+        self.length = 0;
+        Ok(Some(Mode::Name))
+    }
+
+    /// Consume the optional name or comment until its NUL byte appears.
+    /// Incomplete metadata yields None with its mode and cursor intact.
+    fn decode_gzip_string(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        field: GzipStringField,
+    ) -> Option<Mode> {
+        let (flag, next) = match field {
+            GzipStringField::Name => (0x0800, Mode::Comment),
+            GzipStringField::Comment => (0x1000, Mode::HCrc),
+        };
+        if self.gzip_flags & flag != 0 {
+            if !consume_gzip_header_string(
+                reader,
+                self.head,
+                field,
+                &mut self.length,
+                &mut self.checksum,
+                self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0,
+            ) {
+                return None;
+            }
+        } else if let Some(mut head) = self.head {
+            match field {
+                GzipStringField::Name => head.clear_name(),
+                GzipStringField::Comment => head.clear_comment(),
+            }
+        }
+        if matches!(field, GzipStringField::Name) {
+            self.length = 0;
+        }
+        Some(next)
+    }
+
+    fn decode_gzip_header_crc(&mut self, reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        if self.gzip_flags & 0x0200 != 0 {
+            need_bits_for_mode(reader, 16, Mode::HCrc)?;
+            let checksum_bytes = self.checksum.to_le_bytes();
+            let expected = u16::from_le_bytes([checksum_bytes[0], checksum_bytes[1]]);
+            if self.wrap & 4 != 0 && reader.bits_u16(16) != expected {
+                return Err(self.invalid_header("header crc mismatch\0"));
+            }
+            reader.init_bits();
+        }
+
+        if let Some(mut head) = self.head {
+            head.finish((self.gzip_flags >> 9) & 1);
+        }
+
+        // Header CRC accumulation ends here; initialize data CRC state.
+        if self.wrap & 4 != 0 && self.gzip_flags != 0 {
+            self.crc_fold = Crc32Fold::new();
+            self.checksum = crate::CRC32_INITIAL_VALUE;
+        }
+        Ok(Mode::Type)
+    }
+
     fn dispatch(
         &mut self,
         bit_reader: &mut BitReader<'_>,
@@ -1545,254 +1786,28 @@ impl State<'_> {
         let ret = 'label: loop {
             mode = 'blk: {
                 match mode {
-                    Mode::Head => {
-                        if self.wrap == 0 {
-                            break 'blk Mode::TypeDo;
-                        }
-
-                        need_bits_for_mode(bit_reader, 16, mode)?;
-
-                        // Gzip
-                        if (self.wrap & 2) != 0 && bit_reader.hold() == 0x8b1f {
-                            if self.wbits == 0 {
-                                self.wbits = 15;
-                            }
-
-                            let b0 = bit_reader.bits_u16(8).to_le_bytes()[0];
-                            let b1 = (bit_reader.hold() >> 8) as u8;
-                            self.checksum = crc32(crate::CRC32_INITIAL_VALUE, &[b0, b1]);
-                            bit_reader.init_bits();
-
-                            break 'blk Mode::Flags;
-                        }
-
-                        if let Some(mut header) = self.head {
-                            header.set_done(-1);
-                        }
-
-                        // check if zlib header is allowed
-                        if (self.wrap & 1) == 0
-                            || ((bit_reader.bits(8) << 8) + (bit_reader.hold() >> 8)) % 31 != 0
-                        {
-                            mode = Mode::Bad;
-                            break 'label self.bad("incorrect header check\0");
-                        }
-
-                        if bit_reader.bits(4) != Z_DEFLATED as u64 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("unknown compression method\0");
-                        }
-
-                        bit_reader.drop_bits(4);
-                        let len = bit_reader.bits_u16(4).to_le_bytes()[0] + 8;
-
-                        if self.wbits == 0 {
-                            self.wbits = len;
-                        }
-
-                        if i32::from(len) > MAX_WBITS || len > self.wbits {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid window size\0");
-                        }
-
-                        self.dmax = 1 << len;
-                        self.gzip_flags = 0; // indicate zlib header
-                        self.checksum = crate::ADLER32_INITIAL_VALUE as _;
-
-                        if bit_reader.hold() & 0x200 != 0 {
-                            bit_reader.init_bits();
-
-                            break 'blk Mode::DictId;
-                        } else {
-                            bit_reader.init_bits();
-
-                            break 'blk Mode::Type;
-                        }
-                    }
-                    Mode::Flags => {
-                        need_bits_for_mode(bit_reader, 16, mode)?;
-                        self.gzip_flags = bit_reader.hold() as i32;
-
-                        // Z_DEFLATED = 8 is the only supported method
-                        if self.gzip_flags & 0xff != Z_DEFLATED {
-                            mode = Mode::Bad;
-                            break 'label self.bad("unknown compression method\0");
-                        }
-
-                        if self.gzip_flags & 0xe000 != 0 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("unknown header flags set\0");
-                        }
-
-                        if let Some(mut head) = self.head {
-                            head.set_text(((bit_reader.hold() >> 8) & 1) as i32);
-                        }
-
-                        if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let b0 = bit_reader.bits_u16(8).to_le_bytes()[0];
-                            let b1 = (bit_reader.hold() >> 8) as u8;
-                            self.checksum = crc32(self.checksum, &[b0, b1]);
-                        }
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::Time;
-                    }
-                    Mode::Time => {
-                        need_bits_for_mode(bit_reader, 32, mode)?;
-                        if let Some(mut head) = self.head {
-                            head.set_time(bit_reader.hold() as z_size);
-                        }
-
-                        if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let bytes = (bit_reader.hold() as u32).to_le_bytes();
-                            self.checksum = crc32(self.checksum, &bytes);
-                        }
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::Os;
-                    }
-                    Mode::Os => {
-                        need_bits_for_mode(bit_reader, 16, mode)?;
-                        if let Some(mut head) = self.head {
-                            head.set_os(
-                                (bit_reader.hold() & 0xff) as i32,
-                                (bit_reader.hold() >> 8) as i32,
-                            );
-                        }
-
-                        if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let bytes = (bit_reader.hold() as u16).to_le_bytes();
-                            self.checksum = crc32(self.checksum, &bytes);
-                        }
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::ExLen;
-                    }
-                    Mode::ExLen => {
-                        if (self.gzip_flags & 0x0400) != 0 {
-                            need_bits_for_mode(bit_reader, 16, mode)?;
-
-                            // XLEN occupies exactly two bytes on the wire. Keep the
-                            // parsed length in its native domain through the header
-                            // destination, and widen only for slice indexing.
-                            let raw = bit_reader.bits(16).to_le_bytes();
-                            let extra_len = u16::from_le_bytes([raw[0], raw[1]]);
-                            self.length = usize::from(extra_len);
-                            if let Some(mut head) = self.head {
-                                head.set_extra_len(extra_len);
-                            }
-
-                            if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                self.checksum = crc32(self.checksum, &extra_len.to_le_bytes());
-                            }
-                            bit_reader.init_bits();
-                        } else if let Some(mut head) = self.head {
-                            head.clear_extra();
-                        }
-
-                        break 'blk Mode::Extra;
-                    }
-                    Mode::Extra => {
-                        if (self.gzip_flags & 0x0400) != 0 {
-                            // self.length is the number of remaining `extra` bytes. But they may not all be available
-                            let extra_available =
-                                Ord::min(self.length, bit_reader.bytes_remaining());
-
-                            if extra_available > 0 {
-                                if let Some(mut head) = self.head {
-                                    head.write_extra(
-                                        self.length,
-                                        &bit_reader.as_slice()[..extra_available],
-                                    )
-                                    .map_err(|code| DispatchExit { mode, code })?;
-                                }
-
-                                // Checksum
-                                if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                    let extra_slice = &bit_reader.as_slice()[..extra_available];
-                                    self.checksum = crc32(self.checksum, extra_slice);
-                                }
-
-                                bit_reader.advance(extra_available);
-                                self.length -= extra_available;
-                            }
-
-                            // Checks for errors occur after returning
-                            if self.length != 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-                        }
-
-                        self.length = 0;
-
-                        break 'blk Mode::Name;
-                    }
+                    Mode::Head => break 'blk self.decode_wrapper_head(bit_reader)?,
+                    Mode::Flags => break 'blk self.decode_gzip_flags(bit_reader)?,
+                    Mode::Time => break 'blk self.decode_gzip_time(bit_reader)?,
+                    Mode::Os => break 'blk self.decode_gzip_os(bit_reader)?,
+                    Mode::ExLen => break 'blk self.decode_gzip_extra_length(bit_reader)?,
+                    Mode::Extra => match self.decode_gzip_extra(bit_reader)? {
+                        Some(next) => break 'blk next,
+                        None => break 'label ReturnCode::Ok,
+                    },
                     Mode::Name => {
-                        if (self.gzip_flags & 0x0800) != 0 {
-                            if !consume_gzip_header_string(
-                                bit_reader,
-                                self.head,
-                                GzipStringField::Name,
-                                &mut self.length,
-                                &mut self.checksum,
-                                (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0,
-                            ) {
-                                break 'label ReturnCode::Ok;
-                            }
-                        } else if let Some(mut head) = self.head {
-                            head.clear_name();
+                        match self.decode_gzip_string(bit_reader, GzipStringField::Name) {
+                            Some(next) => break 'blk next,
+                            None => break 'label ReturnCode::Ok,
                         }
-
-                        self.length = 0;
-                        break 'blk Mode::Comment;
                     }
                     Mode::Comment => {
-                        if (self.gzip_flags & 0x1000) != 0 {
-                            if !consume_gzip_header_string(
-                                bit_reader,
-                                self.head,
-                                GzipStringField::Comment,
-                                &mut self.length,
-                                &mut self.checksum,
-                                (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0,
-                            ) {
-                                break 'label ReturnCode::Ok;
-                            }
-                        } else if let Some(mut head) = self.head {
-                            head.clear_comment();
+                        match self.decode_gzip_string(bit_reader, GzipStringField::Comment) {
+                            Some(next) => break 'blk next,
+                            None => break 'label ReturnCode::Ok,
                         }
-
-                        break 'blk Mode::HCrc;
                     }
-                    Mode::HCrc => {
-                        if (self.gzip_flags & 0x0200) != 0 {
-                            need_bits_for_mode(bit_reader, 16, mode)?;
-
-                            if (self.wrap & 4) != 0
-                                && bit_reader.hold() as u32 != (self.checksum & 0xffff)
-                            {
-                                mode = Mode::Bad;
-                                break 'label self.bad("header crc mismatch\0");
-                            }
-
-                            bit_reader.init_bits();
-                        }
-
-                        if let Some(mut head) = self.head {
-                            head.finish((self.gzip_flags >> 9) & 1);
-                        }
-
-                        // compute crc32 checksum if not in raw mode
-                        if (self.wrap & 4 != 0) && self.gzip_flags != 0 {
-                            self.crc_fold = Crc32Fold::new();
-                            self.checksum = crate::CRC32_INITIAL_VALUE;
-                        }
-
-                        break 'blk Mode::Type;
-                    }
+                    Mode::HCrc => break 'blk self.decode_gzip_header_crc(bit_reader)?,
                     Mode::Type => {
                         use InflateFlush::*;
 
@@ -1872,16 +1887,16 @@ impl State<'_> {
 
                         need_bits_for_mode(bit_reader, 32, mode)?;
 
-                        let hold = bit_reader.bits(32) as u32;
+                        let hold = bit_reader.bits_u32(32);
 
                         traceln!("hold {hold:#x}");
 
-                        if hold as u16 != !((hold >> 16) as u16) {
+                        let Some(length) = stored_block_length(hold) else {
                             mode = Mode::Bad;
                             break 'label self.bad("invalid stored block lengths\0");
-                        }
+                        };
 
-                        self.length = hold as usize & 0xFFFF;
+                        self.length = usize::from(length);
                         traceln!("inflate:     stored length {}", self.length);
 
                         bit_reader.init_bits();
@@ -1935,9 +1950,9 @@ impl State<'_> {
                             }
 
                             let given_checksum = if self.gzip_flags != 0 {
-                                bit_reader.hold() as u32
+                                bit_reader.bits_u32(32)
                             } else {
-                                zswap32(bit_reader.hold() as u32)
+                                zswap32(bit_reader.bits_u32(32))
                             };
 
                             output.mark_accounted();
@@ -2145,14 +2160,14 @@ impl State<'_> {
                             break 'label ReturnCode::NeedDict;
                         }
 
-                        self.checksum = crate::ADLER32_INITIAL_VALUE as _;
+                        self.checksum = crate::ADLER32_INITIAL_VALUE;
 
                         break 'blk Mode::Type;
                     }
                     Mode::DictId => {
                         need_bits_for_mode(bit_reader, 32, mode)?;
 
-                        self.checksum = zswap32(bit_reader.hold() as u32);
+                        self.checksum = zswap32(bit_reader.bits_u32(32));
 
                         bit_reader.init_bits();
 
@@ -2179,7 +2194,7 @@ impl State<'_> {
                         if self.wrap != 0 && self.gzip_flags != 0 {
                             need_bits_for_mode(bit_reader, 32, mode)?;
                             if (self.wrap & 0b100) != 0
-                                && bit_reader.hold() as u32 != self.total as u32
+                                && bit_reader.bits_u32(32) != gzip_isize(self.total)
                             {
                                 mode = Mode::Bad;
                                 break 'label self.bad("incorrect length check\0");
@@ -2820,7 +2835,7 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
     }
 
     state.mode = Mode::Head;
-    state.checksum = crate::ADLER32_INITIAL_VALUE as u32;
+    state.checksum = crate::ADLER32_INITIAL_VALUE;
 
     state.flags.update(Flags::IS_LAST_BLOCK, false);
     state.flags.update(Flags::HAVE_DICT, false);
@@ -3262,6 +3277,27 @@ mod tests {
             assert_eq!(reader.bytes_remaining(), input.len());
             assert_eq!(reader.bits_in_buffer(), 0);
             assert_eq!(output.len(), 0);
+        }
+    }
+
+    #[test]
+    fn stored_block_length_matches_all_65536_wire_lengths() {
+        for value in u16::MIN..=u16::MAX {
+            let header = u32::from(value) | (u32::from(!value) << 16);
+            assert_eq!(stored_block_length(header), Some(value));
+            assert_eq!(stored_block_length(header ^ (1 << 16)), None);
+            assert_eq!(stored_block_length(header ^ 1), None);
+        }
+    }
+
+    #[test]
+    fn gzip_isize_uses_modulo_32_bit_wire_length() {
+        assert_eq!(gzip_isize(0), 0);
+        assert_eq!(gzip_isize(usize::from(u16::MAX)), u32::from(u16::MAX));
+        #[cfg(target_pointer_width = "64")]
+        {
+            let over_4gib = (u64::from(u32::MAX) + 4097) as usize;
+            assert_eq!(gzip_isize(over_4gib), 4096);
         }
     }
 
@@ -3784,6 +3820,97 @@ mod tests {
 
         end(copied);
         end(source);
+    }
+
+    #[test]
+    fn extended_gzip_header_resumes_across_every_small_chunk_and_rejects_bad_crc(
+    ) -> Result<(), &'static str> {
+        // Extended gzip prefix including FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT,
+        // with an independently generated CRC16 at the end. The decoder
+        // must finish metadata parsing before attempting the payload.
+        let header = [
+            0x1f, 0x8b, 0x08, 0x1f, 0x44, 0x0a, 0x45, 0x65, 0x00, 0x03, 0x0e, 0x00, 0x54, 0x47,
+            0x0a, 0x00, 0x45, 0x58, 0x54, 0x52, 0x41, 0x20, 0x44, 0x41, 0x54, 0x41, 0x74, 0x65,
+            0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x00, 0x41, 0x20, 0x63, 0x6f, 0x6d, 0x6d, 0x65,
+            0x6e, 0x74, 0x00, 0x3b, 0x92,
+        ];
+        for chunk in [1usize, 2, 3, 5, 7, 13, header.len()] {
+            for corrupt_crc in [false, true] {
+                let mut input = header;
+                if corrupt_crc {
+                    let last = input.len() - 1;
+                    input[last] ^= 1;
+                }
+                let mut extra = [0u8; 14];
+                let mut name = [0u8; 9];
+                let mut comment = [0u8; 10];
+                let mut destination = gz_header {
+                    extra: extra.as_mut_ptr(),
+                    extra_max: 14,
+                    name: name.as_mut_ptr(),
+                    name_max: 9,
+                    comment: comment.as_mut_ptr(),
+                    comm_max: 10,
+                    ..gz_header::default()
+                };
+                let mut raw = z_stream::default();
+                assert_eq!(
+                    init(&mut raw, InflateConfig { window_bits: 47 }),
+                    ReturnCode::Ok
+                );
+                // SAFETY: successful init created an exclusively borrowed
+                // regular inflate state; destination buffers remain live.
+                let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+                    .ok_or("initialized gzip state is unavailable")?;
+                // SAFETY: the independent nested arrays are live, disjoint,
+                // and writable for exactly the configured capacities.
+                assert_eq!(
+                    unsafe { get_header(stream, Some(&mut destination)) },
+                    ReturnCode::Ok
+                );
+
+                let mut consumed = 0;
+                let mut scratch = [0u8; 1];
+                let mut status = ReturnCode::Ok;
+                while consumed < input.len() && destination.done == 0 {
+                    let offered = chunk.min(input.len() - consumed);
+                    stream.next_in = input[consumed..].as_ptr().cast_mut();
+                    stream.avail_in = u32::try_from(offered).map_err(|_| "chunk too large")?;
+                    stream.next_out = scratch.as_mut_ptr();
+                    stream.avail_out = 1;
+
+                    // SAFETY: both ABI slices are live and bounded by the
+                    // exact current per-call avail_in/avail_out counts.
+                    status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+                    let taken = offered
+                        - usize::try_from(stream.avail_in)
+                            .map_err(|_| "invalid input remainder")?;
+                    assert!(taken > 0, "gzip header parser stalled at {consumed}");
+                    consumed += taken;
+                    if matches!(status, ReturnCode::DataError) {
+                        break;
+                    }
+                }
+
+                assert_eq!(consumed, input.len());
+                if corrupt_crc {
+                    assert_eq!(status, ReturnCode::DataError);
+                    assert_eq!(destination.done, 0);
+                } else {
+                    assert_eq!(destination.done, 1);
+                    assert_eq!(destination.text, 1);
+                    assert_eq!(destination.time, 1_699_023_428);
+                    assert_eq!(destination.os, 3);
+                    assert_eq!(destination.extra_len, 14);
+                    assert_eq!(destination.hcrc, 1);
+                    assert_eq!(extra, *b"TG\n\0EXTRA DATA");
+                    assert_eq!(name, *b"test.txt\0");
+                    assert_eq!(comment, *b"A comment\0");
+                }
+                assert_eq!(end(stream).state, core::ptr::null_mut());
+            }
+        }
+        Ok(())
     }
 
     #[test]

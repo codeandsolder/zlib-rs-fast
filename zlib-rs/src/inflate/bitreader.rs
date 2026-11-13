@@ -45,6 +45,16 @@ impl BitBuffer {
         usize::from(self.bits_u16(n))
     }
 
+    /// Decode a complete 32-bit wire field (CRC, Adler checksum, ISIZE,
+    /// gzip timestamp, stored-block LEN/NLEN) without truncating a u64
+    /// reservoir or relying on the host's usize width.
+    #[inline]
+    pub const fn bits_u32(&self, n: usize) -> u32 {
+        assert!(n <= 32, "DEFLATE wire field exceeds 32 bits");
+        let bytes = self.bits(n).to_le_bytes();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
     #[inline]
     pub const fn drop_bits(&mut self, n: u8) {
         self.bit_buffer >>= n;
@@ -256,6 +266,11 @@ impl<'input> BitReader<'input> {
     }
 
     #[inline]
+    pub const fn bits_u32(&self, n: usize) -> u32 {
+        self.bits.bits_u32(n)
+    }
+
+    #[inline]
     pub const fn drop_bits(&mut self, n: u8) {
         self.bits.drop_bits(n);
     }
@@ -335,6 +350,29 @@ mod tests {
         assert_eq!(BitBuffer::huffman_mask(15), Some(0x7fff));
         assert_eq!(BitBuffer::huffman_mask(16), None);
         assert_eq!(BitBuffer::huffman_mask(usize::MAX), None);
+    }
+
+    #[test]
+    fn full_word_extraction_is_exact_for_every_width_and_portable_to_32_bit() {
+        let mut bits = BitBuffer::default();
+        bits.prime(32, 0xa5bf_c4ed);
+        bits.prime(16, 0x7e39);
+        let reader = BitReader::from_buffer(bits, &[]);
+        for width in 0..=32 {
+            assert_eq!(
+                u64::from(reader.bits_u32(width)),
+                reader.bits(width),
+                "32-bit wire field width {width}"
+            );
+        }
+        assert_eq!(reader.bits_u32(32), 0xa5bf_c4ed);
+    }
+
+    #[test]
+    #[should_panic(expected = "DEFLATE wire field exceeds 32 bits")]
+    fn full_word_extraction_rejects_truncating_widths() {
+        let reader = BitReader::from_buffer(BitBuffer::default(), &[]);
+        let _ = reader.bits_u32(33);
     }
 
     #[test]
