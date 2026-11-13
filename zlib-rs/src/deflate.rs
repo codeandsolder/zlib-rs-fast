@@ -4244,6 +4244,27 @@ pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] 
 const DEFLATE_ALLOC_ALIGN: usize = 64;
 const LIT_BUFS: usize = 4;
 
+// Every typed view into the shared deflate allocation must fit within the
+// cache-line-aligned base and offsets established by DeflateAllocOffsets.
+const _: () = {
+    assert!(DEFLATE_ALLOC_ALIGN.is_power_of_two());
+    assert!(core::mem::align_of::<State<'static>>() <= DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<Pos>() <= DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<[Pos; HASH_SIZE]>() <= DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<MaybeUninit<u8>>() <= DEFLATE_ALLOC_ALIGN);
+};
+
+/// All raw region pointers derive from the same aligned allocation base.
+/// This is the sole place where byte offsets become typed deflate regions.
+struct DeflateAllocRegions<'a> {
+    state_ptr: *mut State<'a>,
+    window_ptr: *mut u8,
+    prev_ptr: *mut Pos,
+    head_ptr: *mut [Pos; HASH_SIZE],
+    pending_ptr: *mut u8,
+    sym_buf_ptr: *mut u8,
+}
+
 #[derive(Clone, Copy)]
 struct DeflateStateInit {
     level: i8,
@@ -4414,6 +4435,30 @@ impl DeflateAllocOffsets {
         NonNull::new(state_ptr)
     }
 
+    /// Resolve the six nonoverlapping regions of the layout from its aligned allocation base.
+    ///
+    /// # Safety
+    ///
+    /// The aligned pointer must designate the layout's 64-byte-aligned interior of a
+    /// writable allocation large enough for all six regions, and remain live while used.
+    const unsafe fn regions<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocRegions<'a> {
+        let base = aligned.as_ptr();
+
+        // SAFETY: offsets are within this same allocated region and multiples of
+        // DEFLATE_ALLOC_ALIGN. The base alignment and const assertions establish the
+        // alignment of every typed target.
+        unsafe {
+            DeflateAllocRegions {
+                state_ptr: base.add(self.state_pos).cast(),
+                window_ptr: base.add(self.window_pos),
+                prev_ptr: base.add(self.prev_pos).cast(),
+                head_ptr: base.add(self.head_pos).cast(),
+                pending_ptr: base.add(self.pending_pos).cast(),
+                sym_buf_ptr: base.add(self.sym_buf_pos),
+            }
+        }
+    }
+
     /// Resolve this layout inside one raw allocator block and initialize every region whose typed
     /// wrapper requires initialized values before constructing that wrapper.
     ///
@@ -4422,34 +4467,37 @@ impl DeflateAllocOffsets {
     /// `aligned` must be the aligned interior base of a writable allocation described by this
     /// layout, remain alive for `'a`, and not be aliased by another live deflate state.
     const unsafe fn initialize_buffers<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocBuffers<'a> {
-        let base = aligned.as_ptr();
+        // SAFETY: the caller supplies the aligned base of an independent allocation described
+        // by this layout; each returned region has the required alignment and valid extent.
+        let DeflateAllocRegions {
+            state_ptr,
+            window_ptr,
+            prev_ptr,
+            head_ptr,
+            pending_ptr,
+            sym_buf_ptr,
+        } = unsafe { self.regions(aligned) };
         let w_size = 1usize << self.window_bits;
 
-        let window_ptr = unsafe { base.add(self.window_pos) };
-        let window = unsafe { Window::from_raw_parts(window_ptr, self.window_bits) };
+        // SAFETY: all regions are disjoint, adequately sized, and backed by this live allocation.
+        // The position tables are initialized before creating their typed views.
+        unsafe {
+            let window = Window::from_raw_parts(window_ptr, self.window_bits);
+            prev_ptr.write_bytes(0, w_size);
+            let prev = WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size);
+            head_ptr.write_bytes(0, 1);
+            let head = WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr);
+            let pending = Pending::from_raw_parts(pending_ptr.cast(), self.lit_bufsize * LIT_BUFS);
+            let sym_buf = SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize * (LIT_BUFS - 1));
 
-        let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
-        unsafe { prev_ptr.write_bytes(0, w_size) };
-        let prev = unsafe { WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size) };
-
-        let head_ptr = unsafe { base.add(self.head_pos).cast::<[Pos; HASH_SIZE]>() };
-        unsafe { head_ptr.write_bytes(0, 1) };
-        let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
-
-        let pending_ptr = unsafe { base.add(self.pending_pos).cast::<MaybeUninit<u8>>() };
-        let pending = unsafe { Pending::from_raw_parts(pending_ptr, self.lit_bufsize * LIT_BUFS) };
-
-        let sym_buf_ptr = unsafe { base.add(self.sym_buf_pos) };
-        let sym_buf =
-            unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize * (LIT_BUFS - 1)) };
-
-        DeflateAllocBuffers {
-            state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
+            DeflateAllocBuffers {
+                state_ptr,
+                window,
+                prev,
+                head,
+                pending,
+                sym_buf,
+            }
         }
     }
 
@@ -4465,37 +4513,39 @@ impl DeflateAllocOffsets {
         aligned: NonNull<u8>,
         source: &State<'_>,
     ) -> DeflateAllocBuffers<'a> {
-        let base = aligned.as_ptr();
+        // SAFETY: caller guarantees a fresh destination allocation disjoint from source.
+        let DeflateAllocRegions {
+            state_ptr,
+            window_ptr,
+            prev_ptr,
+            head_ptr,
+            pending_ptr,
+            sym_buf_ptr,
+        } = unsafe { self.regions(aligned) };
         let w_size = 1usize << self.window_bits;
         debug_assert_eq!(source.w_size, w_size);
         debug_assert_eq!(source.lit_bufsize, self.lit_bufsize);
 
-        let window_ptr = unsafe { base.add(self.window_pos) };
-        let window = unsafe { source.window.clone_to(window_ptr) };
+        // SAFETY: all destination regions are sized and aligned by the shared layout; none
+        // overlap the source buffers. Each typed view is created only after its contents
+        // have been cloned into the new allocation.
+        unsafe {
+            let window = source.window.clone_to(window_ptr);
+            prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len());
+            let prev = WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size);
+            head_ptr.copy_from_nonoverlapping(source.head.as_ptr(), 1);
+            let head = WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr);
+            let pending = source.bit_writer.pending.clone_to(pending_ptr);
+            let sym_buf = source.sym_buf.clone_to(sym_buf_ptr);
 
-        let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
-        unsafe { prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len()) };
-        let prev = unsafe { WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size) };
-
-        let head_ptr = unsafe { base.add(self.head_pos).cast::<[Pos; HASH_SIZE]>() };
-        unsafe { head_ptr.copy_from_nonoverlapping(source.head.as_ptr(), 1) };
-        let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
-
-        let pending = unsafe {
-            source
-                .bit_writer
-                .pending
-                .clone_to(base.add(self.pending_pos))
-        };
-        let sym_buf = unsafe { source.sym_buf.clone_to(base.add(self.sym_buf_pos)) };
-
-        DeflateAllocBuffers {
-            state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
+            DeflateAllocBuffers {
+                state_ptr,
+                window,
+                prev,
+                head,
+                pending,
+                sym_buf,
+            }
         }
     }
 
@@ -6085,6 +6135,129 @@ mod test {
 
             assert!(end(stream).is_ok());
         }
+    }
+
+    struct MisalignedAlloc {
+        remainder: usize,
+        allocations: usize,
+        frees: usize,
+        buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
+    }
+
+    unsafe extern "C" fn misaligned_alloc_callback(
+        opaque: *mut core::ffi::c_void,
+        items: crate::c_api::uInt,
+        size: crate::c_api::uInt,
+    ) -> *mut core::ffi::c_void {
+        // SAFETY: init and copy receive a live pointer to our stack-local allocator context.
+        let Some(ctx) = (unsafe { opaque.cast::<MisalignedAlloc>().as_mut() }) else {
+            return core::ptr::null_mut();
+        };
+        let Some(length) = usize::try_from(items)
+            .ok()
+            .and_then(|count| usize::try_from(size).ok()?.checked_mul(count))
+            .and_then(|size| size.checked_add(DEFLATE_ALLOC_ALIGN))
+        else {
+            return core::ptr::null_mut();
+        };
+        let mut data = vec![0u8; length].into_boxed_slice();
+        let base = data.as_mut_ptr() as usize;
+        let delta = (ctx.remainder + DEFLATE_ALLOC_ALIGN - base % DEFLATE_ALLOC_ALIGN)
+            % DEFLATE_ALLOC_ALIGN;
+        // SAFETY: the allocation reserves one full alignment unit beyond the requested
+        // size, so the shifted pointer still has all requested bytes available.
+        let ptr = unsafe { data.as_mut_ptr().add(delta) }.cast();
+        ctx.buffers.push((ptr, data));
+        ctx.allocations += 1;
+        ptr
+    }
+
+    unsafe extern "C" fn misaligned_free_callback(
+        opaque: *mut core::ffi::c_void,
+        ptr: *mut core::ffi::c_void,
+    ) {
+        // SAFETY: zfree is invoked before the stack-local context is destroyed, and
+        // receives the exact pointer previously returned by the matching allocator.
+        if let Some(ctx) = unsafe { opaque.cast::<MisalignedAlloc>().as_mut() } {
+            if let Some(index) = ctx.buffers.iter().position(|(address, _)| *address == ptr) {
+                ctx.buffers.swap_remove(index);
+                ctx.frees += 1;
+            }
+        }
+    }
+
+    /// A valid zalloc callback is not required to return cache-line-aligned
+    /// memory. Cover every possible remainder and both initialization/copy.
+    #[test]
+    fn custom_unaligned_allocator_preserves_state_layout_and_copy() -> Result<(), &'static str> {
+        for remainder in 0..DEFLATE_ALLOC_ALIGN {
+            let mut ctx = MisalignedAlloc {
+                remainder,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let mut raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut ctx).cast(),
+                ..z_stream::default()
+            };
+            let config = DeflateConfig {
+                window_bits: if remainder % 2 == 0 {
+                    MIN_WBITS
+                } else {
+                    MAX_WBITS
+                },
+                mem_level: if remainder % 2 == 0 { 1 } else { MAX_MEM_LEVEL },
+                ..DeflateConfig::default()
+            };
+            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            // SAFETY: successful initialization owns one state and its allocation.
+            let source = (unsafe { DeflateStream::from_stream_mut(&raw mut raw) })
+                .ok_or("state missing after initialization")?;
+            assert_eq!(source.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(
+                source.state.window.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
+                0
+            );
+            assert_eq!(source.state.prev.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.head.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            source.state.prev.as_mut_slice()[0] = 0x1234;
+            source.state.head.as_mut_slice()[0] = 0x4321;
+            source.state.bit_writer.pending.extend(&[11, 22, 33]);
+
+            let mut dest = MaybeUninit::<DeflateStream>::uninit();
+            assert_eq!(copy(&mut dest, source), ReturnCode::Ok);
+            // SAFETY: successful deflate copy initializes a complete independent state.
+            let cloned = unsafe { dest.assume_init_mut() };
+            assert_eq!(cloned.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(
+                cloned.state.window.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
+                0
+            );
+            assert_eq!(cloned.state.prev.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.head.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
+            assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
+            assert_eq!(cloned.state.prev.as_slice()[0], 0x1234);
+            assert_eq!(cloned.state.head.as_slice()[0], 0x4321);
+            assert_eq!(cloned.state.bit_writer.pending.pending(), &[11, 22, 33]);
+            source.state.prev.as_mut_slice()[0] = 0xabcd;
+            assert_eq!(cloned.state.prev.as_slice()[0], 0x1234);
+            assert!(end(source).is_ok());
+            assert!(end(cloned).is_ok());
+            assert_eq!(
+                ctx.allocations, 2,
+                "allocation count at remainder {remainder}"
+            );
+            assert_eq!(ctx.frees, 2, "free count at remainder {remainder}");
+            assert!(
+                ctx.buffers.is_empty(),
+                "leaked buffers at remainder {remainder}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
