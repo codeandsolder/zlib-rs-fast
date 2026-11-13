@@ -1765,15 +1765,154 @@ impl State<'_> {
     ) -> ReturnCode {
         let mode = self.mode;
         match self.dispatch_inner(bit_reader, output, flush, mode) {
-            Ok((mode, code)) => {
-                self.mode = mode;
-                code
-            }
-            Err(DispatchExit { mode, code }) => {
+            Ok((mode, code)) | Err(DispatchExit { mode, code }) => {
                 self.mode = mode;
                 code
             }
         }
+    }
+
+    /// Decode the next DEFLATE block header. The final-block marker and
+    /// Huffman table selection belong to this state transition, not its caller.
+    fn decode_block_type(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        if self.flags.contains(Flags::IS_LAST_BLOCK) {
+            bit_reader.next_byte_boundary();
+            return Ok(Mode::Check);
+        }
+
+        need_bits_for_mode(bit_reader, 3, Mode::TypeDo)?;
+        let last = bit_reader.bits(1) != 0;
+        self.flags.update(Flags::IS_LAST_BLOCK, last);
+        bit_reader.drop_bits(1);
+        let block_type = bit_reader.bits(2);
+        bit_reader.drop_bits(2);
+
+        match block_type {
+            0b00 => {
+                traceln!("inflate:     stored block (last = {last})");
+                Ok(Mode::Stored)
+            }
+            0b01 => {
+                traceln!("inflate:     fixed codes block (last = {last})");
+                self.len_table = Table {
+                    codes: Codes::Fixed,
+                    bits: 9,
+                };
+                self.dist_table = Table {
+                    codes: Codes::Fixed,
+                    bits: 5,
+                };
+                Ok(Mode::Len_)
+            }
+            0b10 => {
+                traceln!("inflate:     dynamic codes block (last = {last})");
+                Ok(Mode::Table)
+            }
+            0b11 => {
+                traceln!("inflate:     invalid block type");
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: self.bad("invalid block type\0"),
+                })
+            }
+            _ => unreachable!("two buffered bits yield only values 0..=3"),
+        }
+    }
+
+    /// Verify the trailer checksum only after its complete 32-bit field is
+    /// available. Account for the current output exactly once on resume.
+    fn decode_data_checksum(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+        output: &mut InflateOutput<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        if self.wrap != 0 {
+            need_bits_for_mode(bit_reader, 32, Mode::Check)?;
+            let verify_checksum =
+                self.wrap & 4 != 0 && !cfg!(feature = "__internal-fuzz-disable-checksum");
+            // Even without verification, the trailer and output count must advance.
+            self.total = self.total.wrapping_add(output.len());
+
+            if verify_checksum {
+                if self.gzip_flags != 0 {
+                    self.crc_fold.fold(output.filled());
+                    self.checksum = self.crc_fold.finish();
+                } else {
+                    self.checksum = adler32(self.checksum, output.filled());
+                }
+            }
+
+            let given_checksum = if self.gzip_flags != 0 {
+                bit_reader.bits_u32(32)
+            } else {
+                zswap32(bit_reader.bits_u32(32))
+            };
+            output.mark_accounted();
+
+            if verify_checksum && given_checksum != self.checksum {
+                return Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: self.bad("incorrect data check\0"),
+                });
+            }
+            bit_reader.init_bits();
+        }
+        Ok(Mode::Length)
+    }
+
+    /// Complete the dynamic literal/length and distance alphabets. Input
+    /// starvation preserves the CodeLens mode and the partial symbol count.
+    fn decode_code_lengths(&mut self, bit_reader: &mut BitReader<'_>) -> Result<(), DispatchExit> {
+        while self.have < self.nlen + self.ndist {
+            let here = loop {
+                let bits = bit_reader.bits_usize(self.len_table.bits);
+                let here = self.len_table_get(bits);
+                if here.bits <= bit_reader.bits_in_buffer() {
+                    break here;
+                }
+
+                pull_byte_for_mode(bit_reader, Mode::CodeLens)?;
+            };
+
+            let here_bits = here.bits;
+            match here.val {
+                0..=15 => {
+                    bit_reader.drop_bits(here_bits);
+                    self.lens[self.have] = here.val;
+                    self.have += 1;
+                }
+                symbol => {
+                    let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
+                        return Err(DispatchExit {
+                            mode: Mode::Bad,
+                            code: self.bad("invalid bit length repeat\0"),
+                        });
+                    };
+                    need_bits_for_mode(
+                        bit_reader,
+                        usize::from(here_bits) + usize::from(repeat.extra_bits),
+                        Mode::CodeLens,
+                    )?;
+                    bit_reader.drop_bits(here_bits);
+                    let extra = bit_reader.bits(usize::from(repeat.extra_bits));
+                    bit_reader.drop_bits(repeat.extra_bits);
+                    if let Err(msg) = self.append_code_length_repeat(repeat, extra) {
+                        return Err(DispatchExit {
+                            mode: Mode::Bad,
+                            code: self.bad(msg),
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Err(msg) = self.finish_dynamic_trees() {
+            return Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad(msg),
+            });
+        }
+        Ok(())
     }
 
     fn dispatch_inner(
@@ -1820,67 +1959,12 @@ impl State<'_> {
                         }
                     }
                     Mode::TypeDo => {
-                        if self.flags.contains(Flags::IS_LAST_BLOCK) {
-                            bit_reader.next_byte_boundary();
-                            break 'blk Mode::Check;
+                        let next = self.decode_block_type(bit_reader)?;
+                        if flush == InflateFlush::Trees && matches!(next, Mode::Len_) {
+                            mode = next;
+                            break 'label ReturnCode::Ok;
                         }
-
-                        need_bits_for_mode(bit_reader, 3, mode)?;
-                        let last = bit_reader.bits(1) != 0;
-                        self.flags.update(Flags::IS_LAST_BLOCK, last);
-                        bit_reader.drop_bits(1);
-
-                        match bit_reader.bits(2) {
-                            0b00 => {
-                                traceln!("inflate:     stored block (last = {last})");
-
-                                bit_reader.drop_bits(2);
-
-                                break 'blk Mode::Stored;
-                            }
-                            0b01 => {
-                                traceln!("inflate:     fixed codes block (last = {last})");
-
-                                self.len_table = Table {
-                                    codes: Codes::Fixed,
-                                    bits: 9,
-                                };
-
-                                self.dist_table = Table {
-                                    codes: Codes::Fixed,
-                                    bits: 5,
-                                };
-
-                                mode = Mode::Len_;
-
-                                bit_reader.drop_bits(2);
-
-                                if let InflateFlush::Trees = flush {
-                                    break 'label ReturnCode::Ok;
-                                } else {
-                                    break 'blk Mode::Len_;
-                                }
-                            }
-                            0b10 => {
-                                traceln!("inflate:     dynamic codes block (last = {last})");
-
-                                bit_reader.drop_bits(2);
-
-                                break 'blk Mode::Table;
-                            }
-                            0b11 => {
-                                traceln!("inflate:     invalid block type");
-
-                                bit_reader.drop_bits(2);
-
-                                mode = Mode::Bad;
-                                break 'label self.bad("invalid block type\0");
-                            }
-                            _ => {
-                                // LLVM will optimize this branch away
-                                unreachable!("BitReader::bits(2) only yields a value of two bits, so this match is already exhaustive")
-                            }
-                        }
+                        break 'blk next;
                     }
                     Mode::Stored => {
                         bit_reader.next_byte_boundary();
@@ -1901,11 +1985,13 @@ impl State<'_> {
 
                         bit_reader.init_bits();
 
-                        if let InflateFlush::Trees = flush {
+                        if flush == InflateFlush::Trees {
+                            // Z_TREES stops after the validated LEN/NLEN header,
+                            // so the next call must resume at the first stored byte.
+                            mode = Mode::CopyBlock;
                             break 'label ReturnCode::Ok;
-                        } else {
-                            break 'blk Mode::CopyBlock;
                         }
+                        break 'blk Mode::CopyBlock;
                     }
                     Mode::CopyBlock => {
                         loop {
@@ -1931,41 +2017,7 @@ impl State<'_> {
                         break 'blk Mode::Type;
                     }
                     Mode::Check => {
-                        if self.wrap != 0 {
-                            need_bits_for_mode(bit_reader, 32, mode)?;
-                            let verify_checksum = self.wrap & 4 != 0
-                                && !cfg!(feature = "__internal-fuzz-disable-checksum");
-                            // Disabling checksum verification must not skip the
-                            // trailer or the final output-length accounting.
-
-                            self.total = self.total.wrapping_add(output.len());
-
-                            if verify_checksum {
-                                if self.gzip_flags != 0 {
-                                    self.crc_fold.fold(output.filled());
-                                    self.checksum = self.crc_fold.finish();
-                                } else {
-                                    self.checksum = adler32(self.checksum, output.filled());
-                                }
-                            }
-
-                            let given_checksum = if self.gzip_flags != 0 {
-                                bit_reader.bits_u32(32)
-                            } else {
-                                zswap32(bit_reader.bits_u32(32))
-                            };
-
-                            output.mark_accounted();
-
-                            if verify_checksum && given_checksum != self.checksum {
-                                mode = Mode::Bad;
-                                break 'label self.bad("incorrect data check\0");
-                            }
-
-                            bit_reader.init_bits();
-                        }
-
-                        break 'blk Mode::Length;
+                        break 'blk self.decode_data_checksum(bit_reader, output)?;
                     }
                     Mode::Len_ => {
                         break 'blk Mode::Len;
@@ -2101,58 +2153,11 @@ impl State<'_> {
                         break 'blk Mode::CodeLens;
                     }
                     Mode::CodeLens => {
-                        while self.have < self.nlen + self.ndist {
-                            let here = loop {
-                                let bits = bit_reader.bits_usize(self.len_table.bits);
-                                let here = self.len_table_get(bits);
-                                if here.bits <= bit_reader.bits_in_buffer() {
-                                    break here;
-                                }
-
-                                pull_byte_for_mode(bit_reader, mode)?;
-                            };
-
-                            let here_bits = here.bits;
-
-                            match here.val {
-                                0..=15 => {
-                                    bit_reader.drop_bits(here_bits);
-                                    self.lens[self.have] = here.val;
-                                    self.have += 1;
-                                }
-                                symbol => {
-                                    let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    };
-                                    need_bits_for_mode(
-                                        bit_reader,
-                                        usize::from(here_bits) + usize::from(repeat.extra_bits),
-                                        mode,
-                                    )?;
-                                    bit_reader.drop_bits(here_bits);
-                                    let extra = bit_reader.bits(usize::from(repeat.extra_bits));
-                                    bit_reader.drop_bits(repeat.extra_bits);
-                                    if let Err(msg) = self.append_code_length_repeat(repeat, extra)
-                                    {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad(msg);
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Err(msg) = self.finish_dynamic_trees() {
-                            mode = Mode::Bad;
-                            break 'label self.bad(msg);
-                        }
-
+                        self.decode_code_lengths(bit_reader)?;
                         mode = Mode::Len_;
-
-                        if matches!(flush, InflateFlush::Trees) {
+                        if flush == InflateFlush::Trees {
                             break 'label ReturnCode::Ok;
                         }
-
                         break 'blk Mode::Len_;
                     }
                     Mode::Dict => {
@@ -3288,6 +3293,86 @@ mod tests {
             assert_eq!(stored_block_length(header ^ (1 << 16)), None);
             assert_eq!(stored_block_length(header ^ 1), None);
         }
+    }
+
+    #[test]
+    fn trees_flush_resumes_stored_payload_after_length_header() {
+        let input = [3, 0, 0xfc, 0xff, b'a', b'b', b'c'];
+        let mut state = State::new(InflateStateKind::Regular);
+        state.mode = Mode::Stored;
+        let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
+        let mut destination = [0u8; 8];
+        // SAFETY: destination is exclusively writable for its full stack allocation;
+        // only its initialized prefix is observed before returning.
+        let mut output =
+            unsafe { InflateOutput::new_uninit(destination.as_mut_ptr(), destination.len()) };
+
+        assert_eq!(
+            state.dispatch(&mut reader, &mut output, InflateFlush::Trees),
+            ReturnCode::Ok
+        );
+        assert!(matches!(state.mode, Mode::CopyBlock));
+        assert_eq!(state.length, 3);
+        assert_eq!(reader.as_slice(), b"abc");
+        assert_eq!(output.len(), 0);
+
+        assert_eq!(
+            state.dispatch(&mut reader, &mut output, InflateFlush::NoFlush),
+            ReturnCode::Ok
+        );
+        assert_eq!(output.filled(), b"abc");
+        assert_eq!(state.length, 0);
+    }
+
+    #[test]
+    fn trees_flush_stored_payload_resumes_through_stream_api() -> Result<(), &'static str> {
+        // A final raw stored block containing abc, delivered in two input spans.
+        let mut prefix = [0x01u8];
+        let mut payload = [3, 0, 0xfc, 0xff, b'a', b'b', b'c'];
+        let mut destination = [0xa5u8; 8];
+        let mut raw = z_stream::default();
+        assert_eq!(
+            init(&mut raw, InflateConfig { window_bits: -15 }),
+            ReturnCode::Ok
+        );
+        // SAFETY: init created an exclusively borrowed regular inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("raw inflate stream was not initialized")?;
+        stream.next_out = destination.as_mut_ptr();
+        stream.avail_out = 8;
+
+        stream.next_in = prefix.as_mut_ptr();
+        stream.avail_in = 1;
+        // SAFETY: both input spans and output allocation stay live and disjoint.
+        assert_eq!(
+            unsafe { inflate(stream, InflateFlush::NoFlush) },
+            ReturnCode::Ok
+        );
+        assert!(matches!(stream.state.mode, Mode::Stored));
+        assert_eq!(stream.avail_in, 0);
+
+        stream.next_in = payload.as_mut_ptr();
+        stream.avail_in = 7;
+        // SAFETY: payload and destination are live, disjoint, and lengths are exact.
+        assert_eq!(
+            unsafe { inflate(stream, InflateFlush::Trees) },
+            ReturnCode::Ok
+        );
+        assert!(matches!(stream.state.mode, Mode::CopyBlock));
+        assert_eq!(stream.avail_in, 3);
+        assert_eq!(stream.total_out, 0);
+
+        // SAFETY: the ABI pointers now address the valid unconsumed payload suffix.
+        assert_eq!(
+            unsafe { inflate(stream, InflateFlush::NoFlush) },
+            ReturnCode::StreamEnd
+        );
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.total_out, 3);
+        assert_eq!(&destination[..3], b"abc");
+        assert_eq!(&destination[3..], &[0xa5; 5]);
+        assert!(end(stream).state.is_null());
+        Ok(())
     }
 
     #[test]
