@@ -414,18 +414,21 @@ impl GzState {
         })
     }
 
-    fn input_ptr(&self) -> *mut u8 {
-        self.input
-            .as_ref()
-            .expect("gzip input buffer must be initialized")
-            .as_ptr()
+    // C gzip entrypoints report missing internal owners as stream errors.
+    fn input_ptr(&mut self) -> Result<*mut u8, ()> {
+        let Some(ptr) = self.input.as_ref().map(GzBuffer::as_ptr) else {
+            self.invalid_write_cursor();
+            return Err(());
+        };
+        Ok(ptr)
     }
 
-    fn output_ptr(&self) -> *mut u8 {
-        self.output
-            .as_ref()
-            .expect("gzip output buffer must be initialized")
-            .as_ptr()
+    fn output_ptr(&mut self) -> Result<*mut u8, ()> {
+        let Some(ptr) = self.output.as_ref().map(GzBuffer::as_ptr) else {
+            self.invalid_write_cursor();
+            return Err(());
+        };
+        Ok(ptr)
     }
 
     fn allocate_input_buffer(&self) -> Option<GzBuffer> {
@@ -2363,7 +2366,10 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
     if input.len() < state.in_size() {
         loop {
             if state.stream.avail_in == 0 {
-                state.stream.next_in = state.input_ptr();
+                let Ok(input_ptr) = state.input_ptr() else {
+                    return 0;
+                };
+                state.stream.next_in = input_ptr;
             }
             let Some(have) = state.owned_write_input_end() else {
                 state.invalid_write_cursor();
@@ -2472,16 +2478,21 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
     let mut first = true;
     while len != 0 {
         let n = Ord::min(state.in_size(), len);
+        if n == 0 {
+            state.invalid_write_cursor();
+            return Err(());
+        }
+        let input_ptr = state.input_ptr()?;
         if first {
             // gz_zero initialized the owned input buffer before entering this
             // loop, and n is bounded by its usable compression prefix.
             // SAFETY: gz_zero initialized the owned writable input above, and
             // n is bounded by its usable prefix, so the fill stays inside it.
-            unsafe { state.input_ptr().write_bytes(0u8, n) };
+            unsafe { input_ptr.write_bytes(0u8, n) };
             first = false;
         }
         state.stream.avail_in = n as _;
-        state.stream.next_in = state.input_ptr();
+        state.stream.next_in = input_ptr;
         state.advance_position(n)?;
         if gz_comp(state, Z_NO_FLUSH).is_err() {
             return Err(());
@@ -2552,7 +2563,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
     // Initialize write buffer if compressing.
     if !state.direct {
         state.stream.avail_out = state.out_avail();
-        state.stream.next_out = state.output_ptr();
+        state.stream.next_out = state.output_ptr()?;
         state.next = state.stream.next_out;
     }
 
@@ -2647,7 +2658,7 @@ fn gz_comp(state: &mut GzState, flush: c_int) -> Result<(), ()> {
             }
             if state.stream.avail_out == 0 {
                 state.stream.avail_out = state.out_avail();
-                state.stream.next_out = state.output_ptr();
+                state.stream.next_out = state.output_ptr()?;
             }
             state.next = state.stream.next_out;
         }
@@ -2882,7 +2893,10 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     // Try writing to the owned input buffer for speed when it has been initialized.
     if state.input.is_some() {
         if state.stream.avail_in == 0 {
-            state.stream.next_in = state.input_ptr();
+            let Ok(input_ptr) = state.input_ptr() else {
+                return -1;
+            };
+            state.stream.next_in = input_ptr;
         }
         // Safety: `state.stream.next_in` points into the buffer starting at `state.input`.
         // (This is an invariant maintained throughout this module, except for a specific
@@ -3583,7 +3597,10 @@ pub unsafe extern "C" fn gzvprintf(
     // buffer is double-sized just for this function, so there is guaranteed to
     // be state.size bytes available after the current contents
     if state.stream.avail_in == 0 {
-        state.stream.next_in = state.input_ptr();
+        let Ok(input_ptr) = state.input_ptr() else {
+            return state.err;
+        };
+        state.stream.next_in = input_ptr;
     }
 
     // The write input allocation is twice `in_size()` specifically for this function,
@@ -3640,14 +3657,11 @@ pub unsafe extern "C" fn gzvprintf(
         if gz_comp(state, Z_NO_FLUSH).is_err() {
             return state.err;
         }
-        unsafe {
-            core::ptr::copy(
-                state.input_ptr().add(state.in_size()),
-                state.input_ptr(),
-                left as usize,
-            )
+        let Ok(input_ptr) = state.input_ptr() else {
+            return state.err;
         };
-        state.stream.next_in = state.input_ptr();
+        unsafe { core::ptr::copy(input_ptr.add(state.in_size()), input_ptr, left as usize) };
+        state.stream.next_in = input_ptr;
         state.stream.avail_in = left;
     }
 
@@ -5359,6 +5373,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_owned_write_buffer_pointers_return_stream_error() {
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        assert_eq!(state.input_ptr(), Err(()));
+        assert_eq!(state.err, Z_STREAM_ERROR);
+
+        let mut state = GzState::new();
+        state.mode = GzMode::Write;
+        assert_eq!(state.output_ptr(), Err(()));
+        assert_eq!(state.err, Z_STREAM_ERROR);
+    }
+
+    #[test]
     fn large_gzip_read_keeps_abi_cursor_in_owned_output() -> Result<(), ()> {
         let path = std::env::temp_dir().join(format!(
             "zlib-rs-fast-read-cursor-{}.gz",
@@ -5420,7 +5447,8 @@ mod tests {
         state.fd = -2;
 
         assert!(gz_init(&mut state).is_ok());
-        let owned_input = state.input_ptr();
+        let owned_input = state.input_ptr().unwrap_or(ptr::null_mut());
+        assert!(!owned_input.is_null());
         let saved_next_in = state.stream.next_in;
         assert_ne!(owned_input.cast_const(), saved_next_in);
 
@@ -5898,7 +5926,8 @@ mod tests {
             let expected_avail = BLOCK_SIZE - CONSUME + (FILE_SIZE - BLOCK_SIZE);
             assert_eq!(gz_avail(state), Ok(expected_avail));
             assert_eq!(state.stream.avail_in as usize, expected_avail);
-            assert_eq!(state.stream.next_in, state.input_ptr().cast_const());
+            let owned_input = state.input_ptr().ok_or(())?;
+            assert_eq!(state.stream.next_in, owned_input.cast_const());
             let buffered = state.buffered_read_input().ok_or(())?;
             assert_eq!(&buffered[..expected_suffix.len()], expected_suffix);
         };
