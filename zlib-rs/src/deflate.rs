@@ -3143,7 +3143,14 @@ fn encode_block_core(state: &mut State<'_>, is_last: bool) {
     state.block_start = next_origin;
 }
 
-fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
+/// Append an optional gzip metadata field incrementally. The caller supplies
+/// only the not-yet-buffered suffix, using state.gzindex after an output pause.
+/// FHCRC's own two bytes must not become part of the header CRC accumulator.
+fn flush_bytes(
+    stream: &mut Compressor<'_, '_>,
+    mut bytes: &[u8],
+    update_header_crc: bool,
+) -> ControlFlow<ReturnCode> {
     let mut state = &mut *stream.state;
 
     // we'll be using the pending buffer as temporary storage
@@ -3154,9 +3161,11 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
 
         state.bit_writer.pending.extend(&bytes[..copy]);
 
-        stream
-            .checksum
-            .update_crc(&state.bit_writer.pending.pending()[beg..]);
+        if update_header_crc {
+            stream
+                .checksum
+                .update_crc(&state.bit_writer.pending.pending()[beg..]);
+        }
 
         state.gzindex += copy;
         let _ = stream.drain_pending();
@@ -3174,9 +3183,11 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
 
     state.bit_writer.pending.extend(bytes);
 
-    stream
-        .checksum
-        .update_crc(&state.bit_writer.pending.pending()[beg..]);
+    if update_header_crc {
+        stream
+            .checksum
+            .update_crc(&state.bit_writer.pending.pending()[beg..]);
+    }
     state.gzindex = 0;
 
     ControlFlow::Continue(())
@@ -3199,6 +3210,174 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     }
 
     result
+}
+
+/// Emit the RFC 1950/zlib or RFC 1952/gzip wrapper prefix, including
+/// optional gzip metadata. Incomplete output is not an error: the caller
+/// retains its flush mode and resumes this exact header state.
+/// Resume gzip extra/name/comment fields and the optional FHCRC from
+/// their saved metadata cursor. No payload compression occurs here.
+fn emit_gzip_metadata(stream: &mut Compressor<'_, '_>) -> ControlFlow<ReturnCode> {
+    if stream.state.status == Status::Extra {
+        if let Some(gzhead) = stream.state.gzhead {
+            if let Some(extra) = gzhead.encoded_extra() {
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &extra[stream.state.gzindex..], true)
+                {
+                    return ControlFlow::Break(err);
+                }
+            }
+        }
+        stream.state.status = Status::Name;
+    }
+
+    if stream.state.status == Status::Name {
+        if let Some(gzhead) = stream.state.gzhead {
+            if let Some(name) = gzhead.name() {
+                if let ControlFlow::Break(err) = flush_bytes(
+                    stream,
+                    &name.to_bytes_with_nul()[stream.state.gzindex..],
+                    true,
+                ) {
+                    return ControlFlow::Break(err);
+                }
+            }
+            stream.state.status = Status::Comment;
+        }
+    }
+
+    if stream.state.status == Status::Comment {
+        if let Some(gzhead) = stream.state.gzhead {
+            if let Some(comment) = gzhead.comment() {
+                if let ControlFlow::Break(err) = flush_bytes(
+                    stream,
+                    &comment.to_bytes_with_nul()[stream.state.gzindex..],
+                    true,
+                ) {
+                    return ControlFlow::Break(err);
+                }
+            }
+            stream.state.status = Status::Hcrc;
+        }
+    }
+
+    if stream.state.status == Status::Hcrc {
+        if let Some(gzhead) = stream.state.gzhead {
+            if gzhead.hcrc() {
+                let word = stream.checksum.low_word().to_le_bytes();
+                let bytes = [word[0], word[1]];
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &bytes[stream.state.gzindex..], false)
+                {
+                    return ControlFlow::Break(err);
+                }
+            }
+        }
+
+        stream.state.status = Status::Busy;
+
+        // compression must start with an empty pending buffer
+        let _ = stream.drain_pending();
+        if !stream.state.bit_writer.pending.is_empty() {
+            stream.state.last_flush = -1;
+            return ControlFlow::Break(ReturnCode::Ok);
+        }
+    }
+
+    ControlFlow::Continue(())
+}
+
+fn emit_wrapper_header(stream: &mut Compressor<'_, '_>) -> ControlFlow<ReturnCode> {
+    /* Write the header */
+    if stream.state.status == Status::Init && stream.state.wrap == 0 {
+        stream.state.status = Status::Busy;
+    }
+
+    if stream.state.status == Status::Init {
+        let header = stream.state.header();
+        stream
+            .state
+            .bit_writer
+            .pending
+            .extend(&header.to_be_bytes());
+
+        /* Save the adler32 of the preset dictionary: */
+        if stream.state.strstart != 0 {
+            let adler = stream.checksum.low_word();
+            stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
+        }
+
+        stream.checksum.reset_adler();
+        stream.state.status = Status::Busy;
+
+        // compression must start with an empty pending buffer
+        let _ = stream.drain_pending();
+
+        if !stream.state.bit_writer.pending.is_empty() {
+            stream.state.last_flush = -1;
+
+            return ControlFlow::Break(ReturnCode::Ok);
+        }
+    }
+
+    if stream.state.status == Status::GZip {
+        /* gzip header */
+        stream.state.crc_fold = Crc32Fold::new();
+
+        stream.state.bit_writer.pending.extend(&[31, 139, 8]);
+
+        let extra_flags = if stream.state.level == 9 {
+            2
+        } else if stream.state.strategy >= Strategy::HuffmanOnly || stream.state.level < 2 {
+            4
+        } else {
+            0
+        };
+
+        match stream.state.gzhead {
+            None => {
+                let bytes = [0, 0, 0, 0, 0, extra_flags, gz_header::OS_CODE];
+                stream.state.bit_writer.pending.extend(&bytes);
+                stream.state.status = Status::Busy;
+
+                /* Compression must start with an empty pending buffer */
+                let _ = stream.drain_pending();
+                if !stream.state.bit_writer.pending.is_empty() {
+                    stream.state.last_flush = -1;
+                    return ControlFlow::Break(ReturnCode::Ok);
+                }
+            }
+            Some(gzhead) => {
+                stream.state.bit_writer.pending.extend(&[gzhead.flags()]);
+                stream
+                    .state
+                    .bit_writer
+                    .pending
+                    .extend(&gzhead.time().to_le_bytes());
+                stream
+                    .state
+                    .bit_writer
+                    .pending
+                    .extend(&[extra_flags, gzhead.os()]);
+
+                if let Some(extra) = gzhead.encoded_extra() {
+                    let bytes = gzip_extra_wire_len(extra.len()).to_le_bytes();
+                    stream.state.bit_writer.pending.extend(&bytes);
+                }
+
+                if gzhead.hcrc() {
+                    stream
+                        .checksum
+                        .update_crc(stream.state.bit_writer.pending.pending());
+                }
+
+                stream.state.gzindex = 0;
+                stream.state.status = Status::Extra;
+            }
+        }
+    }
+
+    emit_gzip_metadata(stream)
 }
 
 fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnCode {
@@ -3235,148 +3414,8 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         return ReturnCode::BufError;
     }
 
-    /* Write the header */
-    if stream.state.status == Status::Init && stream.state.wrap == 0 {
-        stream.state.status = Status::Busy;
-    }
-
-    if stream.state.status == Status::Init {
-        let header = stream.state.header();
-        stream
-            .state
-            .bit_writer
-            .pending
-            .extend(&header.to_be_bytes());
-
-        /* Save the adler32 of the preset dictionary: */
-        if stream.state.strstart != 0 {
-            let adler = stream.checksum.low_word();
-            stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
-        }
-
-        stream.checksum.reset_adler();
-        stream.state.status = Status::Busy;
-
-        // compression must start with an empty pending buffer
-        let _ = stream.drain_pending();
-
-        if !stream.state.bit_writer.pending.is_empty() {
-            stream.state.last_flush = -1;
-
-            return ReturnCode::Ok;
-        }
-    }
-
-    if stream.state.status == Status::GZip {
-        /* gzip header */
-        stream.state.crc_fold = Crc32Fold::new();
-
-        stream.state.bit_writer.pending.extend(&[31, 139, 8]);
-
-        let extra_flags = if stream.state.level == 9 {
-            2
-        } else if stream.state.strategy >= Strategy::HuffmanOnly || stream.state.level < 2 {
-            4
-        } else {
-            0
-        };
-
-        match stream.state.gzhead {
-            None => {
-                let bytes = [0, 0, 0, 0, 0, extra_flags, gz_header::OS_CODE];
-                stream.state.bit_writer.pending.extend(&bytes);
-                stream.state.status = Status::Busy;
-
-                /* Compression must start with an empty pending buffer */
-                let _ = stream.drain_pending();
-                if !stream.state.bit_writer.pending.is_empty() {
-                    stream.state.last_flush = -1;
-                    return ReturnCode::Ok;
-                }
-            }
-            Some(gzhead) => {
-                stream.state.bit_writer.pending.extend(&[gzhead.flags()]);
-                stream
-                    .state
-                    .bit_writer
-                    .pending
-                    .extend(&gzhead.time().to_le_bytes());
-                stream
-                    .state
-                    .bit_writer
-                    .pending
-                    .extend(&[extra_flags, gzhead.os()]);
-
-                if let Some(extra) = gzhead.encoded_extra() {
-                    let bytes = gzip_extra_wire_len(extra.len()).to_le_bytes();
-                    stream.state.bit_writer.pending.extend(&bytes);
-                }
-
-                if gzhead.hcrc() {
-                    stream
-                        .checksum
-                        .update_crc(stream.state.bit_writer.pending.pending());
-                }
-
-                stream.state.gzindex = 0;
-                stream.state.status = Status::Extra;
-            }
-        }
-    }
-
-    if stream.state.status == Status::Extra {
-        if let Some(gzhead) = stream.state.gzhead {
-            if let Some(extra) = gzhead.encoded_extra() {
-                if let ControlFlow::Break(err) = flush_bytes(stream, &extra[stream.state.gzindex..])
-                {
-                    return err;
-                }
-            }
-        }
-        stream.state.status = Status::Name;
-    }
-
-    if stream.state.status == Status::Name {
-        if let Some(gzhead) = stream.state.gzhead {
-            if let Some(name) = gzhead.name() {
-                if let ControlFlow::Break(err) = flush_bytes(stream, name.to_bytes_with_nul()) {
-                    return err;
-                }
-            }
-            stream.state.status = Status::Comment;
-        }
-    }
-
-    if stream.state.status == Status::Comment {
-        if let Some(gzhead) = stream.state.gzhead {
-            if let Some(comment) = gzhead.comment() {
-                if let ControlFlow::Break(err) = flush_bytes(stream, comment.to_bytes_with_nul()) {
-                    return err;
-                }
-            }
-            stream.state.status = Status::Hcrc;
-        }
-    }
-
-    if stream.state.status == Status::Hcrc {
-        if let Some(gzhead) = stream.state.gzhead {
-            if gzhead.hcrc() {
-                let word = stream.checksum.low_word().to_le_bytes();
-                let bytes = [word[0], word[1]];
-                if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
-                    return err;
-                }
-            }
-        }
-
-        stream.state.status = Status::Busy;
-
-        // compression must start with an empty pending buffer
-        let _ = stream.drain_pending();
-        if !stream.state.bit_writer.pending.is_empty() {
-            stream.state.last_flush = -1;
-            return ReturnCode::Ok;
-        }
+    if let ControlFlow::Break(code) = emit_wrapper_header(stream) {
+        return code;
     }
 
     // Start a new block or continue the current one.
@@ -7465,6 +7504,121 @@ mod test {
                 27, 27, 27, 27, 27, 27, 27, 27, 27, 9, 0, 60, 101, 156, 55, 18, 0, 0, 0,
             ],
         )
+    }
+
+    fn encode_custom_gzip_header(output_chunk: usize) -> Result<Vec<u8>, &'static str> {
+        // All three metadata fields exceed the mem-level-1 pending buffer.
+        // Every state must therefore handle an interrupted header flush.
+        let extra = vec![0x5au8; 701];
+        let mut name = vec![b'n'; 709];
+        name.push(0);
+        // Make the gzip header length 511 modulo 512, so FHCRC itself
+        // must also resume across an exhausted pending buffer.
+        let mut comment = vec![b'c'; 1_135];
+        comment.push(0);
+        let mut header = gz_header {
+            text: 1,
+            time: 0x1020_3040,
+            os: 3,
+            extra: extra.as_ptr().cast_mut(),
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| "extra header fixture exceeds C length")?,
+            name: name.as_mut_ptr(),
+            comment: comment.as_mut_ptr(),
+            hcrc: 1,
+            ..gz_header::default()
+        };
+
+        let config = DeflateConfig {
+            window_bits: 16 + crate::MAX_WBITS,
+            mem_level: 1,
+            ..DeflateConfig::default()
+        };
+        let mut stream =
+            DeflateStream::new(config).map_err(|_| "valid gzip compressor configuration failed")?;
+        // SAFETY: header and all three backing buffers remain live and
+        // unmodified until deflateEnd, including every resumed call.
+        let header_status = unsafe { set_header(&mut stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
+        let source = b"chunked gzip header then actual deflate payload".repeat(8);
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(source.len())
+            .map_err(|_| "source fixture exceeds C length")?;
+
+        let limit = bound(Some(&stream), source.len());
+        let mut encoded = vec![0u8; limit];
+        let mut written = 0usize;
+        let mut finished = false;
+        let mut paused_header_crc = false;
+        for _ in 0..limit.saturating_add(8) {
+            let count = output_chunk.min(encoded.len() - written);
+            if count == 0 {
+                break;
+            }
+            stream.next_out = encoded[written..].as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(count)
+                .map_err(|_| "output fixture exceeds C length")?;
+            let status = deflate(&mut stream, DeflateFlush::Finish);
+            paused_header_crc |= stream.state.status == Status::Hcrc && stream.state.gzindex != 0;
+            let remaining = usize::try_from(stream.avail_out)
+                .map_err(|_| "output cursor exceeds host pointer width")?;
+            written += count - remaining;
+            if status == ReturnCode::StreamEnd {
+                finished = true;
+                break;
+            }
+            assert_eq!(
+                status,
+                ReturnCode::Ok,
+                "gzip streaming failed at chunk {output_chunk}"
+            );
+        }
+        assert!(
+        finished,
+        "gzip chunk {output_chunk} stuck: produced {written}/{limit}, status={:?}, gzindex={}, pending={}, avail_in={}, last_flush={}",
+        stream.state.status,
+        stream.state.gzindex,
+        stream.state.bit_writer.pending.pending().len(),
+        stream.avail_in,
+        stream.state.last_flush
+    );
+        assert_eq!(stream.avail_in, 0);
+        if output_chunk == 1 {
+            assert!(
+                paused_header_crc,
+                "the one-byte output fixture must interrupt FHCRC"
+            );
+        }
+        assert!(end(&mut stream).is_ok());
+        encoded.truncate(written);
+        assert!(encoded.starts_with(&[31, 139, 8, 0x1f]));
+        Ok(encoded)
+    }
+
+    #[test]
+    fn gzip_custom_header_is_identical_across_tiny_output_chunks() -> Result<(), &'static str> {
+        let baseline = encode_custom_gzip_header(16_384)?;
+        let source = b"chunked gzip header then actual deflate payload".repeat(8);
+        let mut restored = vec![0u8; source.len()];
+        let (decoded, status) = crate::decompress_slice(
+            &mut restored,
+            &baseline,
+            crate::InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, source);
+        let hcrc_at = 10 + 2 + 701 + 710 + 1_136;
+        let expected_crc = crc32(0, &baseline[..hcrc_at]).to_le_bytes();
+        assert_eq!(
+            &baseline[hcrc_at..hcrc_at + 2],
+            &expected_crc[..2],
+            "FHCRC must cover the header without including its own bytes"
+        );
+        for output_chunk in [1usize, 2, 3, 7, 31, 127, 511] {
+            let actual = encode_custom_gzip_header(output_chunk)?;
+            assert_eq!(actual, baseline, "gzip output chunk size {output_chunk}");
+        }
+        Ok(())
     }
 
     #[test]
