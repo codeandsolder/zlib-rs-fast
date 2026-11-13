@@ -371,6 +371,11 @@ pub struct MisalignedAlloc {
     pub(super) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
 }
 
+/// # Safety
+///
+/// The opaque pointer must identify the live, exclusively accessible per-test
+/// MisalignedAlloc context supplied to the matching z_stream. Its lifetime
+/// extends across every zalloc callback until the corresponding frees.
 #[cfg(test)]
 pub unsafe extern "C" fn misaligned_alloc_callback(
     opaque: *mut core::ffi::c_void,
@@ -400,6 +405,11 @@ pub unsafe extern "C" fn misaligned_alloc_callback(
     ptr
 }
 
+/// # Safety
+///
+/// The opaque pointer must identify the same live per-test allocator context
+/// used for allocation, and ptr must be null or a pointer returned by it.
+/// The context records unexpected releases as outstanding allocations.
 #[cfg(test)]
 pub unsafe extern "C" fn misaligned_free_callback(
     opaque: *mut core::ffi::c_void,
