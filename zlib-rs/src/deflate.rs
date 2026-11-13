@@ -200,6 +200,22 @@ impl InputCursor {
     }
 }
 
+/// Native C unsigned long can be wider than the zlib/gzip 32-bit wire
+/// fields. Those fields intentionally encode the low word, modulo 2^32.
+#[inline]
+const fn low_wire_u32(value: core::ffi::c_ulong) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// RFC 1952 extra-field XLEN uses the low 16 bits of the caller's length.
+/// Emit only that many bytes, matching zlib's wire-format contract.
+#[inline]
+const fn gzip_extra_wire_len(length: usize) -> u16 {
+    let bytes = length.to_le_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
 /// Public zlib checksum field detached from caller input traversal.
 ///
 /// zlib overloads `z_stream.adler`: it is the running Adler-32 for zlib streams, temporary gzip
@@ -231,8 +247,7 @@ impl StreamChecksum {
     }
 
     const fn low_word(self) -> u32 {
-        let bytes = self.0.to_le_bytes();
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        low_wire_u32(self.0)
     }
 
     fn update_adler(&mut self, bytes: &[u8]) {
@@ -278,9 +293,7 @@ impl<'a> GzipHeaderRef<'a> {
     }
 
     const fn time(self) -> u32 {
-        // GZIP MTIME carries only the low four bytes of C unsigned long.
-        let bytes = self.header().time.to_le_bytes();
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        low_wire_u32(self.header().time)
     }
 
     const fn os(self) -> u8 {
@@ -304,7 +317,8 @@ impl<'a> GzipHeaderRef<'a> {
     }
 
     fn encoded_extra(&self) -> Option<&[u8]> {
-        self.extra().map(|extra| &extra[..extra.len() & 0xffff])
+        self.extra()
+            .map(|extra| &extra[..usize::from(gzip_extra_wire_len(extra.len()))])
     }
 
     const fn name(&self) -> Option<&CStr> {
@@ -3235,7 +3249,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
         /* Save the adler32 of the preset dictionary: */
         if stream.state.strstart != 0 {
-            let adler = stream.checksum.value() as u32;
+            let adler = stream.checksum.low_word();
             stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
         }
 
@@ -3293,7 +3307,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
                     .extend(&[extra_flags, gzhead.os()]);
 
                 if let Some(extra) = gzhead.encoded_extra() {
-                    let bytes = (extra.len() as u16).to_le_bytes();
+                    let bytes = gzip_extra_wire_len(extra.len()).to_le_bytes();
                     stream.state.bit_writer.pending.extend(&bytes);
                 }
 
@@ -3346,7 +3360,8 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
     if stream.state.status == Status::Hcrc {
         if let Some(gzhead) = stream.state.gzhead {
             if gzhead.hcrc() {
-                let bytes = (stream.checksum.value() as u16).to_le_bytes();
+                let word = stream.checksum.low_word().to_le_bytes();
+                let bytes = [word[0], word[1]];
                 if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
                     return err;
                 }
@@ -3443,17 +3458,17 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         let crc_fold = core::mem::take(&mut stream.state.crc_fold);
         stream.checksum.set(z_checksum::from(crc_fold.finish()));
 
-        let adler = stream.checksum.value() as u32;
+        let adler = stream.checksum.low_word();
         stream.state.bit_writer.pending.extend(&adler.to_le_bytes());
 
-        let total_in = stream.input.total_in as u32;
+        let total_in = low_wire_u32(stream.input.total_in);
         stream
             .state
             .bit_writer
             .pending
             .extend(&total_in.to_le_bytes());
     } else if stream.state.wrap == 1 {
-        let adler = stream.checksum.value() as u32;
+        let adler = stream.checksum.low_word();
         stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
     }
 
@@ -4136,7 +4151,7 @@ pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
             let mut gz_wrap_len = GZIP_WRAPLEN;
 
             if let Some(header) = stream.state.gzhead {
-                if let Some(extra) = header.extra() {
+                if let Some(extra) = header.encoded_extra() {
                     gz_wrap_len += 2 + extra.len();
                 }
                 if let Some(name) = header.name() {
@@ -4509,6 +4524,119 @@ mod test {
         assert!(owned.state.as_ptr().is_null());
         // Drop must not release state a second time after explicit deflateEnd.
         drop(owned);
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_extra_wire_length_uses_low_sixteen_bits_and_exact_prefix() -> Result<(), &'static str> {
+        for (length, expected) in [
+            (0usize, 0u16),
+            (1, 1),
+            (usize::from(u16::MAX), u16::MAX),
+            (usize::from(u16::MAX) + 1, 0),
+            (usize::from(u16::MAX) + 2, 1),
+        ] {
+            assert_eq!(gzip_extra_wire_len(length), expected);
+            let extra = vec![0x5au8; length];
+            let mut header = gz_header {
+                extra: extra.as_ptr().cast_mut(),
+                extra_len: crate::c_api::uInt::try_from(length)
+                    .map_err(|_| "gzip XLEN fixture exceeds C unsigned")?,
+                ..gz_header::default()
+            };
+            // SAFETY: extra is live for the length declared by header;
+            // the metadata pointer is borrowed only for this test scope.
+            let view = unsafe { GzipHeaderRef::new(&mut header) };
+            let emitted = view.encoded_extra();
+            assert_eq!(emitted.map(<[u8]>::len), Some(usize::from(expected)));
+            assert!(emitted.is_some_and(|bytes| bytes.iter().all(|&value| value == 0x5a)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_bound_tracks_encoded_extra_length_not_original_buffer() -> Result<(), &'static str> {
+        let extra = vec![0x5au8; usize::from(u16::MAX) + 2];
+        let mut reference_bound = None;
+        let mut reference_bytes = None;
+
+        for advertised_length in [1usize, extra.len()] {
+            let mut header = gz_header {
+                extra: extra.as_ptr().cast_mut(),
+                extra_len: crate::c_api::uInt::try_from(advertised_length)
+                    .map_err(|_| "extra fixture length exceeds C unsigned")?,
+                ..gz_header::default()
+            };
+            let config = DeflateConfig {
+                window_bits: 16 + crate::MAX_WBITS,
+                ..DeflateConfig::default()
+            };
+            let mut raw = z_stream::default();
+            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            // SAFETY: init created a uniquely owned, live deflate state.
+            let stream = (unsafe { DeflateStream::from_stream_mut(&raw mut raw) })
+                .ok_or("initialized gzip stream lacks a state")?;
+            // SAFETY: the header and extra backing buffer remain live, readable,
+            // and unmodified throughout compression.
+            let header_status = unsafe { set_header(stream, Some(&mut header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
+            let predicted = bound(Some(stream), 0);
+            let mut encoded = [0u8; 128];
+            stream.next_out = encoded.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(encoded.len())
+                .map_err(|_| "output buffer exceeds C unsigned")?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            let written = encoded.len()
+                - usize::try_from(stream.avail_out)
+                    .map_err(|_| "output remaining count exceeds pointer width")?;
+            assert!(written <= predicted);
+            assert_eq!(&encoded[10..13], &[1, 0, 0x5a]);
+            assert!(end(stream).is_ok());
+
+            if let Some(expected) = reference_bound {
+                assert_eq!(predicted, expected);
+                assert_eq!(
+                    &encoded[..written],
+                    reference_bytes.as_deref().ok_or("missing baseline")?
+                );
+            } else {
+                reference_bound = Some(predicted);
+                reference_bytes = Some(encoded[..written].to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_trailer_serializes_modular_c_input_total_without_large_buffers(
+    ) -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        let config = DeflateConfig {
+            window_bits: 16 + crate::MAX_WBITS,
+            ..DeflateConfig::default()
+        };
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        // SAFETY: initialized deflate state is live and borrowed exclusively.
+        let stream = (unsafe { DeflateStream::from_stream_mut(&raw mut raw) })
+            .ok_or("initialized stream missing deflate state")?;
+        // On 64-bit Unix this sets high bits without allocating a 4 GiB input;
+        // on a 32-bit C ABI it still validates the same modulo wire contract.
+        let total = crate::c_api::z_size::MAX - crate::c_api::z_size::from(u32::MAX)
+            + crate::c_api::z_size::from(19u32);
+        stream.total_in = total;
+
+        let mut encoded = [0u8; 128];
+        stream.next_out = encoded.as_mut_ptr();
+        stream.avail_out = crate::c_api::uInt::try_from(encoded.len())
+            .map_err(|_| "output fixture exceeds C unsigned")?;
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let written = encoded.len()
+            - usize::try_from(stream.avail_out)
+                .map_err(|_| "output remaining count exceeds pointer width")?;
+        assert!(written >= 18);
+        assert_eq!(&encoded[written - 8..written - 4], &[0, 0, 0, 0]);
+        assert_eq!(&encoded[written - 4..written], &[19, 0, 0, 0]);
+        assert!(end(stream).is_ok());
         Ok(())
     }
 
