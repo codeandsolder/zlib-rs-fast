@@ -1681,7 +1681,9 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
             }
         } else if state.how == How::Look || n < state.in_size() * 2 {
             if gz_fetch(state).is_err() {
-                return 0;
+                // The caller already owns any bytes copied in earlier passes.
+                // A later refill failure must not discard that initialized prefix.
+                return written;
             }
             continue;
         } else if state.how == How::Copy {
@@ -1690,7 +1692,7 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
                 Ok(result) => result,
                 Err(error) => {
                     gz_read_io_error(state, error);
-                    return 0;
+                    return written;
                 }
             };
             if eof {
@@ -1701,7 +1703,7 @@ fn gz_read(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> usize {
             debug_assert_eq!(state.how, How::Gzip);
             n = match gz_decomp_into(state, &mut output[written..written + n]) {
                 Ok(produced) => produced,
-                Err(()) => return 0,
+                Err(()) => return written,
             };
         }
 
@@ -2174,7 +2176,14 @@ fn gz_decomp_into(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> Result
     state.stream.next_out = ptr::null_mut();
     state.stream.avail_out = 0;
 
-    result.map(|()| produced)
+    // A later I/O or inflate error cannot revoke bytes that the inflater
+    // already initialized in the destination. Return that valid prefix now,
+    // leaving the error status in GzState for the next public operation.
+    if produced != 0 {
+        Ok(produced)
+    } else {
+        result.map(|()| produced)
+    }
 }
 
 /// Compress and write the len uncompressed bytes at buf to file.
@@ -3682,6 +3691,163 @@ mod tests {
         assert_eq!(written, input);
         assert_eq!(retries, 4);
         Ok(())
+    }
+
+    // A complete gzip stream of abc, and a separate valid member for xyz.
+    // A split before the first footer forces inflate to produce three
+    // bytes before a later input refill encounters EAGAIN.
+    const ABC_GZ: [u8; 23] = [
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 75, 76, 74, 6, 0, 194, 65, 36, 53, 3, 0, 0, 0,
+    ];
+    const XYZ_GZ: [u8; 23] = [
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 168, 172, 2, 0, 103, 186, 142, 235, 3, 0, 0, 0,
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn gzip_read_returns_all_copied_bytes_before_later_would_block() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum InputShape {
+            Plain,
+            CompleteGzip,
+            SplitGzip,
+        }
+
+        for scenario in [
+            InputShape::Plain,
+            InputShape::CompleteGzip,
+            InputShape::SplitGzip,
+        ] {
+            for items in [false, true] {
+                let mut descriptors = [-1; 2];
+                // SAFETY: two valid writable C integer slots.
+                assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+                // SAFETY: pipe returned a unique read descriptor.
+                let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+                // SAFETY: pipe returned a unique write descriptor.
+                let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+                // SAFETY: reader is a live descriptor.
+                let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+                assert_ne!(flags, -1);
+                // SAFETY: new flags are valid for the live reader descriptor.
+                let configured = unsafe {
+                    libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                };
+                assert_eq!(configured, 0);
+
+                let send = |bytes: &[u8]| {
+                    // SAFETY: writer remains live and bytes is an initialized readable slice.
+                    let written = unsafe {
+                        libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                    };
+                    assert_eq!(usize::try_from(written), Ok(bytes.len()));
+                };
+                match scenario {
+                    InputShape::Plain => send(b"abc"),
+                    InputShape::CompleteGzip => send(&ABC_GZ),
+                    InputShape::SplitGzip => send(&ABC_GZ[..15]),
+                }
+
+                let fd = reader.into_raw_fd();
+                // SAFETY: gzdopen takes ownership of the live read descriptor.
+                let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+                if file.is_null() {
+                    // SAFETY: ownership wasn't transferred if gzdopen failed.
+                    unsafe { libc::close(fd) };
+                }
+                assert!(!file.is_null());
+
+                let read = |buffer: &mut [u8; 16]| {
+                    if items {
+                        // SAFETY: live handle and at least 16 writable single-byte items.
+                        let amount = unsafe { gzfread(buffer.as_mut_ptr().cast(), 1, 16, file) };
+                        isize::try_from(amount).unwrap_or(-1)
+                    } else {
+                        // SAFETY: live handle and 16 writable bytes.
+                        let amount = unsafe { gzread(file, buffer.as_mut_ptr().cast(), 16) };
+                        isize::try_from(amount).unwrap_or(-1)
+                    }
+                };
+                let mut output = [0xa5u8; 16];
+                let first = read(&mut output);
+                assert_eq!(
+                    first, 3,
+                    "partial output must not be discarded on subsequent EAGAIN"
+                );
+                assert_eq!(&output[..3], b"abc");
+                assert_eq!(output[3], 0xa5);
+                // Verify the success did not incorrectly mark an incomplete
+                // compressed member as EOF or rewind its logical position.
+                // SAFETY: file remains a live gzip handle.
+                assert_eq!(unsafe { gztell64(file) }, 3);
+
+                if scenario == InputShape::Plain {
+                    send(b"xyz");
+                } else {
+                    if scenario == InputShape::SplitGzip {
+                        send(&ABC_GZ[15..]);
+                    }
+                    send(&XYZ_GZ);
+                }
+                output.fill(0xa5);
+                let second = read(&mut output);
+                assert_eq!(second, 3);
+                assert_eq!(&output[..3], b"xyz");
+                assert_eq!(output[3], 0xa5);
+                // SAFETY: file remains valid until gzclose consumes it.
+                assert_eq!(unsafe { gzclose(file) }, Z_OK);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gzip_read_preserves_output_before_corrupted_crc() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        // A corrupt gzip CRC is a permanent error, unlike a transient
+        // EAGAIN. Still return bytes successfully decompressed before that
+        // trailer error, but keep the error sticky for subsequent reads.
+        let mut corrupt = ABC_GZ;
+        corrupt[15] ^= 0x5a;
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors provides exactly two writable integer slots.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: pipe yielded this exclusive read descriptor.
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: pipe yielded this exclusive write descriptor.
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        // SAFETY: writer is live; corrupt contains 23 initialized bytes.
+        let written =
+            unsafe { libc::write(writer.as_raw_fd(), corrupt.as_ptr().cast(), corrupt.len()) };
+        assert_eq!(usize::try_from(written), Ok(corrupt.len()));
+        drop(writer);
+
+        let fd = reader.into_raw_fd();
+        // SAFETY: gzdopen takes ownership of the live descriptor on success.
+        let file = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+        if file.is_null() {
+            // SAFETY: ownership remains with caller when gzdopen fails.
+            unsafe { libc::close(fd) };
+        }
+        assert!(!file.is_null());
+        let mut data = [0xa5u8; 16];
+        // SAFETY: file is live; data contains 16 writable bytes.
+        let first = unsafe { gzread(file, data.as_mut_ptr().cast(), 16) };
+        assert_eq!(first, 3);
+        assert_eq!(&data[..3], b"abc");
+        assert_eq!(data[3], 0xa5);
+        let mut error = 0;
+        // SAFETY: file remains live and error is an aligned writable C integer.
+        let message = unsafe { gzerror(file, &raw mut error) };
+        assert!(!message.is_null());
+        assert_eq!(error, Z_DATA_ERROR);
+        // SAFETY: file remains live; the same writable destination is valid.
+        assert_eq!(unsafe { gzread(file, data.as_mut_ptr().cast(), 16) }, -1);
+        // SAFETY: this consumes the live gzip handle and read descriptor.
+        assert_eq!(unsafe { gzclose(file) }, Z_OK);
     }
 
     #[cfg(unix)]
