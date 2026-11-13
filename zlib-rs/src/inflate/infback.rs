@@ -5,6 +5,8 @@ use core::marker::PhantomData;
 use crate::allocate::Allocator;
 use crate::c_api::internal_state;
 use crate::inflate::bitreader::BitReader;
+#[cfg(test)]
+use crate::inflate::writer::BackWriter;
 use crate::inflate::{
     back_io::{BackInput, BackOutput},
     BackWindow, CodeLengthRepeat, Codes, Flags, InflateAllocOffsets, InflateConfig,
@@ -12,7 +14,7 @@ use crate::inflate::{
     INFLATE_FAST_MIN_LEFT, INFLATE_STRICT, MAX_BITS,
 };
 use crate::traceln;
-use crate::{c_api::z_stream, inflate::writer::BackWriter, ReturnCode};
+use crate::{c_api::z_stream, ReturnCode};
 use crate::{MAX_WBITS, MIN_WBITS};
 
 /// Initialize callback-driven inflate using caller-owned window storage.

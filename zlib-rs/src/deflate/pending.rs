@@ -62,13 +62,13 @@ impl Pending<'_> {
         }
     }
 
+    // Used only by the partial-clone invariant regression.
+    #[cfg(test)]
     #[inline]
     #[track_caller]
     pub fn truncate_tail(&mut self, n: usize) {
         assert!(n <= self.count, "truncating past pending output");
-
         self.count -= n;
-
         if self.count == 0 {
             self.out = 0;
         }

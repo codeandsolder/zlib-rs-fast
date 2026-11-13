@@ -234,6 +234,7 @@ impl StreamChecksum {
         stream.adler = self.0;
     }
 
+    #[cfg(test)]
     const fn value(self) -> crate::c_api::z_checksum {
         self.0
     }
