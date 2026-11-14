@@ -537,7 +537,7 @@ impl Flags {
     const SANE: Self = Self(0b0000_0100);
 
     pub(crate) const fn contains(self, other: Self) -> bool {
-        debug_assert!(other.0.count_ones() == 1);
+        debug_assert!(other.0.is_power_of_two());
 
         self.0 & other.0 != 0
     }
@@ -2784,11 +2784,6 @@ impl InflateAllocOffsets {
         }
     }
 
-    const fn window_pos(&self) -> usize {
-        self.window_pos
-            .expect("inflate allocation layout includes an owned window")
-    }
-
     /// Allocate typed, cache-line-aligned storage using the common allocator.
     /// Custom C allocators are aligned within the allocator itself.
     fn allocate_storage(&self, alloc: &Allocator<'_>) -> Option<NonNull<AlignedAllocationBlock>> {
@@ -2831,23 +2826,19 @@ impl InflateAllocOffsets {
         &self,
         alloc: &Allocator<'a>,
         source: &State<'a>,
-    ) -> Option<NonNull<State<'a>>> {
-        debug_assert_eq!(source.kind, InflateStateKind::Regular);
-        debug_assert_eq!(self.total_size, source.total_allocation_size);
-        debug_assert!(source.back_window.is_empty());
+    ) -> Result<NonNull<State<'a>>, ReturnCode> {
+        // The clone below reads the source history through a raw allocation-backed view.
+        // Reject inconsistent state before acquiring destination storage or copying bytes.
+        let window_pos = self.window_pos.ok_or(ReturnCode::StreamError)?;
+        if source.kind != InflateStateKind::Regular
+            || source.total_allocation_size != self.total_size
+            || !source.back_window.is_empty()
+            || source.window.size() != 1 << MAX_WBITS
+        {
+            return Err(ReturnCode::StreamError);
+        }
 
-        // A regular inflate state always owns the canonical MAX_WBITS backing window. This is a
-        // memory-safety invariant for the raw copy below, so keep it as a release assertion rather
-        // than a debug-only check.
-        assert_eq!(
-            source.window.size(),
-            1 << MAX_WBITS,
-            "regular inflate state owns the canonical history window"
-        );
-
-        let allocation_start = self.allocate_storage(alloc)?;
-
-        let window_pos = self.window_pos();
+        let allocation_start = self.allocate_storage(alloc).ok_or(ReturnCode::MemError)?;
         // SAFETY: the ordinary layout reserves exactly the source window backing length at
         // `window_pos`, and the fresh destination allocation cannot overlap the source.
         let window_allocation = unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
@@ -2859,7 +2850,7 @@ impl InflateAllocOffsets {
         // SAFETY: this fresh typed allocation starts at a valid State-aligned
         // address and has room for the full State. No State has been placed here.
         unsafe { state_ptr.as_ptr().write(state) };
-        Some(state_ptr)
+        Ok(state_ptr)
     }
 }
 
@@ -3245,8 +3236,9 @@ pub fn copy<'a>(
     // The allocation helper keeps the transient duplicated raw window handle private and returns
     // only after the copied state owns independent window storage.
     let allocs = InflateAllocOffsets::with_window();
-    let Some(copy) = allocs.clone_state(&source.alloc, &source.state) else {
-        return ReturnCode::MemError;
+    let copy = match allocs.clone_state(&source.alloc, &source.state) {
+        Ok(copy) => copy,
+        Err(code) => return code,
     };
 
     // Build the destination ABI shell explicitly around the cloned state allocation.
@@ -4305,6 +4297,23 @@ mod tests {
     }
 
     #[test]
+    fn inflate_copy_rejects_inconsistent_owned_window_before_allocating() -> Result<(), &'static str>
+    {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: successful init created one exclusive, live regular inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("regular inflate state missing")?;
+        let original_window = core::mem::replace(&mut stream.state.window, Window::empty());
+        let mut destination = MaybeUninit::<InflateStream>::uninit();
+        assert_eq!(copy(&mut destination, stream), ReturnCode::StreamError);
+        stream.state.window = original_window;
+
+        assert!(end(stream).state.is_null());
+        Ok(())
+    }
+
+    #[test]
     fn aligned_inflate_storage_handles_custom_allocator_residues() -> Result<(), &'static str> {
         for remainder in 0..ALLOCATION_BLOCK_BYTES {
             let mut ctx = MisalignedAlloc {
@@ -4332,6 +4341,7 @@ mod tests {
             // Both layouts put State at the exact typed allocation start, and
             // the ordinary owned window at its sole computed aligned offset.
             let layout = InflateAllocOffsets::with_window();
+            let window_pos = layout.window_pos.ok_or("regular window offset missing")?;
             assert_eq!(
                 source.state.as_ptr() as usize,
                 source.state.allocation_start as usize
@@ -4339,7 +4349,7 @@ mod tests {
             assert_eq!(source.state.total_allocation_size, layout.total_size);
             assert_eq!(
                 source.state.window.as_ptr() as usize,
-                source.state.allocation_start as usize + layout.window_pos()
+                source.state.allocation_start as usize + window_pos
             );
 
             let mut cloned_raw = MaybeUninit::<InflateStream>::uninit();
@@ -4359,7 +4369,7 @@ mod tests {
             );
             assert_eq!(
                 cloned.state.window.as_ptr() as usize,
-                cloned.state.allocation_start as usize + layout.window_pos()
+                cloned.state.allocation_start as usize + window_pos
             );
             end(cloned);
             end(source);
