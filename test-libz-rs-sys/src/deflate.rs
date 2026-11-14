@@ -1536,7 +1536,7 @@ fn test_deflate_prime() {
 
     // SAFETY: live incomplete gzip member and disjoint writable buffer.
     let status = unsafe { libz_rs_sys::inflate(decoder, DeflateFlush::Finish as c_int) };
-    assert_eq!(ReturnCode::from(status), ReturnCode::BufError);
+    assert_eq!(ReturnCode::try_from(status), Ok(ReturnCode::BufError));
     assert_eq!(decoder.avail_in, 0);
     assert_eq!(usize::try_from(decoder.total_in), Ok(produced));
     assert_eq!(usize::try_from(decoder.total_out), Ok(HELLO.len()));
@@ -2881,7 +2881,7 @@ mod fuzz_based_tests {
         if !cfg!(miri) {
             let mut output_ng = vec![0; 1 << 19];
             let (output_ng, err) = compress_slice_ng(&mut output_ng, input, config);
-            assert_eq!(err, ReturnCode::Ok);
+            assert_eq!(err, Ok(ReturnCode::Ok));
 
             assert_eq!(output_rs, output_ng);
         }
@@ -3674,9 +3674,9 @@ fn compress_issue_218_in_chunks(input: &[u8]) -> Vec<u8> {
                 // SAFETY: part is a live readable input span and the output
                 // pointer describes only the live unwritten output suffix.
                 let ret = unsafe { deflate(stream, DeflateFlush::PartialFlush as c_int) };
-                let code = ReturnCode::from(ret);
+                let code = ReturnCode::try_from(ret);
                 assert!(
-                    matches!(code, ReturnCode::Ok | ReturnCode::BufError),
+                    matches!(code, Ok(ReturnCode::Ok | ReturnCode::BufError)),
                     "unexpected PartialFlush status: {code:?}"
                 );
                 assert!(
@@ -3697,12 +3697,12 @@ fn compress_issue_218_in_chunks(input: &[u8]) -> Vec<u8> {
             // SAFETY: input has been consumed; the encoder has live state
             // and a writable, correctly sized output suffix.
             let ret = unsafe { deflate(stream, DeflateFlush::Finish as c_int) };
-            let code = ReturnCode::from(ret);
-            if code == ReturnCode::StreamEnd {
+            let code = ReturnCode::try_from(ret);
+            if code == Ok(ReturnCode::StreamEnd) {
                 break;
             }
             assert!(
-                matches!(code, ReturnCode::Ok | ReturnCode::BufError),
+                matches!(code, Ok(ReturnCode::Ok | ReturnCode::BufError)),
                 "unexpected finish status: {code:?}"
             );
             assert!(

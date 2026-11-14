@@ -20,7 +20,7 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
         data,
         DeflateConfig::best_compression(),
     );
-    assert_eq!(code, ReturnCode::Ok, "zlib-ng compression failed");
+    assert_eq!(code, Ok(ReturnCode::Ok), "zlib-ng compression failed");
 
     let mut stream = libz_rs_sys::z_stream::default();
     // SAFETY: the stream is a valid writable z_stream, and we pass the
@@ -33,7 +33,7 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
             core::mem::size_of::<libz_rs_sys::z_stream>() as i32,
         )
     };
-    assert_eq!(ReturnCode::from(code), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(code), Ok(ReturnCode::Ok));
 
     // The spare byte lets inflate consume an end marker/trailer after producing
     // exactly `data.len()` bytes, including the empty-stream case.
@@ -68,11 +68,11 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
         let code = unsafe { libz_rs_sys::inflate(&raw mut stream, libz_rs_sys::Z_NO_FLUSH) };
         produced += (before_out - stream.avail_out) as usize;
 
-        match ReturnCode::from(code) {
-            ReturnCode::StreamEnd => {
+        match ReturnCode::try_from(code) {
+            Ok(ReturnCode::StreamEnd) => {
                 break;
             }
-            ReturnCode::Ok | ReturnCode::BufError => {
+            Ok(ReturnCode::Ok | ReturnCode::BufError) => {
                 if before_in == stream.avail_in && before_out == stream.avail_out {
                     // A no-progress result is only legitimate at a boundary
                     // where the next iteration can provide new input/output.
@@ -90,7 +90,7 @@ pub fn cross_decode_chunked(data: &[u8], input_chunk: usize, output_chunk: usize
     // SAFETY: a successful inflateInit2_ owns a live state here. This call
     // releases it exactly once after completing the loop.
     let end_code = unsafe { libz_rs_sys::inflateEnd(&raw mut stream) };
-    assert_eq!(ReturnCode::from(end_code), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(end_code), Ok(ReturnCode::Ok));
     assert_eq!(
         supplied - stream.avail_in as usize,
         compressed.len(),

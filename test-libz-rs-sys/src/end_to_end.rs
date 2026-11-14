@@ -28,7 +28,7 @@ pub fn test(data: &[u8], config: DeflateConfig) -> bool {
 
     let mut buffer_ng = vec![0; output_bound];
     let (compressed_ng, code) = compress_slice_ng(&mut buffer_ng, data, config);
-    assert_eq!(ReturnCode::Ok, code);
+    assert_eq!(Ok(ReturnCode::Ok), code);
 
     // Two encoders may produce different, equally valid DEFLATE representations.
     // Cross-decode both outputs: every encoder/decoder combination must round-trip.
@@ -42,7 +42,7 @@ pub fn test(data: &[u8], config: DeflateConfig) -> bool {
     let mut buffer_rs = vec![0; data.len()];
     for (encoder, compressed) in [("zlib-rs", &*compressed_rs), ("zlib-ng", &*compressed_ng)] {
         let (decoded, code) = uncompress_slice_ng(&mut buffer_ng, compressed, inflate_config);
-        assert_eq!(ReturnCode::Ok, code, "zlib-ng decoding {encoder}");
+        assert_eq!(Ok(ReturnCode::Ok), code, "zlib-ng decoding {encoder}");
         assert_eq!(decoded, data, "zlib-ng decoding {encoder}");
 
         let (decoded, code) =

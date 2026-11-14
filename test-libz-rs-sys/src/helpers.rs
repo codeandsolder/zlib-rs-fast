@@ -11,7 +11,7 @@ pub fn compress_slice_ng<'a>(
     output: &'a mut [u8],
     input: &[u8],
     config: DeflateConfig,
-) -> (&'a mut [u8], ReturnCode) {
+) -> (&'a mut [u8], Result<ReturnCode, i32>) {
     compress_slice_with_flush_ng(output, input, config, DeflateFlush::Finish)
 }
 
@@ -20,7 +20,7 @@ pub fn compress_slice_with_flush_ng<'a>(
     input: &[u8],
     config: DeflateConfig,
     final_flush: DeflateFlush,
-) -> (&'a mut [u8], ReturnCode) {
+) -> (&'a mut [u8], Result<ReturnCode, i32>) {
     compress_slice_with_flush_ng_with_limit(output, input, config, final_flush, c_uint::MAX)
 }
 
@@ -30,7 +30,7 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
     config: DeflateConfig,
     final_flush: DeflateFlush,
     transfer_limit: c_uint,
-) -> (&'a mut [u8], ReturnCode) {
+) -> (&'a mut [u8], Result<ReturnCode, i32>) {
     assert_ne!(
         transfer_limit, 0,
         "C-ABI transfers must have positive capacity"
@@ -66,7 +66,7 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
     };
 
     if err != libz_ng_sys::Z_OK {
-        return (&mut [], ReturnCode::from(err));
+        return (&mut [], ReturnCode::try_from(err));
     }
 
     let max = transfer_limit as usize;
@@ -101,11 +101,13 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
     // The C total_out counter can wrap on Windows while usize is 64-bit.
     let produced = output.len() - left - stream.avail_out as usize;
 
-    // may DataError if there was insufficient output space
-    let _ = unsafe { libz_ng_sys::deflateEnd(&raw mut stream) };
-    let return_code: ReturnCode = match ReturnCode::from(err) {
-        ReturnCode::StreamEnd => ReturnCode::Ok,
-        other => other,
+    // Preserve the primary compressor result, but also check the matching
+    // release when compression actually reached a complete stream.
+    let end_code = unsafe { libz_ng_sys::deflateEnd(&raw mut stream) };
+    let return_code = if err == libz_ng_sys::Z_STREAM_END {
+        ReturnCode::try_from(end_code)
+    } else {
+        ReturnCode::try_from(err)
     };
 
     (&mut output[..produced], return_code)
@@ -115,7 +117,7 @@ pub fn uncompress_slice_ng<'a>(
     output: &'a mut [u8],
     input: &[u8],
     config: InflateConfig,
-) -> (&'a mut [u8], ReturnCode) {
+) -> (&'a mut [u8], Result<ReturnCode, i32>) {
     uncompress_slice_ng_with_limit(output, input, config, c_uint::MAX)
 }
 
@@ -126,7 +128,7 @@ fn uncompress_slice_ng_with_limit<'a>(
     input: &[u8],
     config: InflateConfig,
     transfer_limit: c_uint,
-) -> (&'a mut [u8], ReturnCode) {
+) -> (&'a mut [u8], Result<ReturnCode, i32>) {
     assert_ne!(
         transfer_limit, 0,
         "C-ABI transfers must have positive capacity"
@@ -167,7 +169,7 @@ fn uncompress_slice_ng_with_limit<'a>(
         )
     };
     if code != libz_ng_sys::Z_OK {
-        return (&mut [], ReturnCode::from(code));
+        return (&mut [], ReturnCode::try_from(code));
     }
 
     let max_transfer = transfer_limit as usize;
@@ -189,10 +191,10 @@ fn uncompress_slice_ng_with_limit<'a>(
         // SAFETY: the zlib-ng implementation advances next_in/next_out only
         // within the supplied input/output spans; each refill is bounded by
         // both the remaining Rust slice budget and c_uint::MAX.
-        let code = ReturnCode::from(unsafe {
+        let code = ReturnCode::try_from(unsafe {
             libz_ng_sys::inflate(&raw mut stream, InflateFlush::NoFlush as c_int)
         });
-        if code != ReturnCode::Ok {
+        if code != Ok(ReturnCode::Ok) {
             break code;
         }
     };
@@ -207,7 +209,7 @@ fn uncompress_slice_ng_with_limit<'a>(
 
     // The one-byte scratch distinguishes a zero-length, valid decompression
     // from a stream that cannot fit in the caller's zero-length destination.
-    if output_len == 0 && stream.total_out != 0 && code == ReturnCode::BufError {
+    if output_len == 0 && stream.total_out != 0 && code == Ok(ReturnCode::BufError) {
         output_left = 1;
     }
 
@@ -215,12 +217,12 @@ fn uncompress_slice_ng_with_limit<'a>(
     // SAFETY: successful inflateInit2_ created a live zlib-ng inflate state;
     // this is the matching release, performed exactly once.
     let end_code = unsafe { libz_ng_sys::inflateEnd(&raw mut stream) };
-    assert_eq!(ReturnCode::from(end_code), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(end_code), Ok(ReturnCode::Ok));
 
     let result = match code {
-        ReturnCode::StreamEnd => ReturnCode::Ok,
-        ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if remaining_output != 0 => ReturnCode::DataError,
+        Ok(ReturnCode::StreamEnd) => Ok(ReturnCode::Ok),
+        Ok(ReturnCode::NeedDict) => Ok(ReturnCode::DataError),
+        Ok(ReturnCode::BufError) if remaining_output != 0 => Ok(ReturnCode::DataError),
         other => other,
     };
     (&mut output[..produced], result)
@@ -244,7 +246,7 @@ mod tests {
         let mut compressed_storage = vec![0; zlib_rs::deflate::compress_bound(input.len())];
         let (compressed, code) =
             compress_slice_ng(&mut compressed_storage, &input, DeflateConfig::default());
-        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(code, Ok(ReturnCode::Ok));
         assert!(
             compressed.len() > 70_000,
             "regression must span many C-ABI chunks"
@@ -258,7 +260,7 @@ mod tests {
                 InflateConfig::default(),
                 limit,
             );
-            assert_eq!(status, ReturnCode::Ok, "transfer_limit={limit}");
+            assert_eq!(status, Ok(ReturnCode::Ok), "transfer_limit={limit}");
             assert_eq!(result, &input, "transfer_limit={limit}");
         }
     }
@@ -269,7 +271,7 @@ mod tests {
         let mut compressed_storage = vec![0; zlib_rs::deflate::compress_bound(input.len())];
         let (compressed, code) =
             compress_slice_ng(&mut compressed_storage, input, DeflateConfig::default());
-        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(code, Ok(ReturnCode::Ok));
 
         for limit in [1, 3, 17, c_uint::MAX] {
             let mut too_short = [0; 7];
@@ -281,7 +283,7 @@ mod tests {
             );
             assert_eq!(
                 capacity_status,
-                ReturnCode::BufError,
+                Ok(ReturnCode::BufError),
                 "transfer_limit={limit}"
             );
 
@@ -294,7 +296,7 @@ mod tests {
             );
             assert_eq!(
                 truncated_status,
-                ReturnCode::DataError,
+                Ok(ReturnCode::DataError),
                 "transfer_limit={limit}"
             );
         }
@@ -324,7 +326,7 @@ mod tests {
                 DeflateFlush::Finish,
                 limit,
             );
-            assert_eq!(code, ReturnCode::Ok, "transfer_limit={limit}");
+            assert_eq!(code, Ok(ReturnCode::Ok), "transfer_limit={limit}");
 
             let mut decoded = vec![0u8; input.len()];
             let (roundtrip, code) = zlib_rs::inflate::decompress_slice(

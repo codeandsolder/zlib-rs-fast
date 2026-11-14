@@ -159,7 +159,7 @@ fn gzip_window_bits_0() -> Result<(), InflateError> {
         &gzip_wbits_9_lvl_9(),
         InflateConfig { window_bits: 0 },
     );
-    assert_eq!(result, ReturnCode::DataError);
+    assert_eq!(result, Ok(ReturnCode::DataError));
 
     assert!(assert_inflates(true, 0, &gzip_wbits_9_lvl_9(), input_text().as_bytes()).is_err());
     Ok(())

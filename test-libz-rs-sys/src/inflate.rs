@@ -586,7 +586,7 @@ fn gzip_header_check() {
     // SAFETY: initialized stream and valid writable gzip header whose
     // metadata pointers refer to the live caller-owned arrays.
     let ret = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
-    assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(ret), Ok(ReturnCode::Ok));
 
     stream.avail_in = test_c_uint_len(input.len());
     stream.next_in = input.as_ptr().cast_mut();
@@ -694,7 +694,7 @@ fn inf(input: &[u8], what: &str, step: usize, win: i32, len: usize, err: c_int) 
         // SAFETY: header points to live writable fields with capacities
         // equal to the actual allocated test arrays.
         let err = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
     }
 
     let mut have = input.len();
@@ -1947,7 +1947,7 @@ fn uncompress_help(input: &[u8]) -> Vec<u8> {
         status,
         Z_OK,
         "uncompress failed: {:?}",
-        ReturnCode::from(status)
+        ReturnCode::try_from(status)
     );
     let size = usize::try_from(decoded_len).unwrap_or(usize::MAX);
     assert!(size <= decoded.len(), "uncompress exceeded output capacity");
@@ -2578,7 +2578,7 @@ fn encode_gzip_header_fixture(
     // SAFETY: input was fully consumed and next_out refers to the
     // remaining writable suffix of the compressed output buffer.
     let err = unsafe { libz_rs_sys::deflate(stream, InflateFlush::Finish as _) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::StreamEnd));
 
     assert_eq!(
         usize::try_from(stream.total_in),
@@ -2593,7 +2593,7 @@ fn encode_gzip_header_fixture(
 
     // SAFETY: deflateInit2_ succeeded and this is the only stream end.
     let err = unsafe { libz_rs_sys::deflateEnd(stream) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
     output_rs[..compressed_len].to_vec()
 }
 
@@ -2867,7 +2867,7 @@ fn chunked_output_rs() {
             test_c_stream_size::<libz_rs_sys::z_stream>(),
         )
     };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     // SAFETY: a successful initialization wrote the full C stream.
     let stream = unsafe { stream.assume_init_mut() };
@@ -2883,7 +2883,7 @@ fn chunked_output_rs() {
     // SAFETY: the 7-byte compressed input and first 32 bytes of output
     // remain live and non-overlapping during the decode call.
     let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     assert_eq!(stream.avail_out, 0);
     assert_eq!(stream.total_out, 32);
@@ -2893,7 +2893,7 @@ fn chunked_output_rs() {
     // SAFETY: the stream has advanced its output pointer to the final
     // writable byte, and avail_out is limited to that remaining byte.
     let err = unsafe { inflate(stream, InflateFlush::Finish as _) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::StreamEnd));
 
     // SAFETY: the successful inflateInit2_ call initialized this stream
     // and it has not yet been closed.
@@ -2993,7 +2993,7 @@ fn issue_109() {
                 test_c_stream_size::<z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         let stream = { stream.assume_init_mut() };
 
@@ -3021,8 +3021,8 @@ fn issue_109() {
 
             assert!(
                 matches!(
-                    ReturnCode::from(err),
-                    ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd
+                    ReturnCode::try_from(err),
+                    Ok(ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd)
                 ),
                 "unexpected inflate status: {err}"
             );
@@ -3039,7 +3039,7 @@ fn issue_109() {
         }
 
         let err = inflateEnd(stream);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         output
     });
@@ -3066,7 +3066,7 @@ fn window_match_bug() {
                 test_c_stream_size::<z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
         // SAFETY: successful inflateInit2_ initialized every stream field.
         let stream = unsafe { raw.assume_init_mut() };
         stream.next_in = input.as_ptr().cast_mut();
@@ -3085,12 +3085,12 @@ fn window_match_bug() {
             let produced = scratch.len() - remaining_out;
             decoded.extend_from_slice(&scratch[..produced]);
 
-            let status = ReturnCode::from(err);
+            let status = ReturnCode::try_from(err);
             assert!(
-                matches!(status, ReturnCode::BufError | ReturnCode::StreamEnd),
+                matches!(status, Ok(ReturnCode::BufError | ReturnCode::StreamEnd)),
                 "unexpected raw DEFLATE decoder status: {status:?}"
             );
-            if status == ReturnCode::StreamEnd {
+            if status == Ok(ReturnCode::StreamEnd) {
                 break;
             }
             assert_eq!(remaining_out, 0, "buffer error without full output");
@@ -3143,7 +3143,7 @@ fn op_len_edge_case() {
                 test_c_stream_size::<z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         let stream = { stream.assume_init_mut() };
 
@@ -3171,8 +3171,8 @@ fn op_len_edge_case() {
 
             assert!(
                 matches!(
-                    ReturnCode::from(err),
-                    ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd
+                    ReturnCode::try_from(err),
+                    Ok(ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd)
                 ),
                 "unexpected inflate status: {err}"
             );
@@ -3189,7 +3189,7 @@ fn op_len_edge_case() {
         }
 
         let err = inflateEnd(stream);
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         output
     });
@@ -3239,7 +3239,7 @@ fn reference_zblock_trace(
                 test_c_stream_size::<libz_sys::z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(ret), Ok(ReturnCode::Ok));
 
         // SAFETY: successful inflateInit2_ initialized every stream field.
         let stream = unsafe { stream.assume_init_mut() };
@@ -3256,7 +3256,7 @@ fn reference_zblock_trace(
             // SAFETY: the compressed input and the disjoint writable scratch
             // buffer stay live for the synchronous reference decoder call.
             let ret = unsafe { libz_sys::inflate(stream, InflateFlush::Block as i32) };
-            assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+            assert_eq!(ReturnCode::try_from(ret), Ok(ReturnCode::Ok));
             let remaining = usize::try_from(stream.avail_out).unwrap_or(usize::MAX);
             assert!(
                 remaining <= scratch.len(),
@@ -3330,7 +3330,7 @@ fn test_inflate_flush_block() {
                 test_c_stream_size::<z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(ret), Ok(ReturnCode::Ok));
 
         // SAFETY: the successful initialization wrote the complete C stream.
         let stream = unsafe { stream.assume_init_mut() };
@@ -3349,7 +3349,7 @@ fn test_inflate_flush_block() {
             // SAFETY: compressed_data and scratch are live non-overlapping
             // byte spans with accurate C ABI availability counts.
             let ret = unsafe { inflate(stream, InflateFlush::Block as i32) };
-            assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+            assert_eq!(ReturnCode::try_from(ret), Ok(ReturnCode::Ok));
             let remaining = usize::try_from(stream.avail_out).unwrap_or(usize::MAX);
             assert!(
                 remaining <= scratch.len(),
@@ -3634,7 +3634,7 @@ fn issue_232() {
             test_c_stream_size::<z_stream>(),
         )
     };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     let mut output = vec![0; ISSUE_232_INPUT.len()];
     stream.next_out = output.as_mut_ptr();
@@ -3652,8 +3652,8 @@ fn issue_232() {
         let err = unsafe { inflate(&raw mut stream, InflateFlush::Finish as _) };
         assert!(
             matches!(
-                ReturnCode::from(err),
-                ReturnCode::StreamEnd | ReturnCode::BufError | ReturnCode::Ok
+                ReturnCode::try_from(err),
+                Ok(ReturnCode::StreamEnd | ReturnCode::BufError | ReturnCode::Ok)
             ),
             "unexpected inflate result: {err}"
         );
@@ -3715,7 +3715,7 @@ fn blow_up_the_stack_1() {
     let config = InflateConfig::default();
 
     let (_, err) = crate::helpers::uncompress_slice_ng(&mut output_ng, INPUT, config);
-    assert_eq!(err, ReturnCode::DataError);
+    assert_eq!(err, Ok(ReturnCode::DataError));
 
     let (_, err) = decompress_slice(&mut output_rs, INPUT, config);
     assert_eq!(err, ReturnCode::DataError);
@@ -3734,7 +3734,7 @@ fn blow_up_the_stack_2() {
     let config = InflateConfig::default();
 
     let (_, err) = crate::helpers::uncompress_slice_ng(&mut output_ng, INPUT, config);
-    assert_eq!(err, ReturnCode::DataError);
+    assert_eq!(err, Ok(ReturnCode::DataError));
 
     let (_, err) = decompress_slice(&mut output_rs, INPUT, config);
     assert_eq!(err, ReturnCode::DataError);
@@ -3784,7 +3784,7 @@ fn codes_used() {
                     test_c_stream_size::<z_stream>(),
                 )
             };
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+            assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
             // SAFETY: inflateInit2_ initialized the entire stream on success.
             let stream = unsafe { raw.assume_init_mut() };
             // SAFETY: the initialized C stream contains a live inflate state.
@@ -3886,7 +3886,7 @@ fn dictionary_compressed_fixture(
             )
         };
 
-        assert_eq!(ReturnCode::from(ret), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(ret), Ok(ReturnCode::Ok));
         // SAFETY: deflateInit_ successfully initialized the complete stream.
         let c_stream = unsafe { strm.assume_init_mut() };
 
@@ -3899,7 +3899,7 @@ fn dictionary_compressed_fixture(
                 test_c_uint_len(dictionary.len()),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         let dict_id = c_stream.adler;
         c_stream.avail_out = test_c_uint_len(compr.len());
@@ -3911,7 +3911,7 @@ fn dictionary_compressed_fixture(
         // SAFETY: both input and output buffers remain live, writable as
         // required, and disjoint for the entire encoder call.
         let err = unsafe { deflate(c_stream, Z_FINISH) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::StreamEnd);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::StreamEnd));
         // deflateSetDictionary contributes the preset dictionary bytes to
         // total_in before the actual payload is presented to deflate().
         assert_eq!(
@@ -3926,7 +3926,7 @@ fn dictionary_compressed_fixture(
 
         // SAFETY: this initialized deflate stream is ended exactly once.
         let err = unsafe { deflateEnd(c_stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         (compr, dict_id, compressed_len)
     });
@@ -3959,7 +3959,7 @@ fn test_dict_inflate() {
                 test_c_stream_size::<z_stream>(),
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
         // SAFETY: inflateInit_ initialized every C stream field.
         let d_stream = unsafe { stream.assume_init_mut() };
 
@@ -4026,7 +4026,7 @@ fn test_dict_inflate() {
                     "inflate stalled without consuming input or producing output"
                 );
             }
-            assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+            assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
         }
         assert!(
             supplied_dictionary,
@@ -4047,7 +4047,7 @@ fn test_dict_inflate() {
                 &raw mut check_dictionary_len,
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
         assert!(usize::try_from(check_dictionary_len).unwrap_or(0) >= dictionary.len());
         assert!(
             usize::try_from(check_dictionary_len).unwrap_or(usize::MAX) <= check_dictionary.len()
@@ -4062,12 +4062,12 @@ fn test_dict_inflate() {
                 &raw mut check_dictionary_len,
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
         assert_eq!(&check_dictionary[..dictionary.len()], dictionary);
 
         // SAFETY: the initialized inflate stream is ended exactly once.
         let err = unsafe { inflateEnd(d_stream) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         assert_eq!(uncompr[..hello.len()], hello);
     });

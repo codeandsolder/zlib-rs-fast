@@ -273,15 +273,17 @@ fn compress_gz_rs(input: &Input) -> Option<Vec<u8>> {
         };
 
         let err = unsafe { deflate(streamp, flush as i32) };
-        if ReturnCode::from(err) != ReturnCode::Ok {
-            break;
+        match ReturnCode::try_from(err) {
+            Ok(ReturnCode::Ok) => {}
+            Ok(_) => break,
+            Err(raw) => panic!("deflate returned an unknown C status: {raw}"),
         }
     }
 
     unsafe { dest.set_len(streamp.total_out as usize) }
 
     let err = unsafe { deflateEnd(streamp) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     Some(dest)
 }
@@ -374,15 +376,17 @@ fn compress_gz_ng(input: &Input) -> Option<Vec<u8>> {
         };
 
         let err = unsafe { deflate(streamp, flush as i32) };
-        if ReturnCode::from(err) != ReturnCode::Ok {
-            break;
+        match ReturnCode::try_from(err) {
+            Ok(ReturnCode::Ok) => {}
+            Ok(_) => break,
+            Err(raw) => panic!("deflate returned an unknown C status: {raw}"),
         }
     }
 
     unsafe { dest.set_len(streamp.total_out as _) }
 
     let err = unsafe { deflateEnd(streamp) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     Some(dest)
 }

@@ -45,7 +45,7 @@ fn inflate_payload(input: &[u8]) -> (Vec<u8>, ReturnCode) {
             c_int::try_from(size_of::<z_stream>()).unwrap_or(c_int::MAX),
         )
     };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     let mut extra = [0u8; 64];
     let mut name = [0u8; 64];
@@ -68,7 +68,7 @@ fn inflate_payload(input: &[u8]) -> (Vec<u8>, ReturnCode) {
     // SAFETY: the header and nested writable arrays remain alive for the
     // entire decoder lifetime, including all partial-header calls.
     let err = unsafe { inflateGetHeader(&raw mut stream, &raw mut header) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     let mut output = Vec::<u8>::new();
     let mut outcome = ReturnCode::BufError;
@@ -102,7 +102,7 @@ fn inflate_payload(input: &[u8]) -> (Vec<u8>, ReturnCode) {
             // SAFETY: next_in refers to this live input chunk; next_out refers
             // to spare output capacity. Neither span moves during inflate.
             let code =
-                ReturnCode::from(unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) });
+                ReturnCode::try_from(unsafe { inflate(&raw mut stream, InflateFlush::NoFlush as _) });
 
             let written = usize::try_from(before_out - stream.avail_out)
                 .expect("the ABI output count fits in Rust addressable memory");
@@ -111,11 +111,11 @@ fn inflate_payload(input: &[u8]) -> (Vec<u8>, ReturnCode) {
             unsafe { output.set_len(output.len() + written) };
 
             match code {
-                ReturnCode::StreamEnd => {
-                    outcome = code;
+                Ok(ReturnCode::StreamEnd) => {
+                    outcome = ReturnCode::StreamEnd;
                     break 'decompression;
                 }
-                ReturnCode::Ok | ReturnCode::BufError => {
+                Ok(ReturnCode::Ok | ReturnCode::BufError) => {
                     // Drain any pending output even if this input chunk ended.
                     if stream.avail_in == 0 && stream.avail_out != 0 {
                         break;
@@ -127,9 +127,12 @@ fn inflate_payload(input: &[u8]) -> (Vec<u8>, ReturnCode) {
                         break 'decompression;
                     }
                 }
-                _ => {
-                    outcome = code;
+                Ok(other) => {
+                    outcome = other;
                     break 'decompression;
+                }
+                Err(unknown) => {
+                    panic!("inflate returned an unknown C status: {unknown}");
                 }
             }
         }
@@ -143,7 +146,7 @@ fn inflate_payload(input: &[u8]) -> (Vec<u8>, ReturnCode) {
     stream.avail_out = 0;
     // SAFETY: successful init created one live state, released exactly once.
     let err = unsafe { inflateEnd(&raw mut stream) };
-    assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+    assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
     (output, outcome)
 }

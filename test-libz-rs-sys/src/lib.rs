@@ -2249,7 +2249,7 @@ fn inflate_strict_is_off() {
         134, 135, 135, 135, 135, 135, 135, 135, 135, 135, 135, 135, 135, 135, 135, 135, 121,
     ];
 
-    assert_eq_rs_ng!({
+    let (status, _) = assert_eq_rs_ng!({
         let mut dest = vec![0u8; 1 << 16];
         let mut dest_len = dest.len() as _;
 
@@ -2263,8 +2263,12 @@ fn inflate_strict_is_off() {
             )
         };
 
-        (zlib_rs::ReturnCode::from(err), dest_len)
+        (zlib_rs::ReturnCode::try_from(err), dest_len)
     });
+    assert!(
+        status.is_ok(),
+        "unexpected unrecognized C status: {status:?}"
+    );
 }
 
 #[test]
@@ -2374,7 +2378,7 @@ fn deflate_stored_window_out_of_bounds() {
                 std::mem::size_of::<z_stream>() as c_int,
             )
         };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         let strm = strm.assume_init_mut();
 
@@ -2391,15 +2395,15 @@ fn deflate_stored_window_out_of_bounds() {
 
         // Deflate first chunk.
         let err = { deflate(strm, flush) };
-        assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
 
         // Change the parameters.
         let new_level = 0;
         let new_strategy = Z_DEFAULT_STRATEGY;
         let err = { deflateParams(strm, new_level, new_strategy) };
-        match ReturnCode::from(err) {
-            ReturnCode::Ok => {}
-            ReturnCode::BufError => {
+        match ReturnCode::try_from(err) {
+            Ok(ReturnCode::Ok) => {}
+            Ok(ReturnCode::BufError) => {
                 // Flushing the current pending data may run us out of buffer space.
                 // Worst case double the buffer size.
                 let add_space = Ord::min(chunk, buf_size as u32);
@@ -2410,7 +2414,7 @@ fn deflate_stored_window_out_of_bounds() {
                 strm.avail_out += add_space;
 
                 let err = { deflateParams(strm, new_level, new_strategy) };
-                assert_eq!(ReturnCode::from(err), ReturnCode::Ok);
+                assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
             }
             err => panic!("fatal {err:?}"),
         }
@@ -2422,11 +2426,11 @@ fn deflate_stored_window_out_of_bounds() {
             let avail = Ord::min(chunk, left);
             strm.avail_in = avail;
             let err = { deflate(strm, flush) };
-            match ReturnCode::from(err) {
-                ReturnCode::Ok => {
+            match ReturnCode::try_from(err) {
+                Ok(ReturnCode::Ok) => {
                     left -= avail;
                 }
-                ReturnCode::BufError => {
+                Ok(ReturnCode::BufError) => {
                     // Worst case double the buffer size.
                     let add_space = Ord::min(chunk, buf_size as uInt);
                     dest.resize(dest.len() + add_space as usize, 0);

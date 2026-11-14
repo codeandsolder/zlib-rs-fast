@@ -11,7 +11,7 @@ fn cve_test(input: &[u8]) {
         ..DeflateConfig::default()
     };
     let (output_ng, err) = compress_slice_ng(&mut output_ng, input, config);
-    assert_eq!(err, ReturnCode::Ok);
+    assert_eq!(err, Ok(ReturnCode::Ok));
 
     let mut output_rs = [0; 1 << 17];
     let (output_rs, err) = zlib_rs::deflate::compress_slice(&mut output_rs, input, config);
