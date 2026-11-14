@@ -84,6 +84,374 @@ pub(super) fn back_init_window(
     ReturnCode::Ok
 }
 
+fn decode_back_type(state: &mut State<'_>, input: &mut BackInput) -> Result<(), ReturnCode> {
+    if state.flags.contains(Flags::IS_LAST_BLOCK) {
+        input.next_byte_boundary();
+        state.mode = Mode::Done;
+        return Ok(());
+    }
+
+    input.need_bits(3)?;
+
+    let last = input.bits(1) != 0;
+    state.flags.update(Flags::IS_LAST_BLOCK, last);
+    input.drop_bits(1);
+
+    match input.bits(2) {
+        0b00 => {
+            traceln!("inflate:     stored block (last = {last})");
+
+            input.drop_bits(2);
+            state.mode = Mode::Stored;
+        }
+        0b01 => {
+            traceln!("inflate:     fixed codes block (last = {last})");
+
+            state.len_table = Table {
+                codes: Codes::Fixed,
+                bits: 9,
+            };
+
+            state.dist_table = Table {
+                codes: Codes::Fixed,
+                bits: 5,
+            };
+
+            input.drop_bits(2);
+            state.mode = Mode::Len;
+        }
+        0b10 => {
+            traceln!("inflate:     dynamic codes block (last = {last})");
+
+            input.drop_bits(2);
+            state.mode = Mode::Table;
+        }
+        0b11 => {
+            traceln!("inflate:     invalid block type");
+
+            input.drop_bits(2);
+            state.mode = Mode::Bad;
+            state.bad("invalid block type\0");
+        }
+        _ => {
+            // LLVM will optimize this branch away
+            unreachable!("BitReader::bits(2) only yields a value of two bits, so this match is already exhaustive")
+        }
+    }
+    Ok(())
+}
+
+fn decode_back_stored(
+    state: &mut State<'_>,
+    input: &mut BackInput,
+    output: &mut BackOutput,
+    window: &mut BackWindow<'_>,
+) -> Result<(), ReturnCode> {
+    input.next_byte_boundary();
+    input.need_bits(32)?;
+
+    let Some(length) = super::stored_block_length(input.bits_u32(32)) else {
+        state.mode = Mode::Bad;
+        state.bad("invalid stored block lengths\0");
+        return Ok(());
+    };
+
+    state.length = usize::from(length);
+    traceln!("inflate:     stored length {}", state.length);
+
+    input.init_bits();
+
+    /* copy stored block from input to output */
+    while state.length != 0 {
+        let mut copy = state.length;
+
+        input.ensure_available()?;
+        output.flush_if_full(window)?;
+
+        copy = Ord::min(copy, input.available());
+        copy = Ord::min(copy, output.remaining(window));
+        output.extend(window, &input.as_slice()[..copy]);
+        input.advance(copy);
+        state.length -= copy;
+    }
+
+    state.mode = Mode::Type;
+    Ok(())
+}
+
+fn decode_back_table(state: &mut State<'_>, input: &mut BackInput) -> Result<(), ReturnCode> {
+    input.need_bits(14)?;
+    state.nlen = input.bits_usize(5) + 257;
+    input.drop_bits(5);
+    state.ndist = input.bits_usize(5) + 1;
+    input.drop_bits(5);
+    state.ncode = input.bits_usize(4) + 4;
+    input.drop_bits(4);
+
+    // TODO pkzit_bug_workaround
+    if state.nlen > 286 || state.ndist > 30 {
+        state.mode = Mode::Bad;
+        state.bad("too many length or distance symbols\0");
+        return Ok(());
+    }
+
+    traceln!("inflate:       table sizes ok");
+    state.have = 0;
+
+    while state.have < state.ncode {
+        input.need_bits(3)?;
+        state.append_code_length_alphabet(input.bits_u16(3));
+        input.drop_bits(3);
+    }
+
+    if let Err(msg) = state.finish_code_length_alphabet() {
+        state.mode = Mode::Bad;
+        state.bad(msg);
+        return Ok(());
+    }
+
+    traceln!("inflate:       table sizes ok");
+
+    while state.have < state.nlen + state.ndist {
+        let here = loop {
+            let here = state.len_table_get(input.bits_usize(state.len_table.bits));
+            if here.bits <= input.bits_in_buffer() {
+                break here;
+            }
+
+            input.pull_byte()?;
+        };
+
+        let here_bits = here.bits;
+
+        match here.val {
+            0..=15 => {
+                input.drop_bits(here_bits);
+                state.lens[state.have] = here.val;
+                state.have += 1;
+            }
+            symbol => {
+                let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
+                    state.mode = Mode::Bad;
+                    state.bad("invalid bit length repeat\0");
+                    return Ok(());
+                };
+                input.need_bits(usize::from(here_bits) + usize::from(repeat.extra_bits))?;
+                input.drop_bits(here_bits);
+                let extra = input.bits(usize::from(repeat.extra_bits));
+                input.drop_bits(repeat.extra_bits);
+                if let Err(msg) = state.append_code_length_repeat(repeat, extra) {
+                    state.mode = Mode::Bad;
+                    state.bad(msg);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if let Err(msg) = state.finish_dynamic_trees() {
+        state.mode = Mode::Bad;
+        state.bad(msg);
+        return Ok(());
+    }
+
+    state.mode = Mode::Len;
+    Ok(())
+}
+
+fn decode_back_len(
+    state: &mut State<'_>,
+    input: &mut BackInput,
+    output: &mut BackOutput,
+    window: &mut BackWindow<'_>,
+) -> Result<(), ReturnCode> {
+    if input.available() >= INFLATE_FAST_MIN_HAVE
+        && output.remaining(window) >= INFLATE_FAST_MIN_LEFT
+    {
+        let input_len = input.available();
+        let mut bit_reader = BitReader::from_buffer(input.bit_buffer(), input.as_slice());
+        output.with_writer(window, |writer| {
+            super::inflate_fast_help_impl::<false, _>(state, &mut bit_reader, writer);
+        });
+
+        let remaining = bit_reader.bytes_remaining();
+        let bits = bit_reader.into_buffer();
+        input.advance(input_len - remaining);
+        input.set_bit_buffer(bits);
+
+        return Ok(());
+    }
+
+    let len_table = match state.len_table.codes {
+        Codes::Fixed => &crate::inflate::inffixed_tbl::LENFIX[..],
+        Codes::CodeLengths => &state.codes_codes,
+        Codes::Len => &state.len_codes,
+        Codes::Dist => &state.dist_codes,
+    };
+
+    // get a literal, length, or end-of-block code
+    let mut here;
+    loop {
+        here = len_table[input.bits_usize(state.len_table.bits)];
+
+        if here.bits <= input.bits_in_buffer() {
+            break;
+        }
+
+        input.pull_byte()?;
+    }
+
+    if here.op != 0 && here.op & 0xf0 == 0 {
+        let last = here;
+        loop {
+            let tmp = input.bits_u16(usize::from(last.bits + last.op));
+            here = len_table[usize::from(last.val + (tmp >> last.bits))];
+            if last.bits + here.bits <= input.bits_in_buffer() {
+                break;
+            }
+
+            input.pull_byte()?;
+        }
+
+        input.drop_bits(last.bits);
+    }
+
+    input.drop_bits(here.bits);
+    state.length = usize::from(here.val);
+
+    if here.op == 0 {
+        // A decoded literal is one byte; an invalid table entry must not
+        // silently truncate its value before being exposed to the callback.
+        let Ok(literal) = u8::try_from(here.val) else {
+            state.mode = Mode::Bad;
+            state.bad("invalid literal/length code\0");
+            return Ok(());
+        };
+        if (0x20..0x7f).contains(&literal) {
+            traceln!("inflate:         literal '{}'", char::from(literal));
+        } else {
+            traceln!("inflate:         literal {literal:#04x}");
+        }
+        output.flush_if_full(window)?;
+        output.push(window, literal);
+
+        state.mode = Mode::Len;
+        return Ok(());
+    }
+    if here.op & 32 != 0 {
+        // end of block
+
+        traceln!("inflate:         end of block");
+
+        state.mode = Mode::Type;
+        return Ok(());
+    }
+    if here.op & 64 != 0 {
+        state.mode = Mode::Bad;
+        state.bad("invalid literal/length code\0");
+        return Ok(());
+    }
+    // length code
+    state.extra = here.op & MAX_BITS;
+
+    // get extra bits, if any
+    if state.extra != 0 {
+        input.need_bits(usize::from(state.extra))?;
+        state.length += input.bits_usize(usize::from(state.extra));
+        input.drop_bits(state.extra);
+    }
+    traceln!("inflate:         length {}", state.length);
+
+    decode_back_match(state, input, output, window)
+}
+
+fn decode_back_match(
+    state: &mut State<'_>,
+    input: &mut BackInput,
+    output: &mut BackOutput,
+    window: &mut BackWindow<'_>,
+) -> Result<(), ReturnCode> {
+    // get distance code
+    let mut here;
+    loop {
+        here = state.dist_table_get(input.bits_usize(state.dist_table.bits));
+        if here.bits <= input.bits_in_buffer() {
+            break;
+        }
+
+        input.pull_byte()?;
+    }
+
+    if here.op & 0xf0 == 0 {
+        let last = here;
+
+        loop {
+            here = state.dist_table_get(
+                usize::from(last.val)
+                    + (input.bits_usize(usize::from(last.bits + last.op)) >> last.bits),
+            );
+
+            if last.bits + here.bits <= input.bits_in_buffer() {
+                break;
+            }
+
+            input.pull_byte()?;
+        }
+
+        input.drop_bits(last.bits);
+    }
+
+    input.drop_bits(here.bits);
+
+    if here.op & 64 != 0 {
+        state.mode = Mode::Bad;
+        state.bad("invalid distance code\0");
+        return Ok(());
+    }
+
+    state.offset = usize::from(here.val);
+
+    state.extra = here.op & MAX_BITS;
+
+    let extra = state.extra;
+
+    if extra > 0 {
+        input.need_bits(usize::from(extra))?;
+        state.offset += input.bits_usize(usize::from(extra));
+        input.drop_bits(extra);
+    }
+
+    if INFLATE_STRICT && state.offset > output.history_available(window) {
+        state.mode = Mode::Bad;
+        state.bad("invalid distance too far back\0");
+        return Ok(());
+    }
+
+    traceln!("inflate:         distance {}", state.offset);
+
+    loop {
+        output.flush_if_full(window)?;
+        let copy = match output.copy_match(
+            window,
+            state.flags.contains(Flags::SANE),
+            state.offset,
+            state.length,
+        ) {
+            Ok(count) => count,
+            Err(msg) => {
+                state.mode = Mode::Bad;
+                state.bad(msg);
+                return Ok(());
+            }
+        };
+        state.length -= copy;
+        if state.length == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Safe `inflateBack` state-machine core. Raw callback and initial-span contracts are bound before
 /// entry; decoding itself only manipulates checked cursors, state, and the exclusive `BackWriter`.
 pub(super) fn decode_back(
@@ -91,8 +459,6 @@ pub(super) fn decode_back(
     mut input: BackInput,
     mut output: BackOutput,
 ) -> ReturnCode {
-    let mut ret;
-
     /* Reset the state */
     strm.msg = core::ptr::null_mut();
     strm.state.mode = Mode::Type;
@@ -105,403 +471,17 @@ pub(super) fn decode_back(
     let mut window = core::mem::replace(&mut state.back_window, BackWindow::empty());
     window.clear();
 
-    'inf_leave: loop {
-        match state.mode {
-            Mode::Type => {
-                if state.flags.contains(Flags::IS_LAST_BLOCK) {
-                    input.next_byte_boundary();
-                    state.mode = Mode::Done;
-                    continue;
-                }
-
-                if let Err(code) = input.need_bits(3) {
-                    ret = code;
-                    break 'inf_leave;
-                }
-
-                let last = input.bits(1) != 0;
-                state.flags.update(Flags::IS_LAST_BLOCK, last);
-                input.drop_bits(1);
-
-                match input.bits(2) {
-                    0b00 => {
-                        traceln!("inflate:     stored block (last = {last})");
-
-                        input.drop_bits(2);
-                        state.mode = Mode::Stored;
-                    }
-                    0b01 => {
-                        traceln!("inflate:     fixed codes block (last = {last})");
-
-                        state.len_table = Table {
-                            codes: Codes::Fixed,
-                            bits: 9,
-                        };
-
-                        state.dist_table = Table {
-                            codes: Codes::Fixed,
-                            bits: 5,
-                        };
-
-                        input.drop_bits(2);
-                        state.mode = Mode::Len;
-                    }
-                    0b10 => {
-                        traceln!("inflate:     dynamic codes block (last = {last})");
-
-                        input.drop_bits(2);
-                        state.mode = Mode::Table;
-                    }
-                    0b11 => {
-                        traceln!("inflate:     invalid block type");
-
-                        input.drop_bits(2);
-                        state.mode = Mode::Bad;
-                        state.bad("invalid block type\0");
-                    }
-                    _ => {
-                        // LLVM will optimize this branch away
-                        unreachable!("BitReader::bits(2) only yields a value of two bits, so this match is already exhaustive")
-                    }
-                }
-            }
-            Mode::Stored => {
-                input.next_byte_boundary();
-                if let Err(code) = input.need_bits(32) {
-                    ret = code;
-                    break 'inf_leave;
-                }
-
-                let Some(length) = super::stored_block_length(input.bits_u32(32)) else {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid stored block lengths\0");
-                    continue;
-                };
-
-                state.length = usize::from(length);
-                traceln!("inflate:     stored length {}", state.length);
-
-                input.init_bits();
-
-                /* copy stored block from input to output */
-                while state.length != 0 {
-                    let mut copy = state.length;
-
-                    if let Err(code) = input.ensure_available() {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-                    if let Err(code) = output.flush_if_full(&mut window) {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-
-                    copy = Ord::min(copy, input.available());
-                    copy = Ord::min(copy, output.remaining(&window));
-                    output.extend(&mut window, &input.as_slice()[..copy]);
-                    input.advance(copy);
-                    state.length -= copy;
-                }
-
-                state.mode = Mode::Type;
-            }
-            Mode::Table => {
-                if let Err(code) = input.need_bits(14) {
-                    ret = code;
-                    break 'inf_leave;
-                }
-                state.nlen = input.bits_usize(5) + 257;
-                input.drop_bits(5);
-                state.ndist = input.bits_usize(5) + 1;
-                input.drop_bits(5);
-                state.ncode = input.bits_usize(4) + 4;
-                input.drop_bits(4);
-
-                // TODO pkzit_bug_workaround
-                if state.nlen > 286 || state.ndist > 30 {
-                    state.mode = Mode::Bad;
-                    state.bad("too many length or distance symbols\0");
-                    continue;
-                }
-
-                traceln!("inflate:       table sizes ok");
-                state.have = 0;
-
-                while state.have < state.ncode {
-                    if let Err(code) = input.need_bits(3) {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-                    state.append_code_length_alphabet(input.bits_u16(3));
-                    input.drop_bits(3);
-                }
-
-                if let Err(msg) = state.finish_code_length_alphabet() {
-                    state.mode = Mode::Bad;
-                    state.bad(msg);
-                    continue;
-                }
-
-                traceln!("inflate:       table sizes ok");
-
-                while state.have < state.nlen + state.ndist {
-                    let here = loop {
-                        let here = state.len_table_get(input.bits_usize(state.len_table.bits));
-                        if here.bits <= input.bits_in_buffer() {
-                            break here;
-                        }
-
-                        if let Err(code) = input.pull_byte() {
-                            ret = code;
-
-                            break 'inf_leave;
-                        }
-                    };
-
-                    let here_bits = here.bits;
-
-                    match here.val {
-                        0..=15 => {
-                            input.drop_bits(here_bits);
-                            state.lens[state.have] = here.val;
-                            state.have += 1;
-                        }
-                        symbol => {
-                            let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
-                                state.mode = Mode::Bad;
-                                state.bad("invalid bit length repeat\0");
-                                continue 'inf_leave;
-                            };
-                            if let Err(code) = input
-                                .need_bits(usize::from(here_bits) + usize::from(repeat.extra_bits))
-                            {
-                                ret = code;
-                                break 'inf_leave;
-                            }
-                            input.drop_bits(here_bits);
-                            let extra = input.bits(usize::from(repeat.extra_bits));
-                            input.drop_bits(repeat.extra_bits);
-                            if let Err(msg) = state.append_code_length_repeat(repeat, extra) {
-                                state.mode = Mode::Bad;
-                                state.bad(msg);
-                                continue 'inf_leave;
-                            }
-                        }
-                    }
-                }
-
-                if let Err(msg) = state.finish_dynamic_trees() {
-                    state.mode = Mode::Bad;
-                    state.bad(msg);
-                    continue 'inf_leave;
-                }
-
-                state.mode = Mode::Len;
-            }
-            Mode::Len => {
-                if input.available() >= INFLATE_FAST_MIN_HAVE
-                    && output.remaining(&window) >= INFLATE_FAST_MIN_LEFT
-                {
-                    let input_len = input.available();
-                    let mut bit_reader =
-                        BitReader::from_buffer(input.bit_buffer(), input.as_slice());
-                    output.with_writer(&mut window, |writer| {
-                        super::inflate_fast_help_impl::<false, _>(state, &mut bit_reader, writer);
-                    });
-
-                    let remaining = bit_reader.bytes_remaining();
-                    let bits = bit_reader.into_buffer();
-                    input.advance(input_len - remaining);
-                    input.set_bit_buffer(bits);
-
-                    continue 'inf_leave;
-                }
-
-                let len_table = match state.len_table.codes {
-                    Codes::Fixed => &crate::inflate::inffixed_tbl::LENFIX[..],
-                    Codes::CodeLengths => &state.codes_codes,
-                    Codes::Len => &state.len_codes,
-                    Codes::Dist => &state.dist_codes,
-                };
-
-                // get a literal, length, or end-of-block code
-                let mut here;
-                loop {
-                    here = len_table[input.bits_usize(state.len_table.bits)];
-
-                    if here.bits <= input.bits_in_buffer() {
-                        break;
-                    }
-
-                    if let Err(code) = input.pull_byte() {
-                        ret = code;
-
-                        break 'inf_leave;
-                    }
-                }
-
-                if here.op != 0 && here.op & 0xf0 == 0 {
-                    let last = here;
-                    loop {
-                        let tmp = input.bits_u16(usize::from(last.bits + last.op));
-                        here = len_table[usize::from(last.val + (tmp >> last.bits))];
-                        if last.bits + here.bits <= input.bits_in_buffer() {
-                            break;
-                        }
-
-                        if let Err(code) = input.pull_byte() {
-                            ret = code;
-
-                            break 'inf_leave;
-                        }
-                    }
-
-                    input.drop_bits(last.bits);
-                }
-
-                input.drop_bits(here.bits);
-                state.length = here.val as usize;
-
-                if here.op == 0 {
-                    if here.val >= 0x20 && here.val < 0x7f {
-                        traceln!("inflate:         literal '{}'", here.val as u8 as char);
-                    } else {
-                        traceln!("inflate:         literal {:#04x}", here.val);
-                    }
-                    if let Err(code) = output.flush_if_full(&mut window) {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-                    output.push(&mut window, state.length as u8);
-
-                    state.mode = Mode::Len;
-                    continue;
-                } else if here.op & 32 != 0 {
-                    // end of block
-
-                    traceln!("inflate:         end of block");
-
-                    state.mode = Mode::Type;
-                    continue;
-                } else if here.op & 64 != 0 {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid literal/length code\0");
-                    continue;
-                }
-                // length code
-                state.extra = here.op & MAX_BITS;
-
-                // get extra bits, if any
-                if state.extra != 0 {
-                    if let Err(code) = input.need_bits(usize::from(state.extra)) {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-                    state.length += input.bits_usize(usize::from(state.extra));
-                    input.drop_bits(state.extra);
-                }
-                traceln!("inflate:         length {}", state.length);
-
-                // get distance code
-                let mut here;
-                loop {
-                    here = state.dist_table_get(input.bits_usize(state.dist_table.bits));
-                    if here.bits <= input.bits_in_buffer() {
-                        break;
-                    }
-
-                    if let Err(code) = input.pull_byte() {
-                        ret = code;
-
-                        break 'inf_leave;
-                    }
-                }
-
-                if here.op & 0xf0 == 0 {
-                    let last = here;
-
-                    loop {
-                        here = state.dist_table_get(
-                            usize::from(last.val)
-                                + (input.bits_usize(usize::from(last.bits + last.op)) >> last.bits),
-                        );
-
-                        if last.bits + here.bits <= input.bits_in_buffer() {
-                            break;
-                        }
-
-                        if let Err(code) = input.pull_byte() {
-                            ret = code;
-
-                            break 'inf_leave;
-                        }
-                    }
-
-                    input.drop_bits(last.bits);
-                }
-
-                input.drop_bits(here.bits);
-
-                if here.op & 64 != 0 {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid distance code\0");
-                    continue 'inf_leave;
-                }
-
-                state.offset = here.val as usize;
-
-                state.extra = here.op & MAX_BITS;
-
-                let extra = state.extra;
-
-                if extra > 0 {
-                    if let Err(code) = input.need_bits(usize::from(extra)) {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-                    state.offset += input.bits_usize(usize::from(extra));
-                    input.drop_bits(extra);
-                }
-
-                if INFLATE_STRICT && state.offset > output.history_available(&window) {
-                    state.mode = Mode::Bad;
-                    state.bad("invalid distance too far back\0");
-                    continue 'inf_leave;
-                }
-
-                traceln!("inflate:         distance {}", state.offset);
-
-                loop {
-                    if let Err(code) = output.flush_if_full(&mut window) {
-                        ret = code;
-                        break 'inf_leave;
-                    }
-                    let copy = match output.copy_match(
-                        &mut window,
-                        state.flags.contains(Flags::SANE),
-                        state.offset,
-                        state.length,
-                    ) {
-                        Ok(count) => count,
-                        Err(msg) => {
-                            state.mode = Mode::Bad;
-                            state.bad(msg);
-                            continue 'inf_leave;
-                        }
-                    };
-                    state.length -= copy;
-                    if state.length == 0 {
-                        break;
-                    }
-                }
-            }
+    let mut ret = loop {
+        let step = match state.mode {
+            Mode::Type => decode_back_type(state, &mut input),
+            Mode::Stored => decode_back_stored(state, &mut input, &mut output, &mut window),
+            Mode::Table => decode_back_table(state, &mut input),
+            Mode::Len => decode_back_len(state, &mut input, &mut output, &mut window),
             Mode::Done => {
-                ret = ReturnCode::StreamEnd;
-                break 'inf_leave;
+                break ReturnCode::StreamEnd;
             }
             Mode::Bad => {
-                ret = ReturnCode::DataError;
-                break 'inf_leave;
+                break ReturnCode::DataError;
             }
 
             Mode::Head
@@ -530,11 +510,13 @@ pub(super) fn decode_back(
             | Mode::DictId
             | Mode::Dict => {
                 // All other states should be unreachable, and return StreamError.
-                ret = ReturnCode::StreamError;
-                break 'inf_leave;
+                break ReturnCode::StreamError;
             }
+        };
+        if let Err(code) = step {
+            break code;
         }
-    }
+    };
 
     if output.flush_remaining(&mut window).is_err() && ret == ReturnCode::StreamEnd {
         ret = ReturnCode::BufError;
