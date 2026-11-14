@@ -108,24 +108,24 @@ struct GzBuffer {
     usable_abi: c_uint,
 }
 
-impl GzBuffer {
-    // Every owned byte buffer is both a Rust allocation/slice and a zlib C
-    // availability span. On 32-bit targets, isize::MAX is the tighter bound.
-    fn checked_abi_len(len: usize) -> Option<c_uint> {
-        if len > isize::MAX.unsigned_abs() {
-            return None;
-        }
-        c_uint::try_from(len).ok()
+// Both owned and caller-supplied gzip spans must fit in one Rust slice and
+// the unsigned zlib availability counter. On 32-bit, isize::MAX is the tighter bound.
+fn checked_gz_abi_len(len: usize) -> Option<c_uint> {
+    if len > isize::MAX.unsigned_abs() {
+        return None;
     }
+    c_uint::try_from(len).ok()
+}
 
+impl GzBuffer {
     fn allocate(capacity: usize, usable: usize) -> Option<Self> {
         // Also guard private callers: never store lengths that can wrap when
         // published through the C ABI, or create an invalid Rust slice.
         if capacity == 0 || usable > capacity {
             return None;
         }
-        Self::checked_abi_len(capacity)?;
-        let usable_abi = Self::checked_abi_len(usable)?;
+        checked_gz_abi_len(capacity)?;
+        let usable_abi = checked_gz_abi_len(usable)?;
         let ptr = ALLOCATOR.allocate_slice_raw::<u8>(capacity)?;
         Some(Self {
             ptr,
@@ -390,7 +390,7 @@ impl GzState {
     // z_stream avail_in/avail_out ABI counters, including the doubled buffer.
     fn doubled_buffer_capacity(want: usize) -> Option<usize> {
         let doubled = want.checked_mul(2)?;
-        GzBuffer::checked_abi_len(doubled)?;
+        checked_gz_abi_len(doubled)?;
         Some(doubled)
     }
 
@@ -1806,6 +1806,10 @@ fn gz_skip(state: &mut GzState, len: i64) -> Result<(), ()> {
     Ok(())
 }
 
+fn checked_stream_struct_size() -> Option<c_int> {
+    c_int::try_from(core::mem::size_of::<z_stream>()).ok()
+}
+
 // Given a gzip file opened for reading, check for a gzip header, and set
 // `state.direct` accordingly.
 //
@@ -1817,6 +1821,11 @@ fn gz_skip(state: &mut GzState, len: i64) -> Result<(), ()> {
 // Lazily allocate the owned gzip read input/output and initialize inflate.
 // No input is consumed: header detection remains the responsibility of gz_look.
 fn gz_init_read(state: &mut GzState) -> Result<(), ()> {
+    // The public inflate initializer accepts a signed C ABI struct size.
+    let Some(stream_size) = checked_stream_struct_size() else {
+        gz_error(state, Some((Z_STREAM_ERROR, "z_stream size exceeds C ABI")));
+        return Err(());
+    };
     // Allocate buffers if needed.
     if state.input.is_none() {
         let Some(input) = state.allocate_input_buffer() else {
@@ -1843,7 +1852,7 @@ fn gz_init_read(state: &mut GzState) -> Result<(), ()> {
                 &raw mut state.stream,
                 MAX_WBITS + 16,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as i32,
+                stream_size,
             )
         } != Z_OK
         {
@@ -2183,7 +2192,13 @@ fn gz_fetch(state: &mut GzState) -> Result<(), ()> {
 // Decompress into an explicit uninitialized output span. The caller decides whether
 // that span is the owned gzip output buffer or the caller's large-read destination.
 fn gz_decomp_into(state: &mut GzState, output: &mut [MaybeUninit<u8>]) -> Result<usize, ()> {
-    let bound_avail_out = output.len() as c_uint;
+    let Some(bound_avail_out) = checked_gz_abi_len(output.len()) else {
+        gz_error(
+            state,
+            Some((Z_STREAM_ERROR, "gzip output span exceeds C ABI limits")),
+        );
+        return Err(());
+    };
     state.stream.avail_out = bound_avail_out;
     state.stream.next_out = output.as_mut_ptr().cast::<u8>();
 
@@ -2385,10 +2400,18 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
                     &mut owned.usable_uninit_mut()[have..have + Ord::min(capacity, input.len())],
                 )
             };
+            let Some(copy_abi) = checked_gz_abi_len(copy) else {
+                state.invalid_write_cursor();
+                return 0;
+            };
+            let Some(available) = state.stream.avail_in.checked_add(copy_abi) else {
+                state.invalid_write_cursor();
+                return 0;
+            };
             if state.advance_position(copy).is_err() {
                 return 0;
             }
-            state.stream.avail_in += copy as c_uint;
+            state.stream.avail_in = available;
             if !input.is_empty() && gz_comp(state, Z_NO_FLUSH).is_err() {
                 return 0;
             }
@@ -2403,9 +2426,15 @@ fn gz_write(state: &mut GzState, input: &mut GzWriteInput) -> usize {
 
         let save_next_in = state.stream.next_in;
         let result = loop {
-            let n = Ord::min(input.len(), c_uint::MAX as usize);
+            let n = input
+                .len()
+                .min(usize::try_from(c_uint::MAX).unwrap_or(usize::MAX));
+            let Some(available) = checked_gz_abi_len(n) else {
+                state.invalid_write_cursor();
+                break Err(());
+            };
             state.stream.next_in = input.as_ptr();
-            state.stream.avail_in = n as c_uint;
+            state.stream.avail_in = available;
             if state.advance_position(n).is_err() {
                 break Err(());
             }
@@ -2491,7 +2520,11 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
             unsafe { input_ptr.write_bytes(0u8, n) };
             first = false;
         }
-        state.stream.avail_in = n as _;
+        let Some(available) = checked_gz_abi_len(n) else {
+            state.invalid_write_cursor();
+            return Err(());
+        };
+        state.stream.avail_in = available;
         state.stream.next_in = input_ptr;
         state.advance_position(n)?;
         if gz_comp(state, Z_NO_FLUSH).is_err() {
@@ -2510,6 +2543,10 @@ fn gz_zero(state: &mut GzState, mut len: usize) -> Result<(), ()> {
 // - `Ok` on success.
 // - `Err` on error.
 fn gz_init(state: &mut GzState) -> Result<(), ()> {
+    let Some(stream_size) = checked_stream_struct_size() else {
+        gz_error(state, Some((Z_STREAM_ERROR, "z_stream size exceeds C ABI")));
+        return Err(());
+    };
     // Allocate input buffer.
     // The buffer is twice as big as state.want, while `in_size()` exposes only half
     // of it to ordinary compression. The reason for this is to
@@ -2547,7 +2584,7 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
                 DEF_MEM_LEVEL,
                 state.strategy as _,
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as _,
+                stream_size,
             )
         } != Z_OK
         {
@@ -3142,6 +3179,9 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
     if buf.is_null() || len < 1 {
         return ptr::null_mut();
     }
+    let Ok(buffer_len) = usize::try_from(len) else {
+        return ptr::null_mut();
+    };
 
     // SAFETY: The enclosing gzip operation holds the live handle exclusively, or receives null, which as_mut rejects.
     let Some(state) = (unsafe { file.cast::<GzState>().as_mut() }) else {
@@ -3157,7 +3197,7 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
 
     // Safety: `buf` is non-null and the public contract guarantees `len` writable bytes.
     let output =
-        unsafe { core::slice::from_raw_parts_mut(buf.cast::<MaybeUninit<u8>>(), len as usize) };
+        unsafe { core::slice::from_raw_parts_mut(buf.cast::<MaybeUninit<u8>>(), buffer_len) };
     let payload_capacity = output.len() - 1;
     if payload_capacity == 0 {
         output[0].write(0);
@@ -5341,13 +5381,18 @@ mod tests {
         // The shared constructor must reject an invalid Rust allocation
         // extent even on 32-bit targets where it fits in an unsigned C int.
         let beyond_rust = isize::MAX.unsigned_abs() + 1;
-        assert_eq!(GzBuffer::checked_abi_len(beyond_rust), None);
+        assert_eq!(checked_gz_abi_len(beyond_rust), None);
         assert!(GzBuffer::allocate(beyond_rust, 1).is_none());
         let biggest_legal = isize::MAX.unsigned_abs().min(c_uint::MAX as usize);
         assert_eq!(
-            GzBuffer::checked_abi_len(biggest_legal),
+            checked_gz_abi_len(biggest_legal),
             c_uint::try_from(biggest_legal).ok()
         );
+        // A caller-owned output slice has the same C counter requirement as
+        // an allocated gzip buffer. No huge allocation is needed to check it.
+        if let Some(beyond_counter) = biggest_legal.checked_add(1) {
+            assert_eq!(checked_gz_abi_len(beyond_counter), None);
+        }
         assert!(GzState::doubled_buffer_capacity(isize::MAX.unsigned_abs() / 2 + 1).is_none());
 
         let Ok(too_wide) = usize::try_from((c_uint::MAX / 2) + 1) else {
