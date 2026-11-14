@@ -248,12 +248,11 @@ pub enum ReturnCode {
     VersionError = -6,
 }
 
-impl From<i32> for ReturnCode {
-    fn from(value: i32) -> Self {
-        match Self::try_from_c_int(value) {
-            Some(value) => value,
-            None => panic!("invalid return code {value}"),
-        }
+impl TryFrom<i32> for ReturnCode {
+    type Error = i32;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        Self::try_from_c_int(value).ok_or(value)
     }
 }
 
@@ -293,6 +292,38 @@ impl ReturnCode {
             -5 => Some(Self::BufError),
             -6 => Some(Self::VersionError),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod return_code_conversion_tests {
+    use super::ReturnCode;
+
+    #[test]
+    fn known_c_status_codes_round_trip() {
+        for status in [
+            ReturnCode::Ok,
+            ReturnCode::StreamEnd,
+            ReturnCode::NeedDict,
+            ReturnCode::ErrNo,
+            ReturnCode::StreamError,
+            ReturnCode::DataError,
+            ReturnCode::MemError,
+            ReturnCode::BufError,
+            ReturnCode::VersionError,
+        ] {
+            let raw = status as i32;
+            assert_eq!(ReturnCode::try_from(raw), Ok(status));
+            assert_eq!(ReturnCode::try_from_c_int(raw), Some(status));
+        }
+    }
+
+    #[test]
+    fn unknown_c_status_codes_are_preserved_in_error() {
+        for raw in [3, -7, i32::MIN, i32::MAX] {
+            assert_eq!(ReturnCode::try_from(raw), Err(raw));
+            assert_eq!(ReturnCode::try_from_c_int(raw), None);
         }
     }
 }
