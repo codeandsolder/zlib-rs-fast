@@ -28,7 +28,7 @@ fn main() {
 
             let err = compress_ng(&mut dest_vec, &mut dest_len, &input, level);
 
-            assert!(err == ReturnCode::Ok, "error {err:?}");
+            assert!(err == Ok(ReturnCode::Ok), "error {err:?}");
 
             dest_vec.truncate(dest_len);
 
@@ -50,7 +50,7 @@ fn main() {
 
             let err = compress_rs(&mut dest_vec, &mut dest_len, &input, level);
 
-            assert!(err == ReturnCode::Ok, "error {err:?}");
+            assert!(err == Ok(ReturnCode::Ok), "error {err:?}");
 
             dest_vec.truncate(dest_len);
 
@@ -84,7 +84,7 @@ fn compress_rs(
     source: &[u8],
     //
     level: i32,
-) -> ReturnCode {
+) -> Result<ReturnCode, i32> {
     use libz_rs_sys::{deflate, deflateEnd, deflateInit2_, z_stream, zlibVersion};
 
     let mut stream = z_stream {
@@ -120,8 +120,8 @@ fn compress_rs(
         }
     };
 
-    if ReturnCode::from(err) != ReturnCode::Ok {
-        return ReturnCode::from(err);
+    if err != ReturnCode::Ok as i32 {
+        return ReturnCode::try_from(err);
     }
 
     let max = c_uint::MAX as usize;
@@ -129,7 +129,7 @@ fn compress_rs(
     let mut left = dest.len();
     let mut source_len = source.len();
 
-    loop {
+    let result = loop {
         if stream.avail_out == 0 {
             stream.avail_out = Ord::min(left, max) as _;
             left -= stream.avail_out as usize;
@@ -147,16 +147,18 @@ fn compress_rs(
         };
 
         let err = unsafe { deflate(&raw mut stream, flush as i32) };
-        if ReturnCode::from(err) != ReturnCode::Ok {
-            break;
+        if err != ReturnCode::Ok as i32 {
+            break ReturnCode::try_from(err);
         }
-    }
-
+    };
     *dest_len = stream.total_out as _;
 
-    unsafe { deflateEnd(&raw mut stream) };
-
-    ReturnCode::Ok
+    // Always release the stream, but preserve the primary deflate error.
+    let end_code = unsafe { deflateEnd(&raw mut stream) };
+    if result != Ok(ReturnCode::StreamEnd) {
+        return result;
+    }
+    ReturnCode::try_from(end_code)
 }
 
 fn compress_ng(
@@ -165,7 +167,7 @@ fn compress_ng(
     source: &[u8],
     //
     level: i32,
-) -> ReturnCode {
+) -> Result<ReturnCode, i32> {
     use libz_ng_sys::{deflate, deflateEnd, deflateInit2_, z_stream, zlibVersion};
 
     let mut stream = z_stream {
@@ -201,8 +203,8 @@ fn compress_ng(
         }
     };
 
-    if ReturnCode::from(err) != ReturnCode::Ok {
-        return ReturnCode::from(err);
+    if err != ReturnCode::Ok as i32 {
+        return ReturnCode::try_from(err);
     }
 
     let max = c_uint::MAX as usize;
@@ -210,7 +212,7 @@ fn compress_ng(
     let mut left = dest.len();
     let mut source_len = source.len();
 
-    loop {
+    let result = loop {
         if stream.avail_out == 0 {
             stream.avail_out = Ord::min(left, max) as _;
             left -= stream.avail_out as usize;
@@ -228,14 +230,16 @@ fn compress_ng(
         };
 
         let err = unsafe { deflate(&raw mut stream, flush as i32) };
-        if ReturnCode::from(err) != ReturnCode::Ok {
-            break;
+        if err != ReturnCode::Ok as i32 {
+            break ReturnCode::try_from(err);
         }
-    }
-
+    };
     *dest_len = stream.total_out as _;
 
-    unsafe { deflateEnd(&raw mut stream) };
-
-    ReturnCode::Ok
+    // Always release the stream, but preserve the primary deflate error.
+    let end_code = unsafe { deflateEnd(&raw mut stream) };
+    if result != Ok(ReturnCode::StreamEnd) {
+        return result;
+    }
+    ReturnCode::try_from(end_code)
 }
