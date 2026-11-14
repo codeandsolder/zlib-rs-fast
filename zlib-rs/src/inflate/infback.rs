@@ -129,7 +129,6 @@ pub(super) fn decode_back(
 
                         input.drop_bits(2);
                         state.mode = Mode::Stored;
-                        continue;
                     }
                     0b01 => {
                         traceln!("inflate:     fixed codes block (last = {last})");
@@ -146,14 +145,12 @@ pub(super) fn decode_back(
 
                         input.drop_bits(2);
                         state.mode = Mode::Len;
-                        continue;
                     }
                     0b10 => {
                         traceln!("inflate:     dynamic codes block (last = {last})");
 
                         input.drop_bits(2);
                         state.mode = Mode::Table;
-                        continue;
                     }
                     0b11 => {
                         traceln!("inflate:     invalid block type");
@@ -161,7 +158,6 @@ pub(super) fn decode_back(
                         input.drop_bits(2);
                         state.mode = Mode::Bad;
                         state.bad("invalid block type\0");
-                        continue;
                     }
                     _ => {
                         // LLVM will optimize this branch away
@@ -208,7 +204,6 @@ pub(super) fn decode_back(
                 }
 
                 state.mode = Mode::Type;
-                continue;
             }
             Mode::Table => {
                 if let Err(code) = input.need_bits(14) {
@@ -392,10 +387,9 @@ pub(super) fn decode_back(
                     state.mode = Mode::Bad;
                     state.bad("invalid literal/length code\0");
                     continue;
-                } else {
-                    // length code
-                    state.extra = here.op & MAX_BITS;
                 }
+                // length code
+                state.extra = here.op & MAX_BITS;
 
                 // get extra bits, if any
                 if state.extra != 0 {
@@ -500,8 +494,6 @@ pub(super) fn decode_back(
                         break;
                     }
                 }
-
-                continue 'inf_leave;
             }
             Mode::Done => {
                 ret = ReturnCode::StreamEnd;
@@ -560,6 +552,12 @@ pub(super) fn decode_back(
     ret
 }
 
+pub fn back_end<'a>(strm: &'a mut InflateStream<'a>) {
+    // With infback the window is user-supplied, so we mustn't try to free it.
+    let _ = core::mem::replace(&mut strm.state.back_window, BackWindow::empty());
+    crate::inflate::end(strm);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,7 +599,10 @@ mod tests {
 
     #[test]
     fn back_writer_match_crosses_previous_window_into_current_output() -> Result<(), &'static str> {
-        let mut storage = core::array::from_fn::<_, 32, _>(|i| i as u8);
+        let mut storage = [0u8; 32];
+        for (value, byte) in (0u8..32).zip(&mut storage) {
+            *byte = value;
+        }
         // The current callback window has already overwritten its first four bytes.
         storage[..4].copy_from_slice(&[100, 101, 102, 103]);
         let mut window = BackWindow::from_initialized_slice(&mut storage);
@@ -642,10 +643,4 @@ mod tests {
             Err("invalid distance too far back\0")
         );
     }
-}
-
-pub fn back_end<'a>(strm: &'a mut InflateStream<'a>) {
-    // With infback the window is user-supplied, so we mustn't try to free it.
-    let _ = core::mem::replace(&mut strm.state.back_window, BackWindow::empty());
-    crate::inflate::end(strm);
 }

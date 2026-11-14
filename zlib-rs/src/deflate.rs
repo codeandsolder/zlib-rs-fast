@@ -1237,7 +1237,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
             state.crc_fold = Crc32Fold::new();
             CRC32_INITIAL_VALUE.into()
         }
-        _ => ADLER32_INITIAL_VALUE as _,
+        _ => ADLER32_INITIAL_VALUE.into(),
     };
 
     state.last_flush = -2;

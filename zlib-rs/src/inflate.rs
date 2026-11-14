@@ -258,6 +258,7 @@ impl<'a> InflateStream<'a> {
     /// If non-null, the stream pointer must be valid, initialized for inflate,
     /// and remain alive for the returned lifetime. There must be no concurrent
     /// exclusive access to the returned stream view.
+    #[must_use]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
         unsafe { Self::from_stream_ref_kind(strm, InflateStateKind::Regular) }
     }
@@ -1033,7 +1034,7 @@ struct InflateOutput<'a> {
     accounted_remaining: usize,
 }
 
-impl<'a> InflateOutput<'a> {
+impl InflateOutput<'_> {
     const unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
         Self {
             writer: unsafe { Writer::new_uninit(ptr, len) },
@@ -3005,6 +3006,7 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
+#[must_use]
 pub fn codes_used(stream: &InflateStream) -> usize {
     stream.state.next
 }
@@ -3063,7 +3065,7 @@ fn inflate_bound_io(
     let state = &mut *stream.state;
 
     // skip check
-    if let Mode::Type = state.mode {
+    if matches!(state.mode, Mode::Type) {
         state.mode = Mode::TypeDo;
     }
 
@@ -3084,8 +3086,13 @@ fn inflate_bound_io(
 
     state.bit_buffer = bit_reader.into_buffer();
 
-    stream.avail_out = output.remaining() as u32;
-    stream.next_out = output.next_out() as *mut u8;
+    // The output cursor was constructed from a C uInt count. Preserve that range
+    // even if a future internal caller supplies a larger independent cursor.
+    let Ok(remaining) = u32::try_from(output.remaining()) else {
+        return ReturnCode::StreamError;
+    };
+    stream.avail_out = remaining;
+    stream.next_out = output.next_out().cast::<u8>();
 
     stream.adler = z_checksum::from(state.checksum);
 
@@ -3117,7 +3124,7 @@ fn inflate_bound_io(
 
     if let Some(msg) = state.error_message {
         assert!(msg.ends_with('\0'));
-        stream.msg = msg.as_ptr().cast_mut() as *mut core::ffi::c_char;
+        stream.msg = msg.as_ptr().cast_mut().cast::<core::ffi::c_char>();
     }
 
     stream.data_type = state.decoding_state();
@@ -3220,6 +3227,7 @@ pub unsafe fn sync(stream: &mut InflateStream) -> ReturnCode {
   block. When decompressing, PPP checks that at the end of input packet,
   inflate is waiting for these length bytes.
 */
+#[must_use]
 pub fn sync_point(stream: &InflateStream) -> bool {
     matches!(stream.state.mode, Mode::Stored) && stream.state.bit_buffer.bits_in_buffer() == 0
 }
@@ -3396,6 +3404,7 @@ pub unsafe fn get_header(
 ///
 /// Raw caller-buffer handling belongs to the C ABI layer; the inflate core exposes only checked
 /// slices over the initialized circular window.
+#[must_use]
 pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8], &'stream [u8]) {
     stream.state.window.dictionary_segments()
 }
