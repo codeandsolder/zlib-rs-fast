@@ -19,6 +19,22 @@ fn checked_test_len<T: TryFrom<usize>>(len: usize) -> T {
     value
 }
 
+// Check a complete, exact-length gzread without repeating the C ABI boundary
+// and its pointer/slice guarantees at every seek position.
+fn assert_gzread_exact<const N: usize>(file: *mut gzFile_s, expected: &[u8; N]) {
+    let mut actual = [0u8; N];
+    // SAFETY: this test owns a live gzip handle; actual provides exactly N writable bytes.
+    let count = unsafe {
+        gzread(
+            file,
+            actual.as_mut_ptr().cast::<c_void>(),
+            checked_test_len(actual.len()),
+        )
+    };
+    assert_eq!(count, checked_test_len(actual.len()));
+    assert_eq!(&actual, expected);
+}
+
 // Generate a file path relative to the project's root
 fn crate_path(file: &str) -> String {
     path(Path::new(env!("CARGO_MANIFEST_DIR")), file)
@@ -2212,19 +2228,7 @@ fn gzseek_read() -> Result<(), ()> {
         assert_eq!(unsafe { gzseek(file, 10, libc::SEEK_SET) }, 10);
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 10);
-        let mut buf = [0u8; 16];
-        assert_eq!(
-            // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
-            unsafe {
-                gzread(
-                    file,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    checked_test_len(buf.len()),
-                )
-            },
-            checked_test_len(buf.len())
-        );
-        assert_eq!(&buf, b"t type=file uid=");
+        assert_gzread_exact(file, b"t type=file uid=");
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 26);
 
@@ -2235,19 +2239,7 @@ fn gzseek_read() -> Result<(), ()> {
         assert_eq!(unsafe { gzseek(file, 24, libc::SEEK_CUR) }, 50);
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 50);
-        let mut buf = [0u8; 16];
-        assert_eq!(
-            // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
-            unsafe {
-                gzread(
-                    file,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    checked_test_len(buf.len()),
-                )
-            },
-            checked_test_len(buf.len())
-        );
-        assert_eq!(&buf, b"DINFO time=16815");
+        assert_gzread_exact(file, b"DINFO time=16815");
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 66);
 
@@ -2258,19 +2250,7 @@ fn gzseek_read() -> Result<(), ()> {
         assert_eq!(unsafe { gzseek(file, -26, libc::SEEK_CUR) }, 40);
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 40);
-        let mut buf = [0u8; 16];
-        assert_eq!(
-            // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
-            unsafe {
-                gzread(
-                    file,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    checked_test_len(buf.len()),
-                )
-            },
-            checked_test_len(buf.len())
-        );
-        assert_eq!(&buf, b"44\n./.BUILDINFO ");
+        assert_gzread_exact(file, b"44\n./.BUILDINFO ");
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 56);
 
@@ -2326,19 +2306,7 @@ fn gzseek_read() -> Result<(), ()> {
         assert_eq!(unsafe { gzseek(file, 1, libc::SEEK_CUR) }, 6);
         // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
         assert_eq!(unsafe { gzseek(file, 2, libc::SEEK_CUR) }, 8);
-        let mut buf = [0u8; 5];
-        assert_eq!(
-            // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
-            unsafe {
-                gzread(
-                    file,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    checked_test_len(buf.len()),
-                )
-            },
-            checked_test_len(buf.len())
-        );
-        assert_eq!(&buf, b"set t");
+        assert_gzread_exact(file, b"set t");
 
         // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
