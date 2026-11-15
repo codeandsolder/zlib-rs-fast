@@ -6024,6 +6024,7 @@ mod test {
 
     #[test]
     fn data_type_override_round_trips_through_state_only_encoder() -> Result<(), ReturnCode> {
+        const CALLER_DATA_TYPE: i32 = 12_345;
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
         // SAFETY: a preceding successful init owns a live deflate state; this test
@@ -6032,40 +6033,51 @@ mod test {
             .ok_or(ReturnCode::StreamError)?;
 
         // zlib only auto-detects when this field is Z_UNKNOWN. Preserve arbitrary caller metadata.
-        const CALLER_DATA_TYPE: i32 = 12_345;
         stream.data_type = CALLER_DATA_TYPE;
 
         let input = b"plain text that is compressible plain text that is compressible";
         let mut output = [0u8; 1024];
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
 
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
         assert_eq!(stream.data_type, CALLER_DATA_TYPE);
         assert_eq!(stream.state.data_type, CALLER_DATA_TYPE);
+        let produced = output
+            .len()
+            .checked_sub(usize::try_from(stream.avail_out).map_err(|_| ReturnCode::StreamError)?)
+            .ok_or(ReturnCode::StreamError)?;
         assert!(end(stream).is_ok());
+
+        let mut restored = [0u8; 256];
+        let (decoded, status) =
+            crate::decompress_slice(&mut restored, &output[..produced], InflateConfig::default());
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, input);
         Ok(())
     }
 
     #[test]
-    fn from_stream_mut() {
-        unsafe {
-            assert!(DeflateStream::from_stream_mut(core::ptr::null_mut()).is_none());
+    fn from_stream_mut() -> Result<(), ReturnCode> {
+        // SAFETY: the accessor explicitly checks for null before reading the stream.
+        assert!(unsafe { DeflateStream::from_stream_mut(core::ptr::null_mut()) }.is_none());
 
-            let mut stream = z_stream::default();
-            assert!(DeflateStream::from_stream_mut(&raw mut stream).is_none());
+        let mut raw = z_stream::default();
+        // SAFETY: default construction leaves state null; the accessor checks
+        // that pointer before attempting to borrow deflate's initialized state.
+        assert!(unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.is_none());
 
-            // state is still NULL
-            assert!(DeflateStream::from_stream_mut(&raw mut stream).is_none());
-
-            init(&mut stream, DeflateConfig::default());
-            let stream = DeflateStream::from_stream_mut(&raw mut stream);
-            assert!(stream.is_some());
-
-            assert!(end(stream.unwrap()).is_ok());
-        }
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: initialization succeeded and this test has exclusive
+        // ownership of the live state until the matching end below.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
+        assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[cfg(feature = "c-allocator")]
@@ -6106,20 +6118,23 @@ mod test {
 
     #[test]
     fn near_optimal_partition_can_merge_beyond_stored_limit() -> Result<(), ReturnCode> {
-        fn repeated_tokens(mut bytes: usize) -> Vec<near_optimal::ParseToken> {
+        fn repeated_tokens(mut bytes: usize) -> Result<Vec<near_optimal::ParseToken>, ReturnCode> {
             let mut tokens = Vec::new();
+            if bytes == 0 {
+                return Ok(tokens);
+            }
             tokens.push(near_optimal::ParseToken::Literal(b'a'));
             bytes -= 1;
             while bytes >= STD_MAX_MATCH {
                 tokens.push(near_optimal::ParseToken::Match {
-                    length: STD_MAX_MATCH as u16,
+                    length: u16::try_from(STD_MAX_MATCH).map_err(|_| ReturnCode::StreamError)?,
                     distance: 1,
                 });
                 bytes -= STD_MAX_MATCH;
             }
             if bytes >= STD_MIN_MATCH {
                 tokens.push(near_optimal::ParseToken::Match {
-                    length: bytes as u16,
+                    length: u16::try_from(bytes).map_err(|_| ReturnCode::StreamError)?,
                     distance: 1,
                 });
             } else {
@@ -6128,9 +6143,11 @@ mod test {
                     bytes,
                 ));
             }
-            tokens
+            Ok(tokens)
         }
 
+        assert_eq!(repeated_tokens(0)?, Vec::new());
+        assert_eq!(repeated_tokens(1)?.len(), 1);
         let mut raw = z_stream::default();
         assert_eq!(
             init_with_lit_bufsize(
@@ -6146,17 +6163,17 @@ mod test {
             .ok_or(ReturnCode::StreamError)?;
         let mut left = near_optimal::PlannedBlock {
             range: 0..60_000,
-            tokens: repeated_tokens(60_000),
+            tokens: repeated_tokens(60_000)?,
         };
         let mut right = near_optimal::PlannedBlock {
             range: 60_000..120_000,
-            tokens: repeated_tokens(60_000),
+            tokens: repeated_tokens(60_000)?,
         };
 
         let outcome =
             near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
-            panic!("expected identical compressible blocks to merge");
+            return Err(ReturnCode::StreamError);
         };
         assert_eq!(merged.range, 0..120_000);
         assert!(merged.tokens.len() <= near_optimal::MAX_BLOCK_TOKENS);
