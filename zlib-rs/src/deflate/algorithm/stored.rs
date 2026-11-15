@@ -143,7 +143,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         have = stored_header_size(stream.state.bit_writer.bits_valid);
 
         // we need room for at least the header
-        if (stream.output.avail_out as usize) < have {
+        if (stream.output.remaining as usize) < have {
             break;
         }
 
@@ -152,7 +152,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         // usize::MAX, so adding buffered bytes must not wrap the total.
         let available = left.saturating_add(stream.input.avail_in as usize);
 
-        have = stream.output.avail_out as usize - have;
+        have = stream.output.remaining as usize - have;
 
         if len > available {
             // limit len to the input

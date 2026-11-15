@@ -4340,7 +4340,7 @@ mod stable_api {
     fn invalid_config() {
         assert_eq!(
             zlib_rs::Deflate::new(9000, true, 15).err(),
-            Some(zlib_rs::DeflateError::StreamError)
+            Some(zlib_rs::DeflateError::InvalidStream)
         );
     }
 
@@ -4447,7 +4447,7 @@ mod stable_api {
         }
 
         // Due to NoFlush there is data to write, but no buffer to write it into.
-        assert_eq!(d.set_level(9), Err(zlib_rs::DeflateError::StreamError));
+        assert_eq!(d.set_level(9), Err(zlib_rs::DeflateError::InvalidStream));
         Ok(())
     }
 

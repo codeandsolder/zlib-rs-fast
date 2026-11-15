@@ -345,41 +345,41 @@ impl<'a> GzipHeaderRef<'a> {
 
 #[derive(Clone, Copy)]
 pub struct OutputCursor {
-    next_out: *mut crate::c_api::Bytef,
-    pub(crate) avail_out: crate::c_api::uInt,
-    pub(crate) total_out: crate::c_api::z_size,
+    cursor: *mut crate::c_api::Bytef,
+    pub(crate) remaining: crate::c_api::uInt,
+    pub(crate) total: crate::c_api::z_size,
 }
 
 impl OutputCursor {
     const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
-            next_out: stream.next_out,
-            avail_out: stream.avail_out,
-            total_out: stream.total_out,
+            cursor: stream.next_out,
+            remaining: stream.avail_out,
+            total: stream.total_out,
         }
     }
 
     const fn apply(self, stream: &mut DeflateStream<'_>) {
-        stream.next_out = self.next_out;
-        stream.avail_out = self.avail_out;
-        stream.total_out = self.total_out;
+        stream.next_out = self.cursor;
+        stream.avail_out = self.remaining;
+        stream.total_out = self.total;
     }
 
     fn write_all(&mut self, bytes: &[u8]) {
         let len = bytes.len();
-        assert!(len <= self.avail_out as usize);
+        assert!(len <= self.remaining as usize);
         if len == 0 {
             return;
         }
 
         // SAFETY: the cursor represents `avail_out` caller-provided writable bytes, and `len` is
         // checked above. Compression state/pending storage must not overlap the caller output.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.next_out, len) };
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.cursor, len) };
         self.advance(len);
     }
 
     fn write_some(&mut self, bytes: &[u8]) -> usize {
-        let len = Ord::min(bytes.len(), self.avail_out as usize);
+        let len = Ord::min(bytes.len(), self.remaining as usize);
         self.write_all(&bytes[..len]);
         len
     }
@@ -389,12 +389,12 @@ impl OutputCursor {
     /// # Safety
     /// `source` must be readable for `len` bytes and must not overlap the cursor's writable output.
     unsafe fn copy_from_raw(&mut self, source: *const u8, len: usize) -> &[u8] {
-        assert!(len <= self.avail_out as usize);
+        assert!(len <= self.remaining as usize);
         if len == 0 {
             return &[];
         }
 
-        let destination = self.next_out;
+        let destination = self.cursor;
         // SAFETY: guaranteed by the caller contract plus the output bound asserted above.
         unsafe { core::ptr::copy_nonoverlapping(source, destination, len) };
         self.advance(len);
@@ -405,12 +405,7 @@ impl OutputCursor {
     }
 
     fn advance(&mut self, len: usize) {
-        advance_abi_bytes(
-            &mut self.next_out,
-            &mut self.avail_out,
-            &mut self.total_out,
-            len,
-        );
+        advance_abi_bytes(&mut self.cursor, &mut self.remaining, &mut self.total, len);
     }
 }
 
@@ -495,7 +490,7 @@ impl<'a, 'state> Compressor<'a, 'state> {
     /// Copy initialized history bytes to the caller's output buffer.
     pub(crate) fn copy_window_to_output(&mut self, range: core::ops::Range<usize>) {
         let len = range.len();
-        assert!(len <= self.output.avail_out as usize);
+        assert!(len <= self.output.remaining as usize);
         let src = &self.state.window.filled()[range];
 
         self.output.write_all(src);
@@ -508,7 +503,7 @@ impl<'a, 'state> Compressor<'a, 'state> {
     /// copy has completed.
     pub(crate) fn copy_input_to_output(&mut self, size: usize) -> usize {
         let len = size.min(self.input.avail_in as usize);
-        assert!(len <= self.output.avail_out as usize);
+        assert!(len <= self.output.remaining as usize);
         if len == 0 {
             return 0;
         }
@@ -3420,7 +3415,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
     /* Flush as much pending output as possible */
     if !stream.state.bit_writer.pending.is_empty() {
         let _ = stream.drain_pending();
-        if stream.output.avail_out == 0 {
+        if stream.output.remaining == 0 {
             /* Since avail_out is 0, deflate will be called again with
              * more output space, but possibly with both pending and
              * avail_in equal to zero. There won't be anything to do,
@@ -3468,7 +3463,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         match bstate {
             BlockState::InvalidState => return ReturnCode::StreamError,
             BlockState::NeedMore | BlockState::FinishStarted => {
-                if stream.output.avail_out == 0 {
+                if stream.output.remaining == 0 {
                     state.last_flush = -1; /* avoid BUF_ERROR next call, see above */
                 }
                 return ReturnCode::Ok;
@@ -3513,7 +3508,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
                 let _ = stream.drain_pending();
 
-                if stream.output.avail_out == 0 {
+                if stream.output.remaining == 0 {
                     stream.state.last_flush = -1; /* avoid BUF_ERROR at next call, see above */
                     return ReturnCode::Ok;
                 }
@@ -3580,7 +3575,7 @@ pub fn drain_pending_output(state: &mut State<'_>, output: &mut OutputCursor) ->
         state.bit_writer.pending.advance(len);
     }
 
-    if output.avail_out == 0 {
+    if output.remaining == 0 {
         DrainOutcome::OutputFull
     } else {
         DrainOutcome::Ready
@@ -5871,14 +5866,11 @@ mod test {
         let second = with_compressor(&mut stream, |compressor| {
             assert_eq!(compressor.input.consumed_here(), 0);
             assert_eq!(compressor.input.avail_in, 3);
-            assert_eq!(compressor.output.avail_out, 13);
+            assert_eq!(compressor.output.remaining, 13);
             assert_eq!(compressor.checksum.value(), stream_adler);
             compressor.input.consume(2);
             compressor.output.write_all(&source[5..7]);
-            (
-                compressor.input.consumed_here(),
-                compressor.output.total_out,
-            )
+            (compressor.input.consumed_here(), compressor.output.total)
         });
         assert_eq!(second, (2, 3));
         assert_eq!(stream.avail_in, 1);

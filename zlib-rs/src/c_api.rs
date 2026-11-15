@@ -128,8 +128,13 @@ impl z_stream {
 pub type z_size = c_ulong;
 pub type z_checksum = c_ulong;
 
-// opaque to the user
-pub enum internal_state {}
+// Opaque to C callers: only a pointer to this zero-sized, private
+// representation crosses the ABI. Its actual allocation is the internal
+// inflate or deflate state, never an instance of this marker.
+#[repr(C)]
+pub struct internal_state {
+    _private: [u8; 0],
+}
 
 pub const Z_NO_FLUSH: c_int = 0;
 pub const Z_PARTIAL_FLUSH: c_int = 1;

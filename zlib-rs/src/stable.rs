@@ -293,19 +293,19 @@ impl Inflate {
 pub enum DeflateError {
     /// The [`Deflate`] is in an inconsistent state, most likely
     /// due to an invalid configuration parameter.
-    StreamError = -2,
+    InvalidStream = -2,
     /// The input is not a valid deflate stream.
-    DataError = -3,
+    InvalidData = -3,
     /// A memory allocation failed.
-    MemError = -4,
+    OutOfMemory = -4,
 }
 
 impl From<DeflateError> for ReturnCode {
     fn from(value: DeflateError) -> Self {
         match value {
-            DeflateError::StreamError => Self::StreamError,
-            DeflateError::DataError => Self::DataError,
-            DeflateError::MemError => Self::MemError,
+            DeflateError::InvalidStream => Self::StreamError,
+            DeflateError::InvalidData => Self::DataError,
+            DeflateError::OutOfMemory => Self::MemError,
         }
     }
 }
@@ -324,9 +324,9 @@ impl From<ReturnCode> for Result<Status, DeflateError> {
             ReturnCode::StreamEnd => Ok(Status::StreamEnd),
             ReturnCode::NeedDict => unreachable!("compression does not use dictionary"),
             ReturnCode::ErrNo => unreachable!("the rust API does not use files"),
-            ReturnCode::StreamError => Err(DeflateError::StreamError),
-            ReturnCode::DataError => Err(DeflateError::DataError),
-            ReturnCode::MemError => Err(DeflateError::MemError),
+            ReturnCode::StreamError => Err(DeflateError::InvalidStream),
+            ReturnCode::DataError => Err(DeflateError::InvalidData),
+            ReturnCode::MemError => Err(DeflateError::OutOfMemory),
             ReturnCode::BufError => Ok(Status::BufError),
             ReturnCode::VersionError => unreachable!("the rust API does not use the version"),
         }
@@ -396,9 +396,9 @@ impl Deflate {
     /// Reports invalid configuration or failed state allocation.
     pub fn new_with_config(config: DeflateConfig) -> Result<Self, DeflateError> {
         let inner = crate::deflate::DeflateStream::new(config).map_err(|status| match status {
-            ReturnCode::MemError => DeflateError::MemError,
-            ReturnCode::DataError => DeflateError::DataError,
-            _ => DeflateError::StreamError,
+            ReturnCode::MemError => DeflateError::OutOfMemory,
+            ReturnCode::DataError => DeflateError::InvalidData,
+            _ => DeflateError::InvalidStream,
         })?;
         Ok(Self {
             inner,
@@ -478,7 +478,7 @@ impl Deflate {
         self.inner.avail_out = 0;
 
         let (Some(consumed), Some(produced)) = (consumed, produced) else {
-            return Err(DeflateError::StreamError);
+            return Err(DeflateError::InvalidStream);
         };
         self.total_in = self.total_in.saturating_add(consumed);
         self.total_out = self.total_out.saturating_add(produced);
@@ -492,14 +492,14 @@ impl Deflate {
     ///
     /// # Errors
     ///
-    /// Returns [`DeflateError::StreamError`] for an invalid stream state
+    /// Returns [`DeflateError::InvalidStream`] for an invalid stream state
     /// or an unusable dictionary.
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, DeflateError> {
         match crate::deflate::set_dictionary(&mut self.inner, dictionary) {
             ReturnCode::Ok => {
-                u32::try_from(self.inner.adler).map_err(|_| DeflateError::StreamError)
+                u32::try_from(self.inner.adler).map_err(|_| DeflateError::InvalidStream)
             }
-            ReturnCode::StreamError => Err(DeflateError::StreamError),
+            ReturnCode::StreamError => Err(DeflateError::InvalidStream),
             other => unreachable!("set_dictionary does not return {other:?}"),
         }
     }
@@ -517,7 +517,7 @@ impl Deflate {
     ///
     /// # Errors
     ///
-    /// Returns [`DeflateError::StreamError`] for invalid compression
+    /// Returns [`DeflateError::InvalidStream`] for invalid compression
     /// parameters or an invalid stream state.
     pub fn set_level(&mut self, level: i32) -> Result<Status, DeflateError> {
         // Clear these pointers so there can be no use after free.
@@ -529,7 +529,7 @@ impl Deflate {
 
         match crate::deflate::params(&mut self.inner, level, crate::deflate::Strategy::default()) {
             ReturnCode::Ok => Ok(Status::Ok),
-            ReturnCode::StreamError => Err(DeflateError::StreamError),
+            ReturnCode::StreamError => Err(DeflateError::InvalidStream),
             ReturnCode::BufError => Ok(Status::BufError),
             other => unreachable!("set_level does not return {other:?}"),
         }

@@ -1291,8 +1291,7 @@ fn decode_huffman_code<const LITERAL_LENGTH: bool>(
         reader.pull_byte()?;
     };
 
-    let mut prefix_bits = 0;
-    if here.op & 0xf0 == 0 && (!LITERAL_LENGTH || here.op != 0) {
+    let prefix_bits = if here.op & 0xf0 == 0 && (!LITERAL_LENGTH || here.op != 0) {
         let last = here;
         here = loop {
             let bits = reader.bits_u16(usize::from(last.bits + last.op));
@@ -1303,8 +1302,10 @@ fn decode_huffman_code<const LITERAL_LENGTH: bool>(
             reader.pull_byte()?;
         };
         reader.drop_bits(last.bits);
-        prefix_bits = usize::from(last.bits);
-    }
+        usize::from(last.bits)
+    } else {
+        0
+    };
 
     reader.drop_bits(here.bits);
     Ok(DecodedHuffmanCode {
@@ -2974,17 +2975,14 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
     // SAFETY: `allocate_state` initialized a regular `State` behind the ABI state pointer.
-    if let Some(stream) = unsafe { InflateStream::from_stream_mut(stream) } {
-        let ret = reset_with_config(stream, config);
-
-        if ret != ReturnCode::Ok {
-            end(stream);
-        }
-
-        ret
-    } else {
-        ReturnCode::StreamError
+    let Some(stream) = (unsafe { InflateStream::from_stream_mut(stream) }) else {
+        return ReturnCode::StreamError;
+    };
+    let ret = reset_with_config(stream, config);
+    if ret != ReturnCode::Ok {
+        end(stream);
     }
+    ret
 }
 
 pub fn reset_with_config(stream: &mut InflateStream, config: InflateConfig) -> ReturnCode {
