@@ -7082,6 +7082,72 @@ mod test {
         }
     }
 
+    /// Owns the initialized C state while leaving the `z_stream` at its
+    /// original stack address. Every test exit, including error propagation
+    /// and assertion panics, releases it once instead of leaking the state.
+    struct ScopedDeflateStream<'a> {
+        raw: &'a mut z_stream,
+    }
+
+    impl<'a> ScopedDeflateStream<'a> {
+        fn new(
+            raw: &'a mut z_stream,
+            config: DeflateConfig,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let code = init(raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        fn stream(&mut self) -> Result<&mut DeflateStream<'_>, SchedulerFixtureError> {
+            // SAFETY: construction succeeded and this guard exclusively holds
+            // the original z_stream until Drop invokes end().
+            unsafe { DeflateStream::from_stream_mut(self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("initialized native stream missing"),
+            )
+        }
+    }
+
+    impl Drop for ScopedDeflateStream<'_> {
+        fn drop(&mut self) {
+            // SAFETY: successful construction installed a live state in raw;
+            // the accessor checks whether a prior call already ended it.
+            if let Some(stream) = unsafe { DeflateStream::from_stream_mut(self.raw) } {
+                let _ = end(stream);
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_deflate_stream_releases_state_on_normal_and_error_exits(
+    ) -> Result<(), SchedulerFixtureError> {
+        fn abort(raw: &mut z_stream) -> Result<(), SchedulerFixtureError> {
+            let mut owned = ScopedDeflateStream::new(raw, DeflateConfig::default())?;
+            let _stream = owned.stream()?;
+            Err(SchedulerFixtureError::Invariant("intentional early exit"))
+        }
+
+        let mut raw = z_stream::default();
+        {
+            let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+            let stream = owned.stream()?;
+            assert_eq!(stream.total_in, 0);
+        }
+        assert!(raw.state.is_null(), "scope exit must release native state");
+
+        assert!(matches!(
+            abort(&mut raw),
+            Err(SchedulerFixtureError::Invariant(_))
+        ));
+        assert!(
+            raw.state.is_null(),
+            "early return must release native state"
+        );
+        Ok(())
+    }
+
     struct RoundRobinCore<'input> {
         raw: z_stream,
         source: &'input [u8],
@@ -7706,7 +7772,7 @@ mod test {
 
     #[test]
     fn tuned_medium_long_chain_still_yields_detached_match_search(
-    ) -> Result<(), crate::deflate::longest_match::MatchSearchError> {
+    ) -> Result<(), SchedulerFixtureError> {
         let input_bytes = b"tuned-medium-detached-search/".repeat(2_000);
         let config = DeflateConfig {
             level: 6,
@@ -7716,15 +7782,17 @@ mod test {
             strategy: Strategy::Default,
         };
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
         assert_eq!(tune(stream, 8, 16, 128, 129), ReturnCode::Ok);
         stream.next_in = input_bytes.as_ptr().cast_mut();
-        stream.avail_in = input_bytes.len() as _;
+        stream.avail_in = crate::c_api::uInt::try_from(input_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test input exceeds C uInt"))?;
         let mut core =
             algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &stream.state)
-                .unwrap();
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "standard core unavailable",
+                ))?;
 
         let search = loop {
             match core.next_event(&mut stream.state) {
@@ -7746,25 +7814,28 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
-                algorithm::CoreEvent::MatchSearchError(error) => return Err(error),
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error.into()),
                 algorithm::CoreEvent::TokenBlockReady(_) => {
-                    panic!("tuned Medium filled a token block before yielding match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "tuned Medium filled a token block before yielding work",
+                    ));
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
-                    panic!("test input exhausted before tuned Medium yielded match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "tuned Medium exhausted input before yielding work",
+                    ));
                 }
             }
         };
 
         let result = search.request(&stream.state)?.execute();
         core.complete_match_search(&mut stream.state, result)?;
-        let _ = end(stream);
         Ok(())
     }
 
     #[test]
     fn standard_core_rejects_production_before_match_search_completes(
-    ) -> Result<(), crate::deflate::longest_match::MatchSearchError> {
+    ) -> Result<(), SchedulerFixtureError> {
         let input_bytes = b"detached-match-search/".repeat(2_000);
         let config = DeflateConfig {
             level: 7,
@@ -7774,14 +7845,16 @@ mod test {
             strategy: Strategy::Default,
         };
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
         stream.next_in = input_bytes.as_ptr().cast_mut();
-        stream.avail_in = input_bytes.len() as _;
+        stream.avail_in = crate::c_api::uInt::try_from(input_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test input exceeds C uInt"))?;
         let mut core =
             algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Slow, &stream.state)
-                .unwrap();
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "standard core unavailable",
+                ))?;
 
         let search = loop {
             match core.next_event(&mut stream.state) {
@@ -7803,12 +7876,16 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
-                algorithm::CoreEvent::MatchSearchError(error) => return Err(error),
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error.into()),
                 algorithm::CoreEvent::TokenBlockReady(_) => {
-                    panic!("Slow filled a token block before yielding match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "Slow emitted a token block before yielding work",
+                    ));
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
-                    panic!("test input exhausted before yielding match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "Slow exhausted input before yielding work",
+                    ));
                 }
             }
         };
@@ -7831,17 +7908,20 @@ mod test {
                 | algorithm::CoreEvent::EndOfInput(_)
         ));
 
-        let _ = end(stream);
         Ok(())
     }
 
     #[test]
     fn standard_core_rejects_production_before_pending_output_is_drained(
-    ) -> Result<(), crate::deflate::longest_match::MatchSearchError> {
+    ) -> Result<(), SchedulerFixtureError> {
         let mut input_bytes = Vec::with_capacity(40_000);
         for i in 0..2_000usize {
             input_bytes.extend_from_slice(b"must-drain-before-producing/");
-            input_bytes.extend_from_slice(&(i as u32).to_le_bytes());
+            input_bytes.extend_from_slice(
+                &u32::try_from(i)
+                    .map_err(|_| SchedulerFixtureError::Invariant("fixture row too large"))?
+                    .to_le_bytes(),
+            );
         }
 
         let config = DeflateConfig {
@@ -7852,14 +7932,16 @@ mod test {
             strategy: Strategy::Default,
         };
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
         stream.next_in = input_bytes.as_ptr().cast_mut();
-        stream.avail_in = input_bytes.len() as _;
+        stream.avail_in = crate::c_api::uInt::try_from(input_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test input exceeds C uInt"))?;
         let mut core =
             algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &stream.state)
-                .unwrap();
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "standard core unavailable",
+                ))?;
 
         let pending = loop {
             match core.next_event(&mut stream.state) {
@@ -7884,12 +7966,14 @@ mod test {
                     let result = work.request(&stream.state)?.execute();
                     core.complete_match_search(&mut stream.state, result)?;
                 }
-                algorithm::CoreEvent::MatchSearchError(error) => return Err(error),
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error.into()),
                 algorithm::CoreEvent::TokenBlockReady(work) => {
                     break core.encode_token_block(&mut stream.state, work);
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
-                    panic!("test input exhausted before producing a token block")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "Fast exhausted input before producing a token block",
+                    ));
                 }
             }
         };
@@ -7904,7 +7988,8 @@ mod test {
 
         let mut output_bytes = vec![0u8; compress_bound(input_bytes.len()) + 64];
         stream.next_out = output_bytes.as_mut_ptr();
-        stream.avail_out = output_bytes.len() as _;
+        stream.avail_out = crate::c_api::uInt::try_from(output_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test output exceeds C uInt"))?;
         let mut output = OutputCursor::from_stream(stream);
         assert!(matches!(
             core.drain_output(&mut stream.state, &mut output, pending),
@@ -7913,7 +7998,6 @@ mod test {
         output.apply(stream);
 
         // This test bypasses the outer zlib status machine; only ensure the allocation is released.
-        let _ = end(stream);
         Ok(())
     }
 
