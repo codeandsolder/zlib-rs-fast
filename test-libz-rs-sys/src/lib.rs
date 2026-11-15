@@ -510,37 +510,39 @@ mod null {
     }
 
     #[test]
-    fn inflate_end_after_inflate() {
+    fn inflate_end_after_inflate() -> Result<(), ()> {
         use libz_rs_sys::*;
+        const EXPECTED: &[u8] = b"Ferris";
 
-        // SAFETY: the initialized stream, compressed input and writable output stay live until inflateEnd.
+        let mut output = [0xa5u8; 100];
+        let input_len = core::ffi::c_uint::try_from(FERRIS_BYTES.len()).map_err(|_| ())?;
+        let output_len = core::ffi::c_uint::try_from(output.len()).map_err(|_| ())?;
+
+        // SAFETY: the initialized stream, compressed source, and writable
+        // output remain alive until inflateEnd releases the stream state.
         unsafe {
-            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let mut storage = MaybeUninit::<z_stream>::zeroed();
+            let init = inflateInit_(
+                storage.as_mut_ptr(),
+                zlibVersion(),
+                crate::abi_z_stream_size(),
+            );
+            assert_eq!(init, Z_OK);
+            let stream = storage.assume_init_mut();
 
-            let err = inflateInit_(strm.as_mut_ptr(), zlibVersion(), crate::abi_z_stream_size());
-            assert_eq!(err, Z_OK);
+            stream.next_in = FERRIS_BYTES.as_ptr().cast_mut();
+            stream.avail_in = input_len;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output_len;
 
-            let strm = strm.assume_init_mut();
-
-            {
-                let mut dest = vec![0u8; 100];
-
-                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                dest.truncate(strm.total_out as usize);
-                assert_eq!(dest, b"Ferris");
-            }
-
-            let err = inflateEnd(strm);
-            assert_eq!(err, Z_OK);
+            assert_eq!(inflate(stream, Z_FINISH), Z_STREAM_END);
+            assert_eq!(usize::try_from(stream.total_out).ok(), Some(EXPECTED.len()));
+            assert_eq!(&output[..EXPECTED.len()], EXPECTED);
+            assert_eq!(output[EXPECTED.len()], 0xa5);
+            assert_eq!(stream.avail_in, 0);
+            assert_eq!(inflateEnd(stream), Z_OK);
         }
+        Ok(())
     }
 
     #[test]
@@ -1496,103 +1498,85 @@ mod null {
     }
 
     #[test]
-    fn inflate_reset_after_inflate() {
-        // SAFETY: The initialized inflate stream and compressed/output buffers remain live through reset/end.
+    fn inflate_reset_after_inflate() -> Result<(), ()> {
+        const EXPECTED: &[u8] = b"Ferris";
+
+        // SAFETY: both output buffers and the compressed source remain live
+        // until the final inflateEnd; reset never retains a dangling pointer.
         assert_eq_rs_ng!(unsafe {
-            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let mut outputs = [[0xa5u8; 100]; 2];
+            let input_len = core::ffi::c_uint::try_from(FERRIS_BYTES.len()).map_err(|_| ())?;
+            let output_len = core::ffi::c_uint::try_from(outputs[0].len()).map_err(|_| ())?;
+            let mut storage = MaybeUninit::<z_stream>::zeroed();
+            assert_eq!(
+                inflateInit_(
+                    storage.as_mut_ptr(),
+                    zlibVersion(),
+                    crate::abi_z_stream_size()
+                ),
+                Z_OK
+            );
+            let stream = storage.assume_init_mut();
 
-            let err = inflateInit_(strm.as_mut_ptr(), zlibVersion(), crate::abi_z_stream_size());
-            assert_eq!(err, Z_OK);
+            for (cycle, output) in outputs.iter_mut().enumerate() {
+                if cycle != 0 {
+                    assert_eq!(inflateReset(stream), Z_OK);
+                }
+                stream.next_in = FERRIS_BYTES.as_ptr().cast_mut();
+                stream.avail_in = input_len;
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = output_len;
 
-            let strm = strm.assume_init_mut();
-
-            {
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
+                assert_eq!(inflate(stream, Z_FINISH), Z_STREAM_END);
+                assert_eq!(usize::try_from(stream.total_out).ok(), Some(EXPECTED.len()));
+                assert_eq!(&output[..EXPECTED.len()], EXPECTED);
+                assert_eq!(output[EXPECTED.len()], 0xa5);
             }
-
-            let err = inflateReset(strm);
-            assert_eq!(err, Z_OK);
-
-            {
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
-            }
-
-            let err = inflateEnd(strm);
-            assert_eq!(err, Z_OK);
-        });
+            assert_eq!(inflateEnd(stream), Z_OK);
+            Ok::<(), ()>(())
+        })?;
+        Ok(())
     }
 
     #[test]
-    fn inflate_reset_keep_after_inflate() {
+    fn inflate_reset_keep_after_inflate() -> Result<(), ()> {
         use libz_rs_sys::*;
+        const EXPECTED: &[u8] = b"Ferris";
 
-        // SAFETY: The live inflate state and buffers remain valid throughout reset-keep and final cleanup.
+        // SAFETY: both output buffers, compressed input, and stream storage
+        // remain live through reset-keep and final stream teardown.
         unsafe {
-            let mut strm = MaybeUninit::<z_stream>::zeroed();
+            let mut outputs = [[0xa5u8; 100]; 2];
+            let input_len = core::ffi::c_uint::try_from(FERRIS_BYTES.len()).map_err(|_| ())?;
+            let output_len = core::ffi::c_uint::try_from(outputs[0].len()).map_err(|_| ())?;
+            let mut storage = MaybeUninit::<z_stream>::zeroed();
+            assert_eq!(
+                inflateInit_(
+                    storage.as_mut_ptr(),
+                    zlibVersion(),
+                    crate::abi_z_stream_size()
+                ),
+                Z_OK
+            );
+            let stream = storage.assume_init_mut();
 
-            let err = inflateInit_(strm.as_mut_ptr(), zlibVersion(), crate::abi_z_stream_size());
-            assert_eq!(err, Z_OK);
+            for (cycle, output) in outputs.iter_mut().enumerate() {
+                if cycle != 0 {
+                    assert_eq!(inflateResetKeep(stream), Z_OK);
+                }
+                stream.next_in = FERRIS_BYTES.as_ptr().cast_mut();
+                stream.avail_in = input_len;
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = output_len;
 
-            let strm = strm.assume_init_mut();
-
-            {
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
+                assert_eq!(inflate(stream, Z_FINISH), Z_STREAM_END);
+                assert_eq!(usize::try_from(stream.total_out).ok(), Some(EXPECTED.len()));
+                assert_eq!(&output[..EXPECTED.len()], EXPECTED);
+                assert_eq!(output[EXPECTED.len()], 0xa5);
             }
-
-            let err = inflateResetKeep(strm);
-            assert_eq!(err, Z_OK);
-
-            {
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
-            }
-
-            let err = inflateEnd(strm);
-            assert_eq!(err, Z_OK);
+            assert_eq!(inflateEnd(stream), Z_OK);
         }
+        Ok(())
     }
 
     #[test]
@@ -1933,58 +1917,46 @@ mod coverage {
     }
 
     #[test]
-    fn deflate_reset_after_deflate() {
+    fn deflate_reset_after_deflate() -> Result<(), ()> {
+        const EXPECTED: &[u8] = &super::null::FERRIS_BYTES;
         let input = b"Ferris";
 
-        // SAFETY: The initialized stream and both buffer lifetimes extend through deflateReset and end.
+        // SAFETY: source, both output buffers, and initialized stream state
+        // remain allocated through deflateReset and deflateEnd.
         assert_eq_rs_ng!(unsafe {
-            let mut strm = MaybeUninit::<z_stream>::zeroed();
-
-            let err = deflateInit_(
-                strm.as_mut_ptr(),
-                6,
-                zlibVersion(),
-                crate::abi_z_stream_size(),
+            let mut outputs = [[0xa5u8; 64]; 2];
+            let input_len = core::ffi::c_uint::try_from(input.len()).map_err(|_| ())?;
+            let output_len = core::ffi::c_uint::try_from(outputs[0].len()).map_err(|_| ())?;
+            let mut storage = MaybeUninit::<z_stream>::zeroed();
+            assert_eq!(
+                deflateInit_(
+                    storage.as_mut_ptr(),
+                    6,
+                    zlibVersion(),
+                    crate::abi_z_stream_size()
+                ),
+                Z_OK
             );
-            assert_eq!(err, Z_OK);
+            let stream = storage.assume_init_mut();
 
-            let strm = strm.assume_init_mut();
+            for (cycle, output) in outputs.iter_mut().enumerate() {
+                if cycle != 0 {
+                    assert_eq!(deflateReset(stream), Z_OK);
+                }
+                stream.next_in = input.as_ptr().cast_mut();
+                stream.avail_in = input_len;
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = output_len;
 
-            {
-                let mut buf = [0; 64];
-
-                strm.next_in = input.as_ptr().cast_mut();
-                strm.avail_in = input.len() as _;
-
-                strm.next_out = buf.as_mut_ptr();
-                strm.avail_out = buf.len() as _;
-
-                let err = deflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&buf[..strm.total_out as usize], super::null::FERRIS_BYTES);
+                assert_eq!(deflate(stream, Z_FINISH), Z_STREAM_END);
+                assert_eq!(usize::try_from(stream.total_out).ok(), Some(EXPECTED.len()));
+                assert_eq!(&output[..EXPECTED.len()], EXPECTED);
+                assert_eq!(output[EXPECTED.len()], 0xa5);
             }
-
-            let err = deflateReset(strm);
-            assert_eq!(err, Z_OK);
-
-            {
-                let mut buf = [0; 64];
-
-                strm.next_in = input.as_ptr().cast_mut();
-                strm.avail_in = input.len() as _;
-
-                strm.next_out = buf.as_mut_ptr();
-                strm.avail_out = buf.len() as _;
-
-                let err = deflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END,);
-
-                assert_eq!(&buf[..strm.total_out as usize], super::null::FERRIS_BYTES);
-            }
-
-            deflateEnd(strm);
-        });
+            assert_eq!(deflateEnd(stream), Z_OK);
+            Ok::<(), ()>(())
+        })?;
+        Ok(())
     }
 }
 
