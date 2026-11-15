@@ -7,6 +7,8 @@ use zlib_rs::c_api::*;
 
 use libc::size_t;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -47,19 +49,6 @@ fn path(prefix: &Path, file: &str) -> String {
     path_buf.to_string_lossy().into_owned()
 }
 
-// Return an open(2) mode, modified as needed to support binary files on the target platform.
-fn binary_mode(mode: c_int) -> c_int {
-    #[cfg(target_os = "windows")]
-    {
-        mode | libc::O_BINARY
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        mode
-    }
-}
-
 // Try to gzopen a file path with a specified mode, and panic if the result is unexpected.
 // NOTE: This is a macro, instead of a function, so that the test runner will report errors
 // with the line number where it is invoked.
@@ -83,25 +72,6 @@ macro_rules! test_open {
     };
 }
 
-// Variant of `test_open` that takes a file descriptor
-macro_rules! test_fdopen {
-    ($fd:expr, $mode:expr, $should_succeed:expr) => {
-        let cmode = CString::new($mode).map_err(|_| ())?;
-        // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
-        let handle = unsafe { gzdopen($fd, cmode.as_ptr()) };
-        assert_eq!(
-            $should_succeed,
-            !handle.is_null(),
-            "gzdopen({}, {})",
-            $fd,
-            $mode
-        );
-        if !handle.is_null() {
-            // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
-            assert_eq!(unsafe { gzclose(handle) }, Z_OK, "gzclose({}) error", $fd);
-        }
-    };
-}
 #[test]
 fn open_close() -> Result<(), ()> {
     // Open a valid file for reading
@@ -127,12 +97,19 @@ fn open_close() -> Result<(), ()> {
     // SAFETY: the null handle deliberately exercises gzclose’s checked Z_STREAM_ERROR path; no object is dereferenced.
     assert_eq!(unsafe { gzclose(ptr::null_mut()) }, Z_STREAM_ERROR);
 
-    // Initialize a gzip stream for reading using an open file descriptor
-    let cpath = CString::new(crate_path("src/test-data/issue-109.gz")).map_err(|_| ())?;
-    // SAFETY: the pathname comes from live NUL-terminated CString storage, and flags are passed by value.
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
-    assert_ne!(fd, -1);
-    test_fdopen!(fd, "r", true);
+    // gzdopen takes descriptor ownership only on success. If it rejects the
+    // mode or descriptor, File closes it rather than leaking it.
+    let raw_file = std::fs::File::open(crate_path("src/test-data/issue-109.gz")).map_err(|_| ())?;
+    // SAFETY: the descriptor is open and owned by raw_file, while the mode
+    // string is statically allocated and NUL terminated.
+    let handle = unsafe { gzdopen(raw_file.as_raw_fd(), c"r".as_ptr()) };
+    if handle.is_null() {
+        return Err(());
+    }
+    std::mem::forget(raw_file);
+    // SAFETY: successful gzdopen owns the descriptor and the handle; gzclose
+    // closes both exactly once.
+    assert_eq!(unsafe { gzclose(handle) }, Z_OK);
     Ok(())
 }
 
@@ -414,29 +391,18 @@ fn gzread_special_cases() -> Result<(), ()> {
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
     let old_size = file_size(&file_name).map_err(|_| ())?;
-    // SAFETY: the pathname comes from live NUL-terminated CString storage, and flags are passed by value.
-    let fd = unsafe {
-        libc::open(
-            CString::new(file_name.as_str()).map_err(|_| ())?.as_ptr(),
-            binary_mode(libc::O_APPEND | libc::O_WRONLY),
-        )
-    };
-    assert_ne!(fd, -1);
-    assert_eq!(
-        // SAFETY: the file descriptor is an integer and the source points to initialized readable bytes of the supplied length.
-        unsafe {
-            libc::write(
-                fd,
-                STRING2.as_ptr().cast::<c_void>(),
-                checked_test_len(STRING2.len()),
-            )
-        },
-        checked_test_len(STRING2.len())
-    );
-    // SAFETY: the integer descriptor is owned by this test and has not yet been closed.
-    assert_eq!(unsafe { libc::close(fd) }, 0);
+    // The append must be complete even when the OS returns partial writes;
+    // File also ensures cleanup on any I/O failure.
+    {
+        let mut output = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_name)
+            .map_err(|_| ())?;
+        output.write_all(STRING2).map_err(|_| ())?;
+        output.flush().map_err(|_| ())?;
+    }
     let new_size = file_size(&file_name).map_err(|_| ())?;
-    assert_eq!(new_size, old_size + STRING2.len());
+    assert_eq!(new_size, old_size.checked_add(STRING2.len()).ok_or(())?);
     // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
     let file = unsafe {
         gzopen(
@@ -446,7 +412,7 @@ fn gzread_special_cases() -> Result<(), ()> {
     };
     assert!(!file.is_null());
     // Read more than expected to make sure we get everything.
-    let mut buf = [0u8; STRING1.len() + 1];
+    let mut buf = [0xa5u8; STRING1.len() + 1];
     assert_eq!(
         // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -458,6 +424,9 @@ fn gzread_special_cases() -> Result<(), ()> {
         },
         checked_test_len(STRING1.len())
     );
+    assert_eq!(&buf[..STRING1.len()], STRING1);
+    // Verify that no byte beyond the reported output span was overwritten.
+    assert_eq!(buf[STRING1.len()], 0xa5);
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
     Ok(())
@@ -2165,17 +2134,7 @@ fn gzseek_read() -> Result<(), ()> {
     // all the implementation paths for gzseek.
     let gzip_file_name = crate_path("src/test-data/issue-109.gz");
     let direct_file_name = path(temp_path, "uncompressed");
-    // SAFETY: the pathname comes from live NUL-terminated CString storage, and flags are passed by value.
-    let fd = unsafe {
-        libc::open(
-            CString::new(direct_file_name.as_str())
-                .map_err(|_| ())?
-                .as_ptr(),
-            binary_mode(libc::O_CREAT | libc::O_WRONLY),
-            0o644,
-        )
-    };
-    assert_ne!(fd, -1);
+    let mut direct_file = std::fs::File::create(&direct_file_name).map_err(|_| ())?;
     // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
     let file = unsafe {
         gzopen(
@@ -2186,7 +2145,7 @@ fn gzseek_read() -> Result<(), ()> {
         )
     };
     assert!(!file.is_null());
-    let mut buf = [0u8; 65536];
+    let mut buf = vec![0u8; 65_536];
     loop {
         // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
         let ret = unsafe {
@@ -2196,20 +2155,18 @@ fn gzseek_read() -> Result<(), ()> {
                 checked_test_len(buf.len()),
             )
         };
-        assert_ne!(ret, -1);
-        if ret == 0 {
+        // The signed C return must be a valid Rust slice bound.
+        let read = usize::try_from(ret).map_err(|_| ())?;
+        assert!(read <= buf.len());
+        if read == 0 {
             break;
         }
-        assert_eq!(
-            // SAFETY: the file descriptor is an integer and the source points to initialized readable bytes of the supplied length.
-            unsafe { libc::write(fd, buf.as_mut_ptr().cast::<c_void>(), ret as _) },
-            ret as _
-        );
+        direct_file.write_all(&buf[..read]).map_err(|_| ())?;
     }
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
-    // SAFETY: the integer descriptor is owned by this test and has not yet been closed.
-    assert_eq!(unsafe { libc::close(fd) }, 0);
+    direct_file.flush().map_err(|_| ())?;
+    drop(direct_file);
 
     for file_name in [direct_file_name, gzip_file_name] {
         // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
