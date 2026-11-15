@@ -35,17 +35,23 @@ struct Stats {
     iters: usize,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
+    if args.len() == 2 && args[1] == "--self-test" {
+        self_test()?;
+        println!("single-stream benchmark invariants passed");
+        return Ok(());
+    }
     let full = args.iter().any(|arg| arg == "--full");
     let sweep = args.iter().any(|arg| arg == "--sweep");
     let profile = args.iter().any(|arg| arg == "--profile");
     let profile_iters = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--profile-iters="))
-        .map_or(Ok(1usize), str::parse)
-        .expect("--profile-iters must be a positive integer");
-    assert!(profile_iters != 0, "--profile-iters must be nonzero");
+        .map_or(Ok(1usize), str::parse)?;
+    if profile_iters == 0 {
+        return Err("--profile-iters must be nonzero".into());
+    }
     let mut cases = if sweep {
         sweep_cases()
     } else if full {
@@ -62,22 +68,21 @@ fn main() {
         for case in cases {
             profile_case(case, profile_iters);
         }
-        return;
+        return Ok(());
     }
 
     let (target, samples) = benchmark_shape(full);
 
     println!("zlib-rs single-stream benchmark");
     println!(
-        "mode: {} | sample target: {:?} x {} samples | synthetic inputs",
+        "mode: {} | sample target: {target:?} x {samples} samples | synthetic inputs",
         if full { "full" } else { "quick" },
-        target,
-        samples
     );
 
     for case in cases {
-        run_case(case, full);
+        run_case(case, full)?;
     }
+    Ok(())
 }
 
 fn quick_cases() -> Vec<Case> {
@@ -187,18 +192,16 @@ fn profile_case(case: Case, iters: usize) {
     black_box((&input, &output, written_len));
 
     println!(
-        "{:<22} {:?} {:>4} KiB L{} | {} bytes ({:.4}) | {} compression iteration(s)",
+        "{:<22} {:?} {:>4} KiB L{} | {written_len} bytes ({ratio:.4}) | {iters} compression iteration(s)",
         case.name,
         case.corpus,
         case.bytes / 1024,
         case.level,
-        written_len,
-        written_len as f64 / input.len() as f64,
-        iters,
+        ratio = approximately_f64(written_len) / approximately_f64(input.len()),
     );
 }
 
-fn run_case(case: Case, full: bool) {
+fn run_case(case: Case, full: bool) -> Result<(), std::num::TryFromIntError> {
     let input = make_input(case.corpus, case.bytes, 0x1234_5678_9abc_def0);
     let config = DeflateConfig::new(case.level);
     let mut output = vec![0u8; compress_bound(input.len()) + 64];
@@ -208,7 +211,7 @@ fn run_case(case: Case, full: bool) {
         assert_eq!(code, ReturnCode::Ok);
         (
             written.len(),
-            written.len() as f64 / input.len().max(1) as f64,
+            approximately_f64(written.len()) / approximately_f64(input.len().max(1)),
         )
     };
 
@@ -218,23 +221,22 @@ fn run_case(case: Case, full: bool) {
         assert_eq!(written.len(), reference_len);
         written.len()
     };
-    let stats = measure(&mut run, full);
+    let stats = measure(&mut run, full)?;
     drop(run);
     black_box(&output);
 
-    let mib_per_s = case.bytes as f64 / MIB / stats.median.as_secs_f64();
+    let mib_per_s = approximately_f64(case.bytes) / MIB / stats.median.as_secs_f64();
     println!(
-        "{:<22} {:?} {:>4} KiB L{} ratio {:.3} | {:8.1} MiB/s | median {:8.3} ms | min {:8.3} ms | iters/sample {}",
+        "{:<22} {:?} {:>4} KiB L{} ratio {ratio:.3} | {mib_per_s:8.1} MiB/s | median {:8.3} ms | min {:8.3} ms | iters/sample {}",
         case.name,
         case.corpus,
         case.bytes / 1024,
         case.level,
-        ratio,
-        mib_per_s,
         stats.median.as_secs_f64() * 1e3,
         stats.min.as_secs_f64() * 1e3,
         stats.iters,
     );
+    Ok(())
 }
 
 const fn benchmark_shape(full: bool) -> (Duration, usize) {
@@ -245,12 +247,16 @@ const fn benchmark_shape(full: bool) -> (Duration, usize) {
     }
 }
 
-fn measure(run: &mut impl FnMut() -> usize, full: bool) -> Stats {
+fn measure(
+    run: &mut impl FnMut() -> usize,
+    full: bool,
+) -> Result<Stats, std::num::TryFromIntError> {
     let start = Instant::now();
     black_box(run());
     let first = start.elapsed();
     let (sample_target, sample_count) = benchmark_shape(full);
-    let iters = iterations_for(first, sample_target);
+    let iters = iterations_for(first, sample_target)?;
+    let divisor = u32::try_from(iters)?;
     let mut samples = Vec::with_capacity(sample_count);
 
     for _ in 0..sample_count {
@@ -260,30 +266,59 @@ fn measure(run: &mut impl FnMut() -> usize, full: bool) -> Stats {
             sink ^= black_box(run());
         }
         black_box(sink);
-        samples.push(start.elapsed() / iters as u32);
+        samples.push(start.elapsed() / divisor);
     }
     samples.sort_unstable();
 
-    Stats {
+    Ok(Stats {
         median: samples[samples.len() / 2],
         min: samples[0],
         iters,
-    }
+    })
 }
 
-fn iterations_for(one: Duration, sample_target: Duration) -> usize {
+fn iterations_for(
+    one: Duration,
+    sample_target: Duration,
+) -> Result<usize, std::num::TryFromIntError> {
     if one.is_zero() {
-        return MAX_SAMPLE_ITERS;
+        return Ok(MAX_SAMPLE_ITERS);
     }
-    ((sample_target.as_nanos() / one.as_nanos()).max(1) as usize).min(MAX_SAMPLE_ITERS)
+    // Ceiling keeps a calibration estimate from systematically missing its
+    // sample target, without rounding through f64 or truncating host widths.
+    let maximum = u128::try_from(MAX_SAMPLE_ITERS)?;
+    usize::try_from(
+        sample_target
+            .as_nanos()
+            .div_ceil(one.as_nanos())
+            .clamp(1, maximum),
+    )
+}
+
+/// Approximate a potentially full-width usize only for human-readable rates.
+/// Bytewise construction avoids silently narrowing large future corpus sizes.
+fn approximately_f64(value: usize) -> f64 {
+    value
+        .to_be_bytes()
+        .into_iter()
+        .fold(0.0, |sum, octet| sum.mul_add(256.0, f64::from(octet)))
 }
 
 fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
     match corpus {
         Corpus::Repetitive => {
             const PATTERN: &[u8] = b"zlib-rs portable SIMD single stream / ";
+            // Match the previous release-mode low-word truncation and wrapping
+            // arithmetic on both 32/64-bit targets without unchecked casts.
+            let phase = seed
+                .to_be_bytes()
+                .into_iter()
+                .fold(0usize, |word, byte| {
+                    word.wrapping_mul(256).wrapping_add(usize::from(byte))
+                })
+                .wrapping_mul(7);
             (0..len)
-                .map(|i| PATTERN[(i + seed as usize * 7) % PATTERN.len()])
+                .map(|i| PATTERN[i.wrapping_add(phase) % PATTERN.len()])
                 .collect()
         }
         Corpus::Structured => {
@@ -310,9 +345,34 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;
-                    state as u8
+                    state.to_le_bytes()[0]
                 })
                 .collect()
         }
     }
+}
+
+/// This target uses Cargo harness=false, so these regressions must be run
+/// through the executable instead of silently ignored #[test] functions.
+fn self_test() -> Result<(), std::num::TryFromIntError> {
+    let target = Duration::from_millis(100);
+    assert_eq!(iterations_for(Duration::ZERO, target)?, MAX_SAMPLE_ITERS);
+    assert_eq!(
+        iterations_for(Duration::from_nanos(1), target)?,
+        MAX_SAMPLE_ITERS
+    );
+    assert_eq!(iterations_for(Duration::from_millis(25), target)?, 4);
+    assert_eq!(iterations_for(Duration::from_millis(30), target)?, 4);
+    assert_eq!(iterations_for(Duration::from_secs(1), target)?, 1);
+    assert_eq!(approximately_f64(0), 0.0);
+    assert_eq!(approximately_f64(1_048_576), 1_048_576.0);
+    for corpus in [Corpus::Repetitive, Corpus::Structured, Corpus::PseudoRandom] {
+        for seed in [0, 1, 0x1234_5678_9abc_def0, u64::MAX] {
+            let short = make_input(corpus, 31, seed);
+            let long = make_input(corpus, 129, seed);
+            assert_eq!(short, long[..short.len()]);
+            assert_eq!(make_input(corpus, 0, seed), Vec::<u8>::new());
+        }
+    }
+    Ok(())
 }
