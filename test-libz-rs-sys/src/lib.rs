@@ -141,17 +141,18 @@ macro_rules! assert_eq_rs_ng {
 #[cfg(not(miri))]
 #[cfg(test)]
 #[test]
-fn zlib_rs_is_not_zlib_ng() {
+fn zlib_rs_is_not_zlib_ng() -> Result<(), std::str::Utf8Error> {
     use std::ffi::CStr;
 
     // SAFETY: zlibVersion returns a valid static NUL-terminated version string from each ABI.
     unsafe {
         let rs = CStr::from_ptr(libz_rs_sys::zlibVersion());
-        assert!(rs.to_str().unwrap().contains("zlib-rs"));
+        assert!(rs.to_str()?.contains("zlib-rs"));
 
         let ng = CStr::from_ptr(libz_sys::zlibVersion());
-        assert!(ng.to_str().unwrap().contains("zlib-ng"));
+        assert!(ng.to_str()?.contains("zlib-ng"));
     }
+    Ok(())
 }
 
 /// a bit of a sanity check that nothing weird happened with symbol resolution
@@ -241,7 +242,7 @@ mod null {
         // assert_eq_rs_ng!({ crc32_combine(2, 123, -16) });
 
         // so let's just lock in what we do
-        assert_eq!(libz_rs_sys::crc32_combine(2, 123, -16), 2171032315);
+        assert_eq!(libz_rs_sys::crc32_combine(2, 123, -16), 2_171_032_315);
     }
 
     #[test]
@@ -670,8 +671,6 @@ mod null {
 
         // SAFETY: The gzip-header object and stream are live during the differential inflate test.
         assert_eq_rs_ng!(unsafe {
-            let mut strm = MaybeUninit::<z_stream>::zeroed();
-
             fn initialize_header_null() -> gz_header {
                 // Every header field is initialized *before* the C callback
                 // receives it. In particular zlib-ng does not populate all
@@ -738,6 +737,8 @@ mod null {
                 assert_eq!(head.done, 1, "gzip header must report completion");
                 Ok(())
             }
+
+            let mut strm = MaybeUninit::<z_stream>::zeroed();
 
             let err = inflateInit2_(
                 strm.as_mut_ptr(),
@@ -995,7 +996,7 @@ mod null {
                     zlib_rs::InflateConfig::default(),
                 );
                 assert_eq!(code, zlib_rs::ReturnCode::Ok);
-                assert!(plain.is_empty());
+                assert_eq!(plain, b"");
             }
             status
         });
@@ -1687,16 +1688,16 @@ mod null {
     }
 
     #[test]
-    fn inflate_with_uninitialized_output_buffer() {
+    fn inflate_with_uninitialized_output_buffer() -> Result<(), ()> {
         let input = include_bytes!("test-data/issue-109.gz");
 
         let config = InflateConfig::default();
 
         assert_eq_rs_ng!({
-            let mut stream = MaybeUninit::<z_stream>::zeroed();
-
             const VERSION: *const c_char = libz_rs_sys::zlibVersion();
             const STREAM_SIZE: c_int = crate::abi_z_stream_size();
+
+            let mut stream = MaybeUninit::<z_stream>::zeroed();
 
             // SAFETY: The zeroed z_stream storage is writable and the initializer receives the correct ABI size.
             let err = unsafe {
@@ -1714,11 +1715,11 @@ mod null {
 
             let mut output = [MaybeUninit::<u8>::uninit(); 256];
             stream.next_out = output.as_mut_ptr().cast();
-            stream.avail_out = output.len() as _;
+            stream.avail_out = core::ffi::c_uint::try_from(output.len()).map_err(|_| ())?;
 
             let chunk = &input[..128];
             stream.next_in = chunk.as_ptr().cast_mut();
-            stream.avail_in = chunk.len() as _;
+            stream.avail_in = core::ffi::c_uint::try_from(chunk.len()).map_err(|_| ())?;
 
             // SAFETY: The live compressed chunk and writable MaybeUninit output array remain valid during inflate.
             let err = unsafe { inflate(stream, InflateFlush::NoFlush as _) };
@@ -1727,7 +1728,9 @@ mod null {
             // SAFETY: The stream was initialized and is still live for the final inflateEnd call.
             let err = unsafe { inflateEnd(stream) };
             assert_eq!(err, ReturnCode::Ok as i32);
-        });
+            Ok::<(), ()>(())
+        })?;
+        Ok(())
     }
 }
 
@@ -2133,7 +2136,7 @@ fn deflate_chunked_input_all_levels() {
             def::<_, _, 0>(&mut empty_input, &mut empty_output, 6),
             Z_STREAM_ERROR
         );
-        assert!(empty_output.is_empty());
+        assert_eq!(empty_output, Vec::<u8>::new());
 
         let mut outputs = Vec::new();
 
