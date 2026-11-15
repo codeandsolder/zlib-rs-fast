@@ -646,8 +646,16 @@ impl<'a> DeflateStream<'a> {
     /// Returns the initialization status for invalid configuration or
     /// allocation failure, without constructing a partially initialized state.
     pub fn new(config: DeflateConfig) -> Result<Self, ReturnCode> {
+        Self::new_with_lit_bufsize(config, None)
+    }
+
+    /// Construct an owned compressor with the validated optional symbol-buffer capacity.
+    fn new_with_lit_bufsize(
+        config: DeflateConfig,
+        lit_bufsize_override: Option<usize>,
+    ) -> Result<Self, ReturnCode> {
         let mut inner = crate::c_api::z_stream::default();
-        let status = crate::deflate::init(&mut inner, config);
+        let status = init_with_lit_bufsize(&mut inner, config, lit_bufsize_override);
         if status != ReturnCode::Ok {
             return Err(status);
         }
@@ -3622,6 +3630,104 @@ fn emit_planned_near_optimal_block(
     drain_near_optimal_pending(state, output, produced)
 }
 
+/// Encode the planned blocks, wrapper and checksum using a live compressor state.
+/// Allocation and unconditional cleanup belong to the owned API wrapper.
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
+fn encode_near_optimal_with_state(
+    state: &mut State<'_>,
+    output: &mut [u8],
+    input: &[u8],
+    optimization_passes: usize,
+) -> Result<Option<usize>, ReturnCode> {
+    // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
+    // reservation, so every distance representable by the configured DEFLATE window is legal.
+    let max_distance = state.w_mask() + 1;
+    let ranges = near_optimal::choose_block_ranges(input, max_distance);
+    debug_assert!(ranges
+        .iter()
+        .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
+
+    // Emit the wrapper while strstart still describes the true initial state. Moving this after
+    // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
+    state
+        .bit_writer
+        .pending
+        .extend(&state.header().to_be_bytes());
+    let mut produced = 0usize;
+    let mut ok = drain_near_optimal_pending(state, output, &mut produced);
+
+    let mut ranges = ranges.into_iter();
+    // Block planning always yields at least an empty-input block. If this
+    // invariant changes, return an error rather than emitting no final block.
+    let Some(first) = ranges.next() else {
+        return Err(ReturnCode::StreamError);
+    };
+    let mut current = near_optimal::parse_planned_block_source(
+        state,
+        input,
+        first,
+        max_distance,
+        optimization_passes,
+        None,
+    )
+    .into_parts();
+
+    for range in ranges {
+        if !ok {
+            break;
+        }
+        let previous_model = Some(&current.1);
+        let mut next = near_optimal::parse_planned_block_source(
+            state,
+            input,
+            range,
+            max_distance,
+            optimization_passes,
+            previous_model,
+        );
+        let (current_block, current_model) = &mut current;
+        match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
+            near_optimal::BoundaryOptimization::Merged(merged) => {
+                next.block = merged;
+                let _ =
+                    next.reparse_with_existing_candidates(state, input, optimization_passes, None);
+                current = next.into_parts();
+                continue;
+            }
+            near_optimal::BoundaryOptimization::Shifted => {
+                *current_model = near_optimal::model_from_tokens(state, &current_block.tokens);
+                let _ = next.reparse_with_existing_candidates(
+                    state,
+                    input,
+                    optimization_passes,
+                    Some(current_model),
+                );
+            }
+            near_optimal::BoundaryOptimization::Unchanged => {}
+        }
+        ok = emit_planned_near_optimal_block(
+            state,
+            input,
+            current_block,
+            false,
+            output,
+            &mut produced,
+        );
+        current = next.into_parts();
+    }
+
+    if ok {
+        ok = emit_planned_near_optimal_block(state, input, &current.0, true, output, &mut produced);
+    }
+
+    if ok {
+        let checksum = adler32(ADLER32_INITIAL_VALUE, input);
+        state.bit_writer.pending.extend(&checksum.to_be_bytes());
+        ok = drain_near_optimal_pending(state, output, &mut produced);
+    }
+    Ok(ok.then_some(produced))
+}
+
 /// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
 ///
 /// This remains behind `__internal-api` while the cost model and splitter are being developed. It
@@ -3635,129 +3741,24 @@ pub fn compress_slice_near_optimal<'a>(
     input: &[u8],
     optimization_passes: usize,
 ) -> (&'a mut [u8], ReturnCode) {
-    let mut raw = z_stream::default();
-    let init_result = init_with_lit_bufsize(
-        &mut raw,
+    let mut stream = match DeflateStream::new_with_lit_bufsize(
         DeflateConfig::new(9),
         Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-    );
-    if init_result != ReturnCode::Ok {
-        return (&mut output[..0], init_result);
-    }
-
-    let produced = {
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .expect("successful deflate init creates typed state");
-        let state = &mut *stream.state;
-        // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
-        // reservation, so every distance representable by the configured DEFLATE window is legal.
-        let max_distance = state.w_mask() + 1;
-        let ranges = near_optimal::choose_block_ranges(input, max_distance);
-        debug_assert!(ranges
-            .iter()
-            .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
-
-        // Emit the wrapper while strstart still describes the true initial state. Moving this after
-        // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
-        state
-            .bit_writer
-            .pending
-            .extend(&state.header().to_be_bytes());
-        let mut produced = 0usize;
-        let mut ok = drain_near_optimal_pending(state, output, &mut produced);
-
-        let mut ranges = ranges.into_iter();
-        let mut current = ranges.next().map(|range| {
-            near_optimal::parse_planned_block_source(
-                state,
-                input,
-                range,
-                max_distance,
-                optimization_passes,
-                None,
-            )
-            .into_parts()
-        });
-
-        for range in ranges {
-            if !ok {
-                break;
-            }
-            let previous_model = current.as_ref().map(|(_, model)| model);
-            let mut next = near_optimal::parse_planned_block_source(
-                state,
-                input,
-                range,
-                max_distance,
-                optimization_passes,
-                previous_model,
-            );
-            let (current_block, current_model) = current
-                .as_mut()
-                .expect("the splitter always returns at least one block");
-            match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
-                near_optimal::BoundaryOptimization::Merged(merged) => {
-                    next.block = merged;
-                    let _ = next.reparse_with_existing_candidates(
-                        state,
-                        input,
-                        optimization_passes,
-                        None,
-                    );
-                    current = Some(next.into_parts());
-                    continue;
-                }
-                near_optimal::BoundaryOptimization::Shifted => {
-                    *current_model = near_optimal::model_from_tokens(state, &current_block.tokens);
-                    let _ = next.reparse_with_existing_candidates(
-                        state,
-                        input,
-                        optimization_passes,
-                        Some(current_model),
-                    );
-                }
-                near_optimal::BoundaryOptimization::Unchanged => {}
-            }
-            ok = emit_planned_near_optimal_block(
-                state,
-                input,
-                current_block,
-                false,
-                output,
-                &mut produced,
-            );
-            current = Some(next.into_parts());
-        }
-
-        if ok {
-            if let Some((final_block, _)) = current.as_ref() {
-                ok = emit_planned_near_optimal_block(
-                    state,
-                    input,
-                    final_block,
-                    true,
-                    output,
-                    &mut produced,
-                );
-            }
-        }
-
-        if ok {
-            let checksum = adler32(ADLER32_INITIAL_VALUE, input);
-            state.bit_writer.pending.extend(&checksum.to_be_bytes());
-            ok = drain_near_optimal_pending(state, output, &mut produced);
-        }
-        ok.then_some(produced)
+    ) {
+        Ok(stream) => stream,
+        Err(code) => return (&mut output[..0], code),
     };
 
-    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut raw) } {
-        stream.state.status = Status::Finish;
-        let _ = end(stream);
-    }
+    let produced =
+        encode_near_optimal_with_state(&mut stream.state, output, input, optimization_passes);
+    // The typed owner releases state on all paths, including output exhaustion.
+    // Do not manufacture a successful stream status just to permit cleanup.
+    drop(stream);
 
     match produced {
-        Some(len) => (&mut output[..len], ReturnCode::Ok),
-        None => (&mut output[..0], ReturnCode::BufError),
+        Ok(Some(len)) => (&mut output[..len], ReturnCode::Ok),
+        Ok(None) => (&mut output[..0], ReturnCode::BufError),
+        Err(code) => (&mut output[..0], code),
     }
 }
 
@@ -4620,6 +4621,33 @@ mod test {
         assert!(owned.state.as_ptr().is_null());
         // Drop must not release state a second time after explicit deflateEnd.
         drop(owned);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_near_optimal_stream_uses_validated_full_symbol_capacity() -> Result<(), ReturnCode> {
+        let default = DeflateStream::new(DeflateConfig::new(9))?;
+        assert!(default.state.lit_bufsize < near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE);
+        drop(default);
+
+        let owned = DeflateStream::new_with_lit_bufsize(
+            DeflateConfig::new(9),
+            Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
+        )?;
+        assert_eq!(
+            owned.state.lit_bufsize,
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE
+        );
+        drop(owned);
+
+        // An invalid custom allocation geometry must return an error without
+        // materializing a partially initialized, owned stream.
+        for invalid in [0, near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE + 1, usize::MAX] {
+            assert!(matches!(
+                DeflateStream::new_with_lit_bufsize(DeflateConfig::new(9), Some(invalid)),
+                Err(ReturnCode::StreamError)
+            ));
+        }
         Ok(())
     }
 
