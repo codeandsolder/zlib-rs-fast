@@ -2188,23 +2188,25 @@ impl<'a> State<'a> {
         );
     }
 
-    fn header(&self) -> u16 {
-        // preset dictionary flag in zlib header
-        const PRESET_DICT: u16 = 0x20;
+    fn header(&self) -> Result<u16, ReturnCode> {
+        const PRESET_DICT: u32 = 0x20;
+        const Z_DEFLATED: u32 = 8;
 
-        // The deflate compression method (the only one supported in this version)
-        const Z_DEFLATED: u16 = 8;
+        // A zlib CMF encodes an LZ77 window size of 2^(CINFO+8).
+        // Invalid internal state must not silently truncate the window
+        // width into a different, apparently valid wire header.
+        let window_bits = self.w_bits();
+        if !(9..=15).contains(&window_bits) {
+            return Err(ReturnCode::StreamError);
+        }
 
-        let dict = match self.strstart {
-            0 => 0,
-            _ => PRESET_DICT,
-        };
-
-        let h = ((Z_DEFLATED + ((self.w_bits() as u16 - 8) << 4)) << 8)
-            | (self.level_flags() << 6)
+        let dict = if self.strstart == 0 { 0 } else { PRESET_DICT };
+        let h = ((Z_DEFLATED + ((window_bits - 8) << 4)) << 8)
+            | (u32::from(self.level_flags()) << 6)
             | dict;
-
-        h + 31 - (h % 31)
+        // FCHECK ensures the two-byte zlib header is a multiple of 31.
+        let header = h + 31 - (h % 31);
+        u16::try_from(header).map_err(|_| ReturnCode::StreamError)
     }
 
     fn level_flags(&self) -> u16 {
@@ -3318,7 +3320,9 @@ fn emit_wrapper_header(stream: &mut Compressor<'_, '_>) -> ControlFlow<ReturnCod
     }
 
     if stream.state.status == Status::Init {
-        let header = stream.state.header();
+        let Ok(header) = stream.state.header() else {
+            return ControlFlow::Break(ReturnCode::StreamError);
+        };
         stream
             .state
             .bit_writer
@@ -3656,10 +3660,8 @@ fn encode_near_optimal_with_state(
 
     // Emit the wrapper while strstart still describes the true initial state. Moving this after
     // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
-    state
-        .bit_writer
-        .pending
-        .extend(&state.header().to_be_bytes());
+    let header = state.header()?;
+    state.bit_writer.pending.extend(&header.to_be_bytes());
     let mut produced = 0usize;
     if !drain_near_optimal_pending(state, output, &mut produced) {
         // In particular, do not build the suffix array when even the header
@@ -6197,10 +6199,8 @@ mod test {
             let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
                 .ok_or(ReturnCode::StreamError)?;
             let state = &mut *stream.state;
-            state
-                .bit_writer
-                .pending
-                .extend(&state.header().to_be_bytes());
+            let header = state.header()?;
+            state.bit_writer.pending.extend(&header.to_be_bytes());
             let mut produced = 0usize;
             assert!(drain_near_optimal_pending(
                 state,
@@ -6500,6 +6500,40 @@ mod test {
             assert_eq!(stream.state.w_bits(), 9);
 
             assert!(end(stream).is_ok());
+            Ok(())
+        }
+
+        #[test]
+        fn zlib_header_rejects_invalid_internal_window_width() -> Result<(), ReturnCode> {
+            for configured_bits in [9, MAX_WBITS] {
+                let mut raw = z_stream::default();
+                assert_eq!(
+                    init(
+                        &mut raw,
+                        DeflateConfig {
+                            window_bits: configured_bits,
+                            ..DeflateConfig::default()
+                        },
+                    ),
+                    ReturnCode::Ok
+                );
+                // SAFETY: successful initialization created the live state;
+                // this test retains its unique mutable stream ownership.
+                let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                    .ok_or(ReturnCode::StreamError)?;
+                let state = &mut stream.state;
+                let original_size = state.w_size;
+                let header = state.header()?;
+                assert_eq!(header % 31, 0);
+                assert_eq!(i32::from(header >> 12), configured_bits - 8);
+
+                for invalid_size in [0, 1usize << 16] {
+                    state.w_size = invalid_size;
+                    assert_eq!(state.header(), Err(ReturnCode::StreamError));
+                }
+                state.w_size = original_size;
+                assert!(end(stream).is_ok());
+            }
             Ok(())
         }
 
