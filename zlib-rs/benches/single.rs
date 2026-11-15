@@ -4,6 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "shared/measurement.rs"]
+mod measurement;
+
+use measurement::{approximately_f64, iterations_for, repeating_phase};
 use zlib_rs::{compress_bound, compress_slice, DeflateConfig, ReturnCode};
 
 const MIB: f64 = (1024 * 1024) as f64;
@@ -255,7 +259,7 @@ fn measure(
     black_box(run());
     let first = start.elapsed();
     let (sample_target, sample_count) = benchmark_shape(full);
-    let iters = iterations_for(first, sample_target)?;
+    let iters = iterations_for(first, sample_target, MAX_SAMPLE_ITERS)?;
     let divisor = u32::try_from(iters)?;
     let mut samples = Vec::with_capacity(sample_count);
 
@@ -277,46 +281,13 @@ fn measure(
     })
 }
 
-fn iterations_for(
-    one: Duration,
-    sample_target: Duration,
-) -> Result<usize, std::num::TryFromIntError> {
-    if one.is_zero() {
-        return Ok(MAX_SAMPLE_ITERS);
-    }
-    // Ceiling keeps a calibration estimate from systematically missing its
-    // sample target, without rounding through f64 or truncating host widths.
-    let maximum = u128::try_from(MAX_SAMPLE_ITERS)?;
-    usize::try_from(
-        sample_target
-            .as_nanos()
-            .div_ceil(one.as_nanos())
-            .clamp(1, maximum),
-    )
-}
-
-/// Approximate a potentially full-width usize only for human-readable rates.
-/// Bytewise construction avoids silently narrowing large future corpus sizes.
-fn approximately_f64(value: usize) -> f64 {
-    value
-        .to_be_bytes()
-        .into_iter()
-        .fold(0.0, |sum, octet| sum.mul_add(256.0, f64::from(octet)))
-}
-
 fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
     match corpus {
         Corpus::Repetitive => {
             const PATTERN: &[u8] = b"zlib-rs portable SIMD single stream / ";
             // Match the previous release-mode low-word truncation and wrapping
             // arithmetic on both 32/64-bit targets without unchecked casts.
-            let phase = seed
-                .to_be_bytes()
-                .into_iter()
-                .fold(0usize, |word, byte| {
-                    word.wrapping_mul(256).wrapping_add(usize::from(byte))
-                })
-                .wrapping_mul(7);
+            let phase = repeating_phase(seed);
             (0..len)
                 .map(|i| PATTERN[i.wrapping_add(phase) % PATTERN.len()])
                 .collect()
@@ -356,14 +327,26 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
 /// through the executable instead of silently ignored #[test] functions.
 fn self_test() -> Result<(), std::num::TryFromIntError> {
     let target = Duration::from_millis(100);
-    assert_eq!(iterations_for(Duration::ZERO, target)?, MAX_SAMPLE_ITERS);
     assert_eq!(
-        iterations_for(Duration::from_nanos(1), target)?,
+        iterations_for(Duration::ZERO, target, MAX_SAMPLE_ITERS)?,
         MAX_SAMPLE_ITERS
     );
-    assert_eq!(iterations_for(Duration::from_millis(25), target)?, 4);
-    assert_eq!(iterations_for(Duration::from_millis(30), target)?, 4);
-    assert_eq!(iterations_for(Duration::from_secs(1), target)?, 1);
+    assert_eq!(
+        iterations_for(Duration::from_nanos(1), target, MAX_SAMPLE_ITERS)?,
+        MAX_SAMPLE_ITERS
+    );
+    assert_eq!(
+        iterations_for(Duration::from_millis(25), target, MAX_SAMPLE_ITERS)?,
+        4
+    );
+    assert_eq!(
+        iterations_for(Duration::from_millis(30), target, MAX_SAMPLE_ITERS)?,
+        4
+    );
+    assert_eq!(
+        iterations_for(Duration::from_secs(1), target, MAX_SAMPLE_ITERS)?,
+        1
+    );
     assert_eq!(approximately_f64(0), 0.0);
     assert_eq!(approximately_f64(1_048_576), 1_048_576.0);
     for corpus in [Corpus::Repetitive, Corpus::Structured, Corpus::PseudoRandom] {

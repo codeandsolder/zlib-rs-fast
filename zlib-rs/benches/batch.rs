@@ -6,6 +6,10 @@ use std::{
 
 #[cfg(feature = "parallel")]
 use zlib_rs::BatchCompressor;
+#[path = "shared/measurement.rs"]
+mod measurement;
+use measurement::{approximately_f64, iterations_for, repeating_phase};
+
 use zlib_rs::{
     compress_bound, compress_slice, compress_slices_batch, compress_slices_batch_with_backend,
     BatchCompressJob, BatchMatchSearchBackend, DeflateConfig, ReturnCode,
@@ -55,8 +59,13 @@ impl Mode {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
+    if args.len() == 2 && args[1] == "--self-test" {
+        self_test()?;
+        println!("batch benchmark invariants passed");
+        return Ok(());
+    }
     let full = args.iter().any(|arg| arg == "--full");
     let include_threads = args.iter().any(|arg| arg == "--threads");
     let cases = if full { full_cases() } else { quick_cases() };
@@ -64,11 +73,9 @@ fn main() {
     println!("zlib-rs batch scheduler benchmark");
     let (sample_target, samples) = benchmark_shape(full);
     println!(
-        "logical CPUs: {} | mode: {} | sample target: {:?} x {} samples",
+        "logical CPUs: {} | mode: {} | sample target: {sample_target:?} x {samples} samples",
         std::thread::available_parallelism().map_or(1, usize::from),
         if full { "full" } else { "quick" },
-        sample_target,
-        samples
     );
     println!(
         "synthetic inputs; threaded backend: {} | use these measurements for scheduler/backend decisions, not general zlib claims\n",
@@ -76,8 +83,9 @@ fn main() {
     );
 
     for case in cases {
-        run_case(case, full, include_threads);
+        run_case(case, full, include_threads)?;
     }
+    Ok(())
 }
 
 const fn benchmark_shape(full: bool) -> (Duration, usize) {
@@ -172,11 +180,21 @@ fn full_cases() -> Vec<Case> {
     cases
 }
 
-fn run_case(case: Case, full: bool, include_threads: bool) {
+fn run_case(
+    case: Case,
+    full: bool,
+    include_threads: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = DeflateConfig::new(case.level);
     let inputs = (0..case.streams)
-        .map(|stream| make_input(case.corpus, case.bytes_per_stream, stream as u64))
-        .collect::<Vec<_>>();
+        .map(|stream| {
+            Ok(make_input(
+                case.corpus,
+                case.bytes_per_stream,
+                u64::try_from(stream)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
     let reference = compress_reference(&inputs, config);
     let total_input = case.streams * case.bytes_per_stream;
     let total_output: usize = reference.iter().map(Vec::len).sum();
@@ -188,7 +206,7 @@ fn run_case(case: Case, full: bool, include_threads: bool) {
         case.streams,
         case.bytes_per_stream / 1024,
         case.level,
-        total_output as f64 / total_input.max(1) as f64
+        approximately_f64(total_output) / approximately_f64(total_input.max(1))
     );
 
     let mut modes = vec![Mode::Independent, Mode::BatchScalar];
@@ -213,17 +231,16 @@ fn run_case(case: Case, full: bool, include_threads: bool) {
     for mode in modes {
         rows.push((
             mode.label(),
-            bench_mode(mode, &inputs, &reference, config, full),
+            bench_mode(mode, &inputs, &reference, config, full)?,
         ));
     }
 
     let independent = rows[0].1.median;
     for (label, stats) in rows {
-        let mib_per_s = total_input as f64 / MIB / stats.median.as_secs_f64();
+        let mib_per_s = approximately_f64(total_input) / MIB / stats.median.as_secs_f64();
         let relative = independent.as_secs_f64() / stats.median.as_secs_f64();
         println!(
-            "  {label:>12}: {:8.1} MiB/s | {:5.2}x independent | median {:8.3} ms | min {:8.3} ms | iters/sample {}",
-            mib_per_s,
+            "  {label:>12}: {mib_per_s:8.1} MiB/s | {:5.2}x independent | median {:8.3} ms | min {:8.3} ms | iters/sample {}",
             relative,
             stats.median.as_secs_f64() * 1e3,
             stats.min.as_secs_f64() * 1e3,
@@ -231,6 +248,7 @@ fn run_case(case: Case, full: bool, include_threads: bool) {
         );
     }
     println!();
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -246,16 +264,14 @@ fn bench_mode(
     reference: &[Vec<u8>],
     config: DeflateConfig,
     full: bool,
-) -> Stats {
+) -> Result<Stats, Box<dyn std::error::Error>> {
     #[cfg(feature = "parallel")]
-    let parallel_compressor = match mode {
-        Mode::ParallelStreams(workers) => Some(
-            BatchCompressor::new(
-                std::num::NonZeroUsize::new(workers).expect("parallel benchmark needs workers"),
-            )
-            .expect("parallel batch compressor should initialize"),
-        ),
-        _ => None,
+    let parallel_compressor = if let Mode::ParallelStreams(workers) = mode {
+        let workers = std::num::NonZeroUsize::new(workers)
+            .ok_or("parallel benchmark needs a nonzero worker count")?;
+        Some(BatchCompressor::new(workers)?)
+    } else {
+        None
     };
 
     let capacities = inputs
@@ -269,18 +285,20 @@ fn bench_mode(
 
     match mode {
         Mode::Independent => {
+            let mut written_lengths = Vec::with_capacity(inputs.len());
             let mut validate = || {
                 let mut sink = 0usize;
                 for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
                     let (written, code) = compress_slice(output, input, config);
                     assert_eq!(code, ReturnCode::Ok);
+                    written_lengths.push(written.len());
                     sink ^= written.len();
                 }
                 sink
             };
             black_box(validate());
             drop(validate);
-            assert_outputs(mode, &outputs, reference);
+            assert_outputs(mode, &outputs, reference, &written_lengths);
 
             let mut run = || {
                 let mut sink = 0usize;
@@ -291,10 +309,10 @@ fn bench_mode(
                 }
                 sink
             };
-            let stats = measure(&mut run, full);
+            let stats = measure(&mut run, full)?;
             drop(run);
             black_box(&outputs);
-            stats
+            Ok(stats)
         }
         _ => {
             let mut jobs = inputs
@@ -302,6 +320,7 @@ fn bench_mode(
                 .zip(outputs.iter_mut())
                 .map(|(input, output)| BatchCompressJob::new(input, output))
                 .collect::<Vec<_>>();
+            let mut written_lengths = Vec::with_capacity(inputs.len());
             let mut run = || {
                 let results = match mode {
                     Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
@@ -319,13 +338,14 @@ fn bench_mode(
                 };
                 results.into_iter().fold(0usize, |sink, result| {
                     assert_eq!(result.code, ReturnCode::Ok);
+                    written_lengths.push(result.written);
                     sink ^ result.written
                 })
             };
             black_box(run());
             drop(run);
             drop(jobs);
-            assert_outputs(mode, &outputs, reference);
+            assert_outputs(mode, &outputs, reference, &written_lengths);
 
             // Rebind jobs after validation so the timed closure owns the same pre-built caller job
             // descriptors for every iteration. Only allocations performed inside the batch API are
@@ -355,21 +375,25 @@ fn bench_mode(
                     sink ^ result.written
                 })
             };
-            let stats = measure(&mut run, full);
+            let stats = measure(&mut run, full)?;
             drop(run);
             drop(jobs);
             black_box(&outputs);
-            stats
+            Ok(stats)
         }
     }
 }
 
-fn measure(run: &mut impl FnMut() -> usize, full: bool) -> Stats {
+fn measure(
+    run: &mut impl FnMut() -> usize,
+    full: bool,
+) -> Result<Stats, std::num::TryFromIntError> {
     let start = Instant::now();
     black_box(run());
     let first = start.elapsed();
     let (sample_target, sample_count) = benchmark_shape(full);
-    let iters = iterations_for(first, sample_target);
+    let iters = iterations_for(first, sample_target, MAX_SAMPLE_ITERS)?;
+    let divisor = u32::try_from(iters)?;
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         let start = Instant::now();
@@ -378,30 +402,38 @@ fn measure(run: &mut impl FnMut() -> usize, full: bool) -> Stats {
             sink ^= black_box(run());
         }
         black_box(sink);
-        samples.push(start.elapsed() / iters as u32);
+        samples.push(start.elapsed() / divisor);
     }
     samples.sort_unstable();
 
-    Stats {
+    Ok(Stats {
         median: samples[samples.len() / 2],
         min: samples[0],
         iters,
-    }
+    })
 }
 
-fn iterations_for(one: Duration, sample_target: Duration) -> usize {
-    if one.is_zero() {
-        return MAX_SAMPLE_ITERS;
-    }
-    let target = sample_target.as_nanos();
-    let one = one.as_nanos();
-    ((target / one).max(1) as usize).min(MAX_SAMPLE_ITERS)
-}
-
-fn assert_outputs(mode: Mode, outputs: &[Vec<u8>], reference: &[Vec<u8>]) {
-    for (index, (output, expected)) in outputs.iter().zip(reference).enumerate() {
+fn assert_outputs(
+    mode: Mode,
+    outputs: &[Vec<u8>],
+    reference: &[Vec<u8>],
+    written_lengths: &[usize],
+) {
+    assert_eq!(outputs.len(), reference.len());
+    assert_eq!(written_lengths.len(), reference.len());
+    for (index, ((output, expected), &written)) in outputs
+        .iter()
+        .zip(reference)
+        .zip(written_lengths)
+        .enumerate()
+    {
         assert_eq!(
-            &output[..expected.len()],
+            written,
+            expected.len(),
+            "{mode:?} changed reported compressed length for stream {index}"
+        );
+        assert_eq!(
+            &output[..written],
             expected,
             "{mode:?} changed compressed output for stream {index}"
         );
@@ -426,8 +458,9 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
     match corpus {
         Corpus::Repetitive => {
             const PATTERN: &[u8] = b"zlib-rs portable SIMD batch scheduling / ";
+            let phase = repeating_phase(seed);
             (0..len)
-                .map(|i| PATTERN[(i + seed as usize * 7) % PATTERN.len()])
+                .map(|i| PATTERN[i.wrapping_add(phase) % PATTERN.len()])
                 .collect()
         }
         Corpus::Structured => {
@@ -455,9 +488,40 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;
-                    state as u8
+                    state.to_le_bytes()[0]
                 })
                 .collect()
         }
     }
+}
+
+/// Cargo harness=false runs this bench directly; invariants must be callable
+/// without relying on otherwise-unregistered test attributes.
+fn self_test() -> Result<(), std::num::TryFromIntError> {
+    let target = Duration::from_millis(80);
+    assert_eq!(
+        iterations_for(Duration::ZERO, target, MAX_SAMPLE_ITERS)?,
+        MAX_SAMPLE_ITERS
+    );
+    assert_eq!(
+        iterations_for(Duration::from_millis(20), target, MAX_SAMPLE_ITERS)?,
+        4
+    );
+    assert_eq!(
+        iterations_for(Duration::from_millis(30), target, MAX_SAMPLE_ITERS)?,
+        3
+    );
+    assert_eq!(approximately_f64(1_048_576), 1_048_576.0);
+    for corpus in [Corpus::Repetitive, Corpus::Structured, Corpus::PseudoRandom] {
+        for seed in [0, 1, u64::MAX] {
+            let short = make_input(corpus, 17, seed);
+            let long = make_input(corpus, 131, seed);
+            assert_eq!(short, long[..short.len()]);
+        }
+    }
+    let expected = vec![b'x', b'y', b'z'];
+    let outputs = vec![expected.clone()];
+    let reference = vec![expected];
+    assert_outputs(Mode::Independent, &outputs, &reference, &[3]);
+    Ok(())
 }
