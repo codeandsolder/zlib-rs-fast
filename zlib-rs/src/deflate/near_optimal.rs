@@ -1094,7 +1094,7 @@ fn parse_range_with_scratch(
     // One candidate can become newly capable at each maximum match length. Keep the sparse values
     // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
     // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
-    assert!(block_len <= u32::MAX as usize);
+    assert!(u32::try_from(block_len).is_ok());
     let mut distance_cost_at_max = [DistanceAtMax {
         generation: 0,
         cost: 0,
@@ -1721,7 +1721,7 @@ mod tests {
             "unexpected first boundary {first_boundary}: {blocks:?}"
         );
         assert_eq!(blocks[0].start, 0);
-        assert_eq!(blocks.last().unwrap().end, input.len());
+        assert_eq!(blocks.last().map(|block| block.end), Some(input.len()));
         assert!(blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
         assert!(blocks
             .iter()
@@ -1734,33 +1734,38 @@ mod tests {
         let input = vec![0x5a; 150_000];
         let blocks = choose_block_ranges(&input, 32_506)?;
         assert_eq!(blocks[0].start, 0);
-        assert_eq!(blocks.last().unwrap().end, input.len());
+        assert_eq!(blocks.last().map(|block| block.end), Some(input.len()));
         assert!(blocks
             .iter()
             .all(|block| block.len() <= MAX_COARSE_BLOCK_INPUT));
-        assert!(blocks
-            .iter()
-            .take(blocks.len() - 1)
-            .all(|block| block.len() >= MIN_BLOCK_LENGTH));
-        assert!(blocks.last().unwrap().len() >= MIN_BLOCK_LENGTH);
+        let (tail, prefix) = blocks.split_last().ok_or(ReturnCode::StreamError)?;
+        assert!(prefix.iter().all(|block| block.len() >= MIN_BLOCK_LENGTH));
+        assert!(tail.len() >= MIN_BLOCK_LENGTH);
         Ok(())
     }
 
     #[test]
     fn splitter_soft_limit_boundary_matrix_is_exact() -> Result<(), ReturnCode> {
+        // Keep both endpoints explicit: the fixture checks contiguous ranges,
+        // including the zero-length stream, not just the number of splits.
         for (len, expected) in [
-            (0, vec![0..0]),
-            (59_999, vec![0..59_999]),
-            (60_000, vec![0..60_000]),
-            (60_001, vec![0..60_001]),
-            (64_999, vec![0..64_999]),
-            (65_000, vec![0..60_000, 60_000..65_000]),
-            (65_001, vec![0..60_000, 60_000..65_001]),
-            (119_999, vec![0..60_000, 60_000..119_999]),
-            (120_000, vec![0..60_000, 60_000..120_000]),
+            (0, &[(0, 0)][..]),
+            (59_999, &[(0, 59_999)][..]),
+            (60_000, &[(0, 60_000)][..]),
+            (60_001, &[(0, 60_001)][..]),
+            (64_999, &[(0, 64_999)][..]),
+            (65_000, &[(0, 60_000), (60_000, 65_000)][..]),
+            (65_001, &[(0, 60_000), (60_000, 65_001)][..]),
+            (119_999, &[(0, 60_000), (60_000, 119_999)][..]),
+            (120_000, &[(0, 60_000), (60_000, 120_000)][..]),
         ] {
             let input = vec![0x5a; len];
-            assert_eq!(choose_block_ranges(&input, 32_768)?, expected, "len={len}");
+            let ranges = choose_block_ranges(&input, 32_768)?;
+            let boundaries = ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>();
+            assert_eq!(boundaries, expected, "len={len}");
         }
         Ok(())
     }
@@ -3756,7 +3761,9 @@ mod encoded_tests {
         // layout between runs. For a fixed range, the optimization loop retains the cheapest exact
         // production-scored path seen so far, so an additional search must not enlarge the stream.
         let input = super::tests::two_distribution_input()[..8_000].to_vec();
-        assert_eq!(choose_block_ranges(&input, 32_506)?, [0..input.len()]);
+        let ranges = choose_block_ranges(&input, 32_506)?;
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..input.len());
 
         let mut previous_len = usize::MAX;
         for passes in 1..=4 {
