@@ -4487,6 +4487,94 @@ mod tests {
     }
 
     #[test]
+    fn rejected_full_output_callback_is_invoked_once() -> Result<(), &'static str> {
+        struct OutputCalls {
+            count: usize,
+            lengths: Vec<usize>,
+        }
+
+        unsafe extern "C" fn reject_output(
+            descriptor: *mut core::ffi::c_void,
+            _bytes: *mut u8,
+            length: u32,
+        ) -> i32 {
+            // SAFETY: the test passes a live, exclusively borrowed OutputCalls
+            // descriptor which remains valid throughout the back() call.
+            let calls = unsafe { &mut *descriptor.cast::<OutputCalls>() };
+            calls.count += 1;
+            calls.lengths.push(length as usize);
+            1
+        }
+
+        unsafe extern "C" fn no_more_input(
+            _descriptor: *mut core::ffi::c_void,
+            next: *mut *const u8,
+        ) -> u32 {
+            // SAFETY: zlib's input callback contract supplies a writable pointer slot.
+            unsafe { *next = core::ptr::null() };
+            0
+        }
+
+        // A stored block just longer than the callback window forces the
+        // full-window output callback before the stream reaches its final block.
+        let window_size = 1usize << MIN_WBITS;
+        let payload_len = u16::try_from(window_size + 1).map_err(|_| "window too large")?;
+        let mut encoded = vec![1u8]; // final, stored DEFLATE block
+        encoded.extend_from_slice(&payload_len.to_le_bytes());
+        encoded.extend_from_slice(&(!payload_len).to_le_bytes());
+        encoded.extend(core::iter::repeat_n(0x5au8, usize::from(payload_len)));
+
+        let mut storage = vec![0xa5; window_size];
+        let mut raw = z_stream::default();
+        let window = Window::from_initialized_slice(&mut storage);
+        assert_eq!(
+            back_init(
+                &mut raw,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                window,
+            ),
+            ReturnCode::Ok,
+        );
+        raw.next_in = encoded.as_mut_ptr();
+        raw.avail_in = u32::try_from(encoded.len()).map_err(|_| "encoded input too large")?;
+
+        let mut calls = OutputCalls {
+            count: 0,
+            lengths: Vec::new(),
+        };
+        // SAFETY: back_init returned a live callback inflater; encoded and
+        // caller window remain allocated and exclusively borrowed, and the
+        // callbacks obey their input/output buffer lifetime contracts.
+        let back = unsafe { InflateStream::from_back_stream_mut(&raw mut raw) }
+            .ok_or("missing callback decoder")?;
+        // SAFETY: the typed callback stream owns a live initialized state,
+        // the input and output storage remain valid for the entire call,
+        // and the callbacks honor their respective span contracts.
+        let status = unsafe {
+            super::back(
+                back,
+                no_more_input,
+                core::ptr::null_mut(),
+                reject_output,
+                (&raw mut calls).cast(),
+            )
+        };
+        let remaining = back.avail_in;
+        back_end(back);
+
+        assert_eq!(status, ReturnCode::BufError);
+        assert_eq!(
+            calls.count, 1,
+            "the rejected full window must not be delivered again"
+        );
+        assert_eq!(calls.lengths, [window_size]);
+        assert_eq!(remaining, 1);
+        Ok(())
+    }
+
+    #[test]
     fn inflate_copy_owns_independent_state_and_window_storage() {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);

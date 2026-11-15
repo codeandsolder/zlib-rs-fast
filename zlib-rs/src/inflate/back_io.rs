@@ -309,11 +309,15 @@ impl BackOutput {
             return Ok(());
         }
 
-        // Only a completely initialized window becomes previous history.
+        // A full window becomes previous history even if the output callback
+        // refuses it. Mark this window consumed after the callback attempt:
+        // the decoder's common exit path must not deliver a rejected full
+        // window a second time as pending partial output. This mirrors
+        // inflateBack's ROOM transition in zlib.
         window.mark_full_history();
-        self.deliver(window)?;
+        let delivered = self.deliver(window);
         self.filled = 0;
-        Ok(())
+        delivered
     }
 
     /// Deliver a final partial prefix, without marking incomplete history.
