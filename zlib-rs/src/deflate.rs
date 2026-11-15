@@ -6093,12 +6093,18 @@ mod test {
         items: crate::c_api::uInt,
         size: crate::c_api::uInt,
     ) -> crate::c_api::voidpf {
+        // SAFETY: each test passes the address of a live, properly aligned
+        // AtomicUsize as opaque. It outlives every allocator callback made by
+        // its native stream, and atomic increments permit concurrent calls.
         let count = unsafe { &*(opaque as *const AtomicUsize) };
 
         if count.fetch_add(1, core::sync::atomic::Ordering::Relaxed) != N {
             // must use the C allocator internally because (de)allocation is based on function
             // pointer values and because we don't use the rust allocator directly, the allocation
             // logic will store the pointer to the start at the start of the allocation.
+            // SAFETY: this is the canonical C allocator callback with the
+            // original opaque pointer and checked C ABI item/count inputs.
+            // Its matching zfree is installed in the same stream.
             unsafe { (crate::allocate::C.zalloc)(opaque, items, size) }
         } else {
             core::ptr::null_mut()
@@ -6474,7 +6480,7 @@ mod test {
 
     #[test]
     #[cfg(feature = "c-allocator")]
-    fn copy_invalid_allocator() {
+    fn copy_invalid_allocator() -> Result<(), SchedulerFixtureError> {
         let mut stream = z_stream::default();
 
         let atomic = AtomicUsize::new(0);
@@ -6485,15 +6491,16 @@ mod test {
         // Init consumes the first state allocation; fail the second allocation used by copy.
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
 
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
-            unreachable!()
-        };
+        let mut owned = ScopedDeflateStream::from_initialized(&mut stream)?;
+        let native = owned.stream()?;
+        let mut destination = MaybeUninit::<DeflateStream>::uninit();
 
-        let mut stream_copy = MaybeUninit::<DeflateStream>::zeroed();
-
-        assert_eq!(copy(&mut stream_copy, stream), ReturnCode::MemError);
-
-        assert!(end(stream).is_ok());
+        assert_eq!(copy(&mut destination, native), ReturnCode::MemError);
+        // This is the second allocation attempt: the first initialized the
+        // source, the deliberately failed second must not produce a clone.
+        assert_eq!(atomic.load(core::sync::atomic::Ordering::Relaxed), 2);
+        assert!(end(native).is_ok());
+        Ok(())
     }
 
     mod invalid_deflate_config {
@@ -6703,19 +6710,13 @@ mod test {
     }
 
     #[test]
-    fn reset_keep_rewinds_partially_drained_pending_output() -> Result<(), ReturnCode> {
+    fn reset_keep_rewinds_partially_drained_pending_output() -> Result<(), SchedulerFixtureError> {
         let mut raw = z_stream::default();
         let config = DeflateConfig {
             window_bits: 31,
             mem_level: 1,
             ..Default::default()
         };
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
-
         // Make the gzip name larger than the small mem_level=1 pending buffer. One deflate call
         // fills that buffer and drains only part of it, leaving `Pending::out` advanced while
         // bytes are still pending.
@@ -6736,10 +6737,14 @@ mod test {
             hcrc: 0,
             done: 0,
         };
-        assert_eq!(
-            unsafe { set_header(stream, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        // Initialize after header/name so both caller-owned buffers outlive
+        // the scoped native state, including on an early failed assertion.
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
+        // SAFETY: the header, name and output allocation are live and disjoint;
+        // the caller retains the header and name until this stream ends.
+        let header_status = unsafe { set_header(stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
 
         let mut output = [0u8; 400];
         stream.next_in = core::ptr::null_mut();
