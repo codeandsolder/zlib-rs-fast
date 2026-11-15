@@ -257,7 +257,7 @@ mod null {
             ))
         }
 
-        fn test(data: Vec<u8>) -> bool {
+        fn test(data: &[u8]) -> bool {
             let Some(buf_len) = data.first().copied() else {
                 return true;
             };
@@ -316,7 +316,7 @@ mod null {
         #[cfg(target_pointer_width = "64")]
         assert_eq!(checked_crc_lengths(usize::MAX), None);
 
-        ::quickcheck::quickcheck(test as fn(_) -> _);
+        ::quickcheck::quickcheck((|data: Vec<u8>| test(&data)) as fn(_) -> _);
     }
 
     #[test]
