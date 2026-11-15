@@ -6316,9 +6316,16 @@ mod test {
                 .ok_or(ReturnCode::StreamError)?;
 
             let effective_window_bits = if window_bits == 8 { 9 } else { window_bits };
-            let w_size = 1usize << effective_window_bits;
-            let lit_bufsize = 1usize << (mem_level + 6);
-            let layout = DeflateAllocOffsets::new(effective_window_bits as usize, lit_bufsize);
+            let bits =
+                usize::try_from(effective_window_bits).map_err(|_| ReturnCode::StreamError)?;
+            let mem_bits = usize::try_from(mem_level + 6).map_err(|_| ReturnCode::StreamError)?;
+            let w_size = 1usize
+                .checked_shl(u32::try_from(bits).map_err(|_| ReturnCode::StreamError)?)
+                .ok_or(ReturnCode::StreamError)?;
+            let lit_bufsize = 1usize
+                .checked_shl(u32::try_from(mem_bits).map_err(|_| ReturnCode::StreamError)?)
+                .ok_or(ReturnCode::StreamError)?;
+            let layout = DeflateAllocOffsets::new(bits, lit_bufsize);
 
             assert_eq!(stream.state.w_size, w_size);
             assert_eq!(stream.state.window.capacity(), 2 * w_size);
@@ -6424,41 +6431,48 @@ mod test {
 
     #[test]
     fn set_dictionary_keeps_abi_input_cursor_detached() -> Result<(), ReturnCode> {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
+        // Exercise the exact window boundary: only the most recent window
+        // of history can be retained, while the zlib dictionary id covers
+        // all caller bytes (including bytes outside that window).
+        for dictionary_size in [0, 1, 31, 32_767, 32_768, 32_769] {
+            let mut raw = z_stream::default();
+            assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+            // SAFETY: successful init owns the live state, and this test has
+            // its unique mutable stream access until end(stream).
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                .ok_or(ReturnCode::StreamError)?;
 
-        // A caller may have already populated the next input cursor even though no bytes have been
-        // consumed yet. Dictionary setup must not temporarily publish its own slice through these
-        // ABI fields or disturb the caller's cursor.
-        let caller_input = b"future caller input";
-        stream.next_in = caller_input.as_ptr().cast_mut();
-        stream.avail_in = caller_input.len() as _;
-        let original_next = stream.next_in;
-        let original_avail = stream.avail_in;
-        let total_before = stream.total_in;
+            let caller_input = b"future caller input";
+            stream.next_in = caller_input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(caller_input.len())
+                .map_err(|_| ReturnCode::StreamError)?;
+            let original_next = stream.next_in;
+            let original_avail = stream.avail_in;
+            let total_before = stream.total_in;
 
-        let retained = stream.state.w_size;
-        let dictionary = vec![0x5a; retained + 1];
-        assert_eq!(set_dictionary(stream, &dictionary), ReturnCode::Ok);
+            let retained = stream.state.w_size.min(dictionary_size);
+            let dictionary = vec![0x5au8; dictionary_size];
+            assert_eq!(set_dictionary(stream, &dictionary), ReturnCode::Ok);
 
-        assert_eq!(stream.next_in, original_next);
-        assert_eq!(stream.avail_in, original_avail);
-        assert_eq!(
-            stream.total_in,
-            total_before + retained as crate::c_api::z_size,
-            "only the logical-window tail is ingested into compression history"
-        );
-        assert_eq!(
-            stream.adler as u32,
-            adler32(ADLER32_INITIAL_VALUE, &dictionary),
-            "zlib wrapper dictionary id still covers the entire supplied dictionary"
-        );
-
-        assert!(end(stream).is_ok());
+            assert_eq!(stream.next_in, original_next);
+            assert_eq!(stream.avail_in, original_avail);
+            let retained =
+                crate::c_api::z_size::try_from(retained).map_err(|_| ReturnCode::StreamError)?;
+            assert_eq!(
+                stream.total_in,
+                total_before
+                    .checked_add(retained)
+                    .ok_or(ReturnCode::StreamError)?,
+                "only the logical-window tail enters history: dictionary length {dictionary_size}"
+            );
+            let adler = u32::try_from(stream.adler).map_err(|_| ReturnCode::StreamError)?;
+            assert_eq!(
+                adler,
+                adler32(ADLER32_INITIAL_VALUE, &dictionary),
+                "zlib dictionary id must cover the whole dictionary: length {dictionary_size}"
+            );
+            assert!(end(stream).is_ok());
+        }
         Ok(())
     }
 
@@ -6644,10 +6658,12 @@ mod test {
         // next deflate into too little space
         let input = b"Hello World\n";
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
         let output = &mut [0, 0, 0];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
 
         // the deflate is fine
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
@@ -6669,18 +6685,21 @@ mod test {
         // next deflate into too little space
         let input = b"Hello World\n";
         stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
 
         let output = &mut [0; 1024];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
 
         assert_eq!(reset_keep(stream), ReturnCode::Ok);
 
         let output = &mut [0; 1024];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
 
         assert!(end(stream).is_ok());
@@ -6730,7 +6749,8 @@ mod test {
         stream.next_in = core::ptr::null_mut();
         stream.avail_in = 0;
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
 
         let capacity = stream.state.bit_writer.pending.capacity();
