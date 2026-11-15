@@ -3667,7 +3667,7 @@ fn encode_near_optimal_with_state(
         return Ok(None);
     }
 
-    let ranges = near_optimal::choose_block_ranges(input, max_distance);
+    let ranges = near_optimal::choose_block_ranges(input, max_distance)?;
     debug_assert!(ranges
         .iter()
         .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
@@ -3686,7 +3686,7 @@ fn encode_near_optimal_with_state(
         max_distance,
         optimization_passes,
         None,
-    )
+    )?
     .into_parts();
 
     for range in ranges {
@@ -3701,7 +3701,7 @@ fn encode_near_optimal_with_state(
             max_distance,
             optimization_passes,
             previous_model,
-        );
+        )?;
         let (current_block, current_model) = &mut current;
         match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
             near_optimal::BoundaryOptimization::Merged(merged) => {
@@ -3746,12 +3746,6 @@ fn encode_near_optimal_with_state(
     Ok(ok.then_some(produced))
 }
 
-#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
-fn checked_near_optimal_input_len(len: usize) -> Result<u32, ReturnCode> {
-    // The suffix index and its inverse are stored in u32 arrays.
-    u32::try_from(len).map_err(|_| ReturnCode::StreamError)
-}
-
 /// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
 ///
 /// This remains behind `__internal-api` while the cost model and splitter are being developed. It
@@ -3775,7 +3769,7 @@ pub fn compress_slice_near_optimal<'a>(
     // Suffix ranks and match positions are stored in u32. An oversized
     // input must be rejected before building the suffix array, not panic
     // during conversion after the output and state have been initialized.
-    if let Err(code) = checked_near_optimal_input_len(input.len()) {
+    if let Err(code) = near_optimal::checked_suffix_input_len(input.len()) {
         return (&mut output[..0], code);
     }
 
@@ -4701,13 +4695,16 @@ mod test {
 
     #[test]
     fn near_optimal_input_length_preflight_prevents_suffix_index_overflow() {
-        assert_eq!(checked_near_optimal_input_len(0), Ok(0));
-        assert_eq!(checked_near_optimal_input_len(1), Ok(1));
+        assert_eq!(near_optimal::checked_suffix_input_len(0), Ok(0));
+        assert_eq!(near_optimal::checked_suffix_input_len(1), Ok(1));
         if let Ok(max_rank_len) = usize::try_from(u32::MAX) {
-            assert_eq!(checked_near_optimal_input_len(max_rank_len), Ok(u32::MAX));
+            assert_eq!(
+                near_optimal::checked_suffix_input_len(max_rank_len),
+                Ok(u32::MAX)
+            );
             if let Some(too_large) = max_rank_len.checked_add(1) {
                 assert_eq!(
-                    checked_near_optimal_input_len(too_large),
+                    near_optimal::checked_suffix_input_len(too_large),
                     Err(ReturnCode::StreamError)
                 );
             }
@@ -5984,10 +5981,13 @@ mod test {
     }
 
     #[test]
-    fn data_type_override_round_trips_through_state_only_encoder() {
+    fn data_type_override_round_trips_through_state_only_encoder() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // zlib only auto-detects when this field is Z_UNKNOWN. Preserve arbitrary caller metadata.
         const CALLER_DATA_TYPE: i32 = 12_345;
@@ -6004,6 +6004,7 @@ mod test {
         assert_eq!(stream.data_type, CALLER_DATA_TYPE);
         assert_eq!(stream.state.data_type, CALLER_DATA_TYPE);
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -6062,7 +6063,7 @@ mod test {
     }
 
     #[test]
-    fn near_optimal_partition_can_merge_beyond_stored_limit() {
+    fn near_optimal_partition_can_merge_beyond_stored_limit() -> Result<(), ReturnCode> {
         fn repeated_tokens(mut bytes: usize) -> Vec<near_optimal::ParseToken> {
             let mut tokens = Vec::new();
             tokens.push(near_optimal::ParseToken::Literal(b'a'));
@@ -6097,7 +6098,10 @@ mod test {
             ),
             ReturnCode::Ok
         );
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
         let mut left = near_optimal::PlannedBlock {
             range: 0..60_000,
             tokens: repeated_tokens(60_000),
@@ -6117,10 +6121,11 @@ mod test {
         assert_eq!(left.tokens.as_slice(), &[]);
         assert_eq!(right.tokens.as_slice(), &[]);
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn near_optimal_partition_respects_huffman_token_capacity() {
+    fn near_optimal_partition_respects_huffman_token_capacity() -> Result<(), ReturnCode> {
         fn literal_block(range: core::ops::Range<usize>) -> near_optimal::PlannedBlock {
             near_optimal::PlannedBlock {
                 tokens: vec![near_optimal::ParseToken::Literal(b'a'); range.len()],
@@ -6137,7 +6142,10 @@ mod test {
             ),
             ReturnCode::Ok
         );
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         let half = near_optimal::MAX_BLOCK_TOKENS / 2;
         let mut left = literal_block(0..half);
@@ -6162,10 +6170,11 @@ mod test {
             near_optimal::MAX_BLOCK_TOKENS + 1
         );
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn near_optimal_emits_exact_huffman_token_capacity() {
+    fn near_optimal_emits_exact_huffman_token_capacity() -> Result<(), ReturnCode> {
         let input = vec![b'a'; near_optimal::MAX_BLOCK_TOKENS];
         let block = near_optimal::PlannedBlock {
             range: 0..input.len(),
@@ -6183,7 +6192,10 @@ mod test {
         );
 
         let produced = {
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+            // SAFETY: a preceding successful init owns a live deflate state; this test
+            // holds the only mutable borrow of its raw stream during this operation.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                .ok_or(ReturnCode::StreamError)?;
             let state = &mut *stream.state;
             state
                 .bit_writer
@@ -6218,17 +6230,21 @@ mod test {
             produced
         };
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
         assert!(end(stream).is_ok());
         let mut decoded = vec![0u8; input.len()];
         let (decoded, code) =
             decompress_slice(&mut decoded, &output[..produced], InflateConfig::default());
         assert_eq!(code, ReturnCode::Ok);
         assert_eq!(decoded, input);
+        Ok(())
     }
 
     #[test]
-    fn init_allocation_geometry_matches_config() {
+    fn init_allocation_geometry_matches_config() -> Result<(), ReturnCode> {
         for (window_bits, mem_level) in [(MIN_WBITS, 1), (MAX_WBITS, MAX_MEM_LEVEL)] {
             let mut raw = z_stream::default();
             let config = DeflateConfig {
@@ -6237,7 +6253,10 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+            // SAFETY: a preceding successful init owns a live deflate state; this test
+            // holds the only mutable borrow of its raw stream during this operation.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                .ok_or(ReturnCode::StreamError)?;
 
             let effective_window_bits = if window_bits == 8 { 9 } else { window_bits };
             let w_size = 1usize << effective_window_bits;
@@ -6268,6 +6287,7 @@ mod test {
 
             assert!(end(stream).is_ok());
         }
+        Ok(())
     }
 
     /// A valid zalloc callback is not required to return cache-line-aligned
@@ -6346,10 +6366,13 @@ mod test {
     }
 
     #[test]
-    fn set_dictionary_keeps_abi_input_cursor_detached() {
+    fn set_dictionary_keeps_abi_input_cursor_detached() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // A caller may have already populated the next input cursor even though no bytes have been
         // consumed yet. Dictionary setup must not temporarily publish its own slice through these
@@ -6379,6 +6402,7 @@ mod test {
         );
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -6444,7 +6468,7 @@ mod test {
         }
 
         #[test]
-        fn sanity_check() {
+        fn sanity_check() -> Result<(), ReturnCode> {
             let mut stream = z_stream::default();
             assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
 
@@ -6452,14 +6476,17 @@ mod test {
             assert!(stream.zfree.is_some());
 
             // this should be the default level
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
+            // SAFETY: successful init created a live state with a unique mutable borrow.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+                .ok_or(ReturnCode::StreamError)?;
             assert_eq!(stream.state.level, 6);
 
             assert!(end(stream).is_ok());
+            Ok(())
         }
 
         #[test]
-        fn window_bits_correction() {
+        fn window_bits_correction() -> Result<(), ReturnCode> {
             // window_bits of 8 gets turned into 9 internally
             let mut stream = z_stream::default();
             let config = DeflateConfig {
@@ -6467,10 +6494,13 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
+            // SAFETY: successful init created a live state with a unique mutable borrow.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+                .ok_or(ReturnCode::StreamError)?;
             assert_eq!(stream.state.w_bits(), 9);
 
             assert!(end(stream).is_ok());
+            Ok(())
         }
 
         #[test]
@@ -6496,22 +6526,29 @@ mod test {
     }
 
     #[test]
-    fn end_leaves_null_abi_state_pointer() {
+    fn end_leaves_null_abi_state_pointer() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         assert!(end(stream).is_ok());
         assert!(stream.as_z_stream_mut().state.is_null());
         assert!(end(stream).is_err());
         assert!(stream.as_z_stream_mut().state.is_null());
+        Ok(())
     }
 
     #[test]
-    fn end_data_error() {
+    fn end_data_error() -> Result<(), ReturnCode> {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // next deflate into too little space
         let input = b"Hello World\n";
@@ -6526,13 +6563,17 @@ mod test {
 
         // but end is not
         assert!(end(stream).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_reset_keep() {
+    fn test_reset_keep() -> Result<(), ReturnCode> {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // next deflate into too little space
         let input = b"Hello World\n";
@@ -6552,10 +6593,11 @@ mod test {
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn reset_keep_rewinds_partially_drained_pending_output() {
+    fn reset_keep_rewinds_partially_drained_pending_output() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         let config = DeflateConfig {
             window_bits: 31,
@@ -6563,7 +6605,10 @@ mod test {
             ..Default::default()
         };
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // Make the gzip name larger than the small mem_level=1 pending buffer. One deflate call
         // fills that buffer and drains only part of it, leaving `Pending::out` advanced while
@@ -6610,6 +6655,7 @@ mod test {
         );
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -6645,7 +6691,7 @@ mod test {
     }
 
     #[test]
-    fn prime_reports_full_pending_buffer() {
+    fn prime_reports_full_pending_buffer() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         let config = DeflateConfig {
             window_bits: -15,
@@ -6653,7 +6699,10 @@ mod test {
             ..Default::default()
         };
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         let calls = stream.state.bit_writer.pending.capacity() / 2;
         for _ in 0..calls {
@@ -6663,6 +6712,7 @@ mod test {
         assert_eq!(prime(stream, 16, 0xa55a), ReturnCode::BufError);
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -7946,10 +7996,13 @@ mod test {
     }
 
     #[test]
-    fn deflate_copy_owns_independent_state_and_buffer_storage() {
+    fn deflate_copy_owns_independent_state_and_buffer_storage() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let source = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let source = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         let initial_window_byte = 0x11u8;
         unsafe {
@@ -8000,10 +8053,11 @@ mod test {
 
         assert!(end(source).is_ok());
         assert!(end(copied).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn gzip_header_is_shared_safely_across_deflate_copy() {
+    fn gzip_header_is_shared_safely_across_deflate_copy() -> Result<(), ReturnCode> {
         let extra = b"copy-extra\0";
         let name = b"copy-name\0";
         let comment = b"copy-comment\0";
@@ -8029,7 +8083,10 @@ mod test {
         };
         let mut source_stream = z_stream::default();
         assert_eq!(init(&mut source_stream, config), ReturnCode::Ok);
-        let source = unsafe { DeflateStream::from_stream_mut(&raw mut source_stream) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let source = unsafe { DeflateStream::from_stream_mut(&raw mut source_stream) }
+            .ok_or(ReturnCode::StreamError)?;
         assert_eq!(
             unsafe { set_header(source, Some(&mut header)) },
             ReturnCode::Ok
@@ -8064,6 +8121,7 @@ mod test {
 
         assert!(end(source).is_ok());
         assert!(end(copied).is_ok());
+        Ok(())
     }
 
     #[test]

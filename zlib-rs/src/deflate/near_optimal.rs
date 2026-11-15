@@ -4,6 +4,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+use crate::ReturnCode;
+
 use super::{
     match_compare, trees_tbl, State, StaticTreeDesc, D_CODES, LENGTH_CODES, L_CODES, STD_MAX_MATCH,
     STD_MIN_MATCH,
@@ -356,16 +358,17 @@ impl ParseStep {
 /// symbol's distance interval. The lexicographic predecessor or successor of the current suffix
 /// maximizes LCP over that set, so two probes recover the longest match for the whole distance class.
 /// Retaining that one maximum per class is lossless for arbitrary DEFLATE Huffman code lengths.
-pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandidates {
+pub fn build_match_candidates(
+    input: &[u8],
+    max_distance: usize,
+) -> Result<MatchCandidates, ReturnCode> {
     const DIRECT_SCAN_MAX: usize = 8;
-    // The parser emits DEFLATE tokens, not arbitrary 16-bit offsets.
-    assert!(
-        max_distance <= 1usize << crate::MAX_WBITS,
-        "candidate history exceeds the DEFLATE window"
-    );
-    // SuffixRanks checks that its compact u32 backing can address the input.
-    // Candidate entry offsets remain usize because there may be D_CODES entries per byte.
-    let suffixes = SuffixRanks::new(input);
+    // Reject invalid history as an API error, not a process-wide panic.
+    if max_distance > 1usize << crate::MAX_WBITS {
+        return Err(ReturnCode::StreamError);
+    }
+    // Candidate offsets remain usize because there may be D_CODES entries per byte.
+    let suffixes = SuffixRanks::new(input)?;
     let ranges = distance_code_ranges(max_distance);
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
@@ -431,7 +434,7 @@ pub fn build_match_candidates(input: &[u8], max_distance: usize) -> MatchCandida
         offsets.push(entries.len());
     }
 
-    MatchCandidates { offsets, entries }
+    Ok(MatchCandidates { offsets, entries })
 }
 
 /// Dense ordered set over suffix ranks. Each level is a bitset whose set bits identify non-empty
@@ -626,6 +629,12 @@ struct SuffixRanks {
     rank: Vec<u32>,
 }
 
+/// The packed suffix permutation and counting-sort offsets require indices
+/// representable as u32, independently of the host pointer width.
+pub(super) fn checked_suffix_input_len(len: usize) -> Result<u32, ReturnCode> {
+    u32::try_from(len).map_err(|_| ReturnCode::StreamError)
+}
+
 impl SuffixRanks {
     #[inline]
     fn rank_of(&self, position: usize) -> usize {
@@ -637,15 +646,14 @@ impl SuffixRanks {
         suffix_index(self.sa[suffix_rank])
     }
 
-    fn new(input: &[u8]) -> Self {
+    fn new(input: &[u8]) -> Result<Self, ReturnCode> {
+        let length = checked_suffix_input_len(input.len())?;
         if input.is_empty() {
-            return Self {
+            return Ok(Self {
                 sa: Vec::new(),
                 rank: Vec::new(),
-            };
+            });
         }
-        let length = u32::try_from(input.len())
-            .unwrap_or_else(|_| panic!("input exceeds the suffix-rank index range"));
 
         let mut sa = (0..length).collect::<Vec<_>>();
         let mut scratch = vec![0u32; input.len()];
@@ -688,9 +696,7 @@ impl SuffixRanks {
                 break;
             }
             max_rank = class;
-            span = span
-                .checked_mul(2)
-                .expect("suffix-array doubling span overflow");
+            span = span.checked_mul(2).ok_or(ReturnCode::StreamError)?;
         }
 
         // The doubling ranks are 1-based equivalence classes. The parser wants direct indices into
@@ -699,7 +705,7 @@ impl SuffixRanks {
             rank[suffix_index(position)] = suffix_rank;
         }
 
-        Self { sa, rank }
+        Ok(Self { sa, rank })
     }
 }
 
@@ -872,11 +878,19 @@ impl BlockSplitStats {
 /// long-match observations and detect distribution changes. This is deliberately cheaper than the
 /// exact suffix-rank frontier; exact match discovery and dynamic programming happen only after a
 /// boundary has been selected.
-pub fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize>> {
+pub fn choose_block_ranges(
+    input: &[u8],
+    max_distance: usize,
+) -> Result<Vec<Range<usize>>, ReturnCode> {
     const HASH_SIZE: usize = 1 << 16;
 
+    // A caller-supplied distance can otherwise overflow the ring size
+    // before the exact candidate builder gets a chance to reject it.
+    if max_distance > 1usize << crate::MAX_WBITS {
+        return Err(ReturnCode::StreamError);
+    }
     if input.is_empty() {
-        return core::iter::once(0..0).collect();
+        return Ok(core::iter::once(0..0).collect());
     }
     let mut head = vec![usize::MAX; HASH_SIZE];
     // Keep one previous-link slot for every position in the legal distance window. Unlike storing a
@@ -978,14 +992,13 @@ pub fn choose_block_ranges(input: &[u8], max_distance: usize) -> Vec<Range<usize
     if block_start < input.len() {
         blocks.push(block_start..input.len());
     }
-    debug_assert!(!blocks.is_empty());
-    debug_assert_eq!(blocks[0].start, 0);
-    debug_assert_eq!(blocks.last().unwrap().end, input.len());
+    debug_assert_eq!(blocks.first().map(|range| range.start), Some(0));
+    debug_assert_eq!(blocks.last().map(|range| range.end), Some(input.len()));
     debug_assert!(blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
     debug_assert!(blocks
         .iter()
         .all(|block| block.len() <= MAX_COARSE_BLOCK_INPUT));
-    blocks
+    Ok(blocks)
 }
 
 #[inline]
@@ -1285,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_ranks_preserve_lexicographic_order() {
+    fn suffix_ranks_preserve_lexicographic_order() -> Result<(), ReturnCode> {
         let mut state = 0x243f_6a88_85a3_08d3u64;
         let mut input = vec![0u8; 32 * 1024];
         for byte in &mut input {
@@ -1295,7 +1308,7 @@ mod tests {
             *byte = state.to_le_bytes()[4] & 0x1f;
         }
 
-        let suffixes = SuffixRanks::new(&input);
+        let suffixes = SuffixRanks::new(&input)?;
         for rank in 0..input.len() {
             let position = suffixes.position_at(rank);
             assert_eq!(suffixes.rank_of(position), rank);
@@ -1303,6 +1316,7 @@ mod tests {
         for pair in suffixes.sa.windows(2) {
             assert!(input[suffix_index(pair[0])..] < input[suffix_index(pair[1])..]);
         }
+        Ok(())
     }
 
     #[test]
@@ -1321,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_ranks_invert_repetitive_and_boundary_length_inputs() {
+    fn suffix_ranks_invert_repetitive_and_boundary_length_inputs() -> Result<(), ReturnCode> {
         for length in [
             0usize, 1, 2, 3, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1_023, 1_024, 1_025, 4_095,
             4_096, 4_097,
@@ -1335,7 +1349,7 @@ mod tests {
                     })
                     .collect();
 
-                let suffixes = SuffixRanks::new(&input);
+                let suffixes = SuffixRanks::new(&input)?;
                 assert_eq!(suffixes.sa.len(), length);
                 assert_eq!(suffixes.rank.len(), length);
                 for rank in 0..length {
@@ -1356,6 +1370,7 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -1428,12 +1443,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "candidate history exceeds the DEFLATE window")]
     fn exact_frontier_rejects_distances_outside_deflate_window() {
         // A u16 can encode more than the 32 KiB permitted by DEFLATE.
         // Reject that input at the candidate boundary, not when the token
         // eventually reaches the Huffman writer.
-        let _ = build_match_candidates(b"aaaaaaa", (1usize << crate::MAX_WBITS) + 1);
+        assert!(matches!(
+            build_match_candidates(b"aaaaaaa", (1usize << crate::MAX_WBITS) + 1),
+            Err(ReturnCode::StreamError)
+        ));
     }
 
     #[test]
@@ -1485,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_frontier_reaches_full_deflate_window() {
+    fn exact_frontier_reaches_full_deflate_window() -> Result<(), ReturnCode> {
         let mut state = 0x94d0_49bb_1331_11ebu64;
         let mut input = vec![0u8; 32_768];
         for byte in &mut input {
@@ -1497,15 +1514,16 @@ mod tests {
         let repeated = input[..STD_MAX_MATCH].to_vec();
         input.extend_from_slice(&repeated);
 
-        let table = build_match_candidates(&input, 32_768);
+        let table = build_match_candidates(&input, 32_768)?;
         assert!(table.for_position(32_768).iter().any(|candidate| {
             usize::from(candidate.distance) == 32_768
                 && usize::from(candidate.length) == STD_MAX_MATCH
         }));
+        Ok(())
     }
 
     #[test]
-    fn exact_frontier_does_not_cross_deflate_window() {
+    fn exact_frontier_does_not_cross_deflate_window() -> Result<(), ReturnCode> {
         let mut state = 0x94d0_49bb_1331_11ebu64;
         let mut input = vec![0u8; 32_769];
         for byte in &mut input {
@@ -1518,11 +1536,12 @@ mod tests {
         assert_ne!(&input[1..=STD_MAX_MATCH], repeated.as_slice());
         input.extend_from_slice(&repeated);
 
-        let table = build_match_candidates(&input, 32_768);
+        let table = build_match_candidates(&input, 32_768)?;
         assert!(table
             .for_position(32_769)
             .iter()
             .all(|candidate| usize::from(candidate.length) < STD_MAX_MATCH));
+        Ok(())
     }
 
     fn brute_frontier(input: &[u8], position: usize, max_distance: usize) -> Vec<MatchCandidate> {
@@ -1606,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_rank_frontier_matches_exhaustive_distance_code_frontier() {
+    fn suffix_rank_frontier_matches_exhaustive_distance_code_frontier() -> Result<(), ReturnCode> {
         let inputs: &[&[u8]] = &[
             b"abcabcabc/abcabcabc/xyzxyzxyz",
             b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1614,7 +1633,7 @@ mod tests {
             b"no useful repetition here",
         ];
         for input in inputs {
-            let table = build_match_candidates(input, 32);
+            let table = build_match_candidates(input, 32)?;
             assert_eq!(table.len(), input.len());
             for position in 0..input.len() {
                 assert_eq!(
@@ -1624,10 +1643,11 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn suffix_rank_frontier_matches_bruteforce_on_generated_inputs() {
+    fn suffix_rank_frontier_matches_bruteforce_on_generated_inputs() -> Result<(), ReturnCode> {
         let mut state = 0x1234_5678_9abc_def0u64;
         for len in 3..96 {
             for alphabet in [2u8, 3, 7, 31, 251] {
@@ -1640,7 +1660,7 @@ mod tests {
                 }
                 for max_distance in [1usize, 2, 3, 7, 16, 31, 50, 64] {
                     let max_distance = max_distance.min(32_506);
-                    let table = build_match_candidates(&input, max_distance);
+                    let table = build_match_candidates(&input, max_distance)?;
                     for position in 0..input.len() {
                         assert_eq!(
                             frontier_signature(table.for_position(position)),
@@ -1651,6 +1671,7 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     pub(super) fn two_distribution_input() -> Vec<u8> {
@@ -1672,9 +1693,24 @@ mod tests {
     }
 
     #[test]
-    fn splitter_detects_distribution_change_and_preserves_block_invariants() {
+    fn splitter_rejects_out_of_window_history_before_allocating() {
+        for input in [b"".as_slice(), b"abcabc".as_slice()] {
+            assert!(matches!(
+                choose_block_ranges(input, usize::MAX),
+                Err(ReturnCode::StreamError)
+            ));
+            assert!(matches!(
+                choose_block_ranges(input, (1usize << crate::MAX_WBITS) + 1),
+                Err(ReturnCode::StreamError)
+            ));
+        }
+    }
+
+    #[test]
+    fn splitter_detects_distribution_change_and_preserves_block_invariants(
+    ) -> Result<(), ReturnCode> {
         let input = two_distribution_input();
-        let blocks = choose_block_ranges(&input, 32_506);
+        let blocks = choose_block_ranges(&input, 32_506)?;
         assert!(
             blocks.len() >= 2,
             "expected a split near the data transition: {blocks:?}"
@@ -1690,12 +1726,13 @@ mod tests {
         assert!(blocks
             .iter()
             .all(|block| block.len() <= MAX_COARSE_BLOCK_INPUT));
+        Ok(())
     }
 
     #[test]
-    fn splitter_soft_limit_never_creates_an_illegal_or_tiny_tail() {
+    fn splitter_soft_limit_never_creates_an_illegal_or_tiny_tail() -> Result<(), ReturnCode> {
         let input = vec![0x5a; 150_000];
-        let blocks = choose_block_ranges(&input, 32_506);
+        let blocks = choose_block_ranges(&input, 32_506)?;
         assert_eq!(blocks[0].start, 0);
         assert_eq!(blocks.last().unwrap().end, input.len());
         assert!(blocks
@@ -1706,10 +1743,11 @@ mod tests {
             .take(blocks.len() - 1)
             .all(|block| block.len() >= MIN_BLOCK_LENGTH));
         assert!(blocks.last().unwrap().len() >= MIN_BLOCK_LENGTH);
+        Ok(())
     }
 
     #[test]
-    fn splitter_soft_limit_boundary_matrix_is_exact() {
+    fn splitter_soft_limit_boundary_matrix_is_exact() -> Result<(), ReturnCode> {
         for (len, expected) in [
             (0, vec![0..0]),
             (59_999, vec![0..59_999]),
@@ -1722,12 +1760,13 @@ mod tests {
             (120_000, vec![0..60_000, 60_000..120_000]),
         ] {
             let input = vec![0x5a; len];
-            assert_eq!(choose_block_ranges(&input, 32_768), expected, "len={len}");
+            assert_eq!(choose_block_ranges(&input, 32_768)?, expected, "len={len}");
         }
+        Ok(())
     }
 
     #[test]
-    fn range_parse_can_reference_history_before_the_block() {
+    fn range_parse_can_reference_history_before_the_block() -> Result<(), ReturnCode> {
         let mut state = 0x517c_c1b7_2722_0a95u64;
         let mut history = vec![0u8; 6_000];
         for byte in &mut history {
@@ -1738,13 +1777,14 @@ mod tests {
         }
         let mut input = history.clone();
         input.extend_from_slice(&history);
-        let table = build_match_candidates(&input, 32_506);
+        let table = build_match_candidates(&input, 32_506)?;
         let parsed = parse_range(&input, &table, 6_000..12_000, &TokenCosts::fixed());
         assert!(matches!(
             parsed.tokens.first(),
             Some(ParseToken::Match { length, distance })
                 if *length >= 32 && *distance == 6_000
         ));
+        Ok(())
     }
 
     #[test]
@@ -1759,22 +1799,23 @@ mod tests {
     }
 
     #[test]
-    fn minimum_cost_parse_matches_exhaustive_oracle() {
+    fn minimum_cost_parse_matches_exhaustive_oracle() -> Result<(), ReturnCode> {
         let input = b"abcabcabcxabcaabcabcabc---abcabc";
-        let table = build_match_candidates(input, 32);
+        let table = build_match_candidates(input, 32)?;
         let fixed = TokenCosts::fixed();
         let parsed = parse_block(input, &table, &fixed);
         assert_eq!(parsed.cost_x16, brute_cost(input, &fixed, 32));
         assert_eq!(expand(&parsed.tokens), input);
+        Ok(())
     }
 
     #[test]
-    fn maximal_symbol_weights_keep_dp_exact_without_u16_overflow() {
+    fn maximal_symbol_weights_keep_dp_exact_without_u16_overflow() -> Result<(), ReturnCode> {
         // A cost model may assign u16::MAX to a Huffman symbol. Extra-bit
         // costs are then added before DP comparison and must not wrap u16,
         // including for distance symbols spanning the full DEFLATE window.
         let input = vec![b'a'; 96];
-        let candidates = build_match_candidates(&input, 64);
+        let candidates = build_match_candidates(&input, 64)?;
         let mut costs = TokenCosts::fixed();
         costs.literal.fill(u16::MAX);
         costs.length.fill(u16::MAX);
@@ -1801,12 +1842,13 @@ mod tests {
                 "distance={distance}",
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn reused_parse_scratch_resets_across_ranges_and_cost_models() {
+    fn reused_parse_scratch_resets_across_ranges_and_cost_models() -> Result<(), ReturnCode> {
         let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
-        let candidates = build_match_candidates(input, 32);
+        let candidates = build_match_candidates(input, 32)?;
         let fixed = TokenCosts::fixed();
         let mut varied = fixed.clone();
         varied.literal[b'a' as usize] = 2 * COST_SCALE;
@@ -1834,12 +1876,13 @@ mod tests {
                 capacity = Some((scratch.best_cost.capacity(), scratch.steps.capacity()));
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn distance_code_reduction_is_valid_for_non_monotone_huffman_costs() {
+    fn distance_code_reduction_is_valid_for_non_monotone_huffman_costs() -> Result<(), ReturnCode> {
         let input = b"aaaaaaaaabaaaaaaaaacaaaaaaaaadaaaaaaaaa";
-        let table = build_match_candidates(input, 32);
+        let table = build_match_candidates(input, 32)?;
         let mut costs = TokenCosts::fixed();
         // Deliberately make farther distance symbols cheaper than nearby ones. Keeping the longest
         // match per distance *symbol* must remain exact even when distance costs are non-monotone.
@@ -1855,6 +1898,7 @@ mod tests {
         let parsed = parse_block(input, &table, &costs);
         assert_eq!(parsed.cost_x16, brute_cost(input, &costs, 32));
         assert_eq!(expand(&parsed.tokens), input);
+        Ok(())
     }
 }
 
@@ -2874,12 +2918,18 @@ pub fn parse_planned_block_source(
     max_distance: usize,
     optimization_passes: usize,
     previous_model: Option<&ParseModel>,
-) -> PlannedBlockSource {
+) -> Result<PlannedBlockSource, ReturnCode> {
+    // This API accepts a caller-provided range, not merely the trusted
+    // output of the built-in splitter. Reject invalid bounds before slicing
+    // or updating any compression model.
+    if range.start > range.end || range.end > input.len() {
+        return Err(ReturnCode::StreamError);
+    }
     let history_start = range.start.saturating_sub(max_distance);
     let context_end = range.end;
     let context = &input[history_start..context_end];
     let local_range = (range.start - history_start)..context.len();
-    let candidates = build_match_candidates(context, max_distance);
+    let candidates = build_match_candidates(context, max_distance)?;
     let (parsed, model) = optimized_parse_range(
         state,
         context,
@@ -2893,18 +2943,42 @@ pub fn parse_planned_block_source(
         tokens: parsed.tokens,
     };
     debug_assert_eq!(block.token_input_len(), block.range.len());
-    PlannedBlockSource {
+    Ok(PlannedBlockSource {
         block,
         model,
         context_start: history_start,
         context_end,
         candidates,
-    }
+    })
 }
 
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn planned_range_rejects_invalid_offsets_and_history_without_panicking(
+    ) -> Result<(), ReturnCode> {
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9))?;
+        let state = &mut *stream.state;
+        let input = b"test input";
+
+        for range in [
+            Range { start: 5, end: 3 },
+            0..input.len() + 1,
+            input.len() + 1..input.len() + 2,
+        ] {
+            assert!(matches!(
+                parse_planned_block_source(state, input, range, 32_768, 2, None),
+                Err(ReturnCode::StreamError)
+            ));
+        }
+        assert!(matches!(
+            parse_planned_block_source(state, input, 0..input.len(), 32_769, 2, None),
+            Err(ReturnCode::StreamError)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn boundary_reparse_keeps_exact_model_of_selected_tokens() -> Result<(), crate::ReturnCode> {
@@ -2925,7 +2999,7 @@ mod boundary_tests {
         let state = &mut *stream.state;
         for passes in [1, 2, 4] {
             let mut block =
-                parse_planned_block_source(state, &input, 4_000..13_000, 32_768, passes, None);
+                parse_planned_block_source(state, &input, 4_000..13_000, 32_768, passes, None)?;
             let previous = model_from_tokens(state, &block.block.tokens);
             for prior in [None, Some(&previous)] {
                 let _changed = block.reparse_with_existing_candidates(state, &input, passes, prior);
@@ -3354,12 +3428,12 @@ mod encoded_tests {
     }
 
     #[test]
-    fn additional_optimization_pass_never_enlarges_single_block_stream() {
+    fn additional_optimization_pass_never_enlarges_single_block_stream() -> Result<(), ReturnCode> {
         // Keep this below twice MIN_BLOCK_LENGTH so adaptive partitioning cannot change the block
         // layout between runs. For a fixed range, the optimization loop retains the cheapest exact
         // production-scored path seen so far, so an additional search must not enlarge the stream.
         let input = super::tests::two_distribution_input()[..8_000].to_vec();
-        assert_eq!(choose_block_ranges(&input, 32_506), [0..input.len()]);
+        assert_eq!(choose_block_ranges(&input, 32_506)?, [0..input.len()]);
 
         let mut previous_len = usize::MAX;
         for passes in 1..=4 {
@@ -3374,26 +3448,28 @@ mod encoded_tests {
             );
             previous_len = encoded.len();
         }
+        Ok(())
     }
 
     #[test]
-    fn long_huffman_block_round_trips_beyond_stored_limit() {
+    fn long_huffman_block_round_trips_beyond_stored_limit() -> Result<(), ReturnCode> {
         let pattern = b"abcdefghijklmnopqrstuvwxyz012345";
         let input = (0..120_000)
             .map(|index| pattern[index % pattern.len()])
             .collect::<Vec<_>>();
         assert_eq!(
-            choose_block_ranges(&input, 32_768),
+            choose_block_ranges(&input, 32_768)?,
             [0..60_000, 60_000..120_000]
         );
 
         assert_round_trip(&input, 1);
+        Ok(())
     }
 
     #[test]
-    fn adaptive_multi_block_stream_round_trips() {
+    fn adaptive_multi_block_stream_round_trips() -> Result<(), ReturnCode> {
         let input = super::tests::two_distribution_input();
-        let blocks = choose_block_ranges(&input, 32_506);
+        let blocks = choose_block_ranges(&input, 32_506)?;
         assert!(
             blocks.len() >= 2,
             "test input must exercise multiple blocks"
@@ -3401,6 +3477,7 @@ mod encoded_tests {
 
         assert_round_trip(&input, 1);
         assert_round_trip(&input, 3);
+        Ok(())
     }
 
     #[test]

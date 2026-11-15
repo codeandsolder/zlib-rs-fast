@@ -4247,7 +4247,7 @@ mod tests {
     fn whole_slice_inflate_distinguishes_empty_stream_from_exhausted_output() {
         // RFC1950 stream containing no uncompressed bytes.
         const EMPTY_STREAM: &[u8] = &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
-        let mut empty_dest = [MaybeUninit::<u8>::uninit(); 0];
+        let mut empty_dest: [MaybeUninit<u8>; 0] = [];
         let (consumed, decoded, code) =
             uncompress2(&mut empty_dest, EMPTY_STREAM, InflateConfig::default());
         assert_eq!(code, ReturnCode::Ok);
@@ -4360,13 +4360,16 @@ mod tests {
     }
 
     #[test]
-    fn end_leaves_null_abi_state_pointer() {
+    fn end_leaves_null_abi_state_pointer() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: successful initialization created a live, uniquely borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         assert!(end(stream).state.is_null());
         assert!(end(stream).state.is_null());
+        Ok(())
     }
 
     #[test]
@@ -4661,15 +4664,18 @@ mod tests {
     }
 
     #[test]
-    fn inflate_copy_owns_independent_state_and_window_storage() {
+    fn inflate_copy_owns_independent_state_and_window_storage() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let source = unsafe { InflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+        // SAFETY: successful initialization created a live, uniquely borrowed inflate state.
+        let source = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
         let source_state = source.state.as_ptr();
         let source_window = source.state.window.as_ptr();
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
         assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
+        // SAFETY: copy returned Ok and initialized the destination stream.
         let copied = unsafe { copied.assume_init_mut() };
 
         assert_ne!(source_state, copied.state.as_ptr());
@@ -4681,6 +4687,7 @@ mod tests {
 
         end(copied);
         end(source);
+        Ok(())
     }
 
     #[test]
@@ -4775,7 +4782,7 @@ mod tests {
     }
 
     #[test]
-    fn gzip_header_destination_is_shared_safely_across_inflate_copy() {
+    fn gzip_header_destination_is_shared_safely_across_inflate_copy() -> Result<(), ReturnCode> {
         // Extended gzip header with FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT set. The payload starts after
         // the header; this test only needs both copied streams to finish parsing the header.
         let input: &[u8] = &[
@@ -4794,11 +4801,11 @@ mod tests {
             os: 0,
             extra: extra.as_mut_ptr(),
             extra_len: 0,
-            extra_max: extra.len() as _,
+            extra_max: u32::try_from(extra.len()).map_err(|_| ReturnCode::StreamError)?,
             name: name.as_mut_ptr(),
-            name_max: name.len() as _,
+            name_max: u32::try_from(name.len()).map_err(|_| ReturnCode::StreamError)?,
             comment: comment.as_mut_ptr(),
-            comm_max: comment.len() as _,
+            comm_max: u32::try_from(comment.len()).map_err(|_| ReturnCode::StreamError)?,
             hcrc: 0,
             done: 0,
         };
@@ -4808,8 +4815,11 @@ mod tests {
             init(&mut source_stream, InflateConfig { window_bits: 47 }),
             ReturnCode::Ok
         );
-        let source = unsafe { InflateStream::from_stream_mut(&raw mut source_stream) }.unwrap();
+        // SAFETY: successful initialization created a live, uniquely borrowed inflate state.
+        let source = unsafe { InflateStream::from_stream_mut(&raw mut source_stream) }
+            .ok_or(ReturnCode::StreamError)?;
         assert_eq!(
+            // SAFETY: the live stream and caller-owned header remain valid through decoding.
             unsafe { get_header(source, Some(&mut header)) },
             ReturnCode::Ok
         );
@@ -4818,17 +4828,19 @@ mod tests {
         // same caller-owned header destination just as zlib's copied C pointer does.
         let mut source_out = [0u8; 1];
         source.next_in = input.as_ptr().cast_mut();
-        source.avail_in = input.len() as _;
+        source.avail_in = u32::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
         source.next_out = source_out.as_mut_ptr();
-        source.avail_out = source_out.len() as _;
+        source.avail_out = u32::try_from(source_out.len()).map_err(|_| ReturnCode::StreamError)?;
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
         assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
+        // SAFETY: copy succeeded, so the destination stream is fully initialized.
         let copied = unsafe { copied.assume_init_mut() };
         let mut copied_out = [0u8; 1];
         copied.next_out = copied_out.as_mut_ptr();
-        copied.avail_out = copied_out.len() as _;
+        copied.avail_out = u32::try_from(copied_out.len()).map_err(|_| ReturnCode::StreamError)?;
 
+        // SAFETY: live input, output and header storage are disjoint for this decoder call.
         let source_ret = unsafe { inflate(source, InflateFlush::NoFlush) };
         assert!(matches!(source_ret, ReturnCode::Ok | ReturnCode::StreamEnd));
         assert_eq!(header.done, 1);
@@ -4837,6 +4849,7 @@ mod tests {
         assert_eq!(header.os, 3);
         assert_eq!(header.hcrc, 1);
 
+        // SAFETY: copied state retains valid caller buffers for this independent call.
         let copied_ret = unsafe { inflate(copied, InflateFlush::NoFlush) };
         assert_eq!(copied_ret, source_ret);
         assert_eq!(header.done, 1);
@@ -4846,6 +4859,7 @@ mod tests {
 
         end(source);
         end(copied);
+        Ok(())
     }
 
     fn inflate_fragmented(
@@ -4853,10 +4867,10 @@ mod tests {
         expected: &[u8],
         input_chunk: usize,
         output_chunk: usize,
-    ) {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }.unwrap();
+    ) -> Result<(), ReturnCode> {
+        // Typed ownership ensures a decoder error or invalid chunk length
+        // frees the inflate allocation as the helper unwinds its Result.
+        let mut stream = InflateStream::new(InflateConfig::default())?;
 
         let mut output = vec![0u8; expected.len() + output_chunk];
         let mut next_input = 0usize;
@@ -4866,7 +4880,7 @@ mod tests {
             if stream.avail_in == 0 && next_input < compressed.len() {
                 let len = input_chunk.min(compressed.len() - next_input);
                 stream.next_in = compressed[next_input..].as_ptr().cast_mut();
-                stream.avail_in = len as u32;
+                stream.avail_in = u32::try_from(len).map_err(|_| ReturnCode::StreamError)?;
                 next_input += len;
             }
 
@@ -4877,25 +4891,26 @@ mod tests {
                     "fragmented inflate exhausted its output allocation"
                 );
                 stream.next_out = output[next_output..].as_mut_ptr();
-                stream.avail_out = len as u32;
+                stream.avail_out = u32::try_from(len).map_err(|_| ReturnCode::StreamError)?;
                 next_output += len;
             }
 
-            match unsafe { inflate(stream, InflateFlush::NoFlush) } {
+            // SAFETY: input/output chunks are live and non-overlapping for this decoder call.
+            match unsafe { inflate(&mut stream, InflateFlush::NoFlush) } {
                 ReturnCode::Ok => {}
                 ReturnCode::StreamEnd => break,
-                code => panic!("fragmented inflate returned {code:?}"),
+                code => return Err(code),
             }
         }
 
-        let written = stream.total_out as usize;
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(written, expected.len());
         assert_eq!(&output[..written], expected);
-        end(stream);
+        Ok(())
     }
 
     #[test]
-    fn inflate_resumes_across_fragmented_input_and_output() {
+    fn inflate_resumes_across_fragmented_input_and_output() -> Result<(), ReturnCode> {
         const PATTERN: &[u8] =
             b"the quick brown fox jumps over the lazy dog | 0123456789 | DEFLATE!";
         let input: Vec<u8> = (0..16 * 1024)
@@ -4912,9 +4927,10 @@ mod tests {
 
         for input_chunk in [1, 2, 3, 5, 7, 13] {
             for output_chunk in [1, 3, 7, 31] {
-                inflate_fragmented(&compressed, &input, input_chunk, output_chunk);
+                inflate_fragmented(&compressed, &input, input_chunk, output_chunk)?;
             }
         }
+        Ok(())
     }
 
     #[test]
