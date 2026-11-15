@@ -2298,17 +2298,38 @@ const STORED_WINDOW_REGRESSION: &[u8] = &[
 ];
 
 #[test]
-fn deflate_stored_window_out_of_bounds() {
+fn deflate_stored_window_out_of_bounds() -> Result<(), ()> {
     use zlib_rs::ReturnCode;
 
+    // Keep the original two-phase, tiny-window transition, but force the
+    // output buffer to grow so pointer rebasing and pending output are tested.
+    const CHUNK: usize = 305;
     let mut source = STORED_WINDOW_REGRESSION.to_vec();
 
-    // SAFETY: The initialized encoder stream and mutable source/destination buffers remain live through the stress test.
+    // SAFETY: input storage stays live and unchanged throughout compression.
+    // The buffer-growth helper rebinds next_out to the actual written prefix
+    // after every Vec reallocation; all native lengths are checked.
     assert_eq_rs_ng!(unsafe {
-        let mut strm = std::mem::MaybeUninit::<z_stream>::zeroed();
-        let err = {
-            deflateInit2_(
-                strm.as_mut_ptr(),
+        fn extend_output(
+            stream: &mut z_stream,
+            output: &mut Vec<u8>,
+            amount: usize,
+        ) -> Result<(), ()> {
+            let written = usize::try_from(stream.total_out).map_err(|_| ())?;
+            assert!(written <= output.len());
+            let new_len = output.len().checked_add(amount).ok_or(())?;
+            output.resize(new_len, 0);
+            stream.next_out = output[written..].as_mut_ptr();
+            stream.avail_out = core::ffi::c_uint::try_from(new_len - written).map_err(|_| ())?;
+            Ok(())
+        }
+
+        let input_len = core::ffi::c_ulong::try_from(source.len()).map_err(|_| ())?;
+        let first_chunk = core::ffi::c_uint::try_from(CHUNK.min(source.len())).map_err(|_| ())?;
+        let mut storage = std::mem::MaybeUninit::<z_stream>::zeroed();
+        assert_eq!(
+            ReturnCode::try_from(deflateInit2_(
+                storage.as_mut_ptr(),
                 0,
                 Z_DEFLATED,
                 8,
@@ -2316,79 +2337,84 @@ fn deflate_stored_window_out_of_bounds() {
                 Z_HUFFMAN_ONLY,
                 zlibVersion(),
                 crate::abi_z_stream_size(),
-            )
-        };
-        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
+            )),
+            Ok(ReturnCode::Ok)
+        );
+        let stream = storage.assume_init_mut();
 
-        let strm = strm.assume_init_mut();
+        let bound = usize::try_from(deflateBound(stream, input_len)).map_err(|_| ())?;
+        assert!(bound > 0);
+        let mut compressed = vec![0; bound.min(CHUNK)];
+        stream.next_in = source.as_mut_ptr();
+        stream.avail_in = first_chunk;
+        stream.next_out = compressed.as_mut_ptr();
+        stream.avail_out = core::ffi::c_uint::try_from(compressed.len()).map_err(|_| ())?;
 
-        let buf_size = { deflateBound(strm, source.len() as _) };
+        assert_eq!(
+            ReturnCode::try_from(deflate(stream, Z_NO_FLUSH)),
+            Ok(ReturnCode::Ok)
+        );
 
-        let mut dest = vec![0; buf_size as usize];
-        let chunk = 305u32;
-        let flush = Z_NO_FLUSH;
-
-        strm.next_in = source.as_mut_ptr().cast();
-        strm.avail_in = chunk; // First chunk.
-        strm.next_out = dest.as_mut_ptr().cast();
-        strm.avail_out = dest.len().try_into().unwrap();
-
-        // Deflate first chunk.
-        let err = { deflate(strm, flush) };
-        assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
-
-        // Change the parameters.
-        let new_level = 0;
-        let new_strategy = Z_DEFAULT_STRATEGY;
-        let err = { deflateParams(strm, new_level, new_strategy) };
-        match ReturnCode::try_from(err) {
-            Ok(ReturnCode::Ok) => {}
-            Ok(ReturnCode::BufError) => {
-                // Flushing the current pending data may run us out of buffer space.
-                // Worst case double the buffer size.
-                let add_space = Ord::min(chunk, buf_size as u32);
-                dest.resize(dest.len() + add_space as usize, 0);
-
-                // If extend() reallocates, it may have moved in memory.
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out += add_space;
-
-                let err = { deflateParams(strm, new_level, new_strategy) };
-                assert_eq!(ReturnCode::try_from(err), Ok(ReturnCode::Ok));
-            }
-            err => panic!("fatal {err:?}"),
-        }
-
-        // Deflate the rest in chunks.
-        let mut left = source.len() as uInt - chunk;
-        while left > 0 {
-            // Write the chunk.
-            let avail = Ord::min(chunk, left);
-            strm.avail_in = avail;
-            let err = { deflate(strm, flush) };
-            match ReturnCode::try_from(err) {
-                Ok(ReturnCode::Ok) => {
-                    left -= avail;
-                }
-                Ok(ReturnCode::BufError) => {
-                    // Worst case double the buffer size.
-                    let add_space = Ord::min(chunk, buf_size as uInt);
-                    dest.resize(dest.len() + add_space as usize, 0);
-
-                    // If extend() reallocates, it may have moved in memory.
-                    strm.next_out = dest.as_mut_ptr();
-                    strm.avail_out += add_space;
-
-                    left -= avail - strm.avail_in;
-                }
-                err => panic!("fatal {err:?}"),
+        // A level/strategy transition can need additional output to flush
+        // the old block. Preserve emitted bytes when output Vec moves.
+        loop {
+            match ReturnCode::try_from(deflateParams(stream, 0, Z_DEFAULT_STRATEGY)) {
+                Ok(ReturnCode::Ok) => break,
+                Ok(ReturnCode::BufError) => extend_output(stream, &mut compressed, CHUNK)?,
+                status => assert_eq!(status, Ok(ReturnCode::Ok)),
             }
         }
 
-        assert_eq!(left, 0);
+        // Feed according to actual total_in rather than assuming that a
+        // successful call consumed every byte in the offered chunk.
+        while usize::try_from(stream.total_in).map_err(|_| ())? < source.len() {
+            let consumed = usize::try_from(stream.total_in).map_err(|_| ())?;
+            if stream.avail_in == 0 {
+                let offered = CHUNK.min(source.len() - consumed);
+                stream.next_in = source[consumed..].as_mut_ptr();
+                stream.avail_in = core::ffi::c_uint::try_from(offered).map_err(|_| ())?;
+            }
+            let before_in = stream.total_in;
+            let before_out = stream.total_out;
+            match ReturnCode::try_from(deflate(stream, Z_NO_FLUSH)) {
+                Ok(ReturnCode::Ok | ReturnCode::BufError) => {}
+                code => assert_eq!(code, Ok(ReturnCode::Ok)),
+            }
+            if stream.avail_out == 0 {
+                extend_output(stream, &mut compressed, CHUNK)?;
+            } else {
+                assert!(
+                    stream.total_in > before_in || stream.total_out > before_out,
+                    "deflate made no progress despite available output"
+                );
+            }
+        }
+        assert_eq!(usize::try_from(stream.total_in).ok(), Some(source.len()));
 
-        let _ = { deflateEnd(strm) };
-    });
+        // Finish the stream and independently decode the produced bytes.
+        loop {
+            match ReturnCode::try_from(deflate(stream, Z_FINISH)) {
+                Ok(ReturnCode::StreamEnd) => break,
+                Ok(ReturnCode::Ok | ReturnCode::BufError) => {
+                    assert_eq!(stream.avail_out, 0);
+                    extend_output(stream, &mut compressed, CHUNK)?;
+                }
+                code => assert_eq!(code, Ok(ReturnCode::StreamEnd)),
+            }
+        }
+        let produced = usize::try_from(stream.total_out).map_err(|_| ())?;
+        assert!(produced <= compressed.len());
+        compressed.truncate(produced);
+        assert_eq!(ReturnCode::try_from(deflateEnd(stream)), Ok(ReturnCode::Ok));
+
+        let mut plain = vec![0u8; source.len()];
+        let (actual, status) =
+            zlib_rs::decompress_slice(&mut plain, &compressed, zlib_rs::InflateConfig::default());
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(actual, source.as_slice());
+        Ok::<(), ()>(())
+    })?;
+    Ok(())
 }
 
 #[test]
