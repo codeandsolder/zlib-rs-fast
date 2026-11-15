@@ -8224,7 +8224,7 @@ mod test {
     }
 
     #[test]
-    fn reset_preserves_custom_gzip_header() {
+    fn reset_preserves_custom_gzip_header() -> Result<(), SchedulerFixtureError> {
         let name = b"survives-reset\0";
         let mut header = gz_header {
             text: 1,
@@ -8246,33 +8246,58 @@ mod test {
             window_bits: 31,
             ..Default::default()
         };
-        let mut stream = z_stream::default();
-        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }.unwrap();
-        assert_eq!(
-            unsafe { set_header(stream, Some(&mut header)) },
-            ReturnCode::Ok
-        );
-
-        assert_eq!(reset(stream), ReturnCode::Ok);
-        assert!(stream.state.gzhead.is_some());
-
         let input = b"gzip after reset";
         let mut output = [0u8; 128];
-        stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let mut raw = z_stream::default();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let produced = {
+            let stream = owned.stream()?;
+            // SAFETY: the caller-owned header and name remain live and unmodified
+            // through final deflate and the matching native stream teardown.
+            assert_eq!(
+                unsafe { set_header(stream, Some(&mut header)) },
+                ReturnCode::Ok
+            );
+            assert_eq!(reset(stream), ReturnCode::Ok);
+            assert!(stream.state.gzhead.is_some());
 
-        // zlib and zlib-ng retain the caller's custom header across both reset variants.
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip input exceeds C uInt"))?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output exceeds C uInt"))?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let remaining = usize::try_from(stream.avail_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output cursor too large"))?;
+            output
+                .len()
+                .checked_sub(remaining)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "gzip output count exceeded buffer",
+                ))?
+        };
+        // Release native ownership while caller header and backing arrays remain live.
+        drop(owned);
+
+        // zlib and zlib-ng retain the caller's custom header across reset.
         assert_eq!(
             &output[..10],
             &[31, 139, 8, 0b1011, 0x78, 0x56, 0x34, 0x12, 0, 3]
         );
         assert_eq!(&output[10..10 + name.len()], name);
 
-        assert!(end(stream).is_ok());
+        // Check the full emitted payload and gzip trailer as well as header bytes.
+        let mut restored = [0u8; 128];
+        let (decoded, code) = crate::decompress_slice(
+            &mut restored,
+            &output[..produced],
+            InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+        Ok(())
     }
 
     #[test]
@@ -8434,7 +8459,7 @@ mod test {
     }
 
     #[test]
-    fn gzip_header_pending_flush() {
+    fn gzip_header_pending_flush() -> Result<(), SchedulerFixtureError> {
         let extra = "aaaaaaaaaaaaaaaaaaaa\0";
         let name = "bbbbbbbbbbbbbbbbbbbb\0";
         let comment = "cccccccccccccccccccc\0";
@@ -8445,7 +8470,8 @@ mod test {
             xflags: 0,
             os: 0,
             extra: extra.as_ptr().cast_mut(),
-            extra_len: extra.len() as _,
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip extra exceeds native count"))?,
             extra_max: 0,
             name: name.as_ptr().cast_mut(),
             name_max: 0,
@@ -8460,43 +8486,70 @@ mod test {
             mem_level: 1,
             ..Default::default()
         };
-
-        let mut stream = z_stream::default();
-        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
-            unreachable!()
-        };
-
-        unsafe { set_header(stream, Some(&mut header)) };
-
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
-
         let mut output = [0u8; 1024];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = 100;
+        let mut raw = z_stream::default();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
+        // SAFETY: the header and all backing string bytes remain alive until
+        // the scoped native stream is finalized at the end of this test.
+        assert_eq!(
+            unsafe { set_header(stream, Some(&mut header)) },
+            ReturnCode::Ok
+        );
 
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(input.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("gzip input exceeds C uInt"))?;
+        stream.next_out = output.as_mut_ptr();
+        let first_capacity = 100usize;
+        stream.avail_out = crate::c_api::uInt::try_from(first_capacity)
+            .map_err(|_| SchedulerFixtureError::Invariant("first chunk exceeds native count"))?;
         assert_eq!(stream.state.bit_writer.pending.capacity(), 512);
 
-        // only 12 bytes remain, so to write the name the pending buffer must be flushed.
-        // but there is insufficient output space to flush (only 100 bytes)
+        // Only 12 pending bytes remain; the header cannot continue until
+        // the first output chunk drains enough of this pending content.
         stream.state.bit_writer.pending.extend(&[0; 500]);
-
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::Ok);
 
-        // now try that again but with sufficient output space
-        stream.avail_out = output.len() as _;
+        let first_remaining = usize::try_from(stream.avail_out)
+            .map_err(|_| SchedulerFixtureError::Invariant("first output cursor too large"))?;
+        let first_written =
+            first_capacity
+                .checked_sub(first_remaining)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "first output count exceeded capacity",
+                ))?;
+
+        // Reset both cursor and count to the *remaining slice*. Merely
+        // restoring avail_out=output.len() while keeping an advanced next_out
+        // would advertise writable memory beyond the 1024-byte array.
+        let remaining = &mut output[first_written..];
+        stream.next_out = remaining.as_mut_ptr();
+        stream.avail_out = crate::c_api::uInt::try_from(remaining.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("second chunk exceeds native count"))?;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        assert_eq!(stream.avail_in, 0);
 
-        let n = stream.total_out as usize;
-
+        let second_remaining = usize::try_from(stream.avail_out)
+            .map_err(|_| SchedulerFixtureError::Invariant("second output cursor too large"))?;
+        let second_written = remaining.len().checked_sub(second_remaining).ok_or(
+            SchedulerFixtureError::Invariant("second output count exceeded capacity"),
+        )?;
+        let written =
+            first_written
+                .checked_add(second_written)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "total gzip output overflow",
+                ))?;
+        assert_eq!(
+            stream.total_out,
+            crate::c_api::z_size::try_from(written)
+                .map_err(|_| SchedulerFixtureError::Invariant("native total output too large"))?
+        );
+        assert_eq!(written, 500 + 99);
         assert!(end(stream).is_ok());
-
-        let output_rs = &mut output[..n];
-
-        assert_eq!(output_rs.len(), 500 + 99);
+        Ok(())
     }
 
     #[test]
