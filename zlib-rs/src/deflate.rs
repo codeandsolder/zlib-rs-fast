@@ -755,28 +755,32 @@ pub struct DeflateConfig {
 #[cfg(any(test, feature = "__internal-test"))]
 impl quickcheck::Arbitrary for DeflateConfig {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-        let mem_levels: Vec<_> = (1..=9).collect();
-        let levels: Vec<_> = (0..=9).collect();
+        const LEVELS: [i32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        const MEM_LEVELS: [i32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        const WINDOW_BITS: [i32; 21] = [
+            9, 10, 11, 12, 13, 14, 15, // zlib
+            25, 26, 27, 28, 29, 30, 31, // gzip
+            -15, -14, -13, -12, -11, -10, -9, // raw DEFLATE
+        ];
+        const STRATEGIES: [Strategy; 5] = [
+            Strategy::Default,
+            Strategy::Filtered,
+            Strategy::HuffmanOnly,
+            Strategy::Rle,
+            Strategy::Fixed,
+        ];
 
-        let mut window_bits = Vec::new();
-        window_bits.extend(9..=15); // zlib
-        window_bits.extend(9 + 16..=15 + 16); // gzip
-        window_bits.extend(-15..=-9); // raw
-
+        // These fixed, nonempty choices do not require an allocation, a
+        // potentially absent selection, or a fallback outside their domain.
+        let index = |g: &mut quickcheck::Gen, choices: usize| {
+            usize::from(<u16 as quickcheck::Arbitrary>::arbitrary(g)) % choices
+        };
         Self {
-            level: *g.choose(&levels).unwrap(),
+            level: LEVELS[index(g, LEVELS.len())],
             method: Method::Deflated,
-            window_bits: *g.choose(&window_bits).unwrap(),
-            mem_level: *g.choose(&mem_levels).unwrap(),
-            strategy: *g
-                .choose(&[
-                    Strategy::Default,
-                    Strategy::Filtered,
-                    Strategy::HuffmanOnly,
-                    Strategy::Rle,
-                    Strategy::Fixed,
-                ])
-                .unwrap(),
+            window_bits: WINDOW_BITS[index(g, WINDOW_BITS.len())],
+            mem_level: MEM_LEVELS[index(g, MEM_LEVELS.len())],
+            strategy: STRATEGIES[index(g, STRATEGIES.len())],
         }
     }
 }
@@ -4738,6 +4742,39 @@ mod test {
                 Err(ReturnCode::StreamError)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_deflate_configs_cover_only_valid_wrappers_and_parameters(
+    ) -> Result<(), &'static str> {
+        let mut generator = quickcheck::Gen::new(64);
+        let mut windows = [false; 21];
+        let mut strategies = [false; 5];
+        for _ in 0..4096 {
+            let config = <DeflateConfig as quickcheck::Arbitrary>::arbitrary(&mut generator);
+            assert!((0..=9).contains(&config.level));
+            assert!((1..=9).contains(&config.mem_level));
+            assert_eq!(config.method, Method::Deflated);
+            let index = match config.window_bits {
+                9..=15 => usize::try_from(config.window_bits - 9),
+                25..=31 => usize::try_from(config.window_bits - 25 + 7),
+                -15..=-9 => usize::try_from(config.window_bits + 15 + 14),
+                _ => return Err("invalid window bits generated"),
+            };
+            let index = index.map_err(|_| "generated window index does not fit usize")?;
+            windows[index] = true;
+            let strategy = match config.strategy {
+                Strategy::Default => 0,
+                Strategy::Filtered => 1,
+                Strategy::HuffmanOnly => 2,
+                Strategy::Rle => 3,
+                Strategy::Fixed => 4,
+            };
+            strategies[strategy] = true;
+        }
+        assert!(windows.into_iter().all(|observed| observed));
+        assert!(strategies.into_iter().all(|observed| observed));
         Ok(())
     }
 
