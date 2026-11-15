@@ -8818,11 +8818,12 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn gzip_with_header() -> Result<(), SchedulerFixtureError> {
+    fn gzip_header_roundtrip(
+        extra: &[u8],
+        expected_compressed_len: usize,
+    ) -> Result<(), SchedulerFixtureError> {
         // Keep gzipHeader readback in addition to the zlib-ng differential
         // suite: it exercises Miri-relevant native input/output lifetimes.
-        let extra = "some extra stuff\0";
         let name = "nomen est omen\0";
         let comment = "such comment\0";
         let mut header = gz_header {
@@ -8883,7 +8884,7 @@ mod test {
             written
         };
         drop(encoder);
-        assert_eq!(encoded_len, 81);
+        assert_eq!(encoded_len, expected_compressed_len);
 
         let gzip_bytes = &compressed[..encoded_len];
         let mut plaintext = [0u8; 12];
@@ -8947,13 +8948,13 @@ mod test {
         assert_eq!(decoded_header.done, 1);
 
         // RFC 1952 extra data is arbitrary bytes, *not* a C string.
-        // Use its explicit wire length, including the NUL in this fixture.
+        // Use its explicit wire length and preserve embedded zeros and invalid UTF-8.
         let extra_size = usize::try_from(decoded_header.extra_len)
             .map_err(|_| SchedulerFixtureError::Invariant("gzip extra count exceeds host width"))?;
         assert_eq!(extra_size, extra.len());
         assert_eq!(
             extra_buf.get(..extra_size),
-            Some(extra.as_bytes()),
+            Some(extra),
             "decoded gzip extra differs from raw binary metadata"
         );
         assert_eq!(extra_buf.get(extra_size), Some(&0xa5));
@@ -8967,6 +8968,18 @@ mod test {
         assert_eq!(name_buf.get(name_text.len() + 1), Some(&0xa5));
         assert_eq!(comment_buf.get(comment_text.len() + 1), Some(&0xa5));
         Ok(())
+    }
+    #[test]
+    fn gzip_with_header() -> Result<(), SchedulerFixtureError> {
+        gzip_header_roundtrip(b"some extra stuff\0", 81)
+    }
+
+    #[test]
+    fn gzip_header_supports_binary_extra_with_embedded_nul_and_non_utf8(
+    ) -> Result<(), SchedulerFixtureError> {
+        // A gzip FEXTRA field is length-prefixed binary data. No NUL
+        // terminator or UTF-8 interpretation is required by the decoder.
+        gzip_header_roundtrip(b"\0\xff\x80\xaa", 68)
     }
 
     #[test]
