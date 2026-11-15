@@ -47,7 +47,7 @@ impl GzCString {
 
         // Safety: `ptr` is a fresh allocation for exactly `bytes.len()` c_char values.
         unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), ptr.as_ptr(), bytes.len())
+            ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), ptr.as_ptr(), bytes.len());
         };
 
         Some(Self {
@@ -71,7 +71,7 @@ impl GzCString {
                     part.as_ptr(),
                     ptr.as_ptr().cast::<u8>().add(offset),
                     part.len(),
-                )
+                );
             };
             offset += part.len();
         }
@@ -85,7 +85,7 @@ impl GzCString {
         self.ptr.as_ptr()
     }
 
-    fn as_c_str(&self) -> &CStr {
+    const fn as_c_str(&self) -> &CStr {
         // Safety: construction always writes one trailing NUL after bytes that came from
         // either a C string or internal byte slices, and the allocation stays owned by self.
         unsafe { CStr::from_ptr(self.as_ptr()) }
@@ -172,7 +172,7 @@ impl GzBuffer {
         self.usable
     }
 
-    fn usable_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    const fn usable_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         // SAFETY: this buffer uniquely owns an allocation of at least its
         // usable length. MaybeUninit<u8> allows uninitialized bytes.
         unsafe {
@@ -310,10 +310,12 @@ struct GzState {
 
 impl GzState {
     fn new() -> Self {
-        let mut stream = z_stream::default();
-        stream.zalloc = Some(ALLOCATOR.zalloc);
-        stream.zfree = Some(ALLOCATOR.zfree);
-        stream.opaque = ALLOCATOR.opaque;
+        let stream = z_stream {
+            zalloc: Some(ALLOCATOR.zalloc),
+            zfree: Some(ALLOCATOR.zfree),
+            opaque: ALLOCATOR.opaque,
+            ..z_stream::default()
+        };
 
         Self {
             have: 0,
@@ -370,7 +372,6 @@ impl GzState {
                         // Read+Write mode isn't supported
                         return Err(());
                     }
-                    b'b' => {} // binary mode is the default
                     b'e' => cloexec = true,
                     b'x' => exclusive = true,
                     b'f' => self.strategy = Strategy::Filtered,
@@ -378,7 +379,8 @@ impl GzState {
                     b'R' => self.strategy = Strategy::Rle,
                     b'F' => self.strategy = Strategy::Fixed,
                     b'T' => self.direct = true,
-                    _ => {} // for compatibility with zlib-ng, ignore unexpected characters in the mode
+                    // Binary mode is the default; zlib-ng ignores other unknown flags.
+                    _ => {}
                 }
             }
         }
@@ -1029,9 +1031,15 @@ fn fd_path(buf: &mut [u8; 27], fd: c_int) -> &CStr {
 
     let mut w = Writer { buf, len: 0 };
 
-    write!(w, "<fd:{fd}>\0").unwrap();
+    // The fixed buffer accommodates any c_int decimal representation, but
+    // formatting failure must never unwind through a gzip C ABI entrypoint.
+    // Keep returning a valid static C string even if that bound changes.
+    if write!(w, "<fd:{fd}>\0").is_err() {
+        return c"<fd:invalid>";
+    }
 
-    // SAFETY: The stack formatter wrote a trailing NUL within the local byte buffer; the pointer remains valid for this borrowed C string.
+    // SAFETY: The successful stack formatter wrote a trailing NUL within
+    // the local byte buffer; the pointer remains valid for this borrow.
     unsafe { CStr::from_ptr(w.buf[..w.len].as_ptr().cast()) }
 }
 
@@ -1146,7 +1154,7 @@ pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
 ///
 /// # Returns
 ///
-/// * Z_OK if `state` has no outstanding error and the file is closed successfully.
+/// * `Z_OK` if `state` has no outstanding error and the file is closed successfully.
 /// * A Z_ error code if the `state` is null or the file close operation fails.
 ///
 /// # Safety
@@ -1199,7 +1207,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
 ///
 /// # Returns
 ///
-/// * Z_OK if `state` has no outstanding error and the file is closed successfully.
+/// * `Z_OK` if `state` has no outstanding error and the file is closed successfully.
 /// * A Z_ error code if the `state` is null or the file close operation fails.
 ///
 /// # Safety
@@ -1356,11 +1364,11 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
         unsafe { *errnum = state.err };
     }
     if state.err == Z_MEM_ERROR {
-        b"out of memory\0".as_ptr().cast::<c_char>()
+        c"out of memory".as_ptr()
     } else if let Some(msg) = state.msg.as_ref() {
         msg.as_ptr()
     } else {
-        b"\0".as_ptr().cast::<c_char>()
+        c"".as_ptr()
     }
 }
 
@@ -1423,7 +1431,7 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
 
     // Per the semantics described in the function comments above, the return value
     // is based on state.past, rather than state.eof.
-    state.past as _
+    c_int::from(state.past)
 }
 
 /// Check whether `file` is in direct mode (reading or writing literal bytes without compression).
@@ -1469,7 +1477,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
         let _ = gz_look(state);
     }
 
-    state.direct as _
+    c_int::from(state.direct)
 }
 
 /// Read and decompress up to `len` uncompressed bytes from `file` into `buf`.  If
@@ -2561,6 +2569,8 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
 
     // Only need output buffer and deflate state if compressing.
     if !state.direct {
+        const DEF_MEM_LEVEL: c_int = 8;
+
         // Allocate output buffer.
         let Some(output) = state.allocate_output_buffer() else {
             free_buffers(state);
@@ -2573,12 +2583,11 @@ fn gz_init(state: &mut GzState) -> Result<(), ()> {
         state.stream.zalloc = Some(ALLOCATOR.zalloc);
         state.stream.zfree = Some(ALLOCATOR.zfree);
         state.stream.opaque = ALLOCATOR.opaque;
-        const DEF_MEM_LEVEL: c_int = 8;
         // SAFETY: The embedded z_stream has its allocator and opaque state set, and the initialization call receives a valid writable stream structure.
         if unsafe {
             deflateInit2_(
                 &raw mut state.stream,
-                state.level as _,
+                c_int::from(state.level),
                 Z_DEFLATED,
                 MAX_WBITS + 16,
                 DEF_MEM_LEVEL,
@@ -3532,7 +3541,7 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
 
 /// Rewind `file` to the start. This function is supported only for reading.
 ///
-/// Note: `gzrewind(file)` is equivalent to [`gzseek`]`(file, 0, SEEK_SET)`
+/// Note: `gzrewind(file)` is equivalent to calling [`gzseek`] with `(file, 0, SEEK_SET)`.
 ///
 /// # Returns
 ///
@@ -3712,7 +3721,7 @@ fn lseek64(fd: c_int, offset: z_off64_t, origin: c_int) -> z_off64_t {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     {
         // SAFETY: lseek64 accepts a file-descriptor integer and offset; invalid descriptors or origins are returned as errors by libc.
-        return unsafe { libc::lseek64(fd, offset as _, origin) as z_off64_t };
+        unsafe { libc::lseek64(fd, offset as _, origin) as z_off64_t }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
@@ -5657,6 +5666,10 @@ mod tests {
         assert_eq!(
             fd_path(&mut buf, i32::MIN).to_bytes(),
             format!("<fd:{}>", i32::MIN).as_bytes(),
+        );
+        assert_eq!(
+            fd_path(&mut buf, i32::MAX).to_bytes(),
+            format!("<fd:{}>", i32::MAX).as_bytes(),
         );
     }
 

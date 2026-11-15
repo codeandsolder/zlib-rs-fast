@@ -40,13 +40,13 @@ impl SymBuf<'_> {
         self.filled = 0;
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn push_lit(&mut self, byte: u8) {
         self.buf.as_mut_slice()[self.filled..][..3].write_copy_of_slice(&[0, 0, byte]);
         self.filled += 3;
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn push_dist(&mut self, dist: u16, len: u8) {
         let buf = &mut self.buf.as_mut_slice()[self.filled..][..3];
 

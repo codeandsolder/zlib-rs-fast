@@ -1077,7 +1077,12 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     }
 
     state.strstart += state.lookahead;
-    state.block_start = state.strstart as _;
+    // The dictionary tail fits in one DEFLATE window. Keep its signed
+    // block-origin conversion checked even if the internal window grows.
+    let Ok(block_start) = isize::try_from(state.strstart) else {
+        return ReturnCode::StreamError;
+    };
+    state.block_start = block_start;
     state.insert = state.lookahead;
     state.lookahead = 0;
     state.prev_length = 0;
@@ -2233,6 +2238,9 @@ impl<'a> State<'a> {
 
     /// initializes a new block
     fn init_block(&mut self) {
+        // The DEFLATE end-of-block symbol is counted even for empty input.
+        const END_BLOCK: usize = 256;
+
         // Initialize the trees.
         // TODO would a memset also work here?
 
@@ -2247,9 +2255,6 @@ impl<'a> State<'a> {
         for value in &mut self.bl_desc.dyn_tree[..BL_CODES] {
             *value.freq_mut() = 0;
         }
-
-        // end of block literal code
-        const END_BLOCK: usize = 256;
 
         *self.l_desc.dyn_tree[END_BLOCK].freq_mut() = 1;
         self.opt_len = 0;
@@ -2408,6 +2413,10 @@ pub fn fill_window_core(
     fill_window_core_with_hash_maintenance(state, input, checksum, true);
 }
 
+/// # Panics
+///
+/// Panics if the internal ring-buffer cursor invariants are violated:
+/// a nonempty input read must always have room for at least two bytes.
 #[inline]
 pub fn fill_window_core_with_hash_maintenance(
     state: &mut State<'_>,
@@ -2603,7 +2612,7 @@ fn build_tree<const N: usize>(
     // Each internal Huffman node consumes one more slot than the leaves.
     // The descriptor must have space for every leaf and combined parent.
     assert!(
-        elements >= 2 && elements <= L_CODES && N >= 2 * elements - 1,
+        (2..=L_CODES).contains(&elements) && N >= 2 * elements - 1,
         "Huffman tree descriptor does not fit its alphabet"
     );
     assert!(
@@ -2703,10 +2712,11 @@ fn gen_bitlen<const N: usize>(
         }
 
         bl_count[usize::from(bits)] += 1;
-        let mut xbits = 0;
-        if n >= base {
-            xbits = extra[n - base] as usize;
-        }
+        let xbits = if n >= base {
+            usize::from(extra[n - base])
+        } else {
+            0
+        };
 
         let f = tree[n].freq() as usize;
         *optimal_bits += f * (bits as usize + xbits);
@@ -3597,7 +3607,7 @@ fn emit_planned_near_optimal_block(
     is_last: bool,
     output: &mut [u8],
     produced: &mut usize,
-) -> bool {
+) -> Result<bool, ReturnCode> {
     near_optimal::tally_tokens(state, &block.tokens);
 
     state.window.clear();
@@ -3611,7 +3621,7 @@ fn emit_planned_near_optimal_block(
             unsafe {
                 state
                     .window
-                    .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr())
+                    .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr());
             };
         }
         state.block_start = 0;
@@ -3623,11 +3633,12 @@ fn emit_planned_near_optimal_block(
         // can therefore span more than 65,535 input bytes as long as its token count fits SymBuf.
         // There is no single stored-block fallback for such a span, so deliberately omit window
         // backing and force the existing tree chooser to select static or dynamic Huffman coding.
-        let stored_len = u32::try_from(block.range.len())
-            .expect("near-optimal token capacity bounds input span below u32::MAX");
+        // A planned block normally fits the token-capacity bound. Preserve
+        // the C-ABI error contract if this internal bound is ever changed.
+        let stored_len = u32::try_from(block.range.len()).map_err(|_| ReturnCode::StreamError)?;
         zng_tr_flush_block(state, None, stored_len, is_last);
     }
-    drain_near_optimal_pending(state, output, produced)
+    Ok(drain_near_optimal_pending(state, output, produced))
 }
 
 /// Encode the planned blocks, wrapper and checksum using a live compressor state.
@@ -3718,12 +3729,13 @@ fn encode_near_optimal_with_state(
             false,
             output,
             &mut produced,
-        );
+        )?;
         current = next.into_parts();
     }
 
     if ok {
-        ok = emit_planned_near_optimal_block(state, input, &current.0, true, output, &mut produced);
+        ok =
+            emit_planned_near_optimal_block(state, input, &current.0, true, output, &mut produced)?;
     }
 
     if ok {
@@ -3732,6 +3744,12 @@ fn encode_near_optimal_with_state(
         ok = drain_near_optimal_pending(state, output, &mut produced);
     }
     Ok(ok.then_some(produced))
+}
+
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
+fn checked_near_optimal_input_len(len: usize) -> Result<u32, ReturnCode> {
+    // The suffix index and its inverse are stored in u32 arrays.
+    u32::try_from(len).map_err(|_| ReturnCode::StreamError)
 }
 
 /// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
@@ -3753,6 +3771,12 @@ pub fn compress_slice_near_optimal<'a>(
     const MIN_ZLIB_STREAM_SIZE: usize = ZLIB_WRAPLEN + 2;
     if output.len() < MIN_ZLIB_STREAM_SIZE {
         return (&mut output[..0], ReturnCode::BufError);
+    }
+    // Suffix ranks and match positions are stored in u32. An oversized
+    // input must be rejected before building the suffix array, not panic
+    // during conversion after the output and state have been initialized.
+    if let Err(code) = checked_near_optimal_input_len(input.len()) {
+        return (&mut output[..0], code);
     }
 
     let mut stream = match DeflateStream::new_with_lit_bufsize(
@@ -3864,7 +3888,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
         let err = deflate(&mut stream, flush);
 
         match err {
-            ReturnCode::Ok => continue,
+            ReturnCode::Ok => {}
             ReturnCode::StreamEnd => break ReturnCode::Ok,
             _ => break err,
         }
@@ -4117,14 +4141,14 @@ pub unsafe fn set_header<'a>(
     stream: &mut DeflateStream<'a>,
     head: Option<&'a mut gz_header>,
 ) -> ReturnCode {
-    if stream.state.wrap != 2 {
-        ReturnCode::StreamError
-    } else {
+    if stream.state.wrap == 2 {
         stream.state.gzhead = head.map(|head| {
             // SAFETY: this function's contract establishes all invariants required by the view.
             unsafe { GzipHeaderRef::new(head) }
         });
         ReturnCode::Ok
+    } else {
+        ReturnCode::StreamError
     }
 }
 
@@ -4150,10 +4174,10 @@ const fn deflate_quick_overhead(x: usize) -> usize {
 }
 
 /// For the default windowBits of 15 and memLevel of 8, this function returns
-/// a close to exact, as well as small, upper bound on the compressed size.
-/// They are coded as constants here for a reason--if the #define's are
-/// changed, then this function needs to be changed as well.  The return
-/// value for 15 and 8 only works for those exact settings.
+/// a compact, close-to-exact upper bound on compressed size.
+///
+/// This bound assumes those exact settings. If either value changes,
+/// the corresponding bound constants must be updated.
 ///
 /// For any setting other than those defaults for windowBits and memLevel,
 /// the value returned is a conservative worst case for the maximum expansion
@@ -4164,9 +4188,12 @@ const fn deflate_quick_overhead(x: usize) -> usize {
 /// every combination of windowBits and memLevel.  But even the conservative
 /// upper bound of about 14% expansion does not seem onerous for output buffer
 /// allocation.
+#[must_use]
 pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
     // on windows, c_ulong is only a 32-bit integer
-    let mask = core::ffi::c_ulong::MAX as usize;
+    // A c_ulong can be wider than usize on unusual ABIs. In that case
+    // every usize bit is representable, so the mask is exactly usize::MAX.
+    let mask = usize::try_from(core::ffi::c_ulong::MAX).unwrap_or(usize::MAX);
 
     // conservative upper bound for compressed data
     let comp_len = source_len
@@ -4241,6 +4268,7 @@ pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
 ///
 /// Raw caller-buffer handling belongs to the C ABI layer; the compression core exposes only a
 /// checked slice over its initialized window storage.
+#[must_use]
 pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] {
     let state = &*stream.state;
     state
@@ -4668,6 +4696,21 @@ mod test {
             // never writes to caller storage or makes existing bytes uninitialized.
             let untouched = uninitialized.map(|byte| unsafe { byte.assume_init() });
             assert_eq!(untouched, [0xa5; 64]);
+        }
+    }
+
+    #[test]
+    fn near_optimal_input_length_preflight_prevents_suffix_index_overflow() {
+        assert_eq!(checked_near_optimal_input_len(0), Ok(0));
+        assert_eq!(checked_near_optimal_input_len(1), Ok(1));
+        if let Ok(max_rank_len) = usize::try_from(u32::MAX) {
+            assert_eq!(checked_near_optimal_input_len(max_rank_len), Ok(u32::MAX));
+            if let Some(too_large) = max_rank_len.checked_add(1) {
+                assert_eq!(
+                    checked_near_optimal_input_len(too_large),
+                    Err(ReturnCode::StreamError)
+                );
+            }
         }
     }
 
@@ -6152,14 +6195,17 @@ mod test {
                 &mut output,
                 &mut produced
             ));
-            assert!(emit_planned_near_optimal_block(
-                state,
-                &input,
-                &block,
-                true,
-                &mut output,
-                &mut produced,
-            ));
+            assert_eq!(
+                emit_planned_near_optimal_block(
+                    state,
+                    &input,
+                    &block,
+                    true,
+                    &mut output,
+                    &mut produced,
+                ),
+                Ok(true)
+            );
             state
                 .bit_writer
                 .pending
