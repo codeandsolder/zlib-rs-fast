@@ -1034,7 +1034,7 @@ mod null {
     }
 
     #[test]
-    fn inflate_prime_raw_stream_preserves_input_cursor() {
+    fn inflate_prime_raw_stream_preserves_input_cursor() -> Result<(), ()> {
         let source: Vec<u8> = (0..16 * 1024)
             .map(|i| ((i * 31 + i / 97) % 251) as u8)
             .collect();
@@ -1053,6 +1053,10 @@ mod null {
         // Prime one or two 16-bit chunks of an actual raw DEFLATE stream, then decode
         // the rest from the caller-provided input. Compare both implementations.
         for prime_bytes in [2, 4] {
+            let input_len =
+                core::ffi::c_uint::try_from(compressed.len() - prime_bytes).map_err(|_| ())?;
+            let capacity = source.len().checked_add(16).ok_or(())?;
+            let output_len = core::ffi::c_uint::try_from(capacity).map_err(|_| ())?;
             // SAFETY: the stream is initialized before use; compressed input and initialized
             // output buffers stay live for the call, with disjoint storage and valid lengths.
             assert_eq_rs_ng!(unsafe {
@@ -1062,7 +1066,7 @@ mod null {
                         raw.as_mut_ptr(),
                         -15,
                         zlibVersion(),
-                        i32::try_from(core::mem::size_of::<z_stream>()).unwrap_or(i32::MAX),
+                        crate::abi_z_stream_size(),
                     ),
                     Z_OK
                 );
@@ -1071,29 +1075,34 @@ mod null {
                     let bits = u16::from_le_bytes(*chunk);
                     assert_eq!(inflatePrime(stream, 16, i32::from(bits)), Z_OK);
                 }
-                let mut output = vec![0u8; source.len() + 64];
+                let mut output = vec![0xa5u8; capacity];
                 stream.next_in = compressed[prime_bytes..].as_ptr().cast_mut();
-                stream.avail_in = u32::try_from(compressed.len() - prime_bytes).unwrap_or(u32::MAX);
+                stream.avail_in = input_len;
                 stream.next_out = output.as_mut_ptr();
-                stream.avail_out = u32::try_from(output.len()).unwrap_or(u32::MAX);
+                stream.avail_out = output_len;
                 let code = inflate(stream, Z_FINISH);
                 let total = stream.total_out;
-                output.truncate(source.len());
                 let remaining = stream.avail_in;
                 let consumed = stream.total_in;
                 let end = inflateEnd(stream);
                 assert_eq!(code, Z_STREAM_END);
                 assert_eq!(end, Z_OK);
                 assert_eq!(usize::try_from(total).ok(), Some(source.len()));
-                assert_eq!(output, source);
+                assert_eq!(&output[..source.len()], source.as_slice());
+                assert!(
+                    output[source.len()..].iter().all(|&byte| byte == 0xa5),
+                    "raw inflater must not touch bytes past its reported output"
+                );
                 assert_eq!(remaining, 0);
                 assert_eq!(
                     usize::try_from(consumed).ok(),
                     Some(compressed.len() - prime_bytes)
                 );
+                output.truncate(source.len());
                 (code, consumed, remaining, output, end)
             });
         }
+        Ok(())
     }
 
     #[test]
@@ -2297,6 +2306,36 @@ const STORED_WINDOW_REGRESSION: &[u8] = &[
     255, 255, 255, 255, 81, 81, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 255, 255,
 ];
 
+/// Grow a C stream's caller-owned output without resetting its write cursor.
+/// The caller must rebind `next_out` to the returned pointer after resizing:
+/// allocating new Vec storage can invalidate the old raw pointer.
+#[cfg(test)]
+fn grow_c_output(
+    output: &mut Vec<u8>,
+    written: core::ffi::c_ulong,
+    additional: usize,
+    grew_nonempty_prefix: &mut bool,
+) -> Result<(*mut u8, core::ffi::c_uint), ()> {
+    let written = usize::try_from(written).map_err(|_| ())?;
+    assert!(written <= output.len());
+    *grew_nonempty_prefix |= written > 0;
+    let new_len = output.len().checked_add(additional).ok_or(())?;
+    output.resize(new_len, 0);
+    let available = core::ffi::c_uint::try_from(new_len - written).map_err(|_| ())?;
+    Ok((output[written..].as_mut_ptr(), available))
+}
+
+/// Verify that a complete native C zlib stream actually round-trips to its
+/// original plaintext, rather than only checking its return status.
+#[cfg(test)]
+fn assert_zlib_roundtrip(encoded: &[u8], original: &[u8]) {
+    let mut decoded = vec![0u8; original.len()];
+    let (actual, status) =
+        zlib_rs::decompress_slice(&mut decoded, encoded, zlib_rs::InflateConfig::default());
+    assert_eq!(status, zlib_rs::ReturnCode::Ok);
+    assert_eq!(actual, original);
+}
+
 #[test]
 fn deflate_stored_window_out_of_bounds() -> Result<(), ()> {
     use zlib_rs::ReturnCode;
@@ -2310,20 +2349,7 @@ fn deflate_stored_window_out_of_bounds() -> Result<(), ()> {
     // The buffer-growth helper rebinds next_out to the actual written prefix
     // after every Vec reallocation; all native lengths are checked.
     assert_eq_rs_ng!(unsafe {
-        fn extend_output(
-            stream: &mut z_stream,
-            output: &mut Vec<u8>,
-            amount: usize,
-        ) -> Result<(), ()> {
-            let written = usize::try_from(stream.total_out).map_err(|_| ())?;
-            assert!(written <= output.len());
-            let new_len = output.len().checked_add(amount).ok_or(())?;
-            output.resize(new_len, 0);
-            stream.next_out = output[written..].as_mut_ptr();
-            stream.avail_out = core::ffi::c_uint::try_from(new_len - written).map_err(|_| ())?;
-            Ok(())
-        }
-
+        let mut grew_nonempty_prefix = false;
         let input_len = core::ffi::c_ulong::try_from(source.len()).map_err(|_| ())?;
         let first_chunk = core::ffi::c_uint::try_from(CHUNK.min(source.len())).map_err(|_| ())?;
         let mut storage = std::mem::MaybeUninit::<z_stream>::zeroed();
@@ -2343,26 +2369,28 @@ fn deflate_stored_window_out_of_bounds() -> Result<(), ()> {
         let stream = storage.assume_init_mut();
 
         let bound = usize::try_from(deflateBound(stream, input_len)).map_err(|_| ())?;
-        assert!(bound > 0);
         let mut compressed = vec![0; bound.min(CHUNK)];
         stream.next_in = source.as_mut_ptr();
         stream.avail_in = first_chunk;
         stream.next_out = compressed.as_mut_ptr();
         stream.avail_out = core::ffi::c_uint::try_from(compressed.len()).map_err(|_| ())?;
 
-        assert_eq!(
-            ReturnCode::try_from(deflate(stream, Z_NO_FLUSH)),
-            Ok(ReturnCode::Ok)
-        );
+        assert_eq!(deflate(stream, Z_NO_FLUSH), Z_OK);
 
         // A level/strategy transition can need additional output to flush
         // the old block. Preserve emitted bytes when output Vec moves.
         loop {
-            match ReturnCode::try_from(deflateParams(stream, 0, Z_DEFAULT_STRATEGY)) {
-                Ok(ReturnCode::Ok) => break,
-                Ok(ReturnCode::BufError) => extend_output(stream, &mut compressed, CHUNK)?,
-                status => assert_eq!(status, Ok(ReturnCode::Ok)),
+            let status = ReturnCode::try_from(deflateParams(stream, 0, Z_DEFAULT_STRATEGY));
+            if status == Ok(ReturnCode::Ok) {
+                break;
             }
+            assert_eq!(status, Ok(ReturnCode::BufError));
+            (stream.next_out, stream.avail_out) = grow_c_output(
+                &mut compressed,
+                stream.total_out,
+                CHUNK,
+                &mut grew_nonempty_prefix,
+            )?;
         }
 
         // Feed according to actual total_in rather than assuming that a
@@ -2376,12 +2404,18 @@ fn deflate_stored_window_out_of_bounds() -> Result<(), ()> {
             }
             let before_in = stream.total_in;
             let before_out = stream.total_out;
-            match ReturnCode::try_from(deflate(stream, Z_NO_FLUSH)) {
-                Ok(ReturnCode::Ok | ReturnCode::BufError) => {}
-                code => assert_eq!(code, Ok(ReturnCode::Ok)),
-            }
+            let code = ReturnCode::try_from(deflate(stream, Z_NO_FLUSH));
+            assert!(
+                matches!(code, Ok(ReturnCode::Ok | ReturnCode::BufError)),
+                "{code:?}"
+            );
             if stream.avail_out == 0 {
-                extend_output(stream, &mut compressed, CHUNK)?;
+                (stream.next_out, stream.avail_out) = grow_c_output(
+                    &mut compressed,
+                    stream.total_out,
+                    CHUNK,
+                    &mut grew_nonempty_prefix,
+                )?;
             } else {
                 assert!(
                     stream.total_in > before_in || stream.total_out > before_out,
@@ -2393,25 +2427,32 @@ fn deflate_stored_window_out_of_bounds() -> Result<(), ()> {
 
         // Finish the stream and independently decode the produced bytes.
         loop {
-            match ReturnCode::try_from(deflate(stream, Z_FINISH)) {
-                Ok(ReturnCode::StreamEnd) => break,
-                Ok(ReturnCode::Ok | ReturnCode::BufError) => {
-                    assert_eq!(stream.avail_out, 0);
-                    extend_output(stream, &mut compressed, CHUNK)?;
-                }
-                code => assert_eq!(code, Ok(ReturnCode::StreamEnd)),
+            let code = ReturnCode::try_from(deflate(stream, Z_FINISH));
+            if code == Ok(ReturnCode::StreamEnd) {
+                break;
             }
+            assert!(
+                matches!(code, Ok(ReturnCode::Ok | ReturnCode::BufError)),
+                "{code:?}"
+            );
+            assert_eq!(stream.avail_out, 0);
+            (stream.next_out, stream.avail_out) = grow_c_output(
+                &mut compressed,
+                stream.total_out,
+                CHUNK,
+                &mut grew_nonempty_prefix,
+            )?;
         }
         let produced = usize::try_from(stream.total_out).map_err(|_| ())?;
         assert!(produced <= compressed.len());
+        assert!(
+            grew_nonempty_prefix,
+            "no nonempty output prefix was rebased"
+        );
         compressed.truncate(produced);
         assert_eq!(ReturnCode::try_from(deflateEnd(stream)), Ok(ReturnCode::Ok));
 
-        let mut plain = vec![0u8; source.len()];
-        let (actual, status) =
-            zlib_rs::decompress_slice(&mut plain, &compressed, zlib_rs::InflateConfig::default());
-        assert_eq!(status, ReturnCode::Ok);
-        assert_eq!(actual, source.as_slice());
+        assert_zlib_roundtrip(&compressed, &source);
         Ok::<(), ()>(())
     })?;
     Ok(())
