@@ -5529,7 +5529,8 @@ mod test {
     }
 
     #[test]
-    fn stored_streaming_fragmentation_preserves_bytes_across_window_slides() {
+    fn stored_streaming_fragmentation_preserves_bytes_across_window_slides(
+    ) -> Result<(), ReturnCode> {
         let input: Vec<u8> = (0usize..190_001)
             .map(|index| ((index * 37) ^ (index / 29)).to_le_bytes()[0])
             .collect();
@@ -5542,7 +5543,7 @@ mod test {
                     ..DeflateConfig::new(0)
                 };
                 for chunk_size in [7, 509, 32_768] {
-                    let compressed = compress_with_output_chunks(&input, config, chunk_size);
+                    let compressed = compress_with_output_chunks(&input, config, chunk_size)?;
                     let mut restored = vec![0u8; input.len()];
                     let (decoded, status) = crate::decompress_slice(
                         &mut restored,
@@ -5560,6 +5561,7 @@ mod test {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -6853,80 +6855,132 @@ mod test {
         assert_eq!(EXPECTED, output);
     }
 
+    // Exercise the native zlib streaming contract with separately offered input
+    // chunks, checking counts before crossing the C ABI.
     fn compress_with_input_chunks(
         input: &[u8],
         config: DeflateConfig,
         chunk_size: usize,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, ReturnCode> {
+        if chunk_size == 0 {
+            return Err(ReturnCode::StreamError);
+        }
+        let capacity = compress_bound(input.len())
+            .checked_add(64)
+            .ok_or(ReturnCode::StreamError)?;
+        let avail_out =
+            crate::c_api::uInt::try_from(capacity).map_err(|_| ReturnCode::StreamError)?;
+        let mut output = vec![0u8; capacity];
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
-
-        let mut output = vec![0u8; compress_bound(input.len()) + 64];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-
-        for chunk in input.chunks(chunk_size) {
-            stream.next_in = chunk.as_ptr().cast_mut();
-            stream.avail_in = chunk.len() as _;
-            while stream.avail_in != 0 {
-                assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-                assert_ne!(
-                    stream.avail_out, 0,
-                    "compress_bound-sized output unexpectedly filled"
-                );
-            }
+        let code = init(&mut raw, config);
+        if code != ReturnCode::Ok {
+            return Err(code);
         }
+        // SAFETY: successful init created a live state; the buffers remain
+        // allocated until the matching end() below, including error paths.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
-        stream.next_in = core::ptr::null_mut();
-        stream.avail_in = 0;
-        loop {
-            match deflate(stream, DeflateFlush::Finish) {
-                ReturnCode::Ok => assert_ne!(
-                    stream.avail_out, 0,
-                    "compress_bound-sized output unexpectedly filled while finishing"
-                ),
-                ReturnCode::StreamEnd => break,
-                other => panic!("input-chunked deflate failed: {other:?}"),
+        let result = (|| -> Result<usize, ReturnCode> {
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = avail_out;
+            for chunk in input.chunks(chunk_size) {
+                stream.next_in = chunk.as_ptr().cast_mut();
+                stream.avail_in = crate::c_api::uInt::try_from(chunk.len())
+                    .map_err(|_| ReturnCode::StreamError)?;
+                while stream.avail_in != 0 {
+                    let before = (stream.avail_in, stream.avail_out);
+                    let code = deflate(stream, DeflateFlush::NoFlush);
+                    if code != ReturnCode::Ok {
+                        return Err(code);
+                    }
+                    if stream.avail_out == 0 || before == (stream.avail_in, stream.avail_out) {
+                        return Err(ReturnCode::BufError);
+                    }
+                }
             }
+            stream.next_in = core::ptr::null_mut();
+            stream.avail_in = 0;
+            loop {
+                let before = stream.avail_out;
+                match deflate(stream, DeflateFlush::Finish) {
+                    ReturnCode::Ok if stream.avail_out != 0 && before != stream.avail_out => {}
+                    ReturnCode::Ok => return Err(ReturnCode::BufError),
+                    ReturnCode::StreamEnd => break,
+                    code => return Err(code),
+                }
+            }
+            let remaining =
+                usize::try_from(stream.avail_out).map_err(|_| ReturnCode::StreamError)?;
+            output
+                .len()
+                .checked_sub(remaining)
+                .ok_or(ReturnCode::StreamError)
+        })();
+        if end(stream).is_err() {
+            return Err(ReturnCode::StreamError);
         }
-
-        output.truncate(stream.total_out as usize);
-        assert!(end(stream).is_ok());
-        output
+        let written = result?;
+        output.truncate(written);
+        Ok(output)
     }
 
+    // Supply an independent output buffer on each native streaming call and
+    // derive the produced length from the exact current span, not total_out.
     fn compress_with_output_chunks(
         input: &[u8],
         config: DeflateConfig,
         chunk_size: usize,
-    ) -> Vec<u8> {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
-        stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
-
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = vec![0u8; chunk_size];
-            stream.next_out = chunk.as_mut_ptr();
-            stream.avail_out = chunk.len() as _;
-            let before = stream.total_out;
-            let rc = deflate(stream, DeflateFlush::Finish);
-            let produced = (stream.total_out - before) as usize;
-            output.extend_from_slice(&chunk[..produced]);
-
-            match rc {
-                ReturnCode::Ok => {}
-                ReturnCode::StreamEnd => break,
-                other => panic!("chunked deflate failed: {other:?}"),
-            }
+    ) -> Result<Vec<u8>, ReturnCode> {
+        if chunk_size == 0 {
+            return Err(ReturnCode::StreamError);
         }
-
-        assert_eq!(stream.avail_in, 0);
-        assert!(end(stream).is_ok());
-        output
+        let avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
+        let avail_out =
+            crate::c_api::uInt::try_from(chunk_size).map_err(|_| ReturnCode::StreamError)?;
+        let mut raw = z_stream::default();
+        let code = init(&mut raw, config);
+        if code != ReturnCode::Ok {
+            return Err(code);
+        }
+        // SAFETY: the raw stream owns a valid state after successful init;
+        // source bytes and each writable chunk remain live through deflate().
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
+        let result = (|| -> Result<Vec<u8>, ReturnCode> {
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = avail_in;
+            let mut output = Vec::new();
+            loop {
+                let mut chunk = vec![0u8; chunk_size];
+                stream.next_out = chunk.as_mut_ptr();
+                stream.avail_out = avail_out;
+                let before = stream.avail_in;
+                let code = deflate(stream, DeflateFlush::Finish);
+                let unused =
+                    usize::try_from(stream.avail_out).map_err(|_| ReturnCode::StreamError)?;
+                let count = chunk
+                    .len()
+                    .checked_sub(unused)
+                    .ok_or(ReturnCode::StreamError)?;
+                output.extend_from_slice(&chunk[..count]);
+                match code {
+                    ReturnCode::StreamEnd => break,
+                    ReturnCode::Ok if count != 0 || stream.avail_in != before => {}
+                    ReturnCode::Ok => return Err(ReturnCode::BufError),
+                    code => return Err(code),
+                }
+            }
+            if stream.avail_in != 0 {
+                return Err(ReturnCode::StreamError);
+            }
+            Ok(output)
+        })();
+        if end(stream).is_err() {
+            return Err(ReturnCode::StreamError);
+        }
+        result
     }
 
     struct RoundRobinCore {
@@ -7570,7 +7624,41 @@ mod test {
     }
 
     #[test]
-    fn fast_deflate_is_input_chunking_independent() {
+    fn chunked_deflate_drivers_check_native_buffer_budgets() -> Result<(), ReturnCode> {
+        let config = DeflateConfig::default();
+        assert_eq!(
+            compress_with_input_chunks(b"bytes", config, 0),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(
+            compress_with_output_chunks(b"bytes", config, 0),
+            Err(ReturnCode::StreamError)
+        );
+        if let Some(overwide) = usize::try_from(crate::c_api::uInt::MAX)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(1))
+        {
+            assert_eq!(
+                compress_with_output_chunks(b"bytes", config, overwide),
+                Err(ReturnCode::StreamError)
+            );
+        }
+
+        for length in [0, 1, 17, 257] {
+            let input = vec![b'q'; length];
+            let expected = compress_with_input_chunks(&input, config, 1)?;
+            for chunk in [1, 2, 7, 31] {
+                assert_eq!(
+                    compress_with_output_chunks(&input, config, chunk)?,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fast_deflate_is_input_chunking_independent() -> Result<(), ReturnCode> {
         let mut input = Vec::with_capacity(100_000);
         for i in 0..3_000usize {
             input.extend_from_slice(b"logical-window-tail/");
@@ -7592,15 +7680,17 @@ mod test {
 
         for chunk_size in [1, 2, 3, 4, 7, 31, 257] {
             assert_eq!(
-                compress_with_input_chunks(&input, config, chunk_size),
+                compress_with_input_chunks(&input, config, chunk_size)?,
                 reference,
                 "fast output changed with {chunk_size}-byte input chunks"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn token_producers_are_output_chunking_independent_across_block_boundaries() {
+    fn token_producers_are_output_chunking_independent_across_block_boundaries(
+    ) -> Result<(), ReturnCode> {
         let mut input = Vec::with_capacity(160_000);
         for i in 0..4_000usize {
             input.extend_from_slice(b"portable-simd::token-block/");
@@ -7632,13 +7722,14 @@ mod test {
             let reference = reference.to_vec();
 
             for chunk_size in [1, 7, 23, 257] {
-                let chunked = compress_with_output_chunks(&input, config, chunk_size);
+                let chunked = compress_with_output_chunks(&input, config, chunk_size)?;
                 assert_eq!(
                     chunked, reference,
                     "output changed with {chunk_size}-byte output chunks for level {level}, strategy {strategy:?}"
                 );
             }
         }
+        Ok(())
     }
 
     fn fuzz_based_test(input: &[u8], config: DeflateConfig, expected: &[u8]) {
