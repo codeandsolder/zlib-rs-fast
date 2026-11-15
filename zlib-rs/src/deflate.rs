@@ -7057,8 +7057,34 @@ mod test {
         result
     }
 
-    struct RoundRobinCore {
+    /// Test-only error with enough context to distinguish ABI corruption from
+    /// match-search protocol failures.
+    #[derive(Debug)]
+    enum SchedulerFixtureError {
+        Native(ReturnCode),
+        Match(crate::deflate::longest_match::MatchSearchError),
+        Invariant(&'static str),
+    }
+
+    impl From<crate::deflate::longest_match::MatchSearchError> for SchedulerFixtureError {
+        fn from(error: crate::deflate::longest_match::MatchSearchError) -> Self {
+            Self::Match(error)
+        }
+    }
+
+    impl core::fmt::Display for SchedulerFixtureError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Native(code) => write!(f, "native deflate returned {code:?}"),
+                Self::Match(error) => write!(f, "match-search failed: {error:?}"),
+                Self::Invariant(message) => f.write_str(message),
+            }
+        }
+    }
+
+    struct RoundRobinCore<'input> {
         raw: z_stream,
+        source: &'input [u8],
         output: Vec<u8>,
         driver: algorithm::StandardDriver,
         done: bool,
@@ -7069,22 +7095,50 @@ mod test {
         match_result_turns: usize,
     }
 
-    impl RoundRobinCore {
+    impl Drop for RoundRobinCore<'_> {
+        fn drop(&mut self) {
+            // SAFETY: init in new() created the only state, and end() nulls
+            // its pointer; an early error must still release that state.
+            if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) } {
+                let _ = end(stream);
+            }
+        }
+    }
+
+    impl<'input> RoundRobinCore<'input> {
         const OUTPUT_CHUNK: usize = 17;
 
-        fn new(input: &[u8], config: DeflateConfig, algorithm: algorithm::Algorithm) -> Self {
+        fn new(
+            input: &'input [u8],
+            config: DeflateConfig,
+            algorithm: algorithm::Algorithm,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("input exceeds native C uInt"))?;
             let mut raw = z_stream::default();
-            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            let code = init(&mut raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
 
-            let driver = {
-                let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
-                stream.next_in = input.as_ptr().cast_mut();
-                stream.avail_in = input.len() as _;
-                algorithm::StandardDriver::for_algorithm(algorithm, &stream.state).unwrap()
+            // SAFETY: a successful init owns the live deflate state; input
+            // remains borrowed for the entire RoundRobinCore lifetime.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.ok_or(
+                SchedulerFixtureError::Invariant("initialized state missing"),
+            )?;
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = avail_in;
+            let Some(driver) = algorithm::StandardDriver::for_algorithm(algorithm, &stream.state)
+            else {
+                let _ = end(stream);
+                return Err(SchedulerFixtureError::Invariant(
+                    "unavailable standard algorithm",
+                ));
             };
 
-            Self {
+            Ok(Self {
                 raw,
+                source: input,
                 output: Vec::new(),
                 driver,
                 done: false,
@@ -7093,22 +7147,23 @@ mod test {
                 pending_match_result: None,
                 match_search_turns: 0,
                 match_result_turns: 0,
-            }
+            })
         }
 
-        /// Perform exactly one production scheduler turn using the same driver as the zlib path.
+        /// Exactly one scheduler turn, with output bounded by the supplied span.
         fn step(
             &mut self,
-        ) -> Result<
-            Option<crate::deflate::longest_match::MatchSearchWork>,
-            crate::deflate::longest_match::MatchSearchError,
-        > {
-            assert!(!self.done);
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.unwrap();
+        ) -> Result<Option<crate::deflate::longest_match::MatchSearchWork>, SchedulerFixtureError>
+        {
+            if self.done {
+                return Err(SchedulerFixtureError::Invariant(
+                    "resumed finalized segment",
+                ));
+            }
+            // SAFETY: new() initialized the state, and Drop releases it once.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }
+                .ok_or(SchedulerFixtureError::Invariant("scheduler state missing"))?;
 
-            // Match computation and result delivery are distinct scheduler turns. This keeps the
-            // test honest: a batch scheduler may collect work from several paused streams before
-            // executing searches, then resume each producer later with its owned result.
             if let Some(result) = self.pending_match_result.take() {
                 self.driver
                     .complete_match_search(&mut stream.state, result)?;
@@ -7118,8 +7173,8 @@ mod test {
 
             let mut chunk = [0u8; Self::OUTPUT_CHUNK];
             stream.next_out = chunk.as_mut_ptr();
-            stream.avail_out = chunk.len() as _;
-            let before = stream.total_out;
+            stream.avail_out = crate::c_api::uInt::try_from(chunk.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("output chunk exceeds C uInt"))?;
 
             let mut input = InputCursor::from_stream(stream);
             let mut output = OutputCursor::from_stream(stream);
@@ -7135,15 +7190,34 @@ mod test {
             output.apply(stream);
             checksum.apply(stream);
 
-            let produced = (stream.total_out - before) as usize;
+            let produced = usize::try_from(stream.avail_out)
+                .ok()
+                .and_then(|unused| chunk.len().checked_sub(unused))
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "output exceeded current chunk",
+                ));
+            // A scheduler turn must not retain a pointer into this stack chunk.
+            stream.next_out = core::ptr::null_mut();
+            stream.avail_out = 0;
+
+            let produced = produced?;
+            let expected_total = self
+                .output
+                .len()
+                .checked_add(produced)
+                .and_then(|len| crate::c_api::z_size::try_from(len).ok())
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "cumulative output exceeds native counter",
+                ))?;
+            if stream.total_out != expected_total {
+                return Err(SchedulerFixtureError::Invariant(
+                    "native total_out disagrees with chunk cursors",
+                ));
+            }
             if produced != 0 {
                 self.output.extend_from_slice(&chunk[..produced]);
                 self.drain_turns += 1;
             }
-
-            // Do not leave a raw cursor into the stack-local chunk between scheduler turns.
-            stream.next_out = core::ptr::null_mut();
-            stream.avail_out = 0;
 
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
@@ -7151,14 +7225,15 @@ mod test {
                     self.match_search_turns += 1;
                     return Ok(Some(work));
                 }
-                algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error),
-                algorithm::StandardTurnOutcome::InvalidSegmentMode => {
-                    return Err(
-                        crate::deflate::longest_match::MatchSearchError::InvalidSegmentMode,
-                    );
-                }
-                algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
-                    panic!("Final mode with all input supplied unexpectedly requested more input")
+                algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error.into()),
+                algorithm::StandardTurnOutcome::InvalidSegmentMode
+                | algorithm::StandardTurnOutcome::NeedMoreCallerInput
+                | algorithm::StandardTurnOutcome::SegmentDone(
+                    algorithm::EndBlockKind::FlushBoundary,
+                ) => {
+                    return Err(SchedulerFixtureError::Invariant(
+                        "invalid final-segment scheduler outcome",
+                    ));
                 }
                 algorithm::StandardTurnOutcome::NeedMoreOutput { .. } => {
                     self.output_full_count += 1;
@@ -7166,9 +7241,6 @@ mod test {
                 algorithm::StandardTurnOutcome::SegmentDone(algorithm::EndBlockKind::Final) => {
                     self.done = true;
                 }
-                algorithm::StandardTurnOutcome::SegmentDone(
-                    algorithm::EndBlockKind::FlushBoundary,
-                ) => panic!("final batch job ended as a non-final flush boundary"),
             }
             Ok(None)
         }
@@ -7176,46 +7248,112 @@ mod test {
         fn match_request(
             &self,
             work: crate::deflate::longest_match::MatchSearchWork,
-        ) -> Result<
-            crate::deflate::longest_match::MatchSearchRequest<'_>,
-            crate::deflate::longest_match::MatchSearchError,
-        > {
-            let stream = unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }.unwrap();
-            work.request(&stream.state)
+        ) -> Result<crate::deflate::longest_match::MatchSearchRequest<'_>, SchedulerFixtureError>
+        {
+            // SAFETY: the state is live for every request until it is ended.
+            let stream = unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("scheduler request state missing"),
+            )?;
+            work.request(&stream.state).map_err(Into::into)
         }
 
-        fn into_output(mut self) -> Vec<u8> {
-            assert!(self.done);
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.unwrap();
-            assert_eq!(stream.avail_in, 0);
-            assert_eq!(stream.total_out as usize, self.output.len());
-            assert!(end(stream).is_ok());
-            self.output
+        fn into_output(mut self) -> Result<Vec<u8>, SchedulerFixtureError> {
+            if !self.done {
+                return Err(SchedulerFixtureError::Invariant("scheduler did not finish"));
+            }
+            // SAFETY: new() initialized this state; this is the unique final borrow.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("finalized stream state missing"),
+            )?;
+            let expected_input =
+                crate::c_api::z_size::try_from(self.source.len()).map_err(|_| {
+                    SchedulerFixtureError::Invariant("input length exceeds native total")
+                })?;
+            let expected_output =
+                crate::c_api::z_size::try_from(self.output.len()).map_err(|_| {
+                    SchedulerFixtureError::Invariant("output length exceeds native total")
+                })?;
+            if stream.avail_in != 0
+                || stream.total_in != expected_input
+                || stream.total_out != expected_output
+            {
+                return Err(SchedulerFixtureError::Invariant(
+                    "final native input/output counters mismatch",
+                ));
+            }
+            if end(stream).is_err() {
+                return Err(SchedulerFixtureError::Invariant(
+                    "native deflate cleanup failed",
+                ));
+            }
+            Ok(core::mem::take(&mut self.output))
         }
     }
 
-    fn direct_algorithm_output(input: &[u8], config: DeflateConfig) -> Vec<u8> {
+    fn direct_algorithm_output(
+        input: &[u8],
+        config: DeflateConfig,
+    ) -> Result<Vec<u8>, SchedulerFixtureError> {
+        let input_avail = crate::c_api::uInt::try_from(input.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("direct input exceeds C uInt"))?;
+        let capacity =
+            compress_bound(input.len())
+                .checked_add(64)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "direct output capacity overflow",
+                ))?;
+        let output_avail = crate::c_api::uInt::try_from(capacity)
+            .map_err(|_| SchedulerFixtureError::Invariant("direct output exceeds C uInt"))?;
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let mut output = vec![0u8; compress_bound(input.len()) + 64];
+        let code = init(&mut raw, config);
+        if code != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(code));
+        }
+        let mut output = vec![0u8; capacity];
+        // SAFETY: init created the uniquely held state; all I/O buffers
+        // remain live throughout the native driver and the matching end.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.ok_or(
+            SchedulerFixtureError::Invariant("direct encoder state missing"),
+        )?;
+        let result = (|| -> Result<usize, SchedulerFixtureError> {
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = input_avail;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output_avail;
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.unwrap();
-        stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-
-        assert!(matches!(
-            with_compressor(stream, |compressor| {
-                algorithm::run(compressor, DeflateFlush::Finish)
-            }),
-            BlockState::FinishDone
-        ));
-        let len = stream.total_out as usize;
-        assert_eq!(stream.avail_in, 0);
-        assert!(end(stream).is_ok());
+            if !matches!(
+                with_compressor(stream, |compressor| algorithm::run(
+                    compressor,
+                    DeflateFlush::Finish
+                )),
+                BlockState::FinishDone
+            ) {
+                return Err(SchedulerFixtureError::Invariant(
+                    "direct encoder did not finish",
+                ));
+            }
+            if stream.avail_in != 0 {
+                return Err(SchedulerFixtureError::Invariant(
+                    "direct encoder left unconsumed input",
+                ));
+            }
+            let unused = usize::try_from(stream.avail_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("native output remainder invalid"))?;
+            output
+                .len()
+                .checked_sub(unused)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "direct output counter exceeds buffer",
+                ))
+        })();
+        if end(stream).is_err() {
+            return Err(SchedulerFixtureError::Invariant(
+                "direct native teardown failed",
+            ));
+        }
+        let len = result?;
         output.truncate(len);
-        output
+        Ok(output)
     }
 
     fn framed_standard_driver_output(
@@ -7362,7 +7500,7 @@ mod test {
 
     #[test]
     fn standard_core_events_can_be_round_robin_scheduled_across_streams(
-    ) -> Result<(), crate::deflate::longest_match::MatchSearchError> {
+    ) -> Result<(), SchedulerFixtureError> {
         let mut input = Vec::with_capacity(160_000);
         for i in 0..4_000usize {
             input.extend_from_slice(b"round-robin-standard-core/");
@@ -7390,8 +7528,8 @@ mod test {
                 mem_level: 1,
                 strategy,
             };
-            references.push(direct_algorithm_output(&input, config()));
-            jobs.push(RoundRobinCore::new(&input, config(), algorithm));
+            references.push(direct_algorithm_output(&input, config())?);
+            jobs.push(RoundRobinCore::new(&input, config(), algorithm)?);
         }
 
         let mut scheduler_turns = 0usize;
@@ -7479,7 +7617,7 @@ mod test {
                 job.match_search_turns, job.match_result_turns,
                 "every yielded match search must resume on a later scheduler turn"
             );
-            assert_eq!(job.into_output(), reference);
+            assert_eq!(job.into_output()?, reference);
         }
         Ok(())
     }
