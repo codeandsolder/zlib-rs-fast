@@ -4483,16 +4483,16 @@ mod tests {
                 frees: 0,
                 buffers: Vec::new(),
             };
-            let mut raw = z_stream {
-                zalloc: Some(misaligned_alloc_callback),
-                zfree: Some(misaligned_free_callback),
-                opaque: (&raw mut ctx).cast(),
-                ..z_stream::default()
-            };
-            assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-            // SAFETY: a successful init creates an exclusively owned inflate state.
-            let source = (unsafe { InflateStream::from_stream_mut(&raw mut raw) })
-                .ok_or("initialized inflate state missing")?;
+            let mut source = InflateStream::new_with_abi_stream(
+                z_stream {
+                    zalloc: Some(misaligned_alloc_callback),
+                    zfree: Some(misaligned_free_callback),
+                    opaque: (&raw mut ctx).cast(),
+                    ..z_stream::default()
+                },
+                InflateConfig::default(),
+            )
+            .map_err(|_| "custom allocator failed to initialize native inflater")?;
             assert_eq!(source.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
             assert_eq!(
                 source.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
@@ -4513,9 +4513,11 @@ mod tests {
             );
 
             let mut cloned_raw = MaybeUninit::<InflateStream>::uninit();
-            assert_eq!(copy(&mut cloned_raw, source), ReturnCode::Ok);
-            // SAFETY: the successful copy initialized all destination state fields.
-            let cloned = unsafe { cloned_raw.assume_init_mut() };
+            assert_eq!(copy(&mut cloned_raw, &source), ReturnCode::Ok);
+            // SAFETY: successful copy constructed every field, including an
+            // independently allocated native state. Owning the cloned value
+            // releases it automatically if an invariant check fails.
+            let mut cloned = unsafe { cloned_raw.assume_init() };
             assert_eq!(cloned.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
             assert_eq!(
                 cloned.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
@@ -4531,8 +4533,8 @@ mod tests {
                 cloned.state.window.as_ptr() as usize,
                 cloned.state.allocation_start as usize + window_pos
             );
-            end(cloned);
-            end(source);
+            assert!(end(&mut cloned).state.is_null());
+            assert!(end(&mut source).state.is_null());
 
             let mut back_raw = z_stream {
                 zalloc: Some(misaligned_alloc_callback),
@@ -4749,18 +4751,15 @@ mod tests {
 
     #[test]
     fn inflate_copy_owns_independent_state_and_window_storage() -> Result<(), ReturnCode> {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        // SAFETY: successful initialization created a live, uniquely borrowed inflate state.
-        let source = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
+        let mut source = InflateStream::new(InflateConfig::default())?;
         let source_state = source.state.as_ptr();
         let source_window = source.state.window.as_ptr();
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        // SAFETY: copy returned Ok and initialized the destination stream.
-        let copied = unsafe { copied.assume_init_mut() };
+        assert_eq!(copy(&mut copied, &source), ReturnCode::Ok);
+        // SAFETY: successful native copy initialized the entire independent
+        // stream. Owning it ensures Drop frees its allocation on any failure.
+        let mut copied = unsafe { copied.assume_init() };
 
         assert_ne!(source_state, copied.state.as_ptr());
         assert_ne!(source_window, copied.state.window.as_ptr());
@@ -4769,8 +4768,8 @@ mod tests {
             copied.state.total_allocation_size
         );
 
-        end(copied);
-        end(source);
+        assert!(end(&mut copied).state.is_null());
+        assert!(end(&mut source).state.is_null());
         Ok(())
     }
 
@@ -4892,19 +4891,11 @@ mod tests {
             done: 0,
         };
 
-        let mut source_stream = z_stream::default();
-        assert_eq!(
-            init(&mut source_stream, InflateConfig { window_bits: 47 }),
-            ReturnCode::Ok
-        );
-        // SAFETY: successful initialization created a live, uniquely borrowed inflate state.
-        let source = unsafe { InflateStream::from_stream_mut(&raw mut source_stream) }
-            .ok_or(ReturnCode::StreamError)?;
-        assert_eq!(
-            // SAFETY: the live stream and caller-owned header remain valid through decoding.
-            unsafe { get_header(source, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        let mut source = InflateStream::new(InflateConfig { window_bits: 47 })?;
+        // SAFETY: the live stream and caller-owned disjoint metadata buffers
+        // remain valid and exclusively writable through both decoder calls.
+        let header_code = unsafe { get_header(&mut source, Some(&mut header)) };
+        assert_eq!(header_code, ReturnCode::Ok);
 
         // Configure I/O before copying, but do not call inflate yet: both states must retain the
         // same caller-owned header destination just as zlib's copied C pointer does.
@@ -4915,15 +4906,16 @@ mod tests {
         source.avail_out = u32::try_from(source_out.len()).map_err(|_| ReturnCode::StreamError)?;
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        // SAFETY: copy succeeded, so the destination stream is fully initialized.
-        let copied = unsafe { copied.assume_init_mut() };
+        assert_eq!(copy(&mut copied, &source), ReturnCode::Ok);
+        // SAFETY: the native clone fully initialized an independent state;
+        // owned storage calls Drop even when later assertions or errors fail.
+        let mut copied = unsafe { copied.assume_init() };
         let mut copied_out = [0u8; 1];
         copied.next_out = copied_out.as_mut_ptr();
         copied.avail_out = u32::try_from(copied_out.len()).map_err(|_| ReturnCode::StreamError)?;
 
         // SAFETY: live input, output and header storage are disjoint for this decoder call.
-        let source_ret = unsafe { inflate(source, InflateFlush::NoFlush) };
+        let source_ret = unsafe { inflate(&mut source, InflateFlush::NoFlush) };
         assert!(matches!(source_ret, ReturnCode::Ok | ReturnCode::StreamEnd));
         assert_eq!(header.done, 1);
         assert_eq!(header.text, 1);
@@ -4932,15 +4924,15 @@ mod tests {
         assert_eq!(header.hcrc, 1);
 
         // SAFETY: copied state retains valid caller buffers for this independent call.
-        let copied_ret = unsafe { inflate(copied, InflateFlush::NoFlush) };
+        let copied_ret = unsafe { inflate(&mut copied, InflateFlush::NoFlush) };
         assert_eq!(copied_ret, source_ret);
         assert_eq!(header.done, 1);
         assert_eq!(extra, *b"TG\n\0EXTRA DATA");
         assert_eq!(&name, b"test.txt\0");
         assert_eq!(&comment, b"A comment\0");
 
-        end(source);
-        end(copied);
+        assert!(end(&mut source).state.is_null());
+        assert!(end(&mut copied).state.is_null());
         Ok(())
     }
 
