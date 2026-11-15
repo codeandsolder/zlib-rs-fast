@@ -5602,7 +5602,8 @@ mod test {
     }
 
     #[test]
-    fn stored_and_compressed_level_transitions_preserve_long_history() -> Result<(), &'static str> {
+    fn stored_and_compressed_level_transitions_preserve_long_history(
+    ) -> Result<(), SchedulerFixtureError> {
         let before: Vec<u8> = (0usize..160_000)
             .map(|index| ((index * 17) ^ (index / 43)).to_le_bytes()[0])
             .collect();
@@ -5613,15 +5614,19 @@ mod test {
                 mem_level: 1,
                 ..DeflateConfig::new(old_level)
             };
-            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-            // SAFETY: init created the uniquely owned live compression state.
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-                .ok_or("initialized compression stream missing its state")?;
+            let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+            let stream = owned.stream()?;
             let mut output = vec![0u8; compress_bound(before.len() + after.len()) + 1024];
             stream.next_in = before.as_ptr().cast_mut();
-            stream.avail_in = before.len().try_into().map_err(|_| "input too long")?;
+            stream.avail_in = before
+                .len()
+                .try_into()
+                .map_err(|_| SchedulerFixtureError::Invariant("input too long"))?;
             stream.next_out = output.as_mut_ptr();
-            stream.avail_out = output.len().try_into().map_err(|_| "output too long")?;
+            stream.avail_out = output
+                .len()
+                .try_into()
+                .map_err(|_| SchedulerFixtureError::Invariant("output too long"))?;
 
             while stream.avail_in > 0 {
                 assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
@@ -5631,18 +5636,22 @@ mod test {
             assert_eq!(i32::from(stream.state.level), new_level);
 
             stream.next_in = after.as_ptr().cast_mut();
-            stream.avail_in = after.len().try_into().map_err(|_| "tail too long")?;
+            stream.avail_in = after
+                .len()
+                .try_into()
+                .map_err(|_| SchedulerFixtureError::Invariant("tail too long"))?;
             loop {
                 match deflate(stream, DeflateFlush::Finish) {
                     ReturnCode::Ok => assert_ne!(stream.avail_out, 0),
                     ReturnCode::StreamEnd => break,
-                    other => panic!("stored-level transition {old_level}->{new_level}: {other:?}"),
+                    other => return Err(SchedulerFixtureError::Native(other)),
                 }
             }
-            let written =
-                usize::try_from(stream.total_out).map_err(|_| "output size exceeds usize")?;
+            let written = usize::try_from(stream.total_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("output size exceeds usize"))?;
             assert_eq!(stream.avail_in, 0);
             assert!(end(stream).is_ok());
+            drop(owned);
 
             let mut original = before.clone();
             original.extend_from_slice(&after);
@@ -6117,7 +6126,7 @@ mod test {
     }
 
     #[test]
-    fn near_optimal_partition_can_merge_beyond_stored_limit() -> Result<(), ReturnCode> {
+    fn near_optimal_partition_can_merge_beyond_stored_limit() -> Result<(), SchedulerFixtureError> {
         fn repeated_tokens(mut bytes: usize) -> Result<Vec<near_optimal::ParseToken>, ReturnCode> {
             let mut tokens = Vec::new();
             if bytes == 0 {
@@ -6149,18 +6158,12 @@ mod test {
         assert_eq!(repeated_tokens(0)?, Vec::new());
         assert_eq!(repeated_tokens(1)?.len(), 1);
         let mut raw = z_stream::default();
-        assert_eq!(
-            init_with_lit_bufsize(
-                &mut raw,
-                DeflateConfig::new(9),
-                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-            ),
-            ReturnCode::Ok
-        );
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
+        let mut owned = ScopedDeflateStream::with_lit_bufsize(
+            &mut raw,
+            DeflateConfig::new(9),
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE,
+        )?;
+        let stream = owned.stream()?;
         let mut left = near_optimal::PlannedBlock {
             range: 0..60_000,
             tokens: repeated_tokens(60_000)?,
@@ -6173,18 +6176,22 @@ mod test {
         let outcome =
             near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
-            return Err(ReturnCode::StreamError);
+            return Err(SchedulerFixtureError::Invariant(
+                "near-optimal 120,000-byte token partitions failed to merge",
+            ));
         };
         assert_eq!(merged.range, 0..120_000);
         assert!(merged.tokens.len() <= near_optimal::MAX_BLOCK_TOKENS);
         assert_eq!(left.tokens.as_slice(), &[]);
         assert_eq!(right.tokens.as_slice(), &[]);
+        // A successful native teardown is itself an ABI invariant.
         assert!(end(stream).is_ok());
         Ok(())
     }
 
     #[test]
-    fn near_optimal_partition_respects_huffman_token_capacity() -> Result<(), ReturnCode> {
+    fn near_optimal_partition_respects_huffman_token_capacity() -> Result<(), SchedulerFixtureError>
+    {
         fn literal_block(range: core::ops::Range<usize>) -> near_optimal::PlannedBlock {
             near_optimal::PlannedBlock {
                 tokens: vec![near_optimal::ParseToken::Literal(b'a'); range.len()],
@@ -6193,18 +6200,12 @@ mod test {
         }
 
         let mut raw = z_stream::default();
-        assert_eq!(
-            init_with_lit_bufsize(
-                &mut raw,
-                DeflateConfig::new(9),
-                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-            ),
-            ReturnCode::Ok
-        );
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
+        let mut owned = ScopedDeflateStream::with_lit_bufsize(
+            &mut raw,
+            DeflateConfig::new(9),
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE,
+        )?;
+        let stream = owned.stream()?;
 
         let half = near_optimal::MAX_BLOCK_TOKENS / 2;
         let mut left = literal_block(0..half);
@@ -6212,7 +6213,9 @@ mod test {
         let outcome =
             near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
-            panic!("the exact 65,534-token Huffman capacity should remain mergeable");
+            return Err(SchedulerFixtureError::Invariant(
+                "the exact 65,534-token Huffman capacity should remain mergeable",
+            ));
         };
         assert_eq!(merged.tokens.len(), near_optimal::MAX_BLOCK_TOKENS);
 
@@ -6228,12 +6231,13 @@ mod test {
             left.tokens.len() + right.tokens.len(),
             near_optimal::MAX_BLOCK_TOKENS + 1
         );
+        // A successful native teardown is itself an ABI invariant.
         assert!(end(stream).is_ok());
         Ok(())
     }
 
     #[test]
-    fn near_optimal_emits_exact_huffman_token_capacity() -> Result<(), ReturnCode> {
+    fn near_optimal_emits_exact_huffman_token_capacity() -> Result<(), SchedulerFixtureError> {
         let input = vec![b'a'; near_optimal::MAX_BLOCK_TOKENS];
         let block = near_optimal::PlannedBlock {
             range: 0..input.len(),
@@ -6241,20 +6245,14 @@ mod test {
         };
         let mut output = vec![0u8; compress_bound(input.len())];
         let mut raw = z_stream::default();
-        assert_eq!(
-            init_with_lit_bufsize(
-                &mut raw,
-                DeflateConfig::new(9),
-                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-            ),
-            ReturnCode::Ok
-        );
+        let mut owned = ScopedDeflateStream::with_lit_bufsize(
+            &mut raw,
+            DeflateConfig::new(9),
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE,
+        )?;
 
         let produced = {
-            // SAFETY: a preceding successful init owns a live deflate state; this test
-            // holds the only mutable borrow of its raw stream during this operation.
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-                .ok_or(ReturnCode::StreamError)?;
+            let stream = owned.stream()?;
             let state = &mut *stream.state;
             let header = state.header()?;
             state.bit_writer.pending.extend(&header.to_be_bytes());
@@ -6287,11 +6285,10 @@ mod test {
             produced
         };
 
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
-        assert!(end(stream).is_ok());
+        // Finalize before verifying the emitted zlib stream, checking the
+        // native teardown status rather than only relying on Drop.
+        assert!(end(owned.stream()?).is_ok());
+        drop(owned);
         let mut decoded = vec![0u8; input.len()];
         let (decoded, code) =
             decompress_slice(&mut decoded, &output[..produced], InflateConfig::default());
@@ -7066,6 +7063,12 @@ mod test {
         Invariant(&'static str),
     }
 
+    impl From<ReturnCode> for SchedulerFixtureError {
+        fn from(code: ReturnCode) -> Self {
+            Self::Native(code)
+        }
+    }
+
     impl From<crate::deflate::longest_match::MatchSearchError> for SchedulerFixtureError {
         fn from(error: crate::deflate::longest_match::MatchSearchError) -> Self {
             Self::Match(error)
@@ -7095,6 +7098,18 @@ mod test {
             config: DeflateConfig,
         ) -> Result<Self, SchedulerFixtureError> {
             let code = init(raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        fn with_lit_bufsize(
+            raw: &'a mut z_stream,
+            config: DeflateConfig,
+            lit_bufsize: usize,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let code = init_with_lit_bufsize(raw, config, Some(lit_bufsize));
             if code != ReturnCode::Ok {
                 return Err(SchedulerFixtureError::Native(code));
             }
