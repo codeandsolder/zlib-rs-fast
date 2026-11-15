@@ -7120,6 +7120,43 @@ mod test {
         }
     }
 
+    /// Mirrors `ScopedDeflateStream` for gzip readback. The owning
+    /// stack `z_stream` never moves and native state is released on every exit.
+    struct ScopedInflateStream<'a> {
+        raw: &'a mut z_stream,
+    }
+
+    impl<'a> ScopedInflateStream<'a> {
+        fn new(
+            raw: &'a mut z_stream,
+            config: InflateConfig,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let code = crate::inflate::init(raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        fn stream(&mut self) -> Result<&mut InflateStream<'_>, SchedulerFixtureError> {
+            // SAFETY: successful initialization constructed native inflate
+            // state; the guard retains exclusive access until Drop.
+            unsafe { InflateStream::from_stream_mut(self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("initialized inflate state missing"),
+            )
+        }
+    }
+
+    impl Drop for ScopedInflateStream<'_> {
+        fn drop(&mut self) {
+            // SAFETY: this guard exclusively owns an initialized stream and
+            // the accessor checks if it has already been ended.
+            if let Some(stream) = unsafe { InflateStream::from_stream_mut(self.raw) } {
+                crate::inflate::end(stream);
+            }
+        }
+    }
+
     #[test]
     fn scoped_deflate_stream_releases_state_on_normal_and_error_exits(
     ) -> Result<(), SchedulerFixtureError> {
@@ -8682,21 +8719,20 @@ mod test {
     }
 
     #[test]
-    fn gzip_with_header() {
-        // this test is here mostly so we get some MIRI action on the gzip header. A test that
-        // compares behavior with zlib-ng is in the libz-rs-sys test suite
-
+    fn gzip_with_header() -> Result<(), SchedulerFixtureError> {
+        // Keep gzipHeader readback in addition to the zlib-ng differential
+        // suite: it exercises Miri-relevant native input/output lifetimes.
         let extra = "some extra stuff\0";
         let name = "nomen est omen\0";
         let comment = "such comment\0";
-
         let mut header = gz_header {
             text: 0,
             time: 0,
             xflags: 0,
             os: 0,
             extra: extra.as_ptr().cast_mut(),
-            extra_len: extra.len() as _,
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip extra too large"))?,
             extra_max: 0,
             name: name.as_ptr().cast_mut(),
             name_max: 0,
@@ -8710,110 +8746,130 @@ mod test {
             window_bits: 31,
             ..Default::default()
         };
-
-        let mut stream = z_stream::default();
-        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
-            unreachable!()
-        };
-
-        unsafe { set_header(stream, Some(&mut header)) };
-
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr().cast_mut();
-        stream.avail_in = input.len() as _;
-
-        let mut output = [0u8; 256];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-
-        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
-
-        let n = stream.total_out as usize;
-
-        assert!(end(stream).is_ok());
-
-        let output_rs = &mut output[..n];
-
-        assert_eq!(output_rs.len(), 81);
-
-        {
-            let mut stream = z_stream::default();
-
-            let config = InflateConfig {
-                window_bits: config.window_bits,
-            };
-
-            assert_eq!(crate::inflate::init(&mut stream, config), ReturnCode::Ok);
-
-            let Some(stream) = (unsafe { InflateStream::from_stream_mut(&raw mut stream) }) else {
-                unreachable!();
-            };
-
-            stream.next_in = output_rs.as_mut_ptr() as _;
-            stream.avail_in = output_rs.len() as _;
-
-            let mut output = [0u8; 12];
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out = output.len() as _;
-
-            let mut extra_buf = [0u8; 64];
-            let mut name_buf = [0u8; 64];
-            let mut comment_buf = [0u8; 64];
-
-            let mut header = gz_header {
-                text: 0,
-                time: 0,
-                xflags: 0,
-                os: 0,
-                extra: extra_buf.as_mut_ptr(),
-                extra_len: 0,
-                extra_max: extra_buf.len() as _,
-                name: name_buf.as_mut_ptr(),
-                name_max: name_buf.len() as _,
-                comment: comment_buf.as_mut_ptr(),
-                comm_max: comment_buf.len() as _,
-                hcrc: 0,
-                done: 0,
-            };
-
+        let mut compressed = [0u8; 256];
+        let mut raw_deflate = z_stream::default();
+        let mut encoder = ScopedDeflateStream::new(&mut raw_deflate, config)?;
+        let encoded_len = {
+            let stream = encoder.stream()?;
+            // SAFETY: header and its three caller-owned backing strings remain
+            // valid throughout compression and native state teardown.
             assert_eq!(
-                unsafe { crate::inflate::get_header(stream, Some(&mut header)) },
+                unsafe { set_header(stream, Some(&mut header)) },
                 ReturnCode::Ok
             );
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip plaintext too large"))?;
+            stream.next_out = compressed.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(compressed.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output capacity too large"))?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let remaining = usize::try_from(stream.avail_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output cursor too large"))?;
+            let written =
+                compressed
+                    .len()
+                    .checked_sub(remaining)
+                    .ok_or(SchedulerFixtureError::Invariant(
+                        "gzip output crossed buffer boundary",
+                    ))?;
+            assert_eq!(
+                stream.total_out,
+                crate::c_api::z_size::try_from(written)
+                    .map_err(|_| SchedulerFixtureError::Invariant("gzip output count too large"))?
+            );
+            written
+        };
+        drop(encoder);
+        assert_eq!(encoded_len, 81);
 
+        let gzip_bytes = &compressed[..encoded_len];
+        let mut plaintext = [0u8; 12];
+        let mut extra_buf = [0u8; 64];
+        let mut name_buf = [0u8; 64];
+        let mut comment_buf = [0u8; 64];
+        let mut decoded_header = gz_header {
+            extra: extra_buf.as_mut_ptr(),
+            extra_max: crate::c_api::uInt::try_from(extra_buf.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip extra destination too large")
+            })?,
+            name: name_buf.as_mut_ptr(),
+            name_max: crate::c_api::uInt::try_from(name_buf.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip name destination too large"))?,
+            comment: comment_buf.as_mut_ptr(),
+            comm_max: crate::c_api::uInt::try_from(comment_buf.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip comment destination too large")
+            })?,
+            ..gz_header::default()
+        };
+
+        let mut raw_inflate = z_stream::default();
+        let mut decoder = ScopedInflateStream::new(
+            &mut raw_inflate,
+            InflateConfig {
+                window_bits: config.window_bits,
+            },
+        )?;
+        {
+            let stream = decoder.stream()?;
+            stream.next_in = gzip_bytes.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(gzip_bytes.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip frame too large"))?;
+            stream.next_out = plaintext.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(plaintext.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip plaintext capacity too large")
+            })?;
+
+            // SAFETY: the gzip header and all nested output arrays are disjoint
+            // from compressed input and remain exclusively writable until end.
+            assert_eq!(
+                unsafe { crate::inflate::get_header(stream, Some(&mut decoded_header)) },
+                ReturnCode::Ok
+            );
+            // SAFETY: input and output are valid disjoint caller-owned slices
+            // advertised with checked native sizes for the entire inflate call.
             assert_eq!(
                 unsafe { crate::inflate::inflate(stream, InflateFlush::Finish) },
                 ReturnCode::StreamEnd
             );
-
-            crate::inflate::end(stream);
-
-            assert!(!header.comment.is_null());
+            assert_eq!(stream.avail_in, 0);
             assert_eq!(
-                unsafe { CStr::from_ptr(header.comment.cast()) }
-                    .to_str()
-                    .unwrap(),
-                comment.trim_end_matches('\0')
-            );
-
-            assert!(!header.name.is_null());
-            assert_eq!(
-                unsafe { CStr::from_ptr(header.name.cast()) }
-                    .to_str()
-                    .unwrap(),
-                name.trim_end_matches('\0')
-            );
-
-            assert!(!header.extra.is_null());
-            assert_eq!(
-                unsafe { CStr::from_ptr(header.extra.cast()) }
-                    .to_str()
-                    .unwrap(),
-                extra.trim_end_matches('\0')
+                stream.total_out,
+                crate::c_api::z_size::try_from(input.len()).map_err(|_| {
+                    SchedulerFixtureError::Invariant("decoded byte count too large")
+                })?
             );
         }
+        drop(decoder);
+        assert_eq!(&plaintext, input);
+        assert_eq!(decoded_header.done, 1);
+
+        // SAFETY: all destination pointers were initialized to live fixed
+        // arrays and native get_header terminated each C string in bounds.
+        assert_eq!(
+            unsafe { CStr::from_ptr(decoded_header.comment.cast()) }
+                .to_str()
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip comment invalid UTF-8"))?,
+            comment.trim_end_matches('\0')
+        );
+        // SAFETY: the name is a terminated C string inside the retained buffer.
+        assert_eq!(
+            unsafe { CStr::from_ptr(decoded_header.name.cast()) }
+                .to_str()
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip name invalid UTF-8"))?,
+            name.trim_end_matches('\0')
+        );
+        // SAFETY: the original test uses a terminated extra field. Its decoded
+        // bytes occupy an independently allocated array in this test.
+        assert_eq!(
+            unsafe { CStr::from_ptr(decoded_header.extra.cast()) }
+                .to_str()
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip extra invalid UTF-8"))?,
+            extra.trim_end_matches('\0')
+        );
+        Ok(())
     }
 
     #[test]
