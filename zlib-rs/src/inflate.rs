@@ -298,7 +298,16 @@ impl<'a> InflateStream<'a> {
     ///
     /// Reports invalid configuration/allocator contracts or failed allocation.
     pub fn new(config: InflateConfig) -> Result<Self, ReturnCode> {
-        let mut inner = crate::c_api::z_stream::default();
+        Self::new_with_abi_stream(crate::c_api::z_stream::default(), config)
+    }
+
+    /// Initialize an owned stream from caller-selected allocator callbacks.
+    /// The public constructor uses the default callbacks; keeping this small
+    /// internal boundary also lets tests verify releases with a counted C allocator.
+    fn new_with_abi_stream(
+        mut inner: crate::c_api::z_stream,
+        config: InflateConfig,
+    ) -> Result<Self, ReturnCode> {
         match crate::inflate::init(&mut inner, config) {
             ReturnCode::Ok => {}
             error => return Err(error),
@@ -334,6 +343,16 @@ impl<'a> InflateStream<'a> {
             adler: inner.adler,
             reserved: inner.reserved,
         })
+    }
+}
+
+impl Drop for InflateStream<'_> {
+    fn drop(&mut self) {
+        // Explicit inflateEnd detaches the state pointer first, so dropping
+        // the typed owner afterwards cannot free the same allocation twice.
+        if !self.state.as_ptr().is_null() {
+            let _ = end(self);
+        }
     }
 }
 
@@ -3974,6 +3993,40 @@ mod tests {
     fn successful_fallible_inflate_stream_construction_can_be_ended() -> Result<(), ReturnCode> {
         let mut stream = InflateStream::new(InflateConfig::default())?;
         assert_eq!(end(&mut stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_inflate_stream_releases_custom_allocation_exactly_once() -> Result<(), ReturnCode> {
+        // Test both unconditional Drop and explicit inflateEnd followed by
+        // Drop. Misaligned callbacks also exercise the generic C allocator's
+        // alignment-prefix path, not just its normal Rust allocator fast path.
+        for (remainder, explicit_end) in [(1usize, false), (1, true), (31, false), (63, true)] {
+            let mut context = MisalignedAlloc {
+                remainder,
+                modulus: ALLOCATION_BLOCK_BYTES,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut context).cast(),
+                ..z_stream::default()
+            };
+            let mut owned = InflateStream::new_with_abi_stream(raw, InflateConfig::default())?;
+            assert_eq!(context.allocations, 1);
+            assert_eq!(context.frees, 0);
+            assert_eq!(context.buffers.len(), 1);
+            if explicit_end {
+                assert!(end(&mut owned).state.is_null());
+                assert_eq!(context.frees, 1);
+            }
+            drop(owned);
+            assert_eq!(context.frees, 1);
+            assert!(context.buffers.is_empty());
+        }
         Ok(())
     }
 

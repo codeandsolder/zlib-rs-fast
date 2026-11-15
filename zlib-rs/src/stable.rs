@@ -288,12 +288,6 @@ impl Inflate {
     }
 }
 
-impl Drop for Inflate {
-    fn drop(&mut self) {
-        let _ = crate::inflate::end(&mut self.inner);
-    }
-}
-
 /// Errors that can occur when compressing.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum DeflateError {
