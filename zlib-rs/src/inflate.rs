@@ -2624,12 +2624,22 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
         };
 
         if here.op == 0 {
-            output.push(here.val as u8);
+            let Ok(literal) = u8::try_from(here.val) else {
+                bad = Some("invalid literal/length code\0");
+                state.mode = Mode::Bad;
+                break 'outer;
+            };
+            output.push(literal);
             bit_reader.drop_bits(here.bits);
             here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
 
             if here.op == 0 {
-                output.push(here.val as u8);
+                let Ok(literal) = u8::try_from(here.val) else {
+                    bad = Some("invalid literal/length code\0");
+                    state.mode = Mode::Bad;
+                    break 'outer;
+                };
+                output.push(literal);
                 bit_reader.drop_bits(here.bits);
                 here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
             }
@@ -2640,7 +2650,12 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             let op = here.op;
 
             if op == 0 {
-                output.push(here.val as u8);
+                let Ok(literal) = u8::try_from(here.val) else {
+                    bad = Some("invalid literal/length code\0");
+                    state.mode = Mode::Bad;
+                    break 'outer;
+                };
+                output.push(literal);
             } else if op & 16 != 0 {
                 let op = op & MAX_BITS;
                 let len = here.val + bit_reader.bits_u16(usize::from(op));
@@ -3468,6 +3483,63 @@ mod tests {
             assert_eq!(reader.bytes_remaining(), input.len());
             assert_eq!(reader.bits_in_buffer(), 0);
             assert_eq!(output.len(), 0);
+        }
+    }
+
+    #[test]
+    fn fast_decoder_rejects_invalid_literal_in_each_decode_branch() {
+        let mut output_storage = [core::mem::MaybeUninit::<u8>::uninit(); 260];
+
+        // First literal, second consecutive literal, and an indirect literal
+        // reached through a subtable all must reject out-of-byte-range values.
+        for (case, invalid_literal) in [(0, 256), (0, u16::MAX), (1, 256), (2, u16::MAX)] {
+            let mut state = State::new(InflateStateKind::Regular);
+            state.len_table = Table {
+                codes: Codes::Len,
+                bits: 1,
+            };
+            state.dist_table = Table {
+                codes: Codes::Fixed,
+                bits: 5,
+            };
+            let invalid = Code {
+                op: 0,
+                bits: 1,
+                val: invalid_literal,
+            };
+            let mut input = [0u8; 32];
+            state.len_codes[..4].fill(invalid);
+            match case {
+                0 => {}
+                1 => {
+                    // First symbol is a literal 'A'; second is invalid.
+                    state.len_codes[0].val = u16::from(b'A');
+                    input[0] = 0b10;
+                }
+                2 => {
+                    // First lookup redirects to a subtable containing the
+                    // invalid literal rather than a normal primary leaf.
+                    state.len_codes[0] = Code {
+                        op: 1,
+                        bits: 1,
+                        val: 2,
+                    };
+                }
+                _ => unreachable!("the test defines only three lookup scenarios"),
+            }
+
+            let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
+            // SAFETY: the stack array is exclusively writable for 260 bytes;
+            // the output cursor tracks initialized bytes in its prefix.
+            let mut output = unsafe {
+                InflateOutput::new_uninit(output_storage.as_mut_ptr().cast(), output_storage.len())
+            };
+
+            inflate_fast_help_impl::<true, _>(&mut state, &mut reader, &mut output);
+
+            assert!(matches!(state.mode, Mode::Bad));
+            assert_eq!(state.error_message, Some("invalid literal/length code\0"));
+            assert_eq!(output.len(), usize::from(case == 1));
         }
     }
 
