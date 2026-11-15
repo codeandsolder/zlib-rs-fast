@@ -194,7 +194,7 @@ fn gz_error_access() -> Result<(), ()> {
     // When the file handle is null, gz_error should not modify the errno
     let mut gz_errno: c_int = UNSET_ERRNO;
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    assert!(unsafe { gzerror(ptr::null_mut::<gzFile_s>(), &mut gz_errno as *mut c_int).is_null() });
+    assert!(unsafe { gzerror(ptr::null_mut::<gzFile_s>(), &raw mut gz_errno).is_null() });
     assert_eq!(gz_errno, UNSET_ERRNO);
 
     // Open a valid gzip file; the error should be an empty string
@@ -205,7 +205,7 @@ fn gz_error_access() -> Result<(), ()> {
     assert!(!handle.is_null());
     let mut gz_errno: c_int = UNSET_ERRNO;
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    let err = unsafe { gzerror(handle, &mut gz_errno as *mut c_int) };
+    let err = unsafe { gzerror(handle, &raw mut gz_errno) };
     assert!(!err.is_null());
     // SAFETY: gzerror returned a non-null pointer to its live NUL-terminated message, validated by the preceding assertion.
     assert_eq!(unsafe { *err }, 0 as c_char);
@@ -322,6 +322,8 @@ fn gz_direct_read() -> Result<(), ()> {
 
 #[test]
 fn gzread_special_cases() -> Result<(), ()> {
+    const STRING1: &[u8] = b"deflated contents";
+    const STRING2: &[u8] = b"\ntrailing data";
     let mut buf = [0u8; 10];
 
     // gzread on an null file handle should return -1.
@@ -375,8 +377,6 @@ fn gzread_special_cases() -> Result<(), ()> {
         )
     };
     assert!(!file.is_null());
-    const STRING1: &[u8] = b"deflated contents";
-    const STRING2: &[u8] = b"\ntrailing data";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -433,15 +433,14 @@ fn gzread_special_cases() -> Result<(), ()> {
 }
 
 #[test]
-fn gzbuffer_rejects_geometry_beyond_abi_counter_width() {
+fn gzbuffer_rejects_geometry_beyond_abi_counter_width() -> Result<(), ()> {
+    let path = CString::new(crate_path("src/test-data/issue-109.gz")).map_err(|_| ())?;
+
     // No buffers are allocated until the first read, so exercise the
     // extreme uInt sizes without requesting gigabytes of memory.
     // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
     let outcomes = crate::assert_eq_rs_ng!(unsafe {
-        let path = CString::new(crate_path("src/test-data/issue-109.gz"))
-            .expect("fixture path contains no interior NUL");
-        let mode = c"r";
-        let handle = gzopen(path.as_ptr(), mode.as_ptr());
+        let handle = gzopen(path.as_ptr(), c"r".as_ptr());
         assert!(!handle.is_null());
 
         let too_large = gzbuffer(handle, 0x8000_0000);
@@ -454,6 +453,7 @@ fn gzbuffer_rejects_geometry_beyond_abi_counter_width() {
         (too_large, max_uint, max_doublable, small, closed)
     });
     assert_eq!(outcomes, (-1, -1, 0, 0, Z_OK));
+    Ok(())
 }
 
 #[test]
@@ -527,7 +527,7 @@ fn gzread_gzip() -> Result<(), ()> {
         }
         bytes_read += usize::try_from(ret).map_err(|_| ())?;
     }
-    assert_eq!(bytes_read, 126094);
+    assert_eq!(bytes_read, 126_094);
 
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
@@ -615,6 +615,10 @@ fn gzread_direct() -> Result<(), ()> {
 
 #[test]
 fn gzwrite_basic() -> Result<(), ()> {
+    const STRING1: &[u8] = b"small write ";
+    const STRING2: &[u8] = b"second write ";
+    const STRING3: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const COPIES: usize = 2;
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -628,7 +632,7 @@ fn gzwrite_basic() -> Result<(), ()> {
         // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
         let file = unsafe {
             gzopen(
-                CString::new(temp_file.clone()).map_err(|_| ())?.as_ptr(),
+                CString::new(temp_file.as_str()).map_err(|_| ())?.as_ptr(),
                 CString::new(mode).map_err(|_| ())?.as_ptr(),
             )
         };
@@ -642,10 +646,6 @@ fn gzwrite_basic() -> Result<(), ()> {
         // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
         assert_eq!(unsafe { gzbuffer(file, 20 as c_uint) }, 0);
 
-        const STRING1: &[u8] = b"small write ";
-        const STRING2: &[u8] = b"second write ";
-        const STRING3: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        const COPIES: usize = 2;
         for _ in 0..COPIES {
             // A zero-byte write should return zero.
             assert_eq!(
@@ -707,7 +707,7 @@ fn gzwrite_basic() -> Result<(), ()> {
         // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
         let file = unsafe {
             gzopen(
-                CString::new(temp_file.clone()).map_err(|_| ())?.as_ptr(),
+                CString::new(temp_file.as_str()).map_err(|_| ())?.as_ptr(),
                 CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
@@ -802,6 +802,9 @@ fn gzwrite_error() -> Result<(), ()> {
 
 #[test]
 fn gzflush_basic() -> Result<(), ()> {
+    const STRING1: &[u8] = b"first write ";
+    const STRING2: &[u8] = b"second write ";
+    const STRING3: &[u8] = b"third write";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -815,7 +818,7 @@ fn gzflush_basic() -> Result<(), ()> {
         // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
         let file = unsafe {
             gzopen(
-                CString::new(temp_file.clone()).map_err(|_| ())?.as_ptr(),
+                CString::new(temp_file.as_str()).map_err(|_| ())?.as_ptr(),
                 CString::new(mode).map_err(|_| ())?.as_ptr(),
             )
         };
@@ -826,9 +829,6 @@ fn gzflush_basic() -> Result<(), ()> {
         // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
         assert_eq!(unsafe { gzbuffer(file, 1024) }, 0);
 
-        const STRING1: &[u8] = b"first write ";
-        const STRING2: &[u8] = b"second write ";
-        const STRING3: &[u8] = b"third write";
         let mut size_before = file_size(&temp_file).map_err(|_| ())?;
         assert_eq!(size_before, 0);
         // Do a small gzwrite. It should not cause any file I/O yet.
@@ -904,7 +904,7 @@ fn gzflush_basic() -> Result<(), ()> {
         // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
         let file = unsafe {
             gzopen(
-                CString::new(temp_file.clone()).map_err(|_| ())?.as_ptr(),
+                CString::new(temp_file.as_str()).map_err(|_| ())?.as_ptr(),
                 CString::new("r").map_err(|_| ())?.as_ptr(),
             )
         };
@@ -1264,6 +1264,8 @@ fn gzputc_error() -> Result<(), ()> {
 
 #[test]
 fn gzputs_basic() -> Result<(), ()> {
+    const CONTENT: [&str; 3] = ["zlib ", "", "string larger than the buffer size"];
+    const EXPECTED: &str = "zlib string larger than the buffer size";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -1289,7 +1291,6 @@ fn gzputs_basic() -> Result<(), ()> {
     assert_eq!(unsafe { gzputs(file, ptr::null()) }, -1);
 
     // Write some data to the file using gzputs.
-    const CONTENT: [&str; 3] = ["zlib ", "", "string larger than the buffer size"];
     for s in CONTENT {
         assert_eq!(
             // SAFETY: the caller supplies a live NUL-terminated C string and live handle, or a null argument that is rejected before reading input.
@@ -1303,7 +1304,6 @@ fn gzputs_basic() -> Result<(), ()> {
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
 
     // Validate that the file contains the expected bytes.
-    const EXPECTED: &str = "zlib string larger than the buffer size";
     let actual = std::fs::read(file_name).map_err(|_| ())?;
     assert_eq!(actual, EXPECTED.as_bytes());
     Ok(())
@@ -1398,6 +1398,9 @@ fn gzgetc_error() -> Result<(), ()> {
 
 #[test]
 fn gzungetc_basic() -> Result<(), ()> {
+    const CONTENT: &[u8] = b"0123456789abcdef";
+    const EXPECTED1: &[u8] = b"123456\nfor tests";
+    const EXPECTED2: &[u8] = b"8ip\nexample";
     // Open a gzip file for reading.
     let file_name = crate_path("src/test-data/text.gz");
     // SAFETY: path and mode point to live NUL-terminated CString storage during the call; null arguments in negative tests are rejected by the API.
@@ -1420,10 +1423,9 @@ fn gzungetc_basic() -> Result<(), ()> {
     // Call gzungetc before doing any read operations on the file. It should return the
     // character pushed. Because the output buffer size is 16 bytes (based on the gzbuffer
     // call above), gzungetc should work exactly 16 times before we do any reads.
-    const CONTENT: &[u8] = b"0123456789abcdef";
     for c in CONTENT.iter().rev() {
         // SAFETY: the handle is live; the pushed-back byte is passed by value and null handles are rejected.
-        assert_eq!(unsafe { gzungetc(*c as c_int, file) }, *c as c_int);
+        assert_eq!(unsafe { gzungetc(c_int::from(*c), file) }, c_int::from(*c));
     }
 
     // gzread should return the characters we pushed into the buffer with gzungetc.
@@ -1489,7 +1491,6 @@ fn gzungetc_basic() -> Result<(), ()> {
 
     // gzread should yield the remaining 10 bytes of uncompressed content from the file,
     // preceded by the 6 bytes we just pushed with gzungetc, for a total of 16 bytes.
-    const EXPECTED1: &[u8] = b"123456\nfor tests";
     // Read more than expected to make sure there's no other output following it.
     let mut buf = [0u8; EXPECTED1.len() + 1];
     assert_eq!(
@@ -1509,7 +1510,7 @@ fn gzungetc_basic() -> Result<(), ()> {
     // 16 calls should succeed, and the last one should fail and set an error.
     let mut err = Z_OK;
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    assert!(!unsafe { gzerror(file, &mut err) }.is_null());
+    assert!(!unsafe { gzerror(file, &raw mut err) }.is_null());
     assert_eq!(err, Z_OK);
     for _ in 0..16 {
         // SAFETY: the handle is live; the pushed-back byte is passed by value and null handles are rejected.
@@ -1518,7 +1519,7 @@ fn gzungetc_basic() -> Result<(), ()> {
     // SAFETY: the handle is live; the pushed-back byte is passed by value and null handles are rejected.
     assert_eq!(unsafe { gzungetc('-' as c_int, file) }, -1);
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    assert!(!unsafe { gzerror(file, &mut err) }.is_null());
+    assert!(!unsafe { gzerror(file, &raw mut err) }.is_null());
     assert_eq!(err, Z_DATA_ERROR);
 
     // Clear the error state, rewind to the start of the file, and read some data
@@ -1528,7 +1529,7 @@ fn gzungetc_basic() -> Result<(), ()> {
     // SAFETY: the handle is live and owned here, or null in a negative test that exercises the explicit error path.
     unsafe { gzrewind(file) };
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    assert!(!unsafe { gzerror(file, &mut err) }.is_null());
+    assert!(!unsafe { gzerror(file, &raw mut err) }.is_null());
     assert_eq!(err, Z_OK);
     // SAFETY: the gzip handle is live and valid, and the call does not borrow it beyond this expression.
     assert_eq!(unsafe { gzgetc(file) }, 'g' as c_int);
@@ -1546,7 +1547,6 @@ fn gzungetc_basic() -> Result<(), ()> {
     assert_eq!(unsafe { gzseek(file, 1, libc::SEEK_CUR) }, 2);
     // SAFETY: the handle is live; the pushed-back byte is passed by value and null handles are rejected.
     assert_eq!(unsafe { gzungetc('8' as c_int, file) }, '8' as c_int);
-    const EXPECTED2: &[u8] = b"8ip\nexample";
     let mut buf = [0u8; EXPECTED2.len()];
     assert_eq!(
         // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
@@ -1870,6 +1870,7 @@ fn gzfread_error() -> Result<(), ()> {
 
 #[test]
 fn gzfwrite_basic() -> Result<(), ()> {
+    const EXPECTED: &[u8] = b"test of gzfwrite";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -1910,7 +1911,6 @@ fn gzfwrite_basic() -> Result<(), ()> {
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
 
     // Read in the file and verify that the contents match what was passed to gzfwrite.
-    const EXPECTED: &[u8] = b"test of gzfwrite";
     let actual = std::fs::read(file_name).map_err(|_| ())?;
     assert_eq!(actual, EXPECTED);
     Ok(())
@@ -1967,6 +1967,10 @@ fn gzfwrite_error() -> Result<(), ()> {
 
 #[test]
 fn gzsetparams_basic() -> Result<(), ()> {
+    const STRING1: &[u8] = b"first write ";
+    const STRING2: &[u8] = b"second write ";
+    const STRING3: &[u8] = b"third write";
+    const EXPECTED: &[u8] = b"first write second write third write";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -1992,7 +1996,6 @@ fn gzsetparams_basic() -> Result<(), ()> {
 
     // Provide some data to the file descriptor for compression. The deflate output
     // should be buffered, so the file size should not increase yet.
-    const STRING1: &[u8] = b"first write ";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2014,7 +2017,6 @@ fn gzsetparams_basic() -> Result<(), ()> {
     assert!(size > 0);
 
     // Write more data to the file descriptor.
-    const STRING2: &[u8] = b"second write ";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2042,7 +2044,6 @@ fn gzsetparams_basic() -> Result<(), ()> {
     let size = new_size;
 
     // Do another write, and close the file.
-    const STRING3: &[u8] = b"third write";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2069,7 +2070,6 @@ fn gzsetparams_basic() -> Result<(), ()> {
         )
     };
     assert!(!file.is_null());
-    const EXPECTED: &[u8] = b"first write second write third write";
     let mut buf = [0u8; EXPECTED.len() + 1];
     assert_eq!(
         // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
@@ -2090,6 +2090,7 @@ fn gzsetparams_basic() -> Result<(), ()> {
 
 #[test]
 fn gzsetparams_error() -> Result<(), ()> {
+    const CONTENT: &[u8] = b"0123456789";
     // gzsetparams on a null file handle should return Z_STREAM_ERROR.
     assert_eq!(
         // SAFETY: the handle is still live when non-null and the compression parameters are passed as integers; invalid values are checked by the C wrapper.
@@ -2133,7 +2134,6 @@ fn gzsetparams_error() -> Result<(), ()> {
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("w").map_err(|_| ())?.as_ptr()) };
     assert!(!file.is_null());
-    const CONTENT: &[u8] = b"0123456789";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2154,6 +2154,7 @@ fn gzsetparams_error() -> Result<(), ()> {
 
 #[test]
 fn gzseek_read() -> Result<(), ()> {
+    const EXPECTED: &[u8] = b"#mtre";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -2281,10 +2282,9 @@ fn gzseek_read() -> Result<(), ()> {
         // beginning of the uncompressed content.
         // SAFETY: the handle is live and owned here, or null in a negative test that exercises the explicit error path.
         assert_eq!(unsafe { gzrewind(file) }, 0);
-        const EXPECTED: &[u8] = b"#mtre";
         for &c in EXPECTED {
             // SAFETY: the gzip handle is live and valid, and the call does not borrow it beyond this expression.
-            assert_eq!(unsafe { gzgetc(file) }, c as _);
+            assert_eq!(unsafe { gzgetc(file) }, c_int::from(c));
         }
 
         // Call gzseek twice and then do a read. The read should begin at the sum of the
@@ -2305,6 +2305,11 @@ fn gzseek_read() -> Result<(), ()> {
 
 #[test]
 fn gzseek_write() -> Result<(), ()> {
+    const BUF_SIZE: usize = 8;
+    const STRING1: &[u8] = b"0123";
+    const STRING2: &[u8] = b"456\0";
+    const EXPECTED1: &[u8] = b"\x00\x00\x000123\x00\x00\x00\x00\x00456\x00\x007\x008";
+    const EXPECTED2: &[u8] = &[0u8; BUF_SIZE * 3 + 1];
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -2325,7 +2330,6 @@ fn gzseek_write() -> Result<(), ()> {
         assert!(!file.is_null());
 
         // Set a small buffer size to help exercise all the code paths.
-        const BUF_SIZE: usize = 8;
         // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
         assert_eq!(unsafe { gzbuffer(file, checked_test_len(BUF_SIZE)) }, 0);
 
@@ -2341,7 +2345,6 @@ fn gzseek_write() -> Result<(), ()> {
         // also implements the pending seek, but it is not supported in direct-mode
         // (non-compressed) files, so it is tested separately in the function
         // gzseek_gzsetparams.
-        const STRING1: &[u8] = b"0123";
         assert_eq!(
             // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
             unsafe {
@@ -2361,7 +2364,6 @@ fn gzseek_write() -> Result<(), ()> {
         assert_eq!(unsafe { gzseek(file, 12, libc::SEEK_SET) }, 12);
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 12);
-        const STRING2: &[u8] = b"456\0";
         assert_eq!(
             // SAFETY: the caller supplies a live NUL-terminated C string and live handle, or a null argument that is rejected before reading input.
             unsafe { gzputs(file, STRING2.as_ptr().cast::<c_char>()) },
@@ -2420,7 +2422,6 @@ fn gzseek_write() -> Result<(), ()> {
             )
         };
         assert!(!file.is_null());
-        const EXPECTED1: &[u8] = b"\x00\x00\x000123\x00\x00\x00\x00\x00456\x00\x007\x008";
         let mut buf = [127u8; EXPECTED1.len()];
         assert_eq!(
             // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
@@ -2434,7 +2435,6 @@ fn gzseek_write() -> Result<(), ()> {
             checked_test_len(buf.len())
         );
         assert_eq!(&buf, EXPECTED1);
-        const EXPECTED2: &[u8] = &[0u8; BUF_SIZE * 3 + 1];
         let mut buf = [127u8; EXPECTED2.len() + 1];
         assert_eq!(
             // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
@@ -2457,6 +2457,9 @@ fn gzseek_write() -> Result<(), ()> {
 
 #[test]
 fn gzseek_gzsetparams() -> Result<(), ()> {
+    const STRING1: &[u8] = b"hello";
+    const SEEK_AMOUNT: usize = 4;
+    const STRING2: &[u8] = b"world";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -2475,7 +2478,6 @@ fn gzseek_gzsetparams() -> Result<(), ()> {
     assert!(!file.is_null());
 
     // Write some content to the file handle.
-    const STRING1: &[u8] = b"hello";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2489,7 +2491,6 @@ fn gzseek_gzsetparams() -> Result<(), ()> {
     );
 
     // Call gzseek to schedule a pending write of some zeros to the compressed stream.
-    const SEEK_AMOUNT: usize = 4;
     // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
     assert_eq!(
         // SAFETY: file is a live owned gzip stream; the relative offset is
@@ -2512,7 +2513,6 @@ fn gzseek_gzsetparams() -> Result<(), ()> {
 
     // Write some more content to the file handle. This will end up in the second gzip stream
     // in the file.
-    const STRING2: &[u8] = b"world";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2579,6 +2579,7 @@ fn gzseek_gzsetparams() -> Result<(), ()> {
 
 #[test]
 fn gzseek_error() -> Result<(), ()> {
+    const CONTENT: &[u8] = b"0123456789";
     // gzseek on a null file handle should return -1.
     // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
     assert_eq!(unsafe { gzseek(ptr::null_mut(), 0, libc::SEEK_CUR) }, -1);
@@ -2589,7 +2590,6 @@ fn gzseek_error() -> Result<(), ()> {
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("w").map_err(|_| ())?.as_ptr()) };
     assert!(!file.is_null());
-    const CONTENT: &[u8] = b"0123456789";
     assert_eq!(
         // SAFETY: the live gzip handle and readable input bytes remain valid through the call, or an invalid length/handle is rejected before accessing caller memory.
         unsafe {
@@ -2726,10 +2726,10 @@ mod gzprintf {
             /* Write hello, hello! using gzputs and gzprintf */
             gzputc(file, b'h' as i32);
             if gzputs(file, cstr!("ello").as_ptr()) != 4 {
-                gz_error!("gzputs err: {}", gzerror(file, &mut err));
+                gz_error!("gzputs err: {}", gzerror(file, &raw mut err));
             }
             if gzprintf(file, cstr!(", %s!").as_ptr(), cstr!("hello").as_ptr()) != 8 {
-                gz_error!("gzprintf err: {}", gzerror(file, &mut err));
+                gz_error!("gzprintf err: {}", gzerror(file, &raw mut err));
             }
             /* Write string null-teriminator using gzseek */
             if gzseek(file, 1, libc::SEEK_CUR) < 0 {
@@ -2737,25 +2737,25 @@ mod gzprintf {
             }
             /* Write hello, hello! using gzfwrite using best compression level */
             if gzsetparams(file, Z_BEST_COMPRESSION, Z_DEFAULT_STRATEGY) != Z_OK {
-                gz_error!("gzsetparams err: {}", gzerror(file, &mut err));
+                gz_error!("gzsetparams err: {}", gzerror(file, &raw mut err));
             }
             if gzfwrite(hello.as_ptr().cast(), len, 1, file) == 0 {
-                gz_error!("gzfwrite err: {}", gzerror(file, &mut err));
+                gz_error!("gzfwrite err: {}", gzerror(file, &raw mut err));
             }
             /* Flush compressed bytes to file */
             if gzflush(file, Z_SYNC_FLUSH) != Z_OK {
-                gz_error!("gzflush err: {}", gzerror(file, &mut err));
+                gz_error!("gzflush err: {}", gzerror(file, &raw mut err));
             }
             let compr_len = gzoffset(file);
             if compr_len <= 0 {
-                gz_error!("gzoffset err: {}", gzerror(file, &mut err));
+                gz_error!("gzoffset err: {}", gzerror(file, &raw mut err));
             }
             gzclose(file);
 
             /* Open gz file we previously wrote */
             file = gzopen(fname.as_ptr(), cstr!("rb").as_ptr());
             if file.is_null() {
-                gz_error!("gzopen error: {}", gzerror(file, &mut err));
+                gz_error!("gzopen error: {}", gzerror(file, &raw mut err));
             }
 
             /* Read uncompressed data - hello, hello! string twice */
@@ -2767,7 +2767,7 @@ mod gzprintf {
             ) as usize
                 != (len + len)
             {
-                gz_error!("gzread err: {}", gzerror(file, &mut err));
+                gz_error!("gzread err: {}", gzerror(file, &raw mut err));
             }
             if libc::strcmp(uncompr.as_ptr(), hello.as_ptr()) != 0 {
                 panic!(
@@ -2802,7 +2802,7 @@ mod gzprintf {
             if libc::strlen(uncompr.as_mut_ptr()) != 7
             /* " hello!" */
             {
-                gz_error!("gzgets err after gzseek: {}", gzerror(file, &mut err));
+                gz_error!("gzgets err after gzseek: {}", gzerror(file, &raw mut err));
             }
             if libc::strcmp(uncompr.as_mut_ptr(), hello.as_ptr().add(6)) != 0 {
                 panic!("bad gzgets after gzseek");
@@ -2843,12 +2843,12 @@ mod gzprintf {
             }
             /* Trigger an error and clear it with gzclearerr */
             gzfread(uncompr.as_mut_ptr().cast(), usize::MAX, usize::MAX, file);
-            gzerror(file, &mut err);
+            gzerror(file, &raw mut err);
             if err == 0 {
                 panic!("gzerror err: no error returned");
             }
             gzclearerr(file);
-            gzerror(file, &mut err);
+            gzerror(file, &raw mut err);
             if err != 0 {
                 panic!("gzclearerr err: not zero {}", err);
             }
