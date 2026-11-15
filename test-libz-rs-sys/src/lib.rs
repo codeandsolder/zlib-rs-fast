@@ -246,52 +246,76 @@ mod null {
 
     #[test]
     fn test_crc32_combine() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
+        // crc32 uses uInt (usually 32-bit), while combine operations
+        // use z_off_t (whose width may differ on LLP64 targets). A large
+        // input must never be silently shortened before either C call.
+        fn checked_crc_lengths(len: usize) -> Option<(core::ffi::c_uint, libz_rs_sys::z_off_t)> {
+            Some((
+                core::ffi::c_uint::try_from(len).ok()?,
+                libz_rs_sys::z_off_t::try_from(len).ok()?,
+            ))
+        }
 
         fn test(data: Vec<u8>) -> bool {
             let Some(buf_len) = data.first().copied() else {
                 return true;
             };
+            let Some((total_uint_len, total_off_len)) = checked_crc_lengths(data.len()) else {
+                return false;
+            };
 
-            let buf_size = Ord::max(buf_len, 1) as usize;
+            let buf_size = usize::from(buf_len.max(1));
 
-            // SAFETY: every CRC input pointer refers to a live borrowed slice for its declared length.
+            // SAFETY: every CRC input pointer refers to a live borrowed slice
+            // with its exact checked C-ABI byte count; combine consumes only scalars.
             assert_eq_rs_ng!(unsafe {
                 let crc0 = 0;
                 let mut crc1 = crc0;
-                let mut crc2 = crc0;
 
-                /* CRC32 */
                 for chunk in data.chunks(buf_size) {
-                    let crc3 = crc32(crc0, chunk.as_ptr(), chunk.len() as _);
-                    let op = crc32_combine_gen(chunk.len() as _);
+                    let Some((chunk_uint_len, chunk_off_len)) = checked_crc_lengths(chunk.len())
+                    else {
+                        return false;
+                    };
+                    let crc3 = crc32(crc0, chunk.as_ptr(), chunk_uint_len);
+                    let op = crc32_combine_gen(chunk_off_len);
                     let crc4 = crc32_combine_op(crc1, crc3, op);
-                    crc1 = crc32(crc1, chunk.as_ptr(), chunk.len() as _);
-
+                    crc1 = crc32(crc1, chunk.as_ptr(), chunk_uint_len);
                     assert_eq!(crc1, crc4);
                 }
 
-                crc2 = crc32(crc2, data.as_ptr(), data.len() as _);
-
+                let crc2 = crc32(crc0, data.as_ptr(), total_uint_len);
                 assert_eq!(crc1, crc2);
 
-                let combine1 = crc32_combine(crc1, crc2, data.len() as _);
-                let combine2 = crc32_combine(crc1, crc1, data.len() as _);
+                let combine1 = crc32_combine(crc1, crc2, total_off_len);
+                let combine2 = crc32_combine(crc1, crc1, total_off_len);
                 assert_eq!(combine1, combine2);
 
-                // Fast CRC32 combine.
-                let op = crc32_combine_gen(data.len() as _);
+                // Fast CRC32 combine must agree for both input orders.
+                let op = crc32_combine_gen(total_off_len);
                 let combine1 = crc32_combine_op(crc1, crc2, op);
                 let combine2 = crc32_combine_op(crc2, crc1, op);
                 assert_eq!(combine1, combine2);
 
-                let combine1 = crc32_combine(crc1, crc2, data.len() as _);
+                let combine1 = crc32_combine(crc1, crc2, total_off_len);
                 let combine2 = crc32_combine_op(crc2, crc1, op);
                 assert_eq!(combine1, combine2);
             });
 
             true
         }
+
+        // Independent ABI limits: on a 64-bit host the offset may be able
+        // to represent values that still overflow the uInt byte-count field.
+        assert_eq!(checked_crc_lengths(0), Some((0, 0)));
+        assert_eq!(
+            checked_crc_lengths(usize::from(u16::MAX)),
+            Some((u32::from(u16::MAX), libz_rs_sys::z_off_t::from(u16::MAX)))
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(checked_crc_lengths(usize::MAX), None);
+
+        ::quickcheck::quickcheck(test as fn(_) -> _);
     }
 
     #[test]
@@ -552,19 +576,18 @@ mod null {
         });
     }
 
+    const FERRIS_BYTES_GZ_NO_HEADER: [u8; 26] = [
+        31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 115, 75, 45, 42, 202, 44, 6, 0, 174, 148, 97, 210, 6, 0,
+        0, 0,
+    ];
+
+    const FERRIS_BYTES_GZ_WITH_HEADER: &[u8] = &[
+        31, 139, 8, 28, 0, 0, 0, 0, 0, 3, 6, 0, 98, 97, 110, 97, 110, 97, 97, 112, 112, 108, 101,
+        0, 112, 101, 97, 114, 0, 115, 75, 45, 42, 202, 44, 6, 0, 174, 148, 97, 210, 6, 0, 0, 0,
+    ];
+
     #[test]
-    fn inflate_get_header_zeroed() {
-        const FERRIS_BYTES_GZ_NO_HEADER: [u8; 26] = [
-            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 115, 75, 45, 42, 202, 44, 6, 0, 174, 148, 97, 210, 6,
-            0, 0, 0,
-        ];
-
-        const FERRIS_BYTES_GZ_WITH_HEADER: &[u8] = &[
-            31, 139, 8, 28, 0, 0, 0, 0, 0, 3, 6, 0, 98, 97, 110, 97, 110, 97, 97, 112, 112, 108,
-            101, 0, 112, 101, 97, 114, 0, 115, 75, 45, 42, 202, 44, 6, 0, 174, 148, 97, 210, 6, 0,
-            0, 0,
-        ];
-
+    fn deflate_gzip_header_metadata_encoding() -> Result<(), ()> {
         let input = b"Ferris";
         let mut buf = [0; 64];
 
@@ -601,7 +624,7 @@ mod null {
                 xflags: 0,
                 os: 3,
                 extra: extra.as_mut_ptr(),
-                extra_len: (extra.len() - 1) as _,
+                extra_len: core::ffi::c_uint::try_from(extra.len() - 1).map_err(|_| ())?,
                 extra_max: 0,
                 name: name.as_mut_ptr(),
                 name_max: 0,
@@ -617,10 +640,10 @@ mod null {
             buf.fill(0);
 
             strm.next_in = input.as_ptr().cast_mut();
-            strm.avail_in = input.len() as _;
+            strm.avail_in = core::ffi::c_uint::try_from(input.len()).map_err(|_| ())?;
 
             strm.next_out = buf.as_mut_ptr();
-            strm.avail_out = buf.len() as _;
+            strm.avail_out = core::ffi::c_uint::try_from(buf.len()).map_err(|_| ())?;
 
             let err = deflate(strm, Z_FINISH);
             assert_eq!(err, Z_STREAM_END);
@@ -628,71 +651,90 @@ mod null {
             let err = deflateEnd(strm);
             assert_eq!(err, Z_OK);
 
-            assert_eq!(&buf[..strm.total_out as usize], FERRIS_BYTES_GZ_WITH_HEADER);
+            assert_eq!(
+                &buf[..usize::try_from(strm.total_out).map_err(|_| ())?],
+                FERRIS_BYTES_GZ_WITH_HEADER
+            );
         });
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_get_header_initialized_destinations() -> Result<(), ()> {
+        let config = zlib_rs::deflate::DeflateConfig {
+            window_bits: 16 + 15,
+            ..Default::default()
+        };
 
         // SAFETY: The gzip-header object and stream are live during the differential inflate test.
         assert_eq_rs_ng!(unsafe {
             let mut strm = MaybeUninit::<z_stream>::zeroed();
 
-            fn initialize_header_null() -> MaybeUninit<gz_header> {
-                let mut head = MaybeUninit::<gz_header>::zeroed();
-
-                // SAFETY: The zeroed gz_header storage is addressable and only the pointer fields are initialized.
-                unsafe {
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).extra),
-                        core::ptr::null_mut(),
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).name),
-                        core::ptr::null_mut(),
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).comment),
-                        core::ptr::null_mut(),
-                    );
+            fn initialize_header_null() -> gz_header {
+                // Every header field is initialized *before* the C callback
+                // receives it. In particular zlib-ng does not populate all
+                // output fields when no gzip header is present.
+                gz_header {
+                    text: 0,
+                    time: 0,
+                    xflags: 0,
+                    os: 0,
+                    extra: core::ptr::null_mut(),
+                    extra_len: 0,
+                    extra_max: 0,
+                    name: core::ptr::null_mut(),
+                    name_max: 0,
+                    comment: core::ptr::null_mut(),
+                    comm_max: 0,
+                    hcrc: 0,
+                    done: 0,
                 }
-
-                head
             }
 
             fn initialize_header_buffers(
                 extra: &mut [u8],
                 name: &mut [u8],
                 comment: &mut [u8],
-            ) -> MaybeUninit<gz_header> {
-                let mut head = MaybeUninit::<gz_header>::zeroed();
+            ) -> Result<gz_header, ()> {
+                let mut head = initialize_header_null();
+                head.extra = extra.as_mut_ptr();
+                head.extra_max = core::ffi::c_uint::try_from(extra.len()).map_err(|_| ())?;
+                head.name = name.as_mut_ptr();
+                head.name_max = core::ffi::c_uint::try_from(name.len()).map_err(|_| ())?;
+                head.comment = comment.as_mut_ptr();
+                head.comm_max = core::ffi::c_uint::try_from(comment.len()).map_err(|_| ())?;
+                Ok(head)
+            }
 
-                // SAFETY: Each gzip-header buffer is live and writable for the individually declared capacity.
-                unsafe {
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).extra),
-                        extra.as_mut_ptr(),
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).extra_max),
-                        extra.len() as _,
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).name),
-                        name.as_mut_ptr(),
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).name_max),
-                        name.len() as _,
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).comment),
-                        comment.as_mut_ptr(),
-                    );
-                    core::ptr::write(
-                        core::ptr::addr_of_mut!((*head.as_mut_ptr()).comm_max),
-                        comment.len() as _,
-                    );
-                }
+            /// Decode one complete gzip stream into a live registered header.
+            ///
+            /// # Safety
+            ///
+            /// The stream must be initialized for gzip, the header's nested
+            /// output buffers must remain writable through this call, and
+            /// its input/output spans must be distinct and valid.
+            unsafe fn decode_header(
+                strm: &mut z_stream,
+                head: &mut gz_header,
+                input: &[u8],
+            ) -> Result<(), ()> {
+                // SAFETY: the caller owns a live stream and header for this
+                // synchronous parse; nested metadata pointers are still valid.
+                assert_eq!(unsafe { inflateGetHeader(strm, head) }, Z_OK);
 
-                head
+                let mut output = [0u8; 100];
+                strm.next_in = input.as_ptr().cast_mut();
+                strm.avail_in = core::ffi::c_uint::try_from(input.len()).map_err(|_| ())?;
+                strm.next_out = output.as_mut_ptr();
+                strm.avail_out = core::ffi::c_uint::try_from(output.len()).map_err(|_| ())?;
+
+                // SAFETY: the live input and writable output arrays are
+                // disjoint and sized exactly by the checked ABI counts.
+                assert_eq!(unsafe { inflate(strm, Z_FINISH) }, Z_STREAM_END);
+                let written = usize::try_from(strm.total_out).map_err(|_| ())?;
+                assert_eq!(&output[..written], b"Ferris");
+                assert_eq!(head.done, 1, "gzip header must report completion");
+                Ok(())
             }
 
             let err = inflateInit2_(
@@ -708,91 +750,43 @@ mod null {
             {
                 let mut head = initialize_header_null();
 
-                let err = inflateGetHeader(strm, head.as_mut_ptr());
-                assert_eq!(err, Z_OK);
-
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES_GZ_NO_HEADER.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES_GZ_NO_HEADER.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
-
-                // zlib-rs will properly initialize this struct, zlib-ng does not!
-                if cfg!(miri) {
-                    let _ = head.assume_init();
-                }
+                // SAFETY: stream and caller-owned metadata buffers stay live
+                // and disjoint through this synchronous decoding operation.
+                decode_header(strm, &mut head, &FERRIS_BYTES_GZ_NO_HEADER)?;
+                // Reset while the registered C header pointer and its nested
+                // writable buffers are still alive, not after they leave scope.
+                assert_eq!(inflateReset(strm), Z_OK);
             }
-
-            assert_eq!(inflateReset(strm), Z_OK);
 
             {
                 let mut name_buf = [0u8; 3];
                 let mut extra_buf = [0u8; 3];
                 let mut comment_buf = [0u8; 3];
                 let mut head =
-                    initialize_header_buffers(&mut name_buf, &mut extra_buf, &mut comment_buf);
+                    initialize_header_buffers(&mut name_buf, &mut extra_buf, &mut comment_buf)?;
 
-                let err = inflateGetHeader(strm, head.as_mut_ptr());
-                assert_eq!(err, Z_OK);
-
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES_GZ_NO_HEADER.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES_GZ_NO_HEADER.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
+                // SAFETY: stream and caller-owned metadata buffers stay live
+                // and disjoint through this synchronous decoding operation.
+                decode_header(strm, &mut head, &FERRIS_BYTES_GZ_NO_HEADER)?;
 
                 assert_eq!(extra_buf, [0u8; 3]);
                 assert_eq!(name_buf, [0u8; 3]);
                 assert_eq!(comment_buf, [0u8; 3]);
-
-                // zlib-rs will properly initialize this struct, zlib-ng does not!
-                if cfg!(miri) {
-                    let _ = head.assume_init();
-                }
+                // Reset while the registered C header pointer and its nested
+                // writable buffers are still alive, not after they leave scope.
+                assert_eq!(inflateReset(strm), Z_OK);
             }
-
-            assert_eq!(inflateReset(strm), Z_OK);
 
             {
                 let mut head = initialize_header_null();
 
-                let err = inflateGetHeader(strm, head.as_mut_ptr());
-                assert_eq!(err, Z_OK);
-
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES_GZ_WITH_HEADER.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES_GZ_WITH_HEADER.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
-
-                // zlib-rs will properly initialize this struct, zlib-ng does not!
-                if cfg!(miri) {
-                    let _ = head.assume_init();
-                }
-            };
-
-            assert_eq!(inflateReset(strm), Z_OK);
+                // SAFETY: stream and caller-owned metadata buffers stay live
+                // and disjoint through this synchronous decoding operation.
+                decode_header(strm, &mut head, FERRIS_BYTES_GZ_WITH_HEADER)?;
+                // The C stream must release this header pointer before
+                // its owner is dropped at the end of the block.
+                assert_eq!(inflateReset(strm), Z_OK);
+            }
 
             {
                 // Deliberately use different capacities. The C API must not
@@ -801,39 +795,23 @@ mod null {
                 let mut extra_buf = [0u8; 2];
                 let mut comment_buf = [0u8; 6];
                 let mut head =
-                    initialize_header_buffers(&mut extra_buf, &mut name_buf, &mut comment_buf);
+                    initialize_header_buffers(&mut extra_buf, &mut name_buf, &mut comment_buf)?;
 
-                let err = inflateGetHeader(strm, head.as_mut_ptr());
-                assert_eq!(err, Z_OK);
-
-                let mut dest = [0u8; 100];
-
-                strm.next_in = FERRIS_BYTES_GZ_WITH_HEADER.as_ptr().cast_mut();
-                strm.avail_in = FERRIS_BYTES_GZ_WITH_HEADER.len() as _;
-
-                strm.next_out = dest.as_mut_ptr();
-                strm.avail_out = dest.len() as _;
-
-                let err = inflate(strm, Z_FINISH);
-                assert_eq!(err, Z_STREAM_END);
-
-                assert_eq!(&dest[..strm.total_out as usize], b"Ferris");
+                // SAFETY: stream and caller-owned metadata buffers stay live
+                // and disjoint through this synchronous decoding operation.
+                decode_header(strm, &mut head, FERRIS_BYTES_GZ_WITH_HEADER)?;
 
                 assert_eq!(&extra_buf, b"ba");
                 assert_eq!(&name_buf, b"apple\0\0");
                 assert_eq!(&comment_buf, b"pear\0\0");
 
-                // zlib-rs will properly initialize this struct, zlib-ng does not!
-                if cfg!(miri) {
-                    let _ = head.assume_init();
-                }
-            };
-
-            let err = inflateEnd(strm);
-            assert_eq!(err, Z_OK);
+                // Finalize the C stream while the last registered header and
+                // its borrowed nested buffers are still alive.
+                assert_eq!(inflateEnd(strm), Z_OK);
+            }
         });
+        Ok(())
     }
-
     #[test]
     fn inflate_mark() {
         // SAFETY: inflateMark must check a null stream before examining state.
