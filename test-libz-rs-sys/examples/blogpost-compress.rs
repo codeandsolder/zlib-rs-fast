@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_uint};
+use std::ffi::c_uint;
 
 // we use the libz_sys but configure zlib-ng in zlib compat mode
 use libz_sys as libz_ng_sys;
@@ -77,7 +77,7 @@ fn compress_rs(
                 MEM_LEVEL,
                 STRATEGY,
                 zlibVersion(),
-                std::mem::size_of::<z_stream>() as c_int,
+                test_libz_rs_sys::abi_z_stream_size(),
             )
         }
     };
@@ -160,7 +160,7 @@ fn compress_ng(
                 MEM_LEVEL,
                 STRATEGY,
                 zlibVersion(),
-                std::mem::size_of::<z_stream>() as c_int,
+                test_libz_rs_sys::abi_z_stream_size(),
             )
         }
     };

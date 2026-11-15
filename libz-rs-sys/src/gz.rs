@@ -5452,10 +5452,12 @@ mod tests {
         // SAFETY: the supplied path/mode are either valid NUL-terminated C strings or intentionally null as accepted and checked by gzopen.
         let writer = unsafe { gzopen(path_c.as_ptr(), write_mode.as_ptr()) };
         assert!(!writer.is_null());
+        let input_count = c_uint::try_from(input.len()).map_err(|_| ())?;
+        let expected_written = c_int::try_from(input.len()).map_err(|_| ())?;
         assert_eq!(
             // SAFETY: writer was successfully opened, and input is an initialized readable slice with exactly the length passed to gzwrite.
-            unsafe { gzwrite(writer, input.as_ptr().cast(), input.len() as c_uint) },
-            input.len() as c_int
+            unsafe { gzwrite(writer, input.as_ptr().cast(), input_count) },
+            expected_written
         );
         // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(writer) }, Z_OK);
@@ -5468,10 +5470,12 @@ mod tests {
         assert_eq!(unsafe { gzbuffer(reader, 64) }, 0);
 
         let mut output = vec![0u8; 4096];
+        let output_count = c_uint::try_from(output.len()).map_err(|_| ())?;
+        let expected_read = c_int::try_from(output.len()).map_err(|_| ())?;
         assert_eq!(
             // SAFETY: reader was successfully opened, and output is a writable slice covering all bytes offered to gzread.
-            unsafe { gzread(reader, output.as_mut_ptr().cast(), output.len() as c_uint) },
-            output.len() as c_int
+            unsafe { gzread(reader, output.as_mut_ptr().cast(), output_count) },
+            expected_read
         );
         assert!(output.iter().all(|&byte| byte == b'A'));
 
@@ -5597,8 +5601,8 @@ mod tests {
         assert!(!(caller_start..caller_end).contains(&(state.stream.next_in as usize)));
     }
 
-    // Map a byte string literal to a C string
-    // FIXME: switch to c"example" format once MSRV >= 1.77
+    // The test fixtures are already byte arrays with explicit trailing NULs.
+    // Preserve their exact byte representation at the C ABI boundary.
     macro_rules! c {
         ($s:literal) => {{
             $s.as_ptr().cast::<c_char>()
@@ -5608,7 +5612,7 @@ mod tests {
     #[test]
     fn gzdopen_invalid_fd() {
         // SAFETY: the mode pointer is a valid, NUL-terminated C string; the descriptor is passed as an integer and may intentionally be invalid.
-        assert_eq!(unsafe { gzdopen(-1, c!(b"r\0")) }, core::ptr::null_mut())
+        assert_eq!(unsafe { gzdopen(-1, c!(b"r\0")) }, core::ptr::null_mut());
     }
 
     #[test]
@@ -5617,7 +5621,7 @@ mod tests {
             // SAFETY: gzopen rejects a null path or mode without reading through that null pointer.
             unsafe { gzopen(core::ptr::null(), c!(b"r\0")) },
             core::ptr::null_mut()
-        )
+        );
     }
 
     #[test]
@@ -5626,7 +5630,7 @@ mod tests {
             // SAFETY: gzopen rejects a null path or mode without reading through that null pointer.
             unsafe { gzopen(c!(b"/foo/bar\0"), core::ptr::null(),) },
             core::ptr::null_mut()
-        )
+        );
     }
 
     #[test]
@@ -5644,7 +5648,10 @@ mod tests {
 
     #[test]
     fn owned_c_string_preserves_non_utf8_bytes() -> Result<(), ()> {
-        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").map_err(|_| ())?;
+        const NON_UTF8_PATH: &[u8] = &[
+            b'b', b'a', b'd', b'-', 0xff, b'-', b'p', b'a', b't', b'h', 0,
+        ];
+        let path = CStr::from_bytes_with_nul(NON_UTF8_PATH).map_err(|_| ())?;
         let owned = GzCString::clone_from_c_str(path).ok_or(())?;
         assert_eq!(owned.as_c_str().to_bytes_with_nul(), b"bad-\xff-path\0");
 
@@ -5758,7 +5765,10 @@ mod tests {
 
     #[test]
     fn gz_error_preserves_non_utf8_path_bytes() -> Result<(), ()> {
-        let path = CStr::from_bytes_with_nul(b"bad-\xff-path\0").map_err(|_| ())?;
+        const NON_UTF8_PATH: &[u8] = &[
+            b'b', b'a', b'd', b'-', 0xff, b'-', b'p', b'a', b't', b'h', 0,
+        ];
+        let path = CStr::from_bytes_with_nul(NON_UTF8_PATH).map_err(|_| ())?;
         let mut state = GzState::new();
         state.mode = GzMode::Read;
         state.source = Some(Source::Path(GzCString::clone_from_c_str(path).ok_or(())?));
@@ -5938,6 +5948,10 @@ mod tests {
     )]
     // Open a gzip file for reading. gzdirect should return 0.
     fn test_gzdirect_gzip_file() -> Result<(), ()> {
+        const FILE_SIZE: usize = 48; // size of test-data/example.gz
+        const BLOCK_SIZE: usize = 40;
+        const CONSUME: usize = 10;
+
         // SAFETY: both path and mode are NUL-terminated CString buffers that remain alive during this gzopen call.
         let file = unsafe {
             gzopen(
@@ -5949,8 +5963,6 @@ mod tests {
         };
         assert!(!file.is_null());
         // Set a smaller read batch size to exercise the buffer management code paths.
-        const FILE_SIZE: usize = 48; // size of test-data/example.gz
-        const BLOCK_SIZE: usize = 40;
         // SAFETY: the open gzip handle owns a live, aligned GzState; this test has exclusive access to it and checks for null via ok_or.
         unsafe { file.cast::<GzState>().as_mut().ok_or(())?.want = BLOCK_SIZE };
         // SAFETY: gzdirect receives the live gzip handle opened immediately above, including its owned buffer state.
@@ -5964,18 +5976,17 @@ mod tests {
         assert_eq!(
             // SAFETY: the opened gzip handle points to a live, aligned GzState, and this temporary immutable inspection cannot outlive the handle.
             unsafe { file.cast::<GzState>().as_ref().ok_or(())?.stream.avail_in },
-            BLOCK_SIZE as uInt
+            uInt::try_from(BLOCK_SIZE).map_err(|_| ())?
         );
         // Consume some of the buffered input and call gz_avail. It should move the remaining
         // input to the front of the input buffer.
         // SAFETY: file points to the live owned GzState, and the buffered suffix is checked before advancing its input cursor within the allocated span.
         unsafe {
             let state = file.cast::<GzState>().as_mut().ok_or(())?;
-            const CONSUME: usize = 10;
             let buffered = state.buffered_read_input().ok_or(())?;
             let expected_suffix = buffered[CONSUME..].to_vec();
             state.stream.next_in = state.stream.next_in.add(CONSUME);
-            state.stream.avail_in -= CONSUME as uInt;
+            state.stream.avail_in -= uInt::try_from(CONSUME).map_err(|_| ())?;
             assert_eq!(
                 state.buffered_read_input(),
                 Some(expected_suffix.as_slice())

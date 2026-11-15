@@ -1465,8 +1465,8 @@ impl PackedBits {
 }
 
 #[inline]
-const fn encode_len(ltree: &[Value], lc: u8) -> PackedBits {
-    let mut lc = lc as usize;
+const fn encode_len(ltree: &[Value], lc: usize) -> PackedBits {
+    let mut lc = lc;
 
     /* Send the length code, len is the match length - STD_MIN_MATCH */
     let code = self::trees_tbl::LENGTH_CODE[lc] as usize;
@@ -1676,7 +1676,7 @@ impl<'a> BitWriter<'a> {
         lc: u8,
         dist: u16,
     ) -> usize {
-        let mut bits = encode_len(ltree, lc);
+        let mut bits = encode_len(ltree, usize::from(lc));
         bits.append(encode_dist(dtree, dist));
         self.send_bits(bits.value, bits.len);
         usize::from(bits.len)
@@ -5094,7 +5094,7 @@ mod test {
     #[test]
     fn packed_match_bits_preserve_every_static_length_and_distance_boundary() {
         for length in 0..=u8::MAX {
-            let length_bits = encode_len(&trees_tbl::STATIC_LTREE, length);
+            let length_bits = encode_len(&trees_tbl::STATIC_LTREE, usize::from(length));
             let precalculated = trees_tbl::STATIC_LTREE_ENCODINGS[usize::from(length)];
             assert_eq!(u64::from(precalculated.code()), length_bits.value);
             assert_eq!(

@@ -260,6 +260,8 @@ impl<'a> InflateStream<'a> {
     /// exclusive access to the returned stream view.
     #[must_use]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
+        // SAFETY: the caller's validity and lifetime contract is passed
+        // unchanged to the kind-checking regular-inflate constructor.
         unsafe { Self::from_stream_ref_kind(strm, InflateStateKind::Regular) }
     }
 
@@ -271,6 +273,8 @@ impl<'a> InflateStream<'a> {
     /// inflate stream for which the caller guarantees exclusive access
     /// throughout the returned lifetime.
     pub unsafe fn from_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
+        // SAFETY: the caller supplies an exclusive live stream for this
+        // borrow, and the kind-specific constructor rejects BackInit state.
         unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Regular) }
     }
 
@@ -282,6 +286,8 @@ impl<'a> InflateStream<'a> {
     /// stream and callback-owned window. The caller must preserve both
     /// lifetimes and exclusive access while the returned view is borrowed.
     pub unsafe fn from_back_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
+        // SAFETY: the caller owns the live BackInit state and window for the
+        // returned borrow; the constructor checks the matching state kind.
         unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Back) }
     }
 
@@ -444,6 +450,8 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
         output_budget.refill(&mut stream.avail_out);
         input_budget.refill(&mut stream.avail_in);
 
+        // SAFETY: both live caller spans are advanced only by the SliceBudget,
+        // which caps each ABI count at its remaining readable/writable length.
         let err = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
 
         if err != ReturnCode::Ok {
@@ -1045,6 +1053,8 @@ struct InflateOutput<'a> {
 impl InflateOutput<'_> {
     const unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
         Self {
+            // SAFETY: this private unsafe constructor carries the same live,
+            // exclusive writable buffer contract as Writer::new_uninit.
             writer: unsafe { Writer::new_uninit(ptr, len) },
             accounted_remaining: len,
         }
@@ -2817,6 +2827,8 @@ impl InflateAllocOffsets {
             // exposes only history proven initialized by `extend`.
             let window_allocation =
                 unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
+            // SAFETY: allocation layout reserves 1 << MAX_WBITS writable bytes
+            // at window_pos; Window never exposes uninitialized history.
             state.window = unsafe { Window::from_raw_parts(window_allocation, 1 << MAX_WBITS) };
         }
 
@@ -2851,6 +2863,8 @@ impl InflateAllocOffsets {
         // SAFETY: the ordinary layout reserves exactly the source window backing length at
         // `window_pos`, and the fresh destination allocation cannot overlap the source.
         let window_allocation = unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
+        // SAFETY: the independent destination allocation has sufficient
+        // window capacity; clone_to copies only initialized history bytes.
         let window = unsafe { source.window.clone_to(window_allocation) };
 
         let state = source.clone_rebound(window, allocation_start.as_ptr(), self.total_size);
@@ -4349,10 +4363,8 @@ mod tests {
         stream.total_in = z_size::MAX - 1;
 
         // SAFETY: the input and output spans remain live and non-overlapping for this call.
-        assert_eq!(
-            unsafe { inflate(stream, InflateFlush::Finish) },
-            ReturnCode::StreamEnd
-        );
+        let status = unsafe { inflate(stream, InflateFlush::Finish) };
+        assert_eq!(status, ReturnCode::StreamEnd);
         assert_eq!(stream.total_in, 6);
         assert_eq!(stream.avail_in, 0);
         assert_eq!(end(stream).state, core::ptr::null_mut());
@@ -4732,10 +4744,8 @@ mod tests {
                     .ok_or("initialized gzip state is unavailable")?;
                 // SAFETY: the independent nested arrays are live, disjoint,
                 // and writable for exactly the configured capacities.
-                assert_eq!(
-                    unsafe { get_header(stream, Some(&mut destination)) },
-                    ReturnCode::Ok
-                );
+                let header_status = unsafe { get_header(stream, Some(&mut destination)) };
+                assert_eq!(header_status, ReturnCode::Ok);
 
                 let mut consumed = 0;
                 let mut scratch = [0u8; 1];
@@ -4988,17 +4998,17 @@ mod tests {
     #[test]
     fn back_init_raw_rejects_null_window() {
         let mut stream = z_stream::default();
-        assert_eq!(
-            unsafe {
-                back_init_raw(
-                    &mut stream,
-                    InflateConfig {
-                        window_bits: MIN_WBITS,
-                    },
-                    core::ptr::null_mut(),
-                )
-            },
-            ReturnCode::StreamError,
-        );
+        // SAFETY: the null window is an intentional invalid argument. The
+        // initializer must reject it before dereferencing the pointer.
+        let status = unsafe {
+            back_init_raw(
+                &mut stream,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ReturnCode::StreamError);
     }
 }

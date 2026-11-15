@@ -77,11 +77,15 @@ pub const STATIC_LTREE_ENCODINGS: [Value; 256] = {
 
     let mut lc = 0;
     while lc < table.len() {
-        let bits = super::encode_len(&STATIC_LTREE, lc as u8);
+        let bits = super::encode_len(&STATIC_LTREE, lc);
 
-        // These precomputed static length encodings fit the compact Value table.
+        // The encoded bits must be representable in Value's u16 code field.
+        // Decode the low two bytes only after checking the full packed value:
+        // no narrowing or discarded high bits are permitted.
         assert!(bits.value <= u16::MAX as u64);
-        table[lc] = Value::new(bits.value as u16, bits.len as u16);
+        let bytes = bits.value.to_le_bytes();
+        let code = u16::from_le_bytes([bytes[0], bytes[1]]);
+        table[lc] = Value::new(code, u16::from_le_bytes([bits.len, 0]));
 
         lc += 1;
     }

@@ -5,7 +5,6 @@ use libz_sys as libz_ng_sys;
 
 macro_rules! chunked_body {
     ($chunk_size:expr, $dest:expr, $source:expr) => {{
-        use core::ffi::*;
         use zlib_rs::{inflate::InflateConfig, InflateFlush, ReturnCode};
 
         let mut stream = core::mem::MaybeUninit::zeroed();
@@ -14,7 +13,7 @@ macro_rules! chunked_body {
             stream.as_mut_ptr(),
             InflateConfig::default().window_bits,
             zlibVersion(),
-            core::mem::size_of::<z_stream>() as c_int,
+            test_libz_rs_sys::abi_z_stream_size(),
         );
         assert_eq!(err, 0);
 

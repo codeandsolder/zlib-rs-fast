@@ -335,7 +335,7 @@ fn gz_direct_read() -> Result<(), ()> {
     assert_eq!(unsafe { gzdirect(file) }, 1);
     let mut err = Z_OK;
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    let msg = unsafe { gzerror(file, &mut err as *mut c_int) };
+    let msg = unsafe { gzerror(file, &raw mut err) };
     assert!(!msg.is_null());
     assert_eq!(err, Z_ERRNO);
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
@@ -506,9 +506,14 @@ fn gzread_gzip() -> Result<(), ()> {
     assert!(!file.is_null());
     // Set a small buffer size to help exercise the various buffer-refilling code paths.
     // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
-    assert_eq!(unsafe { gzbuffer(file, BUF_SIZE as c_uint) }, 0);
+    assert_eq!(
+        // SAFETY: the opened gzip handle is live and exclusively held; the
+        // size is checked against the uInt ABI before calling gzbuffer.
+        unsafe { gzbuffer(file, c_uint::try_from(BUF_SIZE).map_err(|_| ())?) },
+        0
+    );
     // Try to read more bytes than can be represented by a c_int. gzread should return -1.
-    let len = c_int::MAX as c_uint + 1;
+    let len = c_uint::try_from(c_int::MAX).map_err(|_| ())? + 1;
     assert_eq!(
         // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
         unsafe { gzread(file, buf.as_mut_ptr().cast::<c_void>(), len as c_uint) },
@@ -516,7 +521,7 @@ fn gzread_gzip() -> Result<(), ()> {
     );
     let mut err = Z_OK;
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    assert!(!unsafe { gzerror(file, &mut err as *mut c_int) }.is_null());
+    assert!(!unsafe { gzerror(file, &raw mut err) }.is_null());
     assert_eq!(err, Z_STREAM_ERROR);
     // Try a read of a more reasonable number of bytes. This should fail because the last
     // gzread set the file handle's internal error status.
@@ -544,7 +549,7 @@ fn gzread_gzip() -> Result<(), ()> {
             gzread(
                 file,
                 buf.as_mut_ptr().cast::<c_void>(),
-                MAX_READ_SIZE as c_uint,
+                c_uint::try_from(MAX_READ_SIZE).map_err(|_| ())?,
             )
         };
         assert!(ret >= 0);
@@ -578,7 +583,12 @@ fn gzread_direct() -> Result<(), ()> {
     assert!(!file.is_null());
     // Set a small buffer size to help exercise the various buffer-refilling code paths.
     // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
-    assert_eq!(unsafe { gzbuffer(file, BUF_SIZE as c_uint) }, 0);
+    assert_eq!(
+        // SAFETY: the opened gzip handle is live and exclusively held; the
+        // size is checked against the uInt ABI before calling gzbuffer.
+        unsafe { gzbuffer(file, c_uint::try_from(BUF_SIZE).map_err(|_| ())?) },
+        0
+    );
     // gzread should fetch the specified number of bytes from the start of the file.
     assert_eq!(
         // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
@@ -617,7 +627,7 @@ fn gzread_direct() -> Result<(), ()> {
             gzread(
                 file,
                 buf.as_mut_ptr().cast::<c_void>(),
-                MAX_READ_SIZE as c_uint,
+                c_uint::try_from(MAX_READ_SIZE).map_err(|_| ())?,
             )
         };
         assert!(ret >= 0);
@@ -626,9 +636,7 @@ fn gzread_direct() -> Result<(), ()> {
         }
         bytes_read += usize::try_from(ret).map_err(|_| ())?;
     }
-    let Ok(size) = file_size(path.as_str()) else {
-        panic!("Could not find size of file {path}");
-    };
+    let size = file_size(path.as_str()).map_err(|_| ())?;
     assert_eq!(bytes_read, size);
 
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
@@ -805,7 +813,7 @@ fn gzwrite_error() -> Result<(), ()> {
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
 
     // gzwrite should return 0 if the requested length does not fit in the return type.
-    let len = c_int::MAX as c_uint + 1;
+    let len = c_uint::try_from(c_int::MAX).map_err(|_| ())? + 1;
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("w").map_err(|_| ())?.as_ptr()) };
     assert!(!file.is_null());
@@ -816,7 +824,7 @@ fn gzwrite_error() -> Result<(), ()> {
     );
     let mut err = Z_OK;
     // SAFETY: the handle is live and errnum is a writable aligned local integer, or null parameters are intentionally supplied to an API that checks them.
-    assert!(!unsafe { gzerror(file, &mut err as *mut c_int) }.is_null());
+    assert!(!unsafe { gzerror(file, &raw mut err) }.is_null());
     assert_eq!(err, Z_DATA_ERROR);
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_ERRNO);
@@ -1220,6 +1228,7 @@ fn gzoffset_gztell_error() -> Result<(), ()> {
 
 #[test]
 fn gzputc_basic() -> Result<(), ()> {
+    const CONTENT: &[u8] = b"sample text to test gzputc implementation";
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -1241,10 +1250,9 @@ fn gzputc_basic() -> Result<(), ()> {
     assert_eq!(unsafe { gzbuffer(file, 8) }, 0);
 
     // Write to the file one byte at a time, using gzputc.
-    const CONTENT: &[u8] = b"sample text to test gzputc implementation";
     for c in CONTENT {
         // SAFETY: the handle is live and the byte is passed by value; null handles trigger the checked error path.
-        assert_eq!(unsafe { gzputc(file, *c as _) }, *c as _);
+        assert_eq!(unsafe { gzputc(file, c_int::from(*c)) }, c_int::from(*c));
     }
 
     // Close the file to flush any buffered writes.
@@ -1259,6 +1267,7 @@ fn gzputc_basic() -> Result<(), ()> {
 
 #[test]
 fn gzputc_error() -> Result<(), ()> {
+    const BUF_SIZE: usize = 10;
     // gzputc on a null file handle should return -1.
     // SAFETY: the handle is live and the byte is passed by value; null handles trigger the checked error path.
     assert_eq!(unsafe { gzputc(ptr::null_mut(), 1) }, -1);
@@ -1277,9 +1286,13 @@ fn gzputc_error() -> Result<(), ()> {
     // The last gzputc call should return -1.
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("wT").map_err(|_| ())?.as_ptr()) };
-    const BUF_SIZE: usize = 10;
     // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
-    assert_eq!(unsafe { gzbuffer(file, BUF_SIZE as _) }, 0);
+    assert_eq!(
+        // SAFETY: the opened gzip handle is live and exclusively held; the
+        // size is checked against the uInt ABI before calling gzbuffer.
+        unsafe { gzbuffer(file, c_uint::try_from(BUF_SIZE).map_err(|_| ())?) },
+        0
+    );
     for _ in 0..BUF_SIZE {
         // SAFETY: the handle is live and the byte is passed by value; null handles trigger the checked error path.
         assert_eq!(unsafe { gzputc(file, 1) }, 1);
@@ -1365,6 +1378,7 @@ fn gzputs_error() -> Result<(), ()> {
 
 #[test]
 fn gzgetc_basic() -> Result<(), ()> {
+    const EXPECTED: &str = "gzip\nexample data\nfor tests";
     // Read data from a gzip file one byte at a time using gzgetc, and verify that
     // the expected content is returned.
     // FIXME: Replace these closures with simple function pointers once the project MSRV
@@ -1382,13 +1396,12 @@ fn gzgetc_basic() -> Result<(), ()> {
         assert!(!file.is_null());
         // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
         assert_eq!(unsafe { gzbuffer(file, 8) }, 0);
-        const EXPECTED: &str = "gzip\nexample data\nfor tests";
         let mut content = String::with_capacity(EXPECTED.len());
         for _ in 0..EXPECTED.len() {
             // Safety: `file` was initialized by `gzopen`.
             let ch = gzgetc_fn(file);
             assert_ne!(ch, -1);
-            content.push(ch as u8 as char);
+            content.push(char::from(u8::try_from(ch).map_err(|_| ())?));
         }
         // We should be at the end, so the next gzgetc should return -1.
         assert_eq!(gzgetc_fn(file), -1);

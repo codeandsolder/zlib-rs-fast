@@ -38,7 +38,7 @@ fn main() {
 
 fn decompress_files_rs<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
     use libz_rs_sys::{
-        inflate, inflateEnd, inflateInit2_, inflateReset, z_stream, zlibVersion, Z_NO_FLUSH, Z_OK,
+        inflate, inflateEnd, inflateInit2_, inflateReset, zlibVersion, Z_NO_FLUSH, Z_OK,
         Z_STREAM_END,
     };
 
@@ -50,7 +50,7 @@ fn decompress_files_rs<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
             stream.as_mut_ptr(),
             15, // windowBits = 15 (default)
             zlibVersion(),
-            std::mem::size_of::<z_stream>() as i32,
+            test_libz_rs_sys::abi_z_stream_size(),
         );
         assert_eq!(ret, Z_OK);
         let stream = stream.assume_init_mut();
@@ -75,7 +75,7 @@ fn decompress_files_rs<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
 
 fn decompress_files_ng<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
     use libz_ng_sys::{
-        inflate, inflateEnd, inflateInit2_, inflateReset, z_stream, zlibVersion, Z_FINISH, Z_OK,
+        inflate, inflateEnd, inflateInit2_, inflateReset, zlibVersion, Z_FINISH, Z_OK,
     };
 
     let mut outbuf = vec![0u8; 1 << 20];
@@ -86,7 +86,7 @@ fn decompress_files_ng<'a>(inputs: impl Iterator<Item = &'a [u8]>) {
             stream.as_mut_ptr(),
             15, // windowBits = 15 (default)
             zlibVersion(),
-            std::mem::size_of::<z_stream>() as i32,
+            test_libz_rs_sys::abi_z_stream_size(),
         );
         assert_eq!(ret, Z_OK);
         let stream = stream.assume_init_mut();
