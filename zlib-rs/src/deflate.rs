@@ -3608,7 +3608,7 @@ fn emit_planned_near_optimal_block(
     output: &mut [u8],
     produced: &mut usize,
 ) -> Result<bool, ReturnCode> {
-    near_optimal::tally_tokens(state, &block.tokens);
+    near_optimal::tally_tokens(state, &block.tokens)?;
 
     state.window.clear();
     if block.range.len() <= MAX_STORED {
@@ -3703,22 +3703,22 @@ fn encode_near_optimal_with_state(
             previous_model,
         )?;
         let (current_block, current_model) = &mut current;
-        match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
+        match near_optimal::optimize_token_partition(state, current_block, &mut next.block)? {
             near_optimal::BoundaryOptimization::Merged(merged) => {
                 next.block = merged;
                 let _ =
-                    next.reparse_with_existing_candidates(state, input, optimization_passes, None);
+                    next.reparse_with_existing_candidates(state, input, optimization_passes, None)?;
                 current = next.into_parts();
                 continue;
             }
             near_optimal::BoundaryOptimization::Shifted => {
-                *current_model = near_optimal::model_from_tokens(state, &current_block.tokens);
+                *current_model = near_optimal::model_from_tokens(state, &current_block.tokens)?;
                 let _ = next.reparse_with_existing_candidates(
                     state,
                     input,
                     optimization_passes,
                     Some(current_model),
-                );
+                )?;
             }
             near_optimal::BoundaryOptimization::Unchanged => {}
         }
@@ -6112,7 +6112,7 @@ mod test {
         };
 
         let outcome =
-            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
             panic!("expected identical compressible blocks to merge");
         };
@@ -6151,7 +6151,7 @@ mod test {
         let mut left = literal_block(0..half);
         let mut right = literal_block(half..near_optimal::MAX_BLOCK_TOKENS);
         let outcome =
-            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
             panic!("the exact 65,534-token Huffman capacity should remain mergeable");
         };
@@ -6160,7 +6160,7 @@ mod test {
         let mut left = literal_block(0..half);
         let mut right = literal_block(half..near_optimal::MAX_BLOCK_TOKENS + 1);
         let outcome =
-            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         assert!(!matches!(
             outcome,
             near_optimal::BoundaryOptimization::Merged(_)

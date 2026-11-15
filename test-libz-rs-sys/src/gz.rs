@@ -1276,8 +1276,9 @@ fn gzputc_error() -> Result<(), ()> {
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("r").map_err(|_| ())?.as_ptr()) };
     assert!(!file.is_null());
-    // SAFETY: the handle is live and the byte is passed by value; null handles trigger the checked error path.
-    assert_eq!(unsafe { gzputc(ptr::null_mut(), 1) }, -1);
+    // SAFETY: this live read-only handle must be rejected on write without
+    // modifying or consuming the handle; gzclose below still owns it.
+    assert_eq!(unsafe { gzputc(file, 1) }, -1);
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_ERRNO);
 

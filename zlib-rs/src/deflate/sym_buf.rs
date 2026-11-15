@@ -28,6 +28,14 @@ impl SymBuf<'_> {
         self.filled == self.buf.len() - 3
     }
 
+    /// Maximum tokens that fit before reaching the reserved flush slot.
+    /// Near-optimal complete-buffer emission cannot auto-flush halfway
+    /// through a caller-supplied planned block.
+    #[inline]
+    pub const fn block_capacity(&self) -> usize {
+        (self.buf.len() / 3).saturating_sub(1)
+    }
+
     /// Returns true if there are no initialized tokens in this symbol buffer.
     #[inline]
     pub const fn is_empty(&self) -> bool {
