@@ -4630,7 +4630,7 @@ mod test {
     use super::*;
     use crate::allocate::{misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc};
 
-    use core::{ffi::CStr, sync::atomic::AtomicUsize};
+    use core::sync::atomic::AtomicUsize;
 
     #[test]
     fn owned_stream_rejects_invalid_config_and_does_not_double_free_after_end(
@@ -8795,6 +8795,29 @@ mod test {
         Ok(())
     }
 
+    /// Parse a native gzip FNAME/FCOMMENT destination without assuming that
+    /// the native decoder wrote a NUL before the end of its allocation.
+    fn bounded_gzip_string(bytes: &[u8]) -> Result<&str, SchedulerFixtureError> {
+        let terminator =
+            bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "gzip metadata string lacks terminator",
+                ))?;
+        core::str::from_utf8(&bytes[..terminator])
+            .map_err(|_| SchedulerFixtureError::Invariant("gzip metadata string invalid UTF-8"))
+    }
+
+    #[test]
+    fn bounded_gzip_metadata_rejects_unterminated_and_invalid_utf8(
+    ) -> Result<(), SchedulerFixtureError> {
+        assert_eq!(bounded_gzip_string(b"ok\0\xff")?, "ok");
+        assert!(bounded_gzip_string(b"not terminated").is_err());
+        assert!(bounded_gzip_string(b"\xff\0").is_err());
+        Ok(())
+    }
+
     #[test]
     fn gzip_with_header() -> Result<(), SchedulerFixtureError> {
         // Keep gzipHeader readback in addition to the zlib-ng differential
@@ -8864,9 +8887,11 @@ mod test {
 
         let gzip_bytes = &compressed[..encoded_len];
         let mut plaintext = [0u8; 12];
-        let mut extra_buf = [0u8; 64];
-        let mut name_buf = [0u8; 64];
-        let mut comment_buf = [0u8; 64];
+        // Nonzero sentinels prove the decoder wrote the actual NUL
+        // terminators rather than relying on zero-initialized spare space.
+        let mut extra_buf = [0xa5u8; 64];
+        let mut name_buf = [0xa5u8; 64];
+        let mut comment_buf = [0xa5u8; 64];
         let mut decoded_header = gz_header {
             extra: extra_buf.as_mut_ptr(),
             extra_max: crate::c_api::uInt::try_from(extra_buf.len()).map_err(|_| {
@@ -8899,18 +8924,16 @@ mod test {
                 SchedulerFixtureError::Invariant("gzip plaintext capacity too large")
             })?;
 
-            // SAFETY: the gzip header and all nested output arrays are disjoint
-            // from compressed input and remain exclusively writable until end.
-            assert_eq!(
-                unsafe { crate::inflate::get_header(stream, Some(&mut decoded_header)) },
-                ReturnCode::Ok
-            );
-            // SAFETY: input and output are valid disjoint caller-owned slices
-            // advertised with checked native sizes for the entire inflate call.
-            assert_eq!(
-                unsafe { crate::inflate::inflate(stream, InflateFlush::Finish) },
-                ReturnCode::StreamEnd
-            );
+            // SAFETY: the gzip header and all nested output arrays are live,
+            // disjoint from compressed input, and writable for the capacities
+            // advertised to the native decoder until its state is ended.
+            let header_status =
+                unsafe { crate::inflate::get_header(stream, Some(&mut decoded_header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
+            // SAFETY: input and output are valid disjoint caller-owned slices,
+            // advertised with checked native sizes throughout this call.
+            let status = unsafe { crate::inflate::inflate(stream, InflateFlush::Finish) };
+            assert_eq!(status, ReturnCode::StreamEnd);
             assert_eq!(stream.avail_in, 0);
             assert_eq!(
                 stream.total_out,
@@ -8923,29 +8946,26 @@ mod test {
         assert_eq!(&plaintext, input);
         assert_eq!(decoded_header.done, 1);
 
-        // SAFETY: all destination pointers were initialized to live fixed
-        // arrays and native get_header terminated each C string in bounds.
+        // RFC 1952 extra data is arbitrary bytes, *not* a C string.
+        // Use its explicit wire length, including the NUL in this fixture.
+        let extra_size = usize::try_from(decoded_header.extra_len)
+            .map_err(|_| SchedulerFixtureError::Invariant("gzip extra count exceeds host width"))?;
+        assert_eq!(extra_size, extra.len());
         assert_eq!(
-            unsafe { CStr::from_ptr(decoded_header.comment.cast()) }
-                .to_str()
-                .map_err(|_| SchedulerFixtureError::Invariant("gzip comment invalid UTF-8"))?,
-            comment.trim_end_matches('\0')
+            extra_buf.get(..extra_size),
+            Some(extra.as_bytes()),
+            "decoded gzip extra differs from raw binary metadata"
         );
-        // SAFETY: the name is a terminated C string inside the retained buffer.
-        assert_eq!(
-            unsafe { CStr::from_ptr(decoded_header.name.cast()) }
-                .to_str()
-                .map_err(|_| SchedulerFixtureError::Invariant("gzip name invalid UTF-8"))?,
-            name.trim_end_matches('\0')
-        );
-        // SAFETY: the original test uses a terminated extra field. Its decoded
-        // bytes occupy an independently allocated array in this test.
-        assert_eq!(
-            unsafe { CStr::from_ptr(decoded_header.extra.cast()) }
-                .to_str()
-                .map_err(|_| SchedulerFixtureError::Invariant("gzip extra invalid UTF-8"))?,
-            extra.trim_end_matches('\0')
-        );
+        assert_eq!(extra_buf.get(extra_size), Some(&0xa5));
+
+        // FNAME/FCOMMENT are C strings, but only read within their actual
+        // destination allocations; never use unbounded CStr::from_ptr.
+        let name_text = bounded_gzip_string(&name_buf)?;
+        let comment_text = bounded_gzip_string(&comment_buf)?;
+        assert_eq!(name_text, name.trim_end_matches('\0'));
+        assert_eq!(comment_text, comment.trim_end_matches('\0'));
+        assert_eq!(name_buf.get(name_text.len() + 1), Some(&0xa5));
+        assert_eq!(comment_buf.get(comment_text.len() + 1), Some(&0xa5));
         Ok(())
     }
 
