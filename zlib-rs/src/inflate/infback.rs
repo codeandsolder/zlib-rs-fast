@@ -468,6 +468,7 @@ pub(super) fn decode_back(
     // `Writer` views can then never alias a window still reachable through the simultaneously
     // borrowed `&mut State`. The single exit path below restores it before returning.
     let state = &mut *strm.state;
+    state.error_message = None;
     let mut window = core::mem::replace(&mut state.back_window, BackWindow::empty());
     window.clear();
 
@@ -520,6 +521,14 @@ pub(super) fn decode_back(
 
     if output.flush_remaining(&mut window).is_err() && ret == ReturnCode::StreamEnd {
         ret = ReturnCode::BufError;
+    }
+
+    // Return the same stable, NUL-terminated diagnostic as ordinary inflate.
+    // Callback streams can be decoded repeatedly, so stale errors were cleared
+    // on entry and cannot leak into a later successful result.
+    if let Some(msg) = state.error_message {
+        debug_assert!(msg.ends_with('\0'));
+        strm.msg = msg.as_ptr().cast_mut().cast();
     }
 
     let Ok(available) = u32::try_from(input.available()) else {

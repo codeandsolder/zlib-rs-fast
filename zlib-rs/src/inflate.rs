@@ -4487,6 +4487,92 @@ mod tests {
     }
 
     #[test]
+    fn callback_inflate_sets_and_clears_stream_error_messages() -> Result<(), &'static str> {
+        unsafe extern "C" fn no_more_input(_descriptor: *mut c_void, next: *mut *const u8) -> u32 {
+            // SAFETY: the callback receives a valid output slot for the next input span.
+            unsafe { *next = core::ptr::null() };
+            0
+        }
+
+        unsafe extern "C" fn accept_output(
+            _descriptor: *mut c_void,
+            _buffer: *mut u8,
+            _length: u32,
+        ) -> i32 {
+            0
+        }
+
+        // Match stock zlib's messages and verify that a later successful
+        // inflateBack on the same initialized stream clears the previous error.
+        let bad_type = [0x07u8];
+        let bad_stored_length = [0x01, 1, 0, 0, 0, b'A'];
+        let empty_stored_block = [0x01, 0, 0, 0xff, 0xff];
+        let cases: [(&[u8], ReturnCode, Option<&str>); 3] = [
+            (&bad_type, ReturnCode::DataError, Some("invalid block type")),
+            (
+                &bad_stored_length,
+                ReturnCode::DataError,
+                Some("invalid stored block lengths"),
+            ),
+            (&empty_stored_block, ReturnCode::StreamEnd, None),
+        ];
+
+        let mut window_bytes = vec![0u8; 1usize << MIN_WBITS];
+        let mut raw = z_stream::default();
+        assert_eq!(
+            back_init(
+                &mut raw,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                Window::from_initialized_slice(&mut window_bytes),
+            ),
+            ReturnCode::Ok,
+        );
+
+        for (source, expected_status, expected_message) in cases {
+            raw.next_in = source.as_ptr().cast_mut();
+            raw.avail_in = u32::try_from(source.len()).map_err(|_| "invalid test length")?;
+
+            // SAFETY: back_init initialized this callback-only stream, and
+            // source/window storage remain live throughout the invocation.
+            let back = unsafe { InflateStream::from_back_stream_mut(&raw mut raw) }
+                .ok_or("missing callback decoder")?;
+            // SAFETY: callbacks respect their pointer contracts, and no output
+            // storage is mutated while the decoder owns its window.
+            let status = unsafe {
+                super::back(
+                    back,
+                    no_more_input,
+                    core::ptr::null_mut(),
+                    accept_output,
+                    core::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, expected_status);
+
+            let message = if back.msg.is_null() {
+                None
+            } else {
+                // SAFETY: decoder errors use static, NUL-terminated messages;
+                // the live stream still owns the state during inspection.
+                Some(
+                    unsafe { core::ffi::CStr::from_ptr(back.msg) }
+                        .to_str()
+                        .map_err(|_| "invalid error message encoding")?,
+                )
+            };
+            assert_eq!(message, expected_message);
+        }
+
+        // SAFETY: the same initialized stream is still live and exclusive.
+        let back = unsafe { InflateStream::from_back_stream_mut(&raw mut raw) }
+            .ok_or("callback decoder missing at end")?;
+        back_end(back);
+        Ok(())
+    }
+
+    #[test]
     fn rejected_full_output_callback_is_invoked_once() -> Result<(), &'static str> {
         struct OutputCalls {
             count: usize,
