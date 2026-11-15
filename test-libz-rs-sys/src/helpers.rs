@@ -7,6 +7,17 @@ use libz_sys as libz_ng_sys;
 
 use core::ffi::{c_int, c_uint};
 
+/// Cap each offered C-ABI span at both the caller's budget and `uInt::MAX`.
+/// The consumed Rust budget is exact, even if `usize` exceeds native `uInt`.
+fn next_c_transfer(remaining: &mut usize, limit: c_uint) -> c_uint {
+    let count = c_uint::try_from(*remaining)
+        .unwrap_or(c_uint::MAX)
+        .min(limit);
+    // A C uInt fits usize on supported std targets; count <= remaining.
+    *remaining -= count as usize;
+    count
+}
+
 pub fn compress_slice_ng<'a>(
     output: &'a mut [u8],
     input: &[u8],
@@ -35,6 +46,9 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
         transfer_limit, 0,
         "C-ABI transfers must have positive capacity"
     );
+    let Ok(stream_size) = c_int::try_from(core::mem::size_of::<libz_ng_sys::z_stream>()) else {
+        return (&mut [], Ok(ReturnCode::StreamError));
+    };
     let mut stream = libz_ng_sys::z_stream {
         next_in: input.as_ptr().cast_mut(),
         avail_in: 0, // for special logic in the first  iteration
@@ -52,6 +66,8 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
         reserved: 0,
     };
 
+    // SAFETY: live writable native stream, exact checked ABI size and
+    // the version string from the same library.
     let err = unsafe {
         libz_ng_sys::deflateInit2_(
             &raw mut stream,
@@ -61,7 +77,7 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
             config.mem_level,
             config.strategy as i32,
             libz_ng_sys::zlibVersion(),
-            core::mem::size_of::<libz_ng_sys::z_stream>() as c_int,
+            stream_size,
         )
     };
 
@@ -69,20 +85,16 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
         return (&mut [], ReturnCode::try_from(err));
     }
 
-    let max = transfer_limit as usize;
-
     let mut left = output.len();
     let mut source_len = input.len();
 
     let err = loop {
         if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, max) as _;
-            left -= stream.avail_out as usize;
+            stream.avail_out = next_c_transfer(&mut left, transfer_limit);
         }
 
         if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(source_len, max) as _;
-            source_len -= stream.avail_in as usize;
+            stream.avail_in = next_c_transfer(&mut source_len, transfer_limit);
         }
 
         let flush = if source_len > 0 {
@@ -91,6 +103,8 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
             final_flush
         };
 
+        // SAFETY: live disjoint readable/writable buffers, native lengths
+        // bounded by each Rust span and the native C ABI transfer count.
         let err = unsafe { libz_ng_sys::deflate(&raw mut stream, flush as i32) };
 
         if err != libz_ng_sys::Z_OK {
@@ -103,6 +117,8 @@ fn compress_slice_with_flush_ng_with_limit<'a>(
 
     // Preserve the primary compressor result, but also check the matching
     // release when compression actually reached a complete stream.
+    // SAFETY: the initialized stream is released once while all borrowed
+    // buffers remain alive and stable.
     let end_code = unsafe { libz_ng_sys::deflateEnd(&raw mut stream) };
     let return_code = if err == libz_ng_sys::Z_STREAM_END {
         ReturnCode::try_from(end_code)
@@ -134,6 +150,9 @@ fn uncompress_slice_ng_with_limit<'a>(
         "C-ABI transfers must have positive capacity"
     );
 
+    let Ok(stream_size) = c_int::try_from(core::mem::size_of::<libz_ng_sys::z_stream>()) else {
+        return (&mut [], Ok(ReturnCode::StreamError));
+    };
     let output_len = output.len();
     let mut scratch = [0u8];
     let destination = if output_len == 0 {
@@ -165,27 +184,22 @@ fn uncompress_slice_ng_with_limit<'a>(
             &raw mut stream,
             config.window_bits,
             libz_ng_sys::zlibVersion(),
-            core::mem::size_of::<libz_ng_sys::z_stream>() as c_int,
+            stream_size,
         )
     };
     if code != libz_ng_sys::Z_OK {
         return (&mut [], ReturnCode::try_from(code));
     }
 
-    let max_transfer = transfer_limit as usize;
     let mut output_left = if output_len == 0 { 1 } else { output_len };
     let mut input_left = input.len();
 
     let code = loop {
         if stream.avail_out == 0 {
-            let count = output_left.min(max_transfer);
-            stream.avail_out = c_uint::try_from(count).unwrap_or(c_uint::MAX);
-            output_left -= count;
+            stream.avail_out = next_c_transfer(&mut output_left, transfer_limit);
         }
         if stream.avail_in == 0 {
-            let count = input_left.min(max_transfer);
-            stream.avail_in = c_uint::try_from(count).unwrap_or(c_uint::MAX);
-            input_left -= count;
+            stream.avail_in = next_c_transfer(&mut input_left, transfer_limit);
         }
 
         // SAFETY: the zlib-ng implementation advances next_in/next_out only
@@ -233,6 +247,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zlib_ng_reference_transfer_chunk_preserves_exact_budget() {
+        for budget in [0, 1, 7, 255, 65_535, usize::MAX] {
+            for limit in [1, 7, 255, c_uint::MAX] {
+                let mut left = budget;
+                let offered = next_c_transfer(&mut left, limit);
+                assert!(offered <= limit);
+                let offered_usize = usize::try_from(offered).unwrap_or(usize::MAX);
+                assert!(offered_usize <= budget);
+                assert_eq!(left.checked_add(offered_usize), Some(budget));
+                if budget == 0 {
+                    assert_eq!(offered, 0);
+                } else {
+                    assert!(offered > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zlib_ng_reference_zero_capacity_matches_plaintext_semantics() {
+        for source in [&[][..], &b"nonempty output requires space"[..]] {
+            let mut storage = vec![0u8; zlib_rs::deflate::compress_bound(source.len())];
+            let (encoded, status) =
+                zlib_rs::compress_slice(&mut storage, source, DeflateConfig::default());
+            assert_eq!(status, ReturnCode::Ok);
+            for limit in [1, 7, 255, c_uint::MAX] {
+                let mut destination: [u8; 0] = [];
+                let (decoded, status) = uncompress_slice_ng_with_limit(
+                    &mut destination,
+                    encoded,
+                    InflateConfig::default(),
+                    limit,
+                );
+                assert_eq!(decoded, []);
+                assert_eq!(
+                    status,
+                    Ok(if source.is_empty() {
+                        ReturnCode::Ok
+                    } else {
+                        ReturnCode::DataError
+                    }),
+                    "input size {}, limit={limit}",
+                    source.len()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn zlib_ng_reference_inflate_refills_both_c_abi_spans() {
         let mut seed = 0x96ea_42f5u32;
         let input: Vec<u8> = (0..72_313)
@@ -253,15 +316,20 @@ mod tests {
         );
 
         for limit in [1, 7, 255, c_uint::MAX] {
-            let mut decoded = vec![0u8; input.len()];
+            let mut decoded = vec![0xa5u8; input.len() + 16];
             let (result, status) = uncompress_slice_ng_with_limit(
-                &mut decoded,
+                &mut decoded[..input.len()],
                 compressed,
                 InflateConfig::default(),
                 limit,
             );
             assert_eq!(status, Ok(ReturnCode::Ok), "transfer_limit={limit}");
             assert_eq!(result, &input, "transfer_limit={limit}");
+            assert_eq!(
+                &decoded[input.len()..],
+                &[0xa5; 16],
+                "decoder wrote beyond the advertised output span, limit={limit}"
+            );
         }
     }
 
@@ -274,9 +342,9 @@ mod tests {
         assert_eq!(code, Ok(ReturnCode::Ok));
 
         for limit in [1, 3, 17, c_uint::MAX] {
-            let mut too_short = [0; 7];
+            let mut too_short = [0xa5; 7 + 16];
             let (_, capacity_status) = uncompress_slice_ng_with_limit(
-                &mut too_short,
+                &mut too_short[..7],
                 compressed,
                 InflateConfig::default(),
                 limit,
@@ -286,10 +354,11 @@ mod tests {
                 Ok(ReturnCode::BufError),
                 "transfer_limit={limit}"
             );
+            assert_eq!(&too_short[7..], &[0xa5; 16]);
 
-            let mut output = vec![0; input.len() + 1];
+            let mut output = vec![0xa5; input.len() + 1 + 16];
             let (_, truncated_status) = uncompress_slice_ng_with_limit(
-                &mut output,
+                &mut output[..=input.len()],
                 &compressed[..compressed.len() - 2],
                 InflateConfig::default(),
                 limit,
@@ -299,6 +368,7 @@ mod tests {
                 Ok(ReturnCode::DataError),
                 "transfer_limit={limit}"
             );
+            assert_eq!(&output[input.len() + 1..], &[0xa5; 16]);
         }
     }
 
@@ -318,9 +388,10 @@ mod tests {
             .collect();
 
         for limit in [1, 7, 255, c_uint::MAX] {
-            let mut storage = vec![0; zlib_rs::deflate::compress_bound(input.len())];
+            let capacity = zlib_rs::deflate::compress_bound(input.len());
+            let mut storage = vec![0xa5; capacity + 16];
             let (compressed, code) = compress_slice_with_flush_ng_with_limit(
-                &mut storage,
+                &mut storage[..capacity],
                 &input,
                 DeflateConfig::default(),
                 DeflateFlush::Finish,
@@ -336,6 +407,11 @@ mod tests {
             );
             assert_eq!(code, ReturnCode::Ok, "transfer_limit={limit}");
             assert_eq!(roundtrip, &input, "transfer_limit={limit}");
+            assert_eq!(
+                &storage[capacity..],
+                &[0xa5; 16],
+                "encoder wrote beyond the advertised C output span, limit={limit}"
+            );
         }
     }
 }
