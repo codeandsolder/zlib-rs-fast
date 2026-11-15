@@ -428,34 +428,23 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
         output.byte_ptr()
     };
 
-    let mut stream = z_stream {
-        next_in: input.as_ptr().cast_mut(),
-        avail_in: 0,
-
-        zalloc: None,
-        zfree: None,
-        opaque: core::ptr::null_mut(),
-
-        ..z_stream::default()
+    // Use the owned constructor instead of constructing a raw C stream and
+    // reinterpreting it after initialization. Drop releases the decoder state
+    // on every return path; caller buffer borrows remain scoped to this call.
+    let mut stream = match InflateStream::new(config) {
+        Ok(stream) => stream,
+        Err(code) => return (0, 0, code),
     };
-
-    let err = init(&mut stream, config);
-    if err != ReturnCode::Ok {
-        return (0, 0, err);
-    }
-
+    stream.next_in = input.as_ptr().cast_mut();
+    stream.avail_in = 0;
     stream.next_out = dest;
     stream.avail_out = 0;
-
-    let Some(stream) = (unsafe { InflateStream::from_stream_mut(&raw mut stream) }) else {
-        return (0, 0, ReturnCode::StreamError);
-    };
 
     let err = loop {
         output_budget.refill(&mut stream.avail_out);
         input_budget.refill(&mut stream.avail_in);
 
-        let err = unsafe { inflate(stream, InflateFlush::NoFlush) };
+        let err = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
 
         if err != ReturnCode::Ok {
             break err;
@@ -474,7 +463,7 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     // A scratch byte means a zero-capacity caller destination was too small.
     let scratch_overflow = output_len == 0 && stream.total_out != 0;
     let capacity_left = output_budget.pending() != 0 || stream.avail_out != 0;
-    end(stream);
+    drop(stream);
 
     let ret = match err {
         ReturnCode::StreamEnd => ReturnCode::Ok,
@@ -4229,6 +4218,28 @@ mod tests {
             assert_eq!(code, ReturnCode::Ok);
             assert_eq!(decoded, plain);
             assert_eq!(consumed, compressed.len(), "trailing {trailing} bytes");
+        }
+    }
+
+    #[test]
+    fn whole_slice_invalid_configuration_preserves_caller_storage() {
+        for window_bits in [16, 17, 48, i32::MIN, i32::MAX] {
+            let config = InflateConfig { window_bits };
+            let mut destination = [0xa5u8; 64];
+            let (decoded, status) = decompress_slice(&mut destination, b"invalid", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(decoded, &[]);
+            assert_eq!(destination, [0xa5; 64]);
+
+            let mut uninitialized = [MaybeUninit::new(0xa5u8); 64];
+            let (consumed, decoded, status) = uncompress2(&mut uninitialized, b"invalid", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(consumed, 0);
+            assert_eq!(decoded, &[]);
+            // SAFETY: every slot was initialized to 0xa5 before calling
+            // uncompress2; the failed initializer cannot uninitialize it.
+            let untouched = uninitialized.map(|byte| unsafe { byte.assume_init() });
+            assert_eq!(untouched, [0xa5; 64]);
         }
     }
 
