@@ -1001,94 +1001,70 @@ fn gzflush_error() -> Result<(), ()> {
 
 #[test]
 fn gzoffset_gztell_read() -> Result<(), ()> {
-    // Create a temporary directory that will be automatically removed when
-    // temp_dir goes out of scope.
-    let temp_dir_path = temp_base();
-    let temp_dir = tempfile::TempDir::new_in(temp_dir_path).map_err(|_| ())?;
-    let temp_path = temp_dir.path();
-    let file_name = path(temp_path, "output.gz");
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
 
-    // Make a copy of a gzip file with some junk data prepended in front of the gzip
-    // header. This should affect the return values of gzoffset but not gztell.
     const OFFSET: usize = 123;
     const PADDING: &[u8] = &[0u8; OFFSET];
-    // SAFETY: the pathname comes from live NUL-terminated CString storage, and flags are passed by value.
-    let fd = unsafe {
-        libc::open(
-            CString::new(file_name.as_str()).map_err(|_| ())?.as_ptr(),
-            binary_mode(libc::O_CREAT | libc::O_WRONLY),
-            0o644,
-        )
-    };
-    assert_ne!(fd, -1);
-    assert_eq!(
-        // SAFETY: the file descriptor is an integer and the source points to initialized readable bytes of the supplied length.
-        unsafe { libc::write(fd, PADDING.as_ptr().cast::<c_void>(), OFFSET as _) },
-        OFFSET as _
-    );
+    const BUFFER_SIZE: usize = 2048;
+    const EXPECTED: i64 = 1910;
+
+    let temp_dir = tempfile::TempDir::new_in(temp_base()).map_err(|_| ())?;
+    let file_name = path(temp_dir.path(), "output.gz");
     let source_name = crate_path("src/test-data/issue-109.gz");
-    let mode = binary_mode(libc::O_RDONLY);
-    let source_fd =
-        // SAFETY: the pathname comes from live NUL-terminated CString storage, and flags are passed by value.
-        unsafe { libc::open(CString::new(source_name.as_str()).map_err(|_| ())?.as_ptr(), mode) };
-    assert_ne!(source_fd, -1);
-    let mut buf = [0u8; 1024];
-    loop {
-        // SAFETY: the file descriptor is an integer and the destination is a writable live byte buffer of the supplied length.
-        let ret = unsafe {
-            libc::read(
-                source_fd,
-                buf.as_mut_ptr().cast(),
-                checked_test_len(buf.len()),
-            )
-        };
-        assert_ne!(ret, -1);
-        if ret == 0 {
-            break;
-        }
-        assert_eq!(
-            // SAFETY: the file descriptor is an integer and the source points to initialized readable bytes of the supplied length.
-            unsafe { libc::write(fd, buf.as_ptr().cast(), ret as _) },
-            ret as _
-        );
-    }
-    // SAFETY: the integer descriptor is owned by this test and has not yet been closed.
-    assert_eq!(unsafe { libc::close(source_fd) }, 0);
-    // SAFETY: the integer descriptor is owned by this test and has not yet been closed.
-    assert_eq!(unsafe { libc::close(fd) }, 0);
+
+    // Build the same prepended-junk fixture, but do not assume an individual
+    // POSIX read/write transfers the entire requested byte count. write_all
+    // and io::copy handle partial operations and interrupted calls correctly.
+    let mut output = std::fs::File::create(&file_name).map_err(|_| ())?;
+    output.write_all(PADDING).map_err(|_| ())?;
+    let mut source = std::fs::File::open(&source_name).map_err(|_| ())?;
+    std::io::copy(&mut source, &mut output).map_err(|_| ())?;
+    output.flush().map_err(|_| ())?;
+    drop(output);
+    drop(source);
     assert_eq!(
         file_size(&file_name).map_err(|_| ())?,
         file_size(&source_name).map_err(|_| ())? + OFFSET
     );
 
-    // Open the newly created file, seek past the prepended junk to the gzip header, and
-    // use gzdopen to turn the fd into a gzip file handle.
-    // SAFETY: the pathname comes from live NUL-terminated CString storage, and flags are passed by value.
-    let fd = unsafe {
-        libc::open(
-            CString::new(file_name.as_str()).map_err(|_| ())?.as_ptr(),
-            mode,
-        )
-    };
-    assert_ne!(fd, -1);
+    // Seek using an owned Rust descriptor. gzdopen takes ownership of that
+    // descriptor *only after* returning a non-null gzFile. If it rejects the
+    // stream, the File still closes its descriptor automatically.
+    let mut raw_file = std::fs::File::open(&file_name).map_err(|_| ())?;
+    let offset_u64 = u64::try_from(OFFSET).map_err(|_| ())?;
     assert_eq!(
-        // SAFETY: the descriptor is live, and the offset/origin integers are passed by value to libc.
-        unsafe { libc::lseek(fd, OFFSET as _, libc::SEEK_SET) },
-        OFFSET as _
+        raw_file.seek(SeekFrom::Start(offset_u64)).map_err(|_| ())?,
+        offset_u64
     );
-    // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
-    let file = unsafe { gzdopen(fd, CString::new(b"r").map_err(|_| ())?.as_ptr()) };
-    assert!(!file.is_null());
-    const BUFFER_SIZE: usize = 2048;
-    // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
-    assert_eq!(unsafe { gzbuffer(file, BUFFER_SIZE as _) }, 0);
+    let mode = CString::new("r").map_err(|_| ())?;
+    // SAFETY: raw_file owns a live descriptor positioned at the gzip header;
+    // the mode's C string remains alive throughout this synchronous call.
+    let file = unsafe { gzdopen(raw_file.as_raw_fd(), mode.as_ptr()) };
+    if file.is_null() {
+        return Err(());
+    }
+    // Ownership passed to gzFile; gzclose below closes the descriptor once.
+    std::mem::forget(raw_file);
+    let mut buf = [0u8; 1024];
+    assert_eq!(
+        // SAFETY: file is a live exclusively owned gzip handle, and the
+        // checked c_uint capacity exactly matches the requested buffer size.
+        unsafe { gzbuffer(file, c_uint::try_from(BUFFER_SIZE).map_err(|_| ())?) },
+        0
+    );
 
     // With the file just opened for read, gztell should return 0, while gzoffset should return
     // the offset from the start of the file.
     // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
     assert_eq!(unsafe { gztell(file) }, 0);
-    // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its offset.
-    assert_eq!(unsafe { gzoffset(file) }, OFFSET as _);
+    assert_eq!(
+        // SAFETY: this gzip handle is live and uniquely held throughout
+        // the call; the observed offset is compared using the C ABI's
+        // actual signed offset type rather than a narrowing cast.
+        unsafe { gzoffset(file) },
+        libz_rs_sys::z_off_t::try_from(OFFSET).map_err(|_| ())?
+    );
 
     // Consume N bytes of decompressed data. The output of gztell should increase by N.
     assert_eq!(
@@ -1108,9 +1084,13 @@ fn gzoffset_gztell_read() -> Result<(), ()> {
     // of the compressed input that was consumed to produce the requested amount of decompressed
     // output. This works out to 1910 bytes, determined by running the C equivalent of these
     // operations against zlib-ng and original zlib.
-    const EXPECTED: i64 = 1910;
-    // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its offset.
-    assert_eq!(unsafe { gzoffset(file) }, EXPECTED as _);
+    assert_eq!(
+        // SAFETY: this gzip handle is live and uniquely held throughout
+        // the call; the observed offset is compared using the C ABI's
+        // actual signed offset type rather than a narrowing cast.
+        unsafe { gzoffset(file) },
+        libz_rs_sys::z_off_t::try_from(EXPECTED).map_err(|_| ())?
+    );
 
     // The file should close cleanly, as gztell and gzoffset do not set the internal error state.
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
@@ -1120,6 +1100,7 @@ fn gzoffset_gztell_read() -> Result<(), ()> {
 
 #[test]
 fn gzoffset_gztell_write() -> Result<(), ()> {
+    const BUFFER_SIZE: usize = 2048;
     // Create a temporary directory that will be automatically removed when
     // temp_dir goes out of scope.
     let temp_dir_path = temp_base();
@@ -1136,9 +1117,12 @@ fn gzoffset_gztell_write() -> Result<(), ()> {
         )
     };
     assert!(!file.is_null());
-    const BUFFER_SIZE: usize = 2048;
-    // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
-    assert_eq!(unsafe { gzbuffer(file, BUFFER_SIZE as _) }, 0);
+    assert_eq!(
+        // SAFETY: the live gzip handle is uniquely owned, and the configured
+        // capacity is checked against the exact C uInt type before the call.
+        unsafe { gzbuffer(file, c_uint::try_from(BUFFER_SIZE).map_err(|_| ())?) },
+        0
+    );
 
     // With the new file just opened for write, gztell and gzoffset both should return zero.
     // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
@@ -1176,6 +1160,8 @@ fn gzoffset_gztell_write() -> Result<(), ()> {
     assert!(unsafe { gzoffset(file) } > 0);
 
     let size = file_size(&file_name).map_err(|_| ())?;
+    let expected_append_offset =
+        libz_rs_sys::z_off_t::try_from(size.checked_add(10).ok_or(())?).map_err(|_| ())?;
 
     // Close the file and reopen it in append mode.
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
@@ -1188,13 +1174,15 @@ fn gzoffset_gztell_write() -> Result<(), ()> {
         )
     };
 
+    assert!(!file.is_null(), "append mode must open a live gzip handle");
+
     // After opening in append mode, gztell should return zero.
     // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
     assert_eq!(unsafe { gztell(file) }, 0);
     // But gzoffset should return the number of bytes that were already in the file, plus
     // 10 bytes for a new gzip header.
     // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its offset.
-    assert_eq!(unsafe { gzoffset(file) }, (size + 10) as _);
+    assert_eq!(unsafe { gzoffset(file) }, expected_append_offset);
 
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
