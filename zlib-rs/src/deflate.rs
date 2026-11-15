@@ -7639,8 +7639,12 @@ mod test {
         let mut input = Vec::with_capacity(120_000);
         for i in 0..3_000usize {
             input.extend_from_slice(b"framed-standard-driver/");
-            input.extend_from_slice(&(i as u32).rotate_left(9).to_le_bytes());
-            input.extend(core::iter::repeat_n(((i * 29) % 251) as u8, 3 + i % 31));
+            let row = u32::try_from(i)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture row exceeds u32"))?;
+            let marker = u8::try_from((i * 29) % 251)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture byte exceeds u8"))?;
+            input.extend_from_slice(&row.rotate_left(9).to_le_bytes());
+            input.extend(core::iter::repeat_n(marker, 3 + i % 31));
         }
 
         let algorithms = [
@@ -7689,8 +7693,12 @@ mod test {
         let mut input = Vec::with_capacity(160_000);
         for i in 0..4_000usize {
             input.extend_from_slice(b"round-robin-standard-core/");
-            input.extend_from_slice(&(i as u32).rotate_left(7).to_le_bytes());
-            input.extend(core::iter::repeat_n(((i * 17) % 251) as u8, 5 + i % 37));
+            let row = u32::try_from(i)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture row exceeds u32"))?;
+            let marker = u8::try_from((i * 17) % 251)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture byte exceeds u8"))?;
+            input.extend_from_slice(&row.rotate_left(7).to_le_bytes());
+            input.extend(core::iter::repeat_n(marker, 5 + i % 37));
         }
 
         let cases = [
@@ -8077,8 +8085,10 @@ mod test {
         let mut input = Vec::with_capacity(100_000);
         for i in 0..3_000usize {
             input.extend_from_slice(b"logical-window-tail/");
-            input.extend(core::iter::repeat_n((i % 251) as u8, 1 + i % 19));
-            input.extend_from_slice(&(i as u32).to_le_bytes());
+            let marker = u8::try_from(i % 251).map_err(|_| ReturnCode::StreamError)?;
+            let row = u32::try_from(i).map_err(|_| ReturnCode::StreamError)?;
+            input.extend(core::iter::repeat_n(marker, 1 + i % 19));
+            input.extend_from_slice(&row.to_le_bytes());
         }
 
         let config = DeflateConfig {
@@ -8110,9 +8120,10 @@ mod test {
         for i in 0..4_000usize {
             input.extend_from_slice(b"portable-simd::token-block/");
             for _ in 0..(8 + i % 23) {
-                input.push((i % 251) as u8);
+                input.push(u8::try_from(i % 251).map_err(|_| ReturnCode::StreamError)?);
             }
-            input.extend_from_slice(&(i as u32).to_le_bytes());
+            let row = u32::try_from(i).map_err(|_| ReturnCode::StreamError)?;
+            input.extend_from_slice(&row.to_le_bytes());
         }
 
         let configurations = [
@@ -8148,7 +8159,7 @@ mod test {
     }
 
     fn fuzz_based_test(input: &[u8], config: DeflateConfig, expected: &[u8]) {
-        let mut output_rs = [0; 1 << 17];
+        let mut output_rs = vec![0; 1 << 17];
         let (output_rs, err) = compress_slice(&mut output_rs, input, config);
         assert_eq!(err, ReturnCode::Ok);
 
@@ -8158,7 +8169,7 @@ mod test {
     #[test]
     fn simple_rle() {
         fuzz_based_test(
-            "\0\0\0\0\u{6}".as_bytes(),
+            b"\0\0\0\0\x06",
             DeflateConfig {
                 level: -1,
                 method: Method::Deflated,
@@ -8931,7 +8942,7 @@ mod test {
                 window_bits: config.window_bits,
             };
 
-            let mut uncompr = [0; 1 << 17];
+            let mut uncompr = vec![0; 1 << 17];
             let (uncompr, err) = decompress_slice(&mut uncompr, output, config);
 
             if err == ReturnCode::Ok {
@@ -8941,7 +8952,7 @@ mod test {
             err
         }
 
-        let mut output = [0; 1 << 17];
+        let mut output = vec![0; 1 << 17];
 
         // this is too little space
         assert_eq!(
@@ -9029,7 +9040,7 @@ mod test {
     // splits the input into two, deflates them seperately and then joins the deflated byte streams
     // into something that can be correctly inflated again. This is the basic idea behind pigz, and
     // allows for parallel compression.
-    fn split_deflate() {
+    fn split_deflate() -> Result<(), Box<dyn std::error::Error>> {
         let input = "Hello World!\n";
 
         let (input1, input2) = input.split_at(6);
@@ -9068,12 +9079,22 @@ mod test {
         };
 
         // cuts off the length and crc
-        let (suffix, end) = output2.split_at(output2.len() - 8);
-        let (crc2, len2) = end.split_at(4);
-        let crc2 = u32::from_le_bytes(crc2.try_into().unwrap());
+        let trailer_offset = output2
+            .len()
+            .checked_sub(8)
+            .ok_or("second gzip fragment is missing its eight-byte trailer")?;
+        let (suffix, end) = output2
+            .split_at_checked(trailer_offset)
+            .ok_or("invalid gzip trailer boundary")?;
+        let (crc2, len2) = end
+            .split_at_checked(4)
+            .ok_or("gzip trailer is missing its ISIZE field")?;
+        let crc2 = u32::from_le_bytes(crc2.try_into()?);
 
-        // cuts off the gzip header (10 bytes) from the front
-        let suffix = &suffix[10..];
+        // Exclude the ten-byte gzip header from the second fragment.
+        let suffix = suffix
+            .get(10..)
+            .ok_or("second gzip fragment is missing its header")?;
 
         let mut result: Vec<u8> = Vec::new();
         result.extend(prefix.iter());
@@ -9081,9 +9102,9 @@ mod test {
 
         // it would be more proper to use `stream.total_in` here, but the slice helpers hide the
         // stream so we're cheating a bit here
-        let len1 = input1.len() as u32;
-        let len2 = u32::from_le_bytes(len2.try_into().unwrap());
-        assert_eq!(len2 as usize, input2.len());
+        let len1 = u32::try_from(input1.len())?;
+        let len2 = u32::from_le_bytes(len2.try_into()?);
+        assert_eq!(usize::try_from(len2)?, input2.len());
 
         let crc1 = crate::crc32::crc32(0, input1.as_bytes());
         let crc = crate::crc32::crc32_combine(crc1, crc2, u64::from(len2));
@@ -9094,13 +9115,18 @@ mod test {
 
         // write the trailer
         result.extend(crc.to_le_bytes());
-        result.extend((len1 + len2).to_le_bytes());
+        result.extend(
+            len1.checked_add(len2)
+                .ok_or("combined gzip ISIZE exceeded 32 bits")?
+                .to_le_bytes(),
+        );
 
         let mut output = vec![0; 128];
         let (output, err) = crate::inflate::decompress_slice(&mut output, &result, inflate_config);
         assert_eq!(err, ReturnCode::Ok);
 
         assert_eq!(output, input.as_bytes());
+        Ok(())
     }
 
     #[test]
