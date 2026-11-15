@@ -5290,6 +5290,11 @@ mod test {
             for_each_code_length_run(&tree, lengths.len() - 1, |run| actual.push(run));
             assert_eq!(&actual, expected, "RLE boundary {lengths:?}");
         }
+    }
+
+    #[test]
+    fn code_length_runs_roundtrip_randomized() {
+        use CodeLengthRun::{Literal, RepeatPrevious, RepeatZero};
 
         // Every run expands to the original lengths, even when zeros and
         // nonzero codes alternate and split across repeat boundaries.
@@ -5301,7 +5306,11 @@ mod test {
                 state ^= state >> 17;
                 state ^= state << 5;
                 let raw = state.to_le_bytes()[0];
-                lengths.push(if raw & 3 == 0 { 0 } else { u16::from(raw % 16) });
+                lengths.push(if raw.trailing_zeros() >= 2 {
+                    0
+                } else {
+                    u16::from(raw % 16)
+                });
             }
             let tree: Vec<Value> = lengths.iter().map(|&len| Value::new(0, len)).collect();
             let mut rebuilt = Vec::new();
@@ -6098,16 +6107,14 @@ mod test {
         // its native stream, and atomic increments permit concurrent calls.
         let count = unsafe { &*(opaque as *const AtomicUsize) };
 
-        if count.fetch_add(1, core::sync::atomic::Ordering::Relaxed) != N {
-            // must use the C allocator internally because (de)allocation is based on function
-            // pointer values and because we don't use the rust allocator directly, the allocation
-            // logic will store the pointer to the start at the start of the allocation.
-            // SAFETY: this is the canonical C allocator callback with the
-            // original opaque pointer and checked C ABI item/count inputs.
-            // Its matching zfree is installed in the same stream.
-            unsafe { (crate::allocate::C.zalloc)(opaque, items, size) }
-        } else {
+        if count.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == N {
             core::ptr::null_mut()
+        } else {
+            // The C allocator's deallocation matches its callback address;
+            // the corresponding zfree is installed in the same stream.
+            // SAFETY: the original opaque pointer and C ABI item/count
+            // values are forwarded unchanged to the live native allocator.
+            unsafe { (crate::allocate::C.zalloc)(opaque, items, size) }
         }
     }
 
@@ -8210,7 +8217,7 @@ mod test {
                 strategy: Strategy::Rle,
             },
             &[56, 17, 99, 0, 2, 54, 0, 0, 11, 0, 7],
-        )
+        );
     }
 
     #[test]
@@ -8300,7 +8307,7 @@ mod test {
                 0x0, 0x8e, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x6a,
                 0xf5, 0x63, 0x60, 0x60, 0x3, 0x0, 0xee, 0x8a, 0x88, 0x67,
             ],
-        )
+        );
     }
 
     #[test]
@@ -8334,10 +8341,8 @@ mod test {
             let stream = owned.stream()?;
             // SAFETY: the caller-owned header and name remain live and unmodified
             // through final deflate and the matching native stream teardown.
-            assert_eq!(
-                unsafe { set_header(stream, Some(&mut header)) },
-                ReturnCode::Ok
-            );
+            let header_status = unsafe { set_header(stream, Some(&mut header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
             assert_eq!(reset(stream), ReturnCode::Ok);
             assert!(stream.state.gzhead.is_some());
 
@@ -8399,7 +8404,7 @@ mod test {
                 31, 139, 8, 0, 0, 0, 0, 0, 2, os, 243, 72, 205, 201, 201, 87, 8, 207, 47, 202, 73,
                 81, 4, 0, 163, 28, 41, 28, 12, 0, 0, 0,
             ],
-        )
+        );
     }
 
     #[test]
@@ -8420,7 +8425,7 @@ mod test {
                 31, 139, 8, 0, 0, 0, 0, 0, 4, gz_header::OS_CODE, 1, 18, 0, 237, 255, 27, 27, 27, 27, 27, 27, 27,
                 27, 27, 27, 27, 27, 27, 27, 27, 27, 9, 0, 60, 101, 156, 55, 18, 0, 0, 0,
             ],
-        )
+        );
     }
 
     fn encode_custom_gzip_header(output_chunk: usize) -> Result<Vec<u8>, &'static str> {
@@ -8573,10 +8578,8 @@ mod test {
         let stream = owned.stream()?;
         // SAFETY: the header and all backing string bytes remain alive until
         // the scoped native stream is finalized at the end of this test.
-        assert_eq!(
-            unsafe { set_header(stream, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        let header_status = unsafe { set_header(stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
 
         stream.next_in = input.as_ptr().cast_mut();
         stream.avail_in = crate::c_api::uInt::try_from(input.len())
@@ -8646,7 +8649,7 @@ mod test {
             source
                 .state
                 .window
-                .copy_and_initialize(0..1, &raw const initial_window_byte)
+                .copy_and_initialize(0..1, &raw const initial_window_byte);
         };
         source.state.prev.as_mut_slice()[0] = 0x1234;
         source.state.head.as_mut_slice()[0] = 0x2345;
@@ -8762,10 +8765,8 @@ mod test {
         let source = owned.stream()?;
         // SAFETY: the shared header and its caller-owned strings remain
         // valid until both source and destination streams are ended.
-        assert_eq!(
-            unsafe { set_header(source, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        let header_status = unsafe { set_header(source, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
 
         // Copy before either stream starts emitting the caller-owned header. zlib semantics require
         // both compressors to retain the same header pointer.
@@ -8860,10 +8861,8 @@ mod test {
             let stream = encoder.stream()?;
             // SAFETY: header and its three caller-owned backing strings remain
             // valid throughout compression and native state teardown.
-            assert_eq!(
-                unsafe { set_header(stream, Some(&mut header)) },
-                ReturnCode::Ok
-            );
+            let header_status = unsafe { set_header(stream, Some(&mut header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
             stream.next_in = input.as_ptr().cast_mut();
             stream.avail_in = crate::c_api::uInt::try_from(input.len())
                 .map_err(|_| SchedulerFixtureError::Invariant("gzip plaintext too large"))?;
@@ -9062,7 +9061,7 @@ mod test {
                 31, 139, 8, 0, 0, 0, 0, 0, 0, gz_header::OS_CODE, 242, 72, 205, 201, 201, 87, 8, 207, 47, 202, 73,
                 81, 228, 2, 0, 0, 0, 255, 255,
             ],
-        )
+        );
     }
 
     #[test]
