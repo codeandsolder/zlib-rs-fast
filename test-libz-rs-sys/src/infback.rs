@@ -414,7 +414,7 @@ fn differential_inflate_back<const CHUNK: usize>(input: &[u8]) {
                 println!("{:?}", &rs_out[i..]);
             }
 
-            assert_eq!(a, b, "failed at position {} of {}", i, ng_out.len());
+            assert_eq!(a, b, "failed at position {i} of {}", ng_out.len());
         }
     }
 

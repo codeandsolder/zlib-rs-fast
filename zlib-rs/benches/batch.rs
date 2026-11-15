@@ -239,12 +239,11 @@ fn run_case(
     for (label, stats) in rows {
         let mib_per_s = approximately_f64(total_input) / MIB / stats.median.as_secs_f64();
         let relative = independent.as_secs_f64() / stats.median.as_secs_f64();
+        let median_ms = stats.median.as_secs_f64() * 1e3;
+        let min_ms = stats.min.as_secs_f64() * 1e3;
+        let iters = stats.iters;
         println!(
-            "  {label:>12}: {mib_per_s:8.1} MiB/s | {:5.2}x independent | median {:8.3} ms | min {:8.3} ms | iters/sample {}",
-            relative,
-            stats.median.as_secs_f64() * 1e3,
-            stats.min.as_secs_f64() * 1e3,
-            stats.iters
+            "  {label:>12}: {mib_per_s:8.1} MiB/s | {relative:5.2}x independent | median {median_ms:8.3} ms | min {min_ms:8.3} ms | iters/sample {iters}"
         );
     }
     println!();
@@ -467,13 +466,11 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
             let mut out = Vec::with_capacity(len);
             let mut row = seed;
             while out.len() < len {
+                let sensor = row % 37;
+                let value = (row.wrapping_mul(2_654_435_761) >> 11) % 100_000;
+                let status = if row % 11 == 0 { "warn" } else { "ok" };
                 let line = format!(
-                    "{{\"stream\":{},\"row\":{},\"sensor\":{},\"value\":{},\"status\":\"{}\"}}\n",
-                    seed,
-                    row,
-                    row % 37,
-                    (row.wrapping_mul(2_654_435_761) >> 11) % 100_000,
-                    if row % 11 == 0 { "warn" } else { "ok" }
+                    "{{\"stream\":{seed},\"row\":{row},\"sensor\":{sensor},\"value\":{value},\"status\":\"{status}\"}}\n"
                 );
                 let take = (len - out.len()).min(line.len());
                 out.extend_from_slice(&line.as_bytes()[..take]);

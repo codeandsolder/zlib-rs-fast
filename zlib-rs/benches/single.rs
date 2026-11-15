@@ -296,12 +296,11 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
             let mut out = Vec::with_capacity(len);
             let mut row = seed;
             while out.len() < len {
+                let sensor = row % 37;
+                let value = (row.wrapping_mul(2_654_435_761) >> 11) % 100_000;
+                let status = if row % 11 == 0 { "warn" } else { "ok" };
                 let line = format!(
-                    "{{\"row\":{},\"sensor\":{},\"value\":{},\"status\":\"{}\"}}\n",
-                    row,
-                    row % 37,
-                    (row.wrapping_mul(2_654_435_761) >> 11) % 100_000,
-                    if row % 11 == 0 { "warn" } else { "ok" }
+                    "{{\"row\":{row},\"sensor\":{sensor},\"value\":{value},\"status\":\"{status}\"}}\n"
                 );
                 let take = (len - out.len()).min(line.len());
                 out.extend_from_slice(&line.as_bytes()[..take]);

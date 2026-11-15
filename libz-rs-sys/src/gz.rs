@@ -5817,7 +5817,7 @@ mod tests {
             gz_error(
                 handle.cast::<GzState>().as_mut().ok_or(())?,
                 Some((Z_STREAM_ERROR, "example error")),
-            )
+            );
         };
         let mut err = Z_OK;
         // SAFETY: the handle is live and the optional err pointer is an aligned writable local integer; the null/null case is explicitly supported.
@@ -5869,7 +5869,7 @@ mod tests {
                 gz_error(
                     handle.cast::<GzState>().as_mut().ok_or(())?,
                     Some((Z_STREAM_ERROR, "example error")),
-                )
+                );
             };
 
             // gzclearerr should clear the error flag and message.

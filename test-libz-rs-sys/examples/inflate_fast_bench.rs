@@ -181,12 +181,9 @@ fn main() -> BenchResult<()> {
     let compressed = bytes.to_vec();
     assert!(compressed.len() <= usize::try_from(c_uint::MAX)?);
 
-    println!(
-        "corpus={} compressed={} repetitions={}",
-        original.len(),
-        compressed.len(),
-        repetitions
-    );
+    let corpus_bytes = original.len();
+    let compressed_bytes = compressed.len();
+    println!("corpus={corpus_bytes} compressed={compressed_bytes} repetitions={repetitions}");
     let mut output = vec![0u8; original.len()];
     let mut window = vec![0u8; WINDOW_SIZE];
     for (name, chunk) in cases {

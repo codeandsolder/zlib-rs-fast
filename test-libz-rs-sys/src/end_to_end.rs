@@ -10,6 +10,12 @@ fn end_to_end() {
     );
 }
 
+/// Differentially compress and cross-decode a byte slice with both native backends.
+///
+/// # Panics
+///
+/// Panics if either valid-config encoder fails, a native decoder rejects the
+/// result, or the decoded bytes differ from the original input.
 #[must_use]
 pub fn test(data: &[u8], config: DeflateConfig) -> bool {
     // Only proceed if this is a valid config.

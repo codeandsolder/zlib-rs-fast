@@ -275,11 +275,13 @@ impl ReturnCode {
         }
     }
 
+    #[must_use]
     pub const fn error_message(self) -> *const core::ffi::c_char {
         let msg = self.error_message_str_with_null();
         msg.as_ptr().cast::<core::ffi::c_char>()
     }
 
+    #[must_use]
     pub const fn try_from_c_int(err: core::ffi::c_int) -> Option<Self> {
         match err {
             0 => Some(Self::Ok),
