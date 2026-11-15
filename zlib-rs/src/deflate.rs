@@ -3642,10 +3642,6 @@ fn encode_near_optimal_with_state(
     // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
     // reservation, so every distance representable by the configured DEFLATE window is legal.
     let max_distance = state.w_mask() + 1;
-    let ranges = near_optimal::choose_block_ranges(input, max_distance);
-    debug_assert!(ranges
-        .iter()
-        .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
 
     // Emit the wrapper while strstart still describes the true initial state. Moving this after
     // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
@@ -3654,8 +3650,18 @@ fn encode_near_optimal_with_state(
         .pending
         .extend(&state.header().to_be_bytes());
     let mut produced = 0usize;
-    let mut ok = drain_near_optimal_pending(state, output, &mut produced);
+    if !drain_near_optimal_pending(state, output, &mut produced) {
+        // In particular, do not build the suffix array when even the header
+        // cannot be written. Caller output exhaustion is already definitive.
+        return Ok(None);
+    }
 
+    let ranges = near_optimal::choose_block_ranges(input, max_distance);
+    debug_assert!(ranges
+        .iter()
+        .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
+
+    let mut ok = true;
     let mut ranges = ranges.into_iter();
     // Block planning always yields at least an empty-input block. If this
     // invariant changes, return an error rather than emitting no final block.
@@ -3741,6 +3747,14 @@ pub fn compress_slice_near_optimal<'a>(
     input: &[u8],
     optimization_passes: usize,
 ) -> (&'a mut [u8], ReturnCode) {
+    // Every complete zlib stream has a two-byte header, at least two bytes
+    // for a final DEFLATE block, and a four-byte Adler-32 trailer. A smaller
+    // destination cannot succeed, regardless of the input or cost model.
+    const MIN_ZLIB_STREAM_SIZE: usize = ZLIB_WRAPLEN + 2;
+    if output.len() < MIN_ZLIB_STREAM_SIZE {
+        return (&mut output[..0], ReturnCode::BufError);
+    }
+
     let mut stream = match DeflateStream::new_with_lit_bufsize(
         DeflateConfig::new(9),
         Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),

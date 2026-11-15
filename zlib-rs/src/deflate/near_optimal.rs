@@ -3443,6 +3443,27 @@ mod encoded_tests {
     }
 
     #[test]
+    fn too_small_for_any_zlib_stream_does_not_touch_output() {
+        let input = vec![0x5a; 240_000];
+        for passes in [0, 1, 3] {
+            for size in 0..8 {
+                let mut output = vec![0xa5; size];
+                let (encoded, code) =
+                    super::super::compress_slice_near_optimal(&mut output, &input, passes);
+                assert_eq!(code, ReturnCode::BufError, "size={size} passes={passes}");
+                assert_eq!(encoded, &[]);
+                assert!(output.iter().all(|&byte| byte == 0xa5));
+            }
+        }
+
+        // The eight-byte lower bound is tight: an empty zlib stream fits.
+        let mut minimum = [0u8; 8];
+        let (encoded, code) = super::super::compress_slice_near_optimal(&mut minimum, b"", 0);
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(encoded.len(), minimum.len());
+    }
+
+    #[test]
     fn insufficient_output_only_writes_a_valid_stream_prefix() {
         let input = b"abcabcabc---abcabcabc---the quick brown fox---abcabcabcabcabc";
         let mut full_buffer = vec![0u8; compress_bound(input.len())];
