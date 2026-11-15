@@ -1390,11 +1390,12 @@ const BL_CODES: usize = 19;
 /// maximum heap size
 const HEAP_SIZE: usize = 2 * L_CODES + 1;
 
-/// all codes must not exceed `MAX_BITS` bits
-const MAX_BITS: usize = 15;
+/// RFC1951 code-length bounds are represented in the Huffman tree as u16;
+/// use their losslessly widened usize values for array sizes and indexing.
+const MAX_BITS_WIRE: u16 = 15;
+const MAX_BITS: usize = MAX_BITS_WIRE as usize;
 
-/// Bit length codes must not exceed `MAX_BL_BITS` bits
-const MAX_BL_BITS: usize = 7;
+const MAX_BL_BITS_WIRE: u16 = 7;
 
 pub const DIST_CODE_LEN: usize = 512;
 
@@ -2562,7 +2563,7 @@ impl StaticTreeDesc {
         extra_bits: &Self::EXTRA_LBITS,
         extra_base: LITERALS + 1,
         elems: L_CODES,
-        max_length: MAX_BITS as u16,
+        max_length: MAX_BITS_WIRE,
     };
 
     pub(crate) const D: Self = Self {
@@ -2570,7 +2571,7 @@ impl StaticTreeDesc {
         extra_bits: &Self::EXTRA_DBITS,
         extra_base: 0,
         elems: D_CODES,
-        max_length: MAX_BITS as u16,
+        max_length: MAX_BITS_WIRE,
     };
 
     pub(crate) const BL: Self = Self {
@@ -2578,7 +2579,7 @@ impl StaticTreeDesc {
         extra_bits: &Self::EXTRA_BLBITS,
         extra_base: 0,
         elems: BL_CODES,
-        max_length: MAX_BL_BITS as u16,
+        max_length: MAX_BL_BITS_WIRE,
     };
 }
 
