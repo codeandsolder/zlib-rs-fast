@@ -6032,14 +6032,12 @@ mod test {
     }
 
     #[test]
-    fn data_type_override_round_trips_through_state_only_encoder() -> Result<(), ReturnCode> {
+    fn data_type_override_round_trips_through_state_only_encoder(
+    ) -> Result<(), SchedulerFixtureError> {
         const CALLER_DATA_TYPE: i32 = 12_345;
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
+        let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+        let stream = owned.stream()?;
 
         // zlib only auto-detects when this field is Z_UNKNOWN. Preserve arbitrary caller metadata.
         stream.data_type = CALLER_DATA_TYPE;
@@ -6354,7 +6352,8 @@ mod test {
     /// A valid zalloc callback is not required to return cache-line-aligned
     /// memory. Cover every possible remainder and both initialization/copy.
     #[test]
-    fn custom_unaligned_allocator_preserves_state_layout_and_copy() -> Result<(), &'static str> {
+    fn custom_unaligned_allocator_preserves_state_layout_and_copy(
+    ) -> Result<(), SchedulerFixtureError> {
         for remainder in 0..DEFLATE_ALLOC_ALIGN {
             let mut ctx = MisalignedAlloc {
                 remainder,
@@ -6379,9 +6378,8 @@ mod test {
                 ..DeflateConfig::default()
             };
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-            // SAFETY: successful initialization owns one state and its allocation.
-            let source = (unsafe { DeflateStream::from_stream_mut(&raw mut raw) })
-                .ok_or("state missing after initialization")?;
+            let mut source_owner = ScopedDeflateStream::from_initialized(&mut raw)?;
+            let source = source_owner.stream()?;
             assert_eq!(source.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
             assert_eq!(
                 source.state.window.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
@@ -6395,8 +6393,10 @@ mod test {
 
             let mut dest = MaybeUninit::<DeflateStream>::uninit();
             assert_eq!(copy(&mut dest, source), ReturnCode::Ok);
-            // SAFETY: successful deflate copy initializes a complete independent state.
-            let cloned = unsafe { dest.assume_init_mut() };
+            // SAFETY: successful native deflate copy constructed the entire
+            // independent state. Moving it into an owned Rust value ensures
+            // Drop releases it even on error or an assertion unwind.
+            let mut cloned = unsafe { dest.assume_init() };
             assert_eq!(cloned.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
             assert_eq!(
                 cloned.state.window.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
@@ -6412,7 +6412,9 @@ mod test {
             source.state.prev.as_mut_slice()[0] = 0xabcd;
             assert_eq!(cloned.state.prev.as_slice()[0], 0x1234);
             assert!(end(source).is_ok());
-            assert!(end(cloned).is_ok());
+            assert!(end(&mut cloned).is_ok());
+            drop(cloned);
+            drop(source_owner);
             assert_eq!(
                 ctx.allocations, 2,
                 "allocation count at remainder {remainder}"
@@ -6427,17 +6429,14 @@ mod test {
     }
 
     #[test]
-    fn set_dictionary_keeps_abi_input_cursor_detached() -> Result<(), ReturnCode> {
+    fn set_dictionary_keeps_abi_input_cursor_detached() -> Result<(), SchedulerFixtureError> {
         // Exercise the exact window boundary: only the most recent window
         // of history can be retained, while the zlib dictionary id covers
         // all caller bytes (including bytes outside that window).
         for dictionary_size in [0, 1, 31, 32_767, 32_768, 32_769] {
             let mut raw = z_stream::default();
-            assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-            // SAFETY: successful init owns the live state, and this test has
-            // its unique mutable stream access until end(stream).
-            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-                .ok_or(ReturnCode::StreamError)?;
+            let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+            let stream = owned.stream()?;
 
             let caller_input = b"future caller input";
             stream.next_in = caller_input.as_ptr().cast_mut();
@@ -7100,6 +7099,19 @@ mod test {
             let code = init(raw, config);
             if code != ReturnCode::Ok {
                 return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        /// Adopt a stream initialized with a caller-specified C allocator.
+        /// Its original stack address stays fixed while the guard is alive.
+        fn from_initialized(raw: &'a mut z_stream) -> Result<Self, SchedulerFixtureError> {
+            // SAFETY: the caller passed exclusively borrowed stream storage;
+            // the native accessor verifies a live initialized state.
+            if unsafe { DeflateStream::from_stream_mut(raw) }.is_none() {
+                return Err(SchedulerFixtureError::Invariant(
+                    "native state missing after init",
+                ));
             }
             Ok(Self { raw })
         }
