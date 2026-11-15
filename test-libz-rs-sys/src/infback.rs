@@ -177,6 +177,222 @@ fn entry(input: &[u8]) {
     differential_inflate_back::<512>(input);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    status: c_int,
+    message: Option<String>,
+    callback_sizes: Vec<usize>,
+    bytes: Vec<u8>,
+    remaining_input: c_uint,
+}
+
+struct CallbackResult {
+    callback_sizes: Vec<usize>,
+    bytes: Vec<u8>,
+    reject_at: Option<usize>,
+}
+
+unsafe extern "C" fn capture(desc: *mut c_void, buf: *mut c_uchar, count: c_uint) -> c_int {
+    // SAFETY: the live callback descriptor is exclusive to this synchronous
+    // inflateBack invocation and refers to its CallbackResult.
+    let result = unsafe { &mut *desc.cast::<CallbackResult>() };
+    let Ok(count) = usize::try_from(count) else {
+        return 1;
+    };
+    // SAFETY: each callback gives us an initialized prefix of its window.
+    let bytes = unsafe { core::slice::from_raw_parts(buf, count) };
+    result.callback_sizes.push(bytes.len());
+    result.bytes.extend_from_slice(bytes);
+    c_int::from(result.reject_at == Some(result.callback_sizes.len()))
+}
+
+macro_rules! probe {
+    ($library:ident, $input_cb:expr, $output_cb:expr, $encoded:expr, $reject:expr) => {{
+        let encoded: &[u8] = $encoded;
+        let mut stream = MaybeUninit::<$library::z_stream>::zeroed();
+        let mut window = vec![0xa5u8; 32768];
+        let mut input = InputCtx {
+            data: encoded,
+            pos: 0,
+        };
+        let mut output = CallbackResult {
+            callback_sizes: Vec::new(),
+            bytes: Vec::new(),
+            reject_at: $reject,
+        };
+        // SAFETY: live C stream storage, caller-owned 32 KiB window and
+        // matching C ABI version/struct size for the selected library.
+        let init = unsafe {
+            $library::inflateBackInit_(
+                stream.as_mut_ptr(),
+                15,
+                window.as_mut_ptr(),
+                $library::zlibVersion(),
+                stream_struct_size::<$library::z_stream>(),
+            )
+        };
+        assert_eq!(init, $library::Z_OK);
+
+        // SAFETY: both callback descriptors remain valid, the input stays
+        // immutable, and output bytes are copied before the callback returns.
+        let status = unsafe {
+            $library::inflateBack(
+                stream.as_mut_ptr(),
+                $input_cb,
+                (&raw mut input).cast(),
+                $output_cb,
+                (&raw mut output).cast(),
+            )
+        };
+        // SAFETY: successful init created a fully initialized z_stream;
+        // its message storage is stable for the initialized stream lifetime.
+        let raw = unsafe { stream.assume_init_ref() };
+        let message = if raw.msg.is_null() {
+            None
+        } else {
+            // SAFETY: zlib stream errors use NUL-terminated error strings
+            // whose storage remains valid until inflateBackEnd.
+            let text = unsafe { core::ffi::CStr::from_ptr(raw.msg) };
+            Some(text.to_string_lossy().into_owned())
+        };
+        let result = Outcome {
+            status,
+            message,
+            callback_sizes: output.callback_sizes,
+            bytes: output.bytes,
+            remaining_input: raw.avail_in,
+        };
+        // SAFETY: the initialized callback stream is torn down exactly once.
+        let end_status = unsafe { $library::inflateBackEnd(stream.as_mut_ptr()) };
+        assert_eq!(end_status, $library::Z_OK);
+        result
+    }};
+}
+
+#[test]
+fn differential_back_callback_delivery_on_abort_and_truncation() {
+    let plain = vec![0x5au8; 65_539];
+    let mut storage = vec![0u8; zlib_rs::deflate::compress_bound(plain.len())];
+    let (encoded, code) = zlib_rs::deflate::compress_slice(
+        &mut storage,
+        &plain,
+        zlib_rs::deflate::DeflateConfig {
+            level: 0,
+            window_bits: -15,
+            ..zlib_rs::deflate::DeflateConfig::default()
+        },
+    );
+    assert_eq!(code, zlib_rs::ReturnCode::Ok);
+    let encoded: &[u8] = encoded;
+    let truncated = &encoded[..encoded.len() - 1];
+    // Non-final stored "hello" followed by an illegal block type.
+    let malformed = b"\x00\x05\x00\xfa\xffhello\x07".as_slice();
+
+    for (name, source) in [
+        ("complete", encoded),
+        ("truncated", truncated),
+        ("malformed-next-block", malformed),
+    ] {
+        for reject_at in [None, Some(1), Some(2)] {
+            let reference = probe!(libz_ng_sys, pull_cb::<1>, capture, source, reject_at);
+            let ours = probe!(
+                libz_rs_sys,
+                Some(pull_cb::<1>),
+                Some(capture),
+                source,
+                reject_at
+            );
+            assert_eq!(
+                ours, reference,
+                "callback difference: {name}, reject_at={reject_at:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn differential_valid_raw_streams_cover_block_modes_and_window_transitions() {
+    use zlib_rs::deflate::{compress_bound, compress_slice, DeflateConfig, Strategy};
+    use zlib_rs::ReturnCode;
+
+    let mut corpus = vec![
+        Vec::new(),
+        b"x".to_vec(),
+        b"short unique string".to_vec(),
+        vec![b'a'; 65_539],
+    ];
+    // Mix high-entropy bytes, repeated substrings and deliberately shifted
+    // repetition across 32 KiB boundaries. This is real raw DEFLATE input,
+    // unlike the gzip-wrapped fixtures in various().
+    let pattern: Vec<_> = (0..2_057usize)
+        .map(|i| ((i * 73) ^ (i >> 3) ^ (i >> 8)).to_le_bytes()[0])
+        .collect();
+    corpus.push(
+        (0..100_123usize)
+            .map(|i| pattern[(i + (i / 8_192)) % pattern.len()])
+            .collect(),
+    );
+
+    let modes = [
+        (0, Strategy::Default),
+        (1, Strategy::Default),
+        (6, Strategy::Default),
+        (9, Strategy::Default),
+        (6, Strategy::Fixed),
+        (9, Strategy::HuffmanOnly),
+        (6, Strategy::Rle),
+    ];
+
+    for original in &corpus {
+        for (level, strategy) in modes {
+            let config = DeflateConfig {
+                level,
+                strategy,
+                window_bits: -15,
+                ..DeflateConfig::default()
+            };
+            let mut encoded_storage = vec![0u8; compress_bound(original.len())];
+            let (compressed, code) = compress_slice(&mut encoded_storage, original, config);
+            assert_eq!(
+                code,
+                ReturnCode::Ok,
+                "encoding level={level} strategy={strategy:?}"
+            );
+
+            for (chunk, ng, rs) in [
+                (
+                    1,
+                    run_inflate_back_ng::<1>(compressed, 15),
+                    run_inflate_back_rs::<1>(compressed, 15),
+                ),
+                (
+                    15,
+                    run_inflate_back_ng::<15>(compressed, 15),
+                    run_inflate_back_rs::<15>(compressed, 15),
+                ),
+                (
+                    512,
+                    run_inflate_back_ng::<512>(compressed, 15),
+                    run_inflate_back_rs::<512>(compressed, 15),
+                ),
+            ] {
+                assert_eq!(
+                    ng.as_deref(),
+                    Ok(original.as_slice()),
+                    "reference decode len={} level={level} strategy={strategy:?} chunk={chunk}",
+                    original.len()
+                );
+                assert_eq!(
+                    rs.as_deref(),
+                    Ok(original.as_slice()),
+                    "Rust decode len={} level={level} strategy={strategy:?} chunk={chunk}",
+                    original.len()
+                );
+            }
+        }
+    }
+}
+
 fn differential_inflate_back<const CHUNK: usize>(input: &[u8]) {
     // Per the documentation, only window_bits 15 is supported.
     let window_bits = 15;
