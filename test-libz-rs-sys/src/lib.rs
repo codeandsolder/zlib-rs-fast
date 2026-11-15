@@ -1130,13 +1130,21 @@ mod null {
 
             let dictionary = b"foobarbaz";
 
-            let a = inflateSetDictionary(strm, core::ptr::null(), dictionary.len() as _);
+            let a = inflateSetDictionary(
+                strm,
+                core::ptr::null(),
+                crate::inflate::test_c_uint_len(dictionary.len()),
+            );
             let b = inflateSetDictionary(
                 core::ptr::null_mut(),
                 dictionary.as_ptr(),
-                dictionary.len() as _,
+                crate::inflate::test_c_uint_len(dictionary.len()),
             );
-            let c = inflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
+            let c = inflateSetDictionary(
+                strm,
+                dictionary.as_ptr(),
+                crate::inflate::test_c_uint_len(dictionary.len()),
+            );
 
             let d = inflateEnd(strm);
 
@@ -1152,15 +1160,16 @@ mod null {
             let init = inflateInit_(strm.as_mut_ptr(), zlibVersion(), crate::abi_z_stream_size());
             assert_eq!(init, Z_OK);
             let strm = { strm.assume_init_mut() };
-            let mut output = [0u8; 1];
+            let mut output = [0xa5u8; 1];
             strm.next_in = core::ptr::null_mut();
             strm.avail_in = 0;
             strm.next_out = output.as_mut_ptr();
-            strm.avail_out = output.len() as _;
+            strm.avail_out = crate::inflate::test_c_uint_len(output.len());
             let inflate = inflate(strm, Z_NO_FLUSH);
             let input_stayed_null = strm.next_in.is_null();
             let remaining = strm.avail_in;
             let end = inflateEnd(strm);
+            assert_eq!(output, [0xa5]);
             (init, inflate, input_stayed_null, remaining, end)
         });
     }
@@ -1183,7 +1192,7 @@ mod null {
             let prime_zeros = inflatePrime(strm, 16, 0);
             let mut input = [0xffu8, 0xff];
             strm.next_in = input.as_mut_ptr();
-            strm.avail_in = input.len() as _;
+            strm.avail_in = crate::inflate::test_c_uint_len(input.len());
             let sync = inflateSync(strm);
             let end = inflateEnd(strm);
             (init, prime_partial, prime_zeros, sync, end)
@@ -1393,7 +1402,7 @@ mod null {
             deflateSetDictionary(
                 core::ptr::null_mut(),
                 dictionary.as_ptr(),
-                dictionary.len() as _,
+                crate::inflate::test_c_uint_len(dictionary.len()),
             )
         });
 
@@ -1409,8 +1418,16 @@ mod null {
             assert_eq!(init, Z_OK);
             let strm = { strm.assume_init_mut() };
 
-            let a = deflateSetDictionary(strm, core::ptr::null(), dictionary.len() as _);
-            let b = deflateSetDictionary(strm, dictionary.as_ptr(), dictionary.len() as _);
+            let a = deflateSetDictionary(
+                strm,
+                core::ptr::null(),
+                crate::inflate::test_c_uint_len(dictionary.len()),
+            );
+            let b = deflateSetDictionary(
+                strm,
+                dictionary.as_ptr(),
+                crate::inflate::test_c_uint_len(dictionary.len()),
+            );
 
             let c = deflateEnd(strm);
 
@@ -1472,7 +1489,7 @@ mod null {
     #[test]
     fn ferris_bytes() {
         let input = b"Ferris";
-        let mut buf = [0; 64];
+        let mut buf = [0xa5u8; 64];
 
         // SAFETY: The initialized deflate stream and fixed source/output buffers remain live until end.
         assert_eq_rs_ng!(unsafe {
@@ -1488,13 +1505,13 @@ mod null {
 
             let strm = strm.assume_init_mut();
 
-            buf.fill(0);
+            buf.fill(0xa5);
 
             strm.next_in = input.as_ptr().cast_mut();
-            strm.avail_in = input.len() as _;
+            strm.avail_in = crate::inflate::test_c_uint_len(input.len());
 
             strm.next_out = buf.as_mut_ptr();
-            strm.avail_out = buf.len() as _;
+            strm.avail_out = crate::inflate::test_c_uint_len(buf.len());
 
             let err = deflate(strm, Z_FINISH);
             assert_eq!(err, Z_STREAM_END);
@@ -1502,7 +1519,12 @@ mod null {
             let err = deflateEnd(strm);
             assert_eq!(err, Z_OK);
 
-            assert_eq!(&buf[..strm.total_out as usize], FERRIS_BYTES);
+            assert_eq!(usize::try_from(strm.total_out), Ok(FERRIS_BYTES.len()));
+            assert_eq!(&buf[..FERRIS_BYTES.len()], FERRIS_BYTES);
+            assert!(
+                buf[FERRIS_BYTES.len()..].iter().all(|&byte| byte == 0xa5),
+                "deflater wrote beyond the exact compressed output span"
+            );
         });
     }
 
@@ -1717,7 +1739,13 @@ mod coverage {
     fn adler32() {
         let input = [1, 2, 3, 4];
         // SAFETY: The four-byte local input array remains initialized and readable throughout the checksum call.
-        assert_eq_rs_ng!(unsafe { adler32(0, input.as_ptr(), input.len() as _) });
+        assert_eq_rs_ng!(unsafe {
+            adler32(
+                0,
+                input.as_ptr(),
+                crate::inflate::test_c_uint_len(input.len()),
+            )
+        });
     }
 
     #[test]
@@ -1875,10 +1903,10 @@ mod coverage {
             let strm = strm.assume_init_mut();
 
             strm.next_in = input.as_ptr().cast_mut();
-            strm.avail_in = input.len() as _;
+            strm.avail_in = crate::inflate::test_c_uint_len(input.len());
 
             strm.next_out = buf.as_mut_ptr();
-            strm.avail_out = buf.len() as _;
+            strm.avail_out = crate::inflate::test_c_uint_len(buf.len());
 
             let value = deflate(strm, 1234);
 
@@ -1892,7 +1920,7 @@ mod coverage {
     #[test]
     fn deflate_insufficient_output_space() {
         let input = b"Ferris";
-        let mut buf = [0; 5];
+        let mut buf = [0xa5; 6];
 
         // SAFETY: The initialized deflate state and explicitly limited output buffer are valid for this call.
         assert_eq_rs_ng!(unsafe {
@@ -1909,10 +1937,10 @@ mod coverage {
             let strm = strm.assume_init_mut();
 
             strm.next_in = input.as_ptr().cast_mut();
-            strm.avail_in = input.len() as _;
+            strm.avail_in = crate::inflate::test_c_uint_len(input.len());
 
             strm.next_out = buf.as_mut_ptr();
-            strm.avail_out = buf.len() as _;
+            strm.avail_out = crate::inflate::test_c_uint_len(buf.len() - 1);
 
             // Z_NO_FLUSH keeps the state in `Status::Busy`
             let err = deflate(strm, Z_NO_FLUSH);
@@ -1920,6 +1948,10 @@ mod coverage {
 
             let err = deflateEnd(strm);
             assert_eq!(err, Z_DATA_ERROR);
+            assert_eq!(
+                buf[5], 0xa5,
+                "deflater wrote past the five-byte C output span"
+            );
 
             err
         });
