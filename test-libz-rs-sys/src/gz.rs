@@ -2325,9 +2325,9 @@ fn gzseek_write() -> Result<(), ()> {
         assert!(!file.is_null());
 
         // Set a small buffer size to help exercise all the code paths.
-        const BUF_SIZE: c_uint = 8;
+        const BUF_SIZE: usize = 8;
         // SAFETY: the live handle is exclusively owned in this test, or a null handle is passed to exercise its documented error return.
-        assert_eq!(unsafe { gzbuffer(file, BUF_SIZE) }, 0);
+        assert_eq!(unsafe { gzbuffer(file, checked_test_len(BUF_SIZE)) }, 0);
 
         // gzseek forward a few bytes immediately.
         // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
@@ -2365,14 +2365,19 @@ fn gzseek_write() -> Result<(), ()> {
         assert_eq!(
             // SAFETY: the caller supplies a live NUL-terminated C string and live handle, or a null argument that is rejected before reading input.
             unsafe { gzputs(file, STRING2.as_ptr().cast::<c_char>()) },
-            (STRING2.len() - 1) as _
+            checked_test_len::<c_int>(STRING2.len() - 1)
         );
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 15);
         // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
         assert_eq!(unsafe { gzseek(file, 2, libc::SEEK_CUR) }, 17);
         // SAFETY: the handle is live and the byte is passed by value; null handles trigger the checked error path.
-        assert_eq!(unsafe { gzputc(file, b'7' as _) }, b'7' as _);
+        assert_eq!(
+            // SAFETY: file is an exclusively owned live gzip write handle;
+            // gzputc accepts an integer byte and validates stream state.
+            unsafe { gzputc(file, c_int::from(b'7')) },
+            c_int::from(b'7')
+        );
         // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
         assert_eq!(unsafe { gztell(file) }, 18);
         // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
@@ -2380,14 +2385,27 @@ fn gzseek_write() -> Result<(), ()> {
         // SAFETY: the gzip handle remains live through the flush, or null/invalid parameters exercise the entry point’s early error path.
         assert_eq!(unsafe { gzflush(file, Z_SYNC_FLUSH) }, Z_OK);
         // SAFETY: the handle is live and the byte is passed by value; null handles trigger the checked error path.
-        assert_eq!(unsafe { gzputc(file, b'8' as _) }, b'8' as _);
+        assert_eq!(
+            // SAFETY: file remains live after flush; gzputc takes a byte by
+            // value and performs no caller-buffer access.
+            unsafe { gzputc(file, c_int::from(b'8')) },
+            c_int::from(b'8')
+        );
 
         // Do one more gzseek at the end, and then close the file handle. This should produce
         // the specified number of zero bytes at the end of the uncompressed data stream.
+        // Both the requested relative seek and expected absolute position
+        // must fit the signed C offset domain, not wrap on conversion.
+        let skip = BUF_SIZE
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(())?;
+        let end = 20usize.checked_add(skip).ok_or(())?;
         assert_eq!(
-            // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
-            unsafe { gzseek(file, (BUF_SIZE * 3 + 1) as _, libc::SEEK_CUR) },
-            (20 + BUF_SIZE * 3 + 1) as _
+            // SAFETY: file remains a live write handle and checked_test_len
+            // validates the signed z_off_t argument before crossing the ABI.
+            unsafe { gzseek(file, checked_test_len(skip), libc::SEEK_CUR) },
+            checked_test_len::<libz_rs_sys::z_off_t>(end)
         );
         // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
@@ -2416,7 +2434,7 @@ fn gzseek_write() -> Result<(), ()> {
             checked_test_len(buf.len())
         );
         assert_eq!(&buf, EXPECTED1);
-        const EXPECTED2: &[u8] = &[0u8; BUF_SIZE as usize * 3 + 1];
+        const EXPECTED2: &[u8] = &[0u8; BUF_SIZE * 3 + 1];
         let mut buf = [127u8; EXPECTED2.len() + 1];
         assert_eq!(
             // SAFETY: the live gzip handle and writable output slice are valid for the requested length, or an invalid length/handle is rejected before accessing caller memory.
@@ -2430,6 +2448,7 @@ fn gzseek_write() -> Result<(), ()> {
             checked_test_len(EXPECTED2.len())
         );
         assert_eq!(&buf[..EXPECTED2.len()], EXPECTED2);
+        assert_eq!(buf[EXPECTED2.len()], 127);
         // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
     }
@@ -2472,14 +2491,24 @@ fn gzseek_gzsetparams() -> Result<(), ()> {
     // Call gzseek to schedule a pending write of some zeros to the compressed stream.
     const SEEK_AMOUNT: usize = 4;
     // SAFETY: the live handle remains owned by this test; seek offsets and whence values are passed by value and validated by the C entry point.
-    assert_eq!(unsafe { gzseek(file, SEEK_AMOUNT as _, libc::SEEK_CUR) }, 9);
+    assert_eq!(
+        // SAFETY: file is a live owned gzip stream; the relative offset is
+        // converted to the exact signed C ABI type before this call.
+        unsafe { gzseek(file, checked_test_len(SEEK_AMOUNT), libc::SEEK_CUR) },
+        9
+    );
 
     // Before doing another write, call gzsetparams. This should write the pending zeros
     // to the current gzip stream before closing the stream and starting a new one.
     // SAFETY: the handle is still live when non-null and the compression parameters are passed as integers; invalid values are checked by the C wrapper.
     assert_eq!(unsafe { gzsetparams(file, 9, 2) }, Z_OK);
     // SAFETY: the handle is live when non-null; the C wrapper checks null before inspecting its position.
-    assert_eq!(unsafe { gztell(file) }, (STRING1.len() + SEEK_AMOUNT) as _);
+    assert_eq!(
+        // SAFETY: gztell borrows a live gzip handle and returns its current
+        // position without consuming or mutating the caller-owned handle.
+        unsafe { gztell(file) },
+        checked_test_len::<libz_rs_sys::z_off_t>(STRING1.len().checked_add(SEEK_AMOUNT).ok_or(())?)
+    );
 
     // Write some more content to the file handle. This will end up in the second gzip stream
     // in the file.
@@ -2538,9 +2567,10 @@ fn gzseek_gzsetparams() -> Result<(), ()> {
                 checked_test_len(buf.len()),
             )
         },
-        (buf.len() - 1) as _
+        checked_test_len::<c_int>(STRING2.len())
     );
     assert_eq!(&buf[..STRING2.len()], STRING2);
+    assert_eq!(buf[STRING2.len()], 127);
 
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
