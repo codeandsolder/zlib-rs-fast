@@ -4025,7 +4025,7 @@ mod tests {
             }
             drop(owned);
             assert_eq!(context.frees, 1);
-            assert!(context.buffers.is_empty());
+            assert_eq!(context.buffers, []);
         }
         Ok(())
     }
