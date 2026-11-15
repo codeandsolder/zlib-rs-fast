@@ -8590,15 +8590,15 @@ mod test {
     }
 
     #[test]
-    fn deflate_copy_owns_independent_state_and_buffer_storage() -> Result<(), ReturnCode> {
+    fn deflate_copy_owns_independent_state_and_buffer_storage() -> Result<(), SchedulerFixtureError>
+    {
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let source = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
-            .ok_or(ReturnCode::StreamError)?;
+        let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+        let source = owned.stream()?;
 
         let initial_window_byte = 0x11u8;
+        // SAFETY: the live window owns a mutable slot at index zero and the
+        // caller-provided byte remains readable throughout the copy.
         unsafe {
             source
                 .state
@@ -8615,9 +8615,15 @@ mod test {
         let source_prev = source.state.prev.as_ptr();
         let source_head = source.state.head.as_ptr();
 
-        let mut copied = MaybeUninit::<DeflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        let copied = unsafe { copied.assume_init_mut() };
+        let mut clone_storage = MaybeUninit::<DeflateStream>::uninit();
+        let status = copy(&mut clone_storage, source);
+        if status != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(status));
+        }
+        // SAFETY: copy returned Ok and initialized the entire destination
+        // DeflateStream. Moving it into an owned local enables Drop cleanup
+        // on any subsequent failure, unlike a borrowed MaybeUninit slot.
+        let mut copied = unsafe { clone_storage.assume_init() };
 
         assert_ne!(source_state, copied.state.as_ptr());
         assert_ne!(source_window, copied.state.window.as_ptr());
@@ -8646,12 +8652,44 @@ mod test {
         }
 
         assert!(end(source).is_ok());
-        assert!(end(copied).is_ok());
+        assert!(end(&mut copied).is_ok());
         Ok(())
     }
 
     #[test]
-    fn gzip_header_is_shared_safely_across_deflate_copy() -> Result<(), ReturnCode> {
+    fn gzip_header_is_shared_safely_across_deflate_copy() -> Result<(), SchedulerFixtureError> {
+        fn finish(
+            stream: &mut DeflateStream<'_>,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<usize, SchedulerFixtureError> {
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip-copy input exceeds C uInt"))?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip-copy output exceeds C uInt"))?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let unused = usize::try_from(stream.avail_out).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip-copy cursor exceeds host width")
+            })?;
+            let written =
+                output
+                    .len()
+                    .checked_sub(unused)
+                    .ok_or(SchedulerFixtureError::Invariant(
+                        "gzip-copy wrote past output",
+                    ))?;
+            assert_eq!(
+                stream.total_out,
+                crate::c_api::z_size::try_from(written).map_err(|_| {
+                    SchedulerFixtureError::Invariant("gzip-copy count exceeds C size")
+                })?
+            );
+            Ok(written)
+        }
+
         let extra = b"copy-extra\0";
         let name = b"copy-name\0";
         let comment = b"copy-comment\0";
@@ -8661,7 +8699,8 @@ mod test {
             xflags: 0,
             os: 3,
             extra: extra.as_ptr().cast_mut(),
-            extra_len: extra.len() as _,
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("copy gzip extra exceeds C uInt"))?,
             extra_max: 0,
             name: name.as_ptr().cast_mut(),
             name_max: 0,
@@ -8676,11 +8715,10 @@ mod test {
             ..Default::default()
         };
         let mut source_stream = z_stream::default();
-        assert_eq!(init(&mut source_stream, config), ReturnCode::Ok);
-        // SAFETY: a preceding successful init owns a live deflate state; this test
-        // holds the only mutable borrow of its raw stream during this operation.
-        let source = unsafe { DeflateStream::from_stream_mut(&raw mut source_stream) }
-            .ok_or(ReturnCode::StreamError)?;
+        let mut owned = ScopedDeflateStream::new(&mut source_stream, config)?;
+        let source = owned.stream()?;
+        // SAFETY: the shared header and its caller-owned strings remain
+        // valid until both source and destination streams are ended.
         assert_eq!(
             unsafe { set_header(source, Some(&mut header)) },
             ReturnCode::Ok
@@ -8688,33 +8726,34 @@ mod test {
 
         // Copy before either stream starts emitting the caller-owned header. zlib semantics require
         // both compressors to retain the same header pointer.
-        let mut copied = MaybeUninit::<DeflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        let copied = unsafe { copied.assume_init_mut() };
+        let mut clone_storage = MaybeUninit::<DeflateStream>::uninit();
+        let status = copy(&mut clone_storage, source);
+        if status != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(status));
+        }
+        // SAFETY: a successful copy initialized every field and allocated
+        // an independent native state. Ownership makes cleanup automatic.
+        let mut copied = unsafe { clone_storage.assume_init() };
 
         let input = b"same payload through both copied streams";
         let mut source_output = [0u8; 256];
-        source.next_in = input.as_ptr().cast_mut();
-        source.avail_in = input.len() as _;
-        source.next_out = source_output.as_mut_ptr();
-        source.avail_out = source_output.len() as _;
-
         let mut copied_output = [0u8; 256];
-        copied.next_in = input.as_ptr().cast_mut();
-        copied.avail_in = input.len() as _;
-        copied.next_out = copied_output.as_mut_ptr();
-        copied.avail_out = copied_output.len() as _;
-
-        assert_eq!(deflate(source, DeflateFlush::Finish), ReturnCode::StreamEnd);
-        assert_eq!(deflate(copied, DeflateFlush::Finish), ReturnCode::StreamEnd);
-
-        let source_len = source.total_out as usize;
-        let copied_len = copied.total_out as usize;
+        let source_len = finish(source, input, &mut source_output)?;
+        let copied_len = finish(&mut copied, input, &mut copied_output)?;
         assert_eq!(source_len, copied_len);
         assert_eq!(&source_output[..source_len], &copied_output[..copied_len]);
 
+        let mut plaintext = [0u8; 256];
+        let (decoded, decode_status) = crate::decompress_slice(
+            &mut plaintext,
+            &source_output[..source_len],
+            InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(decode_status, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+
         assert!(end(source).is_ok());
-        assert!(end(copied).is_ok());
+        assert!(end(&mut copied).is_ok());
         Ok(())
     }
 
