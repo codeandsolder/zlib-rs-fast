@@ -841,7 +841,7 @@ mod null {
     }
 
     #[test]
-    fn uncompress2_reports_consumed_prefix_with_trailing_data() {
+    fn uncompress2_reports_consumed_prefix_with_trailing_data() -> Result<(), ()> {
         let plain = b"zlib uncompress2 returns consumed source bytes, excluding any trailing data";
         let mut storage = vec![0u8; zlib_rs::compress_bound(plain.len())];
         let (compressed, code) =
@@ -856,8 +856,8 @@ mod null {
         // disjoint and their exact valid sizes are supplied via sourceLen/destLen.
         assert_eq_rs_ng!(unsafe {
             let mut output = vec![0u8; plain.len() + 16];
-            let mut output_len = core::ffi::c_ulong::try_from(output.len()).unwrap_or(0);
-            let mut input_len = core::ffi::c_ulong::try_from(input.len()).unwrap_or(0);
+            let mut output_len = core::ffi::c_ulong::try_from(output.len()).map_err(|_| ())?;
+            let mut input_len = core::ffi::c_ulong::try_from(input.len()).map_err(|_| ())?;
             let status = uncompress2(
                 output.as_mut_ptr(),
                 &raw mut output_len,
@@ -865,16 +865,17 @@ mod null {
                 &raw mut input_len,
             );
             assert_eq!(status, Z_OK);
-            assert_eq!(input_len as usize, compressed_len);
-            assert_eq!(output_len as usize, plain.len());
+            assert_eq!(usize::try_from(input_len).map_err(|_| ())?, compressed_len);
+            assert_eq!(usize::try_from(output_len).map_err(|_| ())?, plain.len());
             output.truncate(plain.len());
             assert_eq!(output, plain);
             (status, input_len, output_len, output)
         });
+        Ok(())
     }
 
     #[test]
-    fn uncompress2_accepts_null_zero_capacity_destination() {
+    fn uncompress2_accepts_null_zero_capacity_destination() -> Result<(), ()> {
         // An empty destination may have a NULL pointer. The decoder uses a
         // private scratch byte to distinguish empty from nonempty streams.
         for plain in [&[][..], &b"nonempty output requires space"[..]] {
@@ -887,7 +888,8 @@ mod null {
             // capacity is zero. Compressed input remains readable and live.
             let (result, produced, consumed) = assert_eq_rs_ng!(unsafe {
                 let mut output_len: core::ffi::c_ulong = 0;
-                let mut input_len = core::ffi::c_ulong::try_from(compressed.len()).unwrap_or(0);
+                let mut input_len =
+                    core::ffi::c_ulong::try_from(compressed.len()).map_err(|_| ())?;
                 let code = uncompress2(
                     core::ptr::null_mut(),
                     &raw mut output_len,
@@ -940,10 +942,11 @@ mod null {
                 libz_rs_sys::Z_STREAM_ERROR
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn uncompress2_accepts_null_zero_length_source() {
+    fn uncompress2_accepts_null_zero_length_source() -> Result<(), ()> {
         for capacity in [0usize, 16] {
             // With no input there is no valid zlib header, but an empty span
             // may be represented with a NULL pointer without being invalid.
@@ -956,7 +959,7 @@ mod null {
                 } else {
                     output.as_mut_ptr()
                 };
-                let mut output_len = core::ffi::c_ulong::try_from(capacity).unwrap_or(0);
+                let mut output_len = core::ffi::c_ulong::try_from(capacity).map_err(|_| ())?;
                 let mut input_len: core::ffi::c_ulong = 0;
                 let code = uncompress2(
                     output_ptr,
@@ -986,16 +989,17 @@ mod null {
                 libz_rs_sys::Z_STREAM_ERROR
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn compress2_accepts_null_zero_length_source() {
+    fn compress2_accepts_null_zero_length_source() -> Result<(), ()> {
         // An empty input needs no backing buffer, including at the C ABI.
         // SAFETY: the source length is zero, so the NULL source is never read;
         // the destination is a valid, independently owned writable array.
         let status = assert_eq_rs_ng!(unsafe {
             let mut output = [0u8; 64];
-            let mut output_len = core::ffi::c_ulong::try_from(output.len()).unwrap_or(0);
+            let mut output_len = core::ffi::c_ulong::try_from(output.len()).map_err(|_| ())?;
             let status = compress2(
                 output.as_mut_ptr(),
                 &raw mut output_len,
@@ -1007,7 +1011,7 @@ mod null {
                 let mut decoded = [0u8; 1];
                 let (plain, code) = zlib_rs::decompress_slice(
                     &mut decoded,
-                    &output[..usize::try_from(output_len).unwrap_or(0)],
+                    &output[..usize::try_from(output_len).map_err(|_| ())?],
                     zlib_rs::InflateConfig::default(),
                 );
                 assert_eq!(code, zlib_rs::ReturnCode::Ok);
@@ -1046,6 +1050,7 @@ mod null {
             },
             libz_rs_sys::Z_STREAM_ERROR
         );
+        Ok(())
     }
 
     #[test]
