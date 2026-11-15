@@ -10,10 +10,15 @@
 /// the signed C integer field required by the initialization ABI.
 #[must_use]
 pub const fn abi_z_stream_size() -> core::ffi::c_int {
-    const SIZE: usize = core::mem::size_of::<libz_rs_sys::z_stream>();
-    assert!(SIZE <= core::ffi::c_int::MAX as usize);
-    let bytes = SIZE.to_le_bytes();
-    core::ffi::c_int::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    // Evaluate the bound at compile time, even if callers invoke this
+    // function from non-const test code.
+    const ABI_SIZE: core::ffi::c_int = {
+        const SIZE: usize = core::mem::size_of::<libz_rs_sys::z_stream>();
+        assert!(SIZE <= core::ffi::c_int::MAX as usize);
+        let bytes = SIZE.to_le_bytes();
+        core::ffi::c_int::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    };
+    ABI_SIZE
 }
 
 pub mod chunked_inflate;
