@@ -1326,7 +1326,7 @@ fn gzputs_error() -> Result<(), ()> {
     assert!(!file.is_null());
     assert_eq!(
         // SAFETY: the caller supplies a live NUL-terminated C string and live handle, or a null argument that is rejected before reading input.
-        unsafe { gzputs(ptr::null_mut(), CONTENT.as_ptr().cast::<c_char>()) },
+        unsafe { gzputs(file, CONTENT.as_ptr().cast::<c_char>()) },
         -1
     );
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
@@ -1613,63 +1613,105 @@ fn gzgets_basic() -> Result<(), ()> {
     // gzgets with a buffer too small to hold the next line should fetch len-1 bytes and
     // add a null terminator. Note: we fill the output buffer with a nonzero value before
     // the call to make sure gzgets null-terminates properly.
-    let mut buf = [127 as c_char; 4];
+    let mut buf = [127u8; 4];
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    let ret = unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) };
+    let ret = unsafe {
+        gzgets(
+            file,
+            buf.as_mut_ptr().cast::<c_char>(),
+            checked_test_len(buf.len()),
+        )
+    };
     assert!(!ret.is_null());
     assert_eq!(
-        // SAFETY: the preceding successful gzip string read wrote a terminating NUL into this live output buffer, which remains allocated.
-        unsafe { CStr::from_ptr(buf.as_ptr()).to_str().map_err(|_| ())? },
+        CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| ())?
+            .to_str()
+            .map_err(|_| ())?,
         "gzi"
     );
 
     // gzgets with a bigger buffer should fetch (only) the remainder of the line, up to and
     // including the '\n'.
-    let mut buf = [127 as c_char; 100];
+    let mut buf = [127u8; 100];
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    let ret = unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) };
+    let ret = unsafe {
+        gzgets(
+            file,
+            buf.as_mut_ptr().cast::<c_char>(),
+            checked_test_len(buf.len()),
+        )
+    };
     assert!(!ret.is_null());
     assert_eq!(
-        // SAFETY: the preceding successful gzip string read wrote a terminating NUL into this live output buffer, which remains allocated.
-        unsafe { CStr::from_ptr(buf.as_ptr()).to_str().map_err(|_| ())? },
+        CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| ())?
+            .to_str()
+            .map_err(|_| ())?,
         "p\n"
     );
 
     // gzgets with len=1 should return a string consisting of just a null terminator.
-    let mut buf = [127 as c_char; 1];
+    let mut buf = [127u8; 1];
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    let ret = unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) };
+    let ret = unsafe {
+        gzgets(
+            file,
+            buf.as_mut_ptr().cast::<c_char>(),
+            checked_test_len(buf.len()),
+        )
+    };
     assert!(!ret.is_null());
-    assert_eq!(buf[0], 0 as c_char);
+    assert_eq!(buf[0], 0);
 
     // Read the next line with gzgets, using a buffer just big enough.
-    let mut buf = [127 as c_char; 14];
+    let mut buf = [127u8; 14];
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    let ret = unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) };
-    assert!(!ret.is_null());
+    let ret = unsafe {
+        gzgets(
+            file,
+            buf.as_mut_ptr().cast::<c_char>(),
+            checked_test_len(buf.len()),
+        )
+    };
     assert!(!ret.is_null());
     assert_eq!(
-        // SAFETY: the preceding successful gzip string read wrote a terminating NUL into this live output buffer, which remains allocated.
-        unsafe { CStr::from_ptr(buf.as_ptr()).to_str().map_err(|_| ())? },
+        CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| ())?
+            .to_str()
+            .map_err(|_| ())?,
         "example data\n"
     );
 
     // Read the final line of the file, which is not terminated by a newline character.
-    let mut buf = [127 as c_char; 100];
+    let mut buf = [127u8; 100];
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    let ret = unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) };
-    assert!(!ret.is_null());
+    let ret = unsafe {
+        gzgets(
+            file,
+            buf.as_mut_ptr().cast::<c_char>(),
+            checked_test_len(buf.len()),
+        )
+    };
     assert!(!ret.is_null());
     assert_eq!(
-        // SAFETY: the preceding successful gzip string read wrote a terminating NUL into this live output buffer, which remains allocated.
-        unsafe { CStr::from_ptr(buf.as_ptr()).to_str().map_err(|_| ())? },
+        CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| ())?
+            .to_str()
+            .map_err(|_| ())?,
         "for tests"
     );
 
     // gzgets at the end of the file should return null.
-    let mut buf = [127 as c_char; 100];
+    let mut buf = [127u8; 100];
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    let ret = unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) };
+    let ret = unsafe {
+        gzgets(
+            file,
+            buf.as_mut_ptr().cast::<c_char>(),
+            checked_test_len(buf.len()),
+        )
+    };
     assert!(ret.is_null());
 
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
@@ -1679,7 +1721,7 @@ fn gzgets_basic() -> Result<(), ()> {
 
 #[test]
 fn gzgets_error() -> Result<(), ()> {
-    let mut buf = [0 as c_char; 16];
+    let mut buf = [0x5a as c_char; 16];
 
     // gzgets on a null file handle should return null.
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
@@ -1696,14 +1738,7 @@ fn gzgets_error() -> Result<(), ()> {
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("w").map_err(|_| ())?.as_ptr()) };
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    assert!(unsafe {
-        gzgets(
-            ptr::null_mut(),
-            buf.as_mut_ptr(),
-            checked_test_len(buf.len()),
-        )
-    }
-    .is_null());
+    assert!(unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) }.is_null());
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_ERRNO);
 
@@ -1711,14 +1746,7 @@ fn gzgets_error() -> Result<(), ()> {
     // SAFETY: mode points to a live NUL-terminated C string; the integer descriptor is passed by value, including intentionally invalid descriptors in negative tests.
     let file = unsafe { gzdopen(-2, CString::new("r").map_err(|_| ())?.as_ptr()) };
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    assert!(unsafe {
-        gzgets(
-            ptr::null_mut(),
-            buf.as_mut_ptr(),
-            checked_test_len(buf.len()),
-        )
-    }
-    .is_null());
+    assert!(unsafe { gzgets(file, buf.as_mut_ptr(), checked_test_len(buf.len())) }.is_null());
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_ERRNO);
 
@@ -1734,12 +1762,14 @@ fn gzgets_error() -> Result<(), ()> {
     assert!(!file.is_null());
     // gzgets with a null buffer should return null.
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    assert!(unsafe { gzgets(ptr::null_mut(), ptr::null_mut(), 1) }.is_null());
+    assert!(unsafe { gzgets(file, ptr::null_mut(), 1) }.is_null());
     // gzgets with a nonpositive len should return null.
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    assert!(unsafe { gzgets(ptr::null_mut(), buf.as_mut_ptr(), 0) }.is_null());
+    assert!(unsafe { gzgets(file, buf.as_mut_ptr(), 0) }.is_null());
     // SAFETY: the caller provides a live writable buffer of the supplied size and a live handle, or passes a null/invalid argument to exercise the early-error branch.
-    assert!(unsafe { gzgets(ptr::null_mut(), buf.as_mut_ptr(), -1) }.is_null());
+    assert!(unsafe { gzgets(file, buf.as_mut_ptr(), -1) }.is_null());
+    // Invalid requests must not overwrite the caller's buffer.
+    assert_eq!(buf, [0x5a as c_char; 16]);
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
     assert_eq!(unsafe { gzclose(file) }, Z_OK);
     Ok(())
@@ -1872,8 +1902,8 @@ fn gzfwrite_basic() -> Result<(), ()> {
     );
 
     // gzfwrite with a null buffer should return 0.
-    // SAFETY: the destination is writable for the requested byte count when valid; intentionally null/overflow-sized requests are rejected before memory access.
-    assert_eq!(unsafe { gzfread(ptr::null_mut(), 1, 1, file) }, 0);
+    // SAFETY: null source is rejected without reading memory; live write handle.
+    assert_eq!(unsafe { gzfwrite(ptr::null(), 1, 1, file) }, 0);
 
     // After the gzfwrite calls, the file should close cleanly.
     // SAFETY: the handle came from a successful gzip open and has not yet been consumed; null handles in negative tests are explicitly rejected.
