@@ -3896,8 +3896,8 @@ mod tests {
         assert_eq!(gzip_isize(usize::from(u16::MAX)), u32::from(u16::MAX));
         #[cfg(target_pointer_width = "64")]
         {
-            let over_4gib = (u64::from(u32::MAX) + 4097) as usize;
-            assert_eq!(gzip_isize(over_4gib), 4096);
+            let over_4gib = u64::from(u32::MAX) + 4097;
+            assert_eq!(usize::try_from(over_4gib).ok().map(gzip_isize), Some(4096));
         }
     }
 
@@ -5017,9 +5017,11 @@ mod tests {
 
     #[test]
     fn uninitialized_output_exposes_exactly_the_decompressed_prefix() {
-        let input: Vec<u8> = (0..257)
+        let input: Vec<u8> = (0u16..257)
             .flat_map(|i| {
-                let byte = (i % 251) as u8;
+                // 0..250 is the intended wire-byte domain; taking its low
+                // byte preserves the exact historical test corpus.
+                let byte = (i % 251).to_le_bytes()[0];
                 [b"typed-inflate-output/".as_slice(), &[byte]].concat()
             })
             .collect();
