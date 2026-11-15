@@ -3838,33 +3838,19 @@ fn compress_into<O: WritableBytes + ?Sized>(
     final_flush: DeflateFlush,
 ) -> (usize, ReturnCode) {
     let output_len = output.len();
-    let mut stream = z_stream {
-        next_in: input.as_ptr().cast_mut(),
-        avail_in: 0, // for special logic in the first iteration
-        total_in: 0,
-        next_out: output.byte_ptr(),
-        avail_out: 0, // for special logic on the first iteration
-        total_out: 0,
-        msg: core::ptr::null_mut(),
-        state: core::ptr::null_mut(),
-        zalloc: None,
-        zfree: None,
-        opaque: core::ptr::null_mut(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
+    // This helper owns its compressor. Using the typed constructor ensures
+    // all exit paths release its state instead of requiring raw ABI cleanup.
+    let mut stream = match DeflateStream::new(config) {
+        Ok(stream) => stream,
+        Err(code) => return (0, code),
     };
-
-    let err = init(&mut stream, config);
-    if err != ReturnCode::Ok {
-        return (0, err);
-    }
+    stream.next_in = input.as_ptr().cast_mut();
+    stream.avail_in = 0; // let SliceBudget issue the first chunk
+    stream.next_out = output.byte_ptr();
+    stream.avail_out = 0; // let SliceBudget issue the first chunk
 
     let mut output_budget = SliceBudget::new(output_len);
     let mut input_budget = SliceBudget::new(input.len());
-    let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&raw mut stream) }) else {
-        return (0, ReturnCode::StreamError);
-    };
 
     let return_code = loop {
         output_budget.refill(&mut stream.avail_out);
@@ -3875,7 +3861,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
         } else {
             final_flush
         };
-        let err = deflate(stream, flush);
+        let err = deflate(&mut stream, flush);
 
         match err {
             ReturnCode::Ok => continue,
@@ -3887,7 +3873,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
     // The public zlib total_out counter may wrap on 64-bit Windows (32-bit c_ulong).
     // Recover the exact Rust-slice length from caller output budgets instead.
     let produced = output_budget.processed(stream.avail_out);
-    let _ = end(stream);
+    drop(stream);
 
     (produced, return_code)
 }
@@ -4636,6 +4622,53 @@ mod test {
         // Drop must not release state a second time after explicit deflateEnd.
         drop(owned);
         Ok(())
+    }
+
+    #[test]
+    fn whole_slice_invalid_compression_config_preserves_caller_storage() {
+        let invalid = [
+            DeflateConfig {
+                level: i32::MIN,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                level: i32::MAX,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                window_bits: i32::MIN,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                window_bits: i32::MAX,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                mem_level: i32::MIN,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                mem_level: i32::MAX,
+                ..DeflateConfig::default()
+            },
+        ];
+
+        for config in invalid {
+            let mut initialized = [0xa5u8; 64];
+            let (compressed, status) = compress_slice(&mut initialized, b"input", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(compressed, &[]);
+            assert_eq!(initialized, [0xa5; 64]);
+
+            let mut uninitialized = [MaybeUninit::new(0xa5u8); 64];
+            let (compressed, status) = compress(&mut uninitialized, b"input", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(compressed, &[]);
+            // SAFETY: every slot started initialized, and rejected initialization
+            // never writes to caller storage or makes existing bytes uninitialized.
+            let untouched = uninitialized.map(|byte| unsafe { byte.assume_init() });
+            assert_eq!(untouched, [0xa5; 64]);
+        }
     }
 
     #[test]
