@@ -6,38 +6,18 @@ use std::ffi::{c_uint, c_ulong};
 
 use libz_sys as libz_ng_sys;
 
+#[path = "shared/native_uncompress.rs"]
+mod native_uncompress;
+
+use native_uncompress::{uncompress_ng, uncompress_rs};
+
 type CliResult<T> = Result<T, Box<dyn Error>>;
 
 const OUTPUT_CAPACITY: usize = 1 << 28;
 const SILESIA_ZLIB: &[u8] = include_bytes!("../../silesia-small.tar.gz");
 
 macro_rules! backend {
-    ($api:ident, $one_shot:ident, $chunked:ident, $adler:ident) => {
-        fn $one_shot(output: &mut [u8], input: &[u8]) -> CliResult<usize> {
-            use $api as ffi;
-
-            let mut output_len = c_ulong::try_from(output.len())?;
-            let input_len = c_ulong::try_from(input.len())?;
-            // SAFETY: input is readable for exactly input_len bytes, output is writable
-            // for exactly output_len bytes, and output_len is a live mutable C scalar.
-            let code = unsafe {
-                ffi::uncompress(
-                    output.as_mut_ptr(),
-                    &raw mut output_len,
-                    input.as_ptr(),
-                    input_len,
-                )
-            };
-            if code != ffi::Z_OK {
-                return Err(format!("native uncompress failed with status {code}").into());
-            }
-            let produced = usize::try_from(output_len)?;
-            if produced > output.len() {
-                return Err("native uncompress returned an output length beyond capacity".into());
-            }
-            Ok(produced)
-        }
-
+    ($api:ident, $chunked:ident, $adler:ident) => {
         fn $chunked(output: &mut [u8], input: &[u8], chunk_size: usize) -> CliResult<usize> {
             use $api as ffi;
 
@@ -155,8 +135,8 @@ macro_rules! backend {
     };
 }
 
-backend!(libz_ng_sys, uncompress_ng, chunked_ng, adler_ng);
-backend!(libz_rs_sys, uncompress_rs, chunked_rs, adler_rs);
+backend!(libz_ng_sys, chunked_ng, adler_ng);
+backend!(libz_rs_sys, chunked_rs, adler_rs);
 
 fn parse_chunk_size(value: &str) -> CliResult<usize> {
     let log: u32 = value.parse()?;

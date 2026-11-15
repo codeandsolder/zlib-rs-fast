@@ -1,64 +1,30 @@
-//! a binary just so we can look at the optimized  assembly
+//! Native zlib-rs and zlib-ng one-shot decompression comparison.
+//! Caller chooses the input and output paths explicitly.
 
-// we use the libz_sys but configure zlib-ng in zlib compat mode
-use libz_sys as libz_ng_sys;
+#[path = "shared/native_uncompress.rs"]
+mod native_uncompress;
 
-use std::{ffi::c_ulong, path::PathBuf};
+use native_uncompress::{uncompress_ng, uncompress_rs, NativeResult};
 
-fn main() {
-    let mut it = std::env::args();
-
-    let _ = it.next().unwrap();
-
-    match it.next().unwrap().as_str() {
-        "ng" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(&path).unwrap();
-
-            let mut dest_vec = vec![0u8; 1 << 28];
-
-            let mut dest_len = dest_vec.len() as c_ulong;
-            let dest = dest_vec.as_mut_ptr();
-
-            let source = input.as_ptr();
-            let source_len = input.len() as _;
-
-            let err =
-                unsafe { libz_ng_sys::uncompress(dest, &raw mut dest_len, source, source_len) };
-
-            assert!(err == 0, "error {err}");
-
-            dest_vec.truncate(dest_len as usize);
-
-            let path = PathBuf::from(path);
-            std::fs::write(path.with_extension(""), &dest_vec).unwrap();
-
-            drop(dest_vec);
-        }
-        "rs" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(&path).unwrap();
-
-            let mut dest_vec = vec![0u8; 1 << 28];
-
-            let mut dest_len = dest_vec.len() as std::ffi::c_ulong;
-            let dest = dest_vec.as_mut_ptr();
-
-            let source = input.as_ptr();
-            let source_len = input.len() as _;
-
-            let err =
-                unsafe { ::libz_rs_sys::uncompress(dest, &raw mut dest_len, source, source_len) };
-
-            assert!(err == 0, "error {err}");
-
-            dest_vec.truncate(dest_len as usize);
-
-            let path = PathBuf::from(path);
-            std::fs::write(path.with_extension(""), &dest_vec).unwrap();
-
-            drop(dest_vec);
-        }
-        other => panic!("invalid option '{other}', expected one of 'rs' or 'ng'"),
+fn main() -> NativeResult<()> {
+    let mut args = std::env::args().skip(1);
+    let backend = args
+        .next()
+        .ok_or("usage: uncompress <ng|rs> <input.zlib> <output>")?;
+    let input_path = args.next().ok_or("missing compressed input path")?;
+    let output_path = args.next().ok_or("missing decompressed output path")?;
+    if args.next().is_some() {
+        return Err("unexpected additional command-line arguments".into());
     }
+
+    let input = std::fs::read(input_path)?;
+    let mut output = vec![0u8; 1 << 28];
+    let produced = match backend.as_str() {
+        "ng" => uncompress_ng(&mut output, &input)?,
+        "rs" => uncompress_rs(&mut output, &input)?,
+        _ => return Err(format!("unknown native decompressor backend: {backend}").into()),
+    };
+    std::fs::write(output_path, &output[..produced])?;
+    println!("decompressed {produced} bytes");
+    Ok(())
 }
