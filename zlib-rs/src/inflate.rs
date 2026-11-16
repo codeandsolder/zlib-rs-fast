@@ -2455,76 +2455,70 @@ impl FastDecodeOutput for InflateOutput<'_> {
         &mut self,
         state: &State<'_>,
         dist: usize,
-        mut len: usize,
+        len: usize,
     ) -> Result<(), &'static str> {
-        let window_size = state.window.size();
-        // max distance in output
-        let written = self.len();
-
-        if dist > written {
-            // Copy from the circular history window
-            if (dist - written) > state.window.have() {
-                if state.flags.contains(Flags::SANE) {
-                    return Err("invalid distance too far back\0");
-                }
-
-                // This cold branch follows the same initialized-history
-                // reconstruction as the ordinary Match decoder. Fast inflate
-                // reserves sufficient output for a whole DEFLATE match.
-                let mut remaining = len;
-                while remaining != 0 {
-                    copy_match_bytes(&state.window, false, dist, &mut remaining, self)?;
-                }
-                return Ok(());
-            }
-
-            let mut op = dist - written;
-            let mut from;
-
-            let window_next = state.window.next();
-
-            if window_next == 0 {
-                // This case is hit when the window has just wrapped around
-                // by logic in `Window::extend`. It is special-cased because
-                // apparently this is quite common.
-                //
-                // the match is at the end of the window, even though the next
-                // position has now wrapped around.
-                from = window_size - op;
-            } else if window_next >= op {
-                // the standard case: a contiguous copy from the window, no wrapping
-                from = window_next - op;
-            } else {
-                // This case is hit when the window has recently wrapped around
-                // by logic in `Window::extend`.
-                //
-                // The match is (partially) at the end of the window
-                op -= window_next;
-                from = window_size - op;
-
-                if op < len {
-                    // This case is hit when part of the match is at the end of the
-                    // window, and part of it has wrapped around to the start. Copy
-                    // the end section here, the start section will be copied below.
-                    len -= op;
-                    self.extend_from_window(&state.window, from..from + op);
-                    from = 0;
-                    op = window_next;
-                }
-            }
-
-            let copy = Ord::min(op, len);
-            self.extend_from_window(&state.window, from..from + copy);
-
-            if op < len {
-                // here we need some bytes from the output itself
-                self.copy_match(dist, len - op);
-            }
-        } else {
+        if dist <= self.len() {
             self.copy_match(dist, len);
+            return Ok(());
         }
-        Ok(())
+        copy_fast_match_from_history(self, state, dist, len)
     }
+}
+
+/// The ordinary fast decoder usually finds the whole reference in the output
+/// produced during this call. Keep history reconstruction and invalid-distance
+/// handling out of that common in-output match-copy path.
+#[cold]
+#[inline(never)]
+fn copy_fast_match_from_history(
+    output: &mut InflateOutput<'_>,
+    state: &State<'_>,
+    dist: usize,
+    mut len: usize,
+) -> Result<(), &'static str> {
+    let written = output.len();
+    debug_assert!(dist > written);
+    let window_size = state.window.size();
+
+    if dist - written > state.window.have() {
+        if state.flags.contains(Flags::SANE) {
+            return Err("invalid distance too far back\0");
+        }
+        // Missing prehistory is materialized as zero bytes only for the
+        // permissive inflateUndermine mode, never read from uninitialized
+        // memory. Fast inflate has space for the full DEFLATE match.
+        let mut remaining = len;
+        while remaining != 0 {
+            copy_match_bytes(&state.window, false, dist, &mut remaining, output)?;
+        }
+        return Ok(());
+    }
+
+    let mut op = dist - written;
+    let mut from;
+
+    let window_next = state.window.next();
+    if window_next == 0 {
+        from = window_size - op;
+    } else if window_next >= op {
+        from = window_next - op;
+    } else {
+        op -= window_next;
+        from = window_size - op;
+        if op < len {
+            len -= op;
+            output.extend_from_window(&state.window, from..from + op);
+            from = 0;
+            op = window_next;
+        }
+    }
+
+    let copy = op.min(len);
+    output.extend_from_window(&state.window, from..from + copy);
+    if op < len {
+        output.copy_match(dist, len - op);
+    }
+    Ok(())
 }
 
 impl FastDecodeOutput for writer::BackWriter<'_> {
