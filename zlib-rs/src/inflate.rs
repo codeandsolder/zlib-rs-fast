@@ -2602,9 +2602,12 @@ fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
 #[inline]
 fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
     state: &mut State,
-    bit_reader: &mut BitReader<'_>,
+    reader: &mut BitReader<'_>,
     output: &mut O,
 ) {
+    // Keep the hot input cursor and reservoir in one local value. This avoids
+    // making every refill/lookup update the caller's borrowed cursor.
+    let mut bit_reader = *reader;
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
     let lcode = state.len_table_ref();
@@ -2703,7 +2706,8 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 let len = here.val + bit_reader.bits_u16(usize::from(op));
                 bit_reader.drop_bits(op);
 
-                if let Err(msg) = decode_fast_distance(state, bit_reader, output, dcode, dmask, len)
+                if let Err(msg) =
+                    decode_fast_distance(state, &mut bit_reader, output, dcode, dmask, len)
                 {
                     bad = Some(msg);
                     state.mode = Mode::Bad;
@@ -2744,6 +2748,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
 
     // return unused bytes (on entry, bits < 8, so in won't go too far back)
     bit_reader.return_unused_bytes();
+    *reader = bit_reader;
 
     if let Some(error_message) = bad {
         debug_assert!(matches!(state.mode, Mode::Bad));
