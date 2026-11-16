@@ -109,7 +109,10 @@ impl<'a> Writer<'a> {
         self.extend(src);
     }
 
-    #[inline]
+    // This is the per-back-reference hot path in fast inflate. Keep the
+    // output cursor visible to the caller: CPU-pinned A/B benchmarks show
+    // that forced inlining recovers substantial decoder throughput.
+    #[inline(always)]
     pub fn copy_match(&mut self, offset_from_end: usize, length: usize) {
         assert_ne!(
             offset_from_end, 0,
