@@ -3659,7 +3659,11 @@ fn emit_planned_near_optimal_block(
 
 /// Encode the planned blocks, wrapper and checksum using a live compressor state.
 /// Allocation and unconditional cleanup belong to the owned API wrapper.
-#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
+#[cfg(any(
+    test,
+    feature = "near-optimal",
+    all(feature = "__internal-api", feature = "rust-allocator")
+))]
 fn encode_near_optimal_with_state(
     state: &mut State<'_>,
     output: &mut [u8],
