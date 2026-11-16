@@ -154,7 +154,7 @@ impl GzBuffer {
         len: usize,
         limit: usize,
     ) -> Option<core::ops::Range<usize>> {
-        let start = (cursor as usize).checked_sub(self.as_ptr() as usize)?;
+        let start = cursor.addr().checked_sub(self.as_ptr().addr())?;
         if start > limit || len > limit - start {
             return None;
         }
@@ -4998,11 +4998,11 @@ mod tests {
             (Putc, true),
             (Close, true),
         ];
+        // One collision-free directory owns every case and is cleaned up on
+        // normal return or assertion unwinding.
+        let temp = tempfile::tempdir().map_err(|_| "failed to create test directory")?;
         for (index, (operation, direct)) in cases.into_iter().enumerate() {
-            let path = std::env::temp_dir().join(format!(
-                "zlib-rs-fast-lazy-zero-{}-{index}.gz",
-                std::process::id()
-            ));
+            let path = temp.path().join(format!("case-{index}.gz"));
             let path_c =
                 CString::new(path.to_string_lossy().as_bytes()).map_err(|_| "invalid test path")?;
             let mode = if direct { &direct_mode } else { &write_mode };
@@ -5056,7 +5056,6 @@ mod tests {
             }
             // SAFETY: gzclose consumes the live reader handle.
             assert_eq!(unsafe { gzclose(reader) }, Z_OK);
-            std::fs::remove_file(path).map_err(|_| "failed to remove temporary gzip file")?;
         }
         Ok(())
     }
@@ -5476,10 +5475,8 @@ mod tests {
 
     #[test]
     fn large_gzip_read_keeps_abi_cursor_in_owned_output() -> Result<(), ()> {
-        let path = std::env::temp_dir().join(format!(
-            "zlib-rs-fast-read-cursor-{}.gz",
-            std::process::id()
-        ));
+        let temp = tempfile::tempdir().map_err(|_| ())?;
+        let path = temp.path().join("read-cursor.gz");
         let path_c = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| ())?;
         let input = vec![b'A'; 8192];
 
@@ -5518,18 +5515,17 @@ mod tests {
         let state = unsafe { reader.cast::<GzState>().as_ref() }.ok_or(())?;
         assert_eq!(state.have, 0);
         let owned = state.output.as_ref().ok_or(())?;
-        let owned_start = owned.as_ptr() as usize;
+        let owned_start = owned.as_ptr().addr();
         let owned_end = owned_start + owned.usable();
-        let next = state.next as usize;
+        let next = state.next.addr();
         assert!((owned_start..=owned_end).contains(&next));
 
-        let caller_start = output.as_ptr() as usize;
+        let caller_start = output.as_ptr().addr();
         let caller_end = caller_start + output.len();
         assert!(!(caller_start..caller_end).contains(&next));
 
         // SAFETY: the handle was returned by gzopen or gzdopen and has not yet been closed; this call consumes the live handle.
         assert_eq!(unsafe { gzclose(reader) }, Z_OK);
-        std::fs::remove_file(path).map_err(|_| ())?;
         Ok(())
     }
 
@@ -5625,7 +5621,7 @@ mod tests {
         assert!(gz_init(&mut state).is_ok());
         let saved_next_in = state.stream.next_in;
         let input = vec![b'A'; state.in_size()];
-        let caller_start = input.as_ptr() as usize;
+        let caller_start = input.as_ptr().addr();
         let caller_end = caller_start + input.len();
 
         let mut input_cursor = GzWriteInput::from_slice(&input);
@@ -5633,7 +5629,7 @@ mod tests {
         assert_eq!(state.err, Z_ERRNO);
         assert_eq!(state.stream.avail_in, 0);
         assert_eq!(state.stream.next_in, saved_next_in);
-        assert!(!(caller_start..caller_end).contains(&(state.stream.next_in as usize)));
+        assert!(!(caller_start..caller_end).contains(&(state.stream.next_in.addr())));
     }
 
     // The test fixtures are already byte arrays with explicit trailing NULs.

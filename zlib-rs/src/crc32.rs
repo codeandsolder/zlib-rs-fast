@@ -256,7 +256,7 @@ mod test {
 
         let mut i = 0;
         let mut flat = FLAT.to_vec();
-        while flat[i..].as_ptr() as usize % 16 != 15 {
+        while flat[i..].as_ptr().addr() % 16 != 15 {
             flat.insert(0, 0);
             i += 1;
         }

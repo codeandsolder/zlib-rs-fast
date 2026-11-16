@@ -264,7 +264,7 @@ impl Allocator<'_> {
         // unit, so these offsets and the eventual payload remain inside the C
         // allocation. Compute padding from the pointer after the metadata prefix.
         let after_prefix = unsafe { ptr.cast::<u8>().add(pointer_bytes) };
-        let remainder = (after_prefix as usize) % layout.align();
+        let remainder = after_prefix.addr() % layout.align();
         let padding = (layout.align() - remainder) % layout.align();
         // SAFETY: padding is smaller than layout.align(), and extra_space reserved
         // that entire alignment unit beyond the pointer metadata prefix.
@@ -278,7 +278,7 @@ impl Allocator<'_> {
         }
         let ptr = aligned.cast::<c_void>();
 
-        debug_assert_eq!(ptr as usize % layout.align(), 0);
+        debug_assert_eq!(ptr.addr() % layout.align(), 0);
 
         ptr
     }
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn misaligned_alloc_callback(
         return core::ptr::null_mut();
     };
     let mut data = vec![0u8; length].into_boxed_slice();
-    let base = data.as_mut_ptr() as usize;
+    let base = data.as_mut_ptr().addr();
     let delta = (ctx.remainder + ctx.modulus - base % ctx.modulus) % ctx.modulus;
     // SAFETY: the allocation reserves one full alignment unit beyond the requested
     // size, so the shifted pointer still has all requested bytes available.
@@ -485,7 +485,7 @@ mod tests {
                 .allocate_raw::<T>()
                 .ok_or("mock allocator failed to return an aligned object")?
                 .as_ptr();
-            assert_eq!(ptr as usize % core::mem::align_of::<T>(), 0);
+            assert_eq!(ptr.addr() % core::mem::align_of::<T>(), 0);
             // SAFETY: the allocation was obtained from allocator for exactly one T.
             unsafe { allocator.deallocate(ptr, 1) };
 
@@ -493,7 +493,7 @@ mod tests {
                 .allocate_slice_raw::<T>(10)
                 .ok_or("mock allocator failed to return an aligned slice")?
                 .as_ptr();
-            assert_eq!(ptr as usize % core::mem::align_of::<T>(), 0);
+            assert_eq!(ptr.addr() % core::mem::align_of::<T>(), 0);
             // SAFETY: the allocation was obtained from allocator for ten Ts.
             unsafe { allocator.deallocate(ptr, 10) };
         }
@@ -565,14 +565,14 @@ mod tests {
             let ptr = allocator
                 .allocate_raw::<T>()
                 .ok_or("overaligned C allocation failed")?;
-            assert_eq!(ptr.as_ptr() as usize % modulus, 0);
+            assert_eq!(ptr.as_ptr().addr() % modulus, 0);
             // SAFETY: the allocation was obtained for exactly one T.
             unsafe { allocator.deallocate(ptr.as_ptr(), 1) };
 
             let ptr = allocator
                 .allocate_slice_raw::<T>(3)
                 .ok_or("overaligned C array allocation failed")?;
-            assert_eq!(ptr.as_ptr() as usize % modulus, 0);
+            assert_eq!(ptr.as_ptr().addr() % modulus, 0);
             let byte_len = mem::size_of::<T>() * 3;
             // SAFETY: the fresh three-element allocation is writable for byte_len
             // bytes; only raw u8 writes/reads are performed, including its last byte.
@@ -607,7 +607,7 @@ mod tests {
             let ptr = RUST
                 .allocate_slice_raw::<T>(count)
                 .ok_or("overaligned Rust allocation failed")?;
-            assert_eq!(ptr.as_ptr() as usize % mem::align_of::<T>(), 0);
+            assert_eq!(ptr.as_ptr().addr() % mem::align_of::<T>(), 0);
             let byte_len = mem::size_of::<T>() * count;
             // SAFETY: the global allocator returned a writable byte_len-byte block.
             unsafe {
@@ -631,7 +631,7 @@ mod tests {
         let ptr = C
             .allocate_slice_raw::<Align4096>(2)
             .ok_or("default C allocator could not provide 4096-byte alignment")?;
-        assert_eq!(ptr.as_ptr() as usize % 4096, 0);
+        assert_eq!(ptr.as_ptr().addr() % 4096, 0);
         // SAFETY: C allocated two Align4096 objects through the generic
         // alignment-prefix path; this returns the exact original C pointer.
         unsafe { C.deallocate(ptr.as_ptr(), 2) };
@@ -713,7 +713,7 @@ mod tests {
         let ptr = allocator
             .allocate_raw::<Align4096>()
             .ok_or("generic path with a mixed callback pair failed")?;
-        assert_eq!(ptr.as_ptr() as usize % typed_layout.align(), 0);
+        assert_eq!(ptr.as_ptr().addr() % typed_layout.align(), 0);
         // SAFETY: this is the pointer returned by the mixed-pair allocator for
         // precisely one Align4096; its free callback releases the original base.
         unsafe { allocator.deallocate(ptr.as_ptr(), 1) };
