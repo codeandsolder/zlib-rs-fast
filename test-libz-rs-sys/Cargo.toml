@@ -11,8 +11,8 @@ publish = false
 
 [features]
 default = ["rust-allocator", "gz"]
-c-allocator = ["libz-rs-sys/c-allocator", "libz-rs-sys/c-allocator"]
-rust-allocator = ["libz-rs-sys/rust-allocator", "libz-rs-sys/rust-allocator"]
+c-allocator = ["libz-rs-sys/c-allocator"]
+rust-allocator = ["libz-rs-sys/rust-allocator"]
 gz = ["libz-rs-sys/gz", "dep:libc"]
 gzprintf = ["libz-rs-sys/gzprintf"]
 lsx = ["zlib-rs/lsx"]

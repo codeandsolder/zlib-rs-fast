@@ -4494,9 +4494,9 @@ mod tests {
                 InflateConfig::default(),
             )
             .map_err(|_| "custom allocator failed to initialize native inflater")?;
-            assert_eq!(source.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(source.state.as_ptr().addr() % ALLOCATION_BLOCK_BYTES, 0);
             assert_eq!(
-                source.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
+                source.state.window.as_ptr().addr() % ALLOCATION_BLOCK_BYTES,
                 0
             );
             // Both layouts put State at the exact typed allocation start, and
@@ -4504,13 +4504,13 @@ mod tests {
             let layout = InflateAllocOffsets::with_window();
             let window_pos = layout.window_pos.ok_or("regular window offset missing")?;
             assert_eq!(
-                source.state.as_ptr() as usize,
-                source.state.allocation_start as usize
+                source.state.as_ptr().addr(),
+                source.state.allocation_start.addr()
             );
             assert_eq!(source.state.total_allocation_size, layout.total_size);
             assert_eq!(
-                source.state.window.as_ptr() as usize,
-                source.state.allocation_start as usize + window_pos
+                source.state.window.as_ptr().addr(),
+                source.state.allocation_start.addr() + window_pos
             );
 
             let mut cloned_raw = MaybeUninit::<InflateStream>::uninit();
@@ -4519,20 +4519,20 @@ mod tests {
             // independently allocated native state. Owning the cloned value
             // releases it automatically if an invariant check fails.
             let mut cloned = unsafe { cloned_raw.assume_init() };
-            assert_eq!(cloned.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(cloned.state.as_ptr().addr() % ALLOCATION_BLOCK_BYTES, 0);
             assert_eq!(
-                cloned.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
+                cloned.state.window.as_ptr().addr() % ALLOCATION_BLOCK_BYTES,
                 0
             );
             assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
             assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
             assert_eq!(
-                cloned.state.as_ptr() as usize,
-                cloned.state.allocation_start as usize
+                cloned.state.as_ptr().addr(),
+                cloned.state.allocation_start.addr()
             );
             assert_eq!(
-                cloned.state.window.as_ptr() as usize,
-                cloned.state.allocation_start as usize + window_pos
+                cloned.state.window.as_ptr().addr(),
+                cloned.state.allocation_start.addr() + window_pos
             );
             assert!(end(&mut cloned).state.is_null());
             assert!(end(&mut source).state.is_null());
@@ -4559,10 +4559,10 @@ mod tests {
             // detaches the caller-provided history window before releasing that state.
             let back = (unsafe { InflateStream::from_back_stream_mut(&raw mut back_raw) })
                 .ok_or("callback inflater state missing")?;
-            assert_eq!(back.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(back.state.as_ptr().addr() % ALLOCATION_BLOCK_BYTES, 0);
             assert_eq!(
-                back.state.as_ptr() as usize,
-                back.state.allocation_start as usize
+                back.state.as_ptr().addr(),
+                back.state.allocation_start.addr()
             );
             assert_eq!(
                 back.state.total_allocation_size,
