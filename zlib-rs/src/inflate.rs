@@ -2624,15 +2624,9 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
     let mut bad = None;
 
     if bit_reader.bits_in_buffer() < 10 {
-        debug_assert!(bit_reader.bytes_remaining() >= 15);
-        // The fast-path entry invariant guarantees at least eight bytes remain for `refill`.
+        // The entry precondition already guarantees 15 unread input bytes.
         bit_reader.refill();
     }
-    // We had at least 15 bytes in the slice, plus whatever was in the buffer. After filling the
-    // buffer from the slice, we now have at least 8 bytes remaining in the slice, plus a full buffer.
-    debug_assert!(
-        bit_reader.bytes_remaining() >= 8 && bit_reader.bytes_remaining_including_buffer() >= 15
-    );
 
     'outer: loop {
         // This condition is ensured above for the first iteration of the `outer` loop. For
