@@ -389,6 +389,21 @@ fn longest_match_help<const SLOW: bool>(
 
     let early_exit = !SLOW && params.level < EARLY_EXIT_TRIGGER_LEVEL;
 
+    // The first eight scan bytes remain the same for the entire search.
+    // The tail probe changes only when a candidate improves best_len.
+    // Cache scan-side words instead of loading them once per hash link.
+    let max_scan_len = params.lookahead.min(STD_MAX_MATCH);
+    let scan_first = if max_scan_len >= 8 {
+        load_u64_le(scan, 0)
+    } else {
+        0
+    };
+    let mut scan_tail = if best_len >= 8 && best_len < max_scan_len {
+        load_u64_le(scan, best_len + 1 - 8)
+    } else {
+        0
+    };
+
     while let Some(candidate_pos) = cursor.candidate_start() {
         let candidate_start = usize::from(candidate_pos);
         if candidate_start >= params.strstart {
@@ -403,7 +418,7 @@ fn longest_match_help<const SLOW: bool>(
         let candidate = &resources.initialized[candidate_start..candidate_start + max_len];
         let scan = &scan[..max_len];
 
-        let len = match probe_candidate(scan, candidate, best_len) {
+        let len = match probe_candidate_cached(scan, candidate, best_len, scan_first, scan_tail) {
             CandidateProbe::Reject => {
                 let Some(next) = next_in_chain(
                     cursor,
@@ -431,6 +446,9 @@ fn longest_match_help<const SLOW: bool>(
             }
 
             best_len = len;
+            if best_len >= 8 && best_len < max_scan_len {
+                scan_tail = load_u64_le(scan, best_len + 1 - 8);
+            }
             if best_len >= usize::from(params.nice_match) {
                 return MatchSearchResult::new(best_len, match_start);
             }
@@ -570,8 +588,31 @@ enum CandidateProbe {
     CompareFrom(usize),
 }
 
-#[inline]
+/// Test-facing uncached entrypoint. Production reuses the invariant scan
+/// words across all candidates and updates the tail only as best_len grows.
+#[cfg(test)]
 fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateProbe {
+    let first = if scan.len() >= 8 {
+        load_u64_le(scan, 0)
+    } else {
+        0
+    };
+    let tail = if best_len >= 8 && best_len < scan.len() {
+        load_u64_le(scan, best_len + 1 - 8)
+    } else {
+        0
+    };
+    probe_candidate_cached(scan, candidate, best_len, first, tail)
+}
+
+#[inline]
+fn probe_candidate_cached(
+    scan: &[u8],
+    candidate: &[u8],
+    best_len: usize,
+    scan_first: u64,
+    scan_tail: u64,
+) -> CandidateProbe {
     debug_assert_eq!(scan.len(), candidate.len());
     debug_assert!(best_len < scan.len());
 
@@ -582,7 +623,7 @@ fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateP
         return CandidateProbe::CompareFrom(0);
     }
 
-    let first_diff = load_u64_le(scan, 0) ^ load_u64_le(candidate, 0);
+    let first_diff = scan_first ^ load_u64_le(candidate, 0);
 
     if best_len < 8 {
         if first_diff == 0 {
@@ -605,7 +646,7 @@ fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateP
     // those bytes as one word, just as the historical hot loop did, then let the exact SIMD matcher
     // cover the gap between the known-equal first word and this tail probe.
     let tail_start = best_len + 1 - 8;
-    if load_u64_le(scan, tail_start) != load_u64_le(candidate, tail_start) {
+    if scan_tail != load_u64_le(candidate, tail_start) {
         return CandidateProbe::Reject;
     }
 
@@ -875,6 +916,34 @@ mod tests {
             CandidateProbe::CompareFrom(0)
         );
         assert_eq!(common_match_length(&scan, &candidate), 5);
+    }
+
+    #[test]
+    fn cached_probe_matches_original_across_tail_refreshes() {
+        // Exercise widths that cross the 8-byte fast-probe boundary and
+        // every match length near the DEFLATE maximum. A changing best_len
+        // must never leave an obsolete scan-tail word in the next probe.
+        for width in [7, 8, 9, 16, 32, STD_MAX_MATCH] {
+            let scan = vec![b'a'; width];
+            let mut candidate = scan.clone();
+            let scan_first = if width >= 8 { load_u64_le(&scan, 0) } else { 0 };
+            for best_len in (0..width).filter(|n| *n < 10 || *n % 13 == 0 || *n + 1 == width) {
+                let scan_tail = if best_len >= 8 {
+                    load_u64_le(&scan, best_len + 1 - 8)
+                } else {
+                    0
+                };
+                for mismatch in 0..width {
+                    candidate[mismatch] = b'b';
+                    assert_eq!(
+                        probe_candidate_cached(&scan, &candidate, best_len, scan_first, scan_tail),
+                        probe_candidate(&scan, &candidate, best_len),
+                        "width={width} best_len={best_len} mismatch={mismatch}"
+                    );
+                    candidate[mismatch] = b'a';
+                }
+            }
+        }
     }
 
     #[test]
