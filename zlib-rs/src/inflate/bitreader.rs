@@ -146,11 +146,12 @@ pub struct BitReader<'input> {
     input: &'input [u8],
     position: usize,
     bits: BitBuffer,
-    // Trailing bytes pulled into this call's reservoir after the last direct input skip.
-    // On entry the reservoir may already hold whole bytes supplied by inflatePrime, which
-    // must never be refunded to the current input pointer. Direct input skips also break
-    // the contiguous suffix of bytes eligible for a rewind.
-    loaded_input_bytes: usize,
+    // Start of the contiguous suffix eligible for bit-reservoir rewind.
+    // The fast path can advance position without separately incrementing
+    // an accounting counter on every refill. A direct input skip starts a
+    // new epoch; bytes supplied before this call (including inflatePrime)
+    // cannot be refunded into the current input.
+    rewind_epoch: usize,
 }
 
 impl<'input> BitReader<'input> {
@@ -159,7 +160,7 @@ impl<'input> BitReader<'input> {
             input,
             position: 0,
             bits,
-            loaded_input_bytes: 0,
+            rewind_epoch: 0,
         }
     }
 
@@ -173,7 +174,7 @@ impl<'input> BitReader<'input> {
         if next != self.position {
             // Bytes buffered before a direct skip are no longer a contiguous suffix of
             // the input. Keep their bits resident rather than rewinding over skipped bytes.
-            self.loaded_input_bytes = 0;
+            self.rewind_epoch = next;
             self.position = next;
         }
     }
@@ -222,7 +223,6 @@ impl<'input> BitReader<'input> {
             return Err(ReturnCode::Ok);
         };
         self.position += 1;
-        self.loaded_input_bytes += 1;
         self.bits.prime(8, u64::from(byte));
         Ok(byte)
     }
@@ -247,7 +247,6 @@ impl<'input> BitReader<'input> {
         ]);
         let loaded_bytes = self.bits.refill_from_word(lookahead);
         self.position += loaded_bytes;
-        self.loaded_input_bytes += loaded_bytes;
     }
 
     #[inline]
@@ -287,9 +286,9 @@ impl<'input> BitReader<'input> {
     /// Neither source is eligible for a rewind.
     #[inline]
     pub fn return_unused_bytes(&mut self) {
-        let bytes = usize::from(self.bits.bits_used >> 3).min(self.loaded_input_bytes);
+        let eligible_bytes = self.position - self.rewind_epoch;
+        let bytes = usize::from(self.bits.bits_used >> 3).min(eligible_bytes);
         self.position -= bytes;
-        self.loaded_input_bytes -= bytes;
         // At most seven whole bytes are refundable. Account for them in the
         // reservoir's native bit-count domain rather than narrowing a host index.
         for _ in 0..bytes {
