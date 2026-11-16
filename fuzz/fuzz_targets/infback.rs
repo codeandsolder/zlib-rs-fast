@@ -24,23 +24,45 @@ fn differential_inflate_back<const CHUNK: usize>(input: &[u8]) {
     let ng_out = run_inflate_back_ng::<CHUNK>(input, window_bits);
     let rs_out = run_inflate_back_rs::<CHUNK>(input, window_bits);
 
-    if let (Ok(ng_out), Ok(rs_out)) = (&ng_out, &rs_out) {
-        assert_eq!(ng_out.len(), rs_out.len());
-
-        for (i, (a, b)) in ng_out.iter().zip(rs_out).enumerate() {
-            if a != b {
-                println!("{:?}", &ng_out[i..]);
-                println!("{:?}", &rs_out[i..]);
-            }
-
-            assert_eq!(a, b, "failed at position {} of {}", i, ng_out.len());
+    // Error-code parity is not a valid property for malformed streams:
+    // zlib-ng built without INFLATE_STRICT may read uninitialized back-history
+    // and report an eventual input-shortage (Z_BUF_ERROR), while zlib-rs
+    // safely rejects the invalid distance (Z_DATA_ERROR).
+    //
+    // Always compare successful bytes exactly, and treat disagreement about
+    // whether a stream is valid as a real differential failure.
+    match (ng_out, rs_out) {
+        (Ok(expected), Ok(actual)) => {
+            assert_eq!(
+                actual, expected,
+                "inflateBack output mismatch for window_bits = {window_bits}, CHUNK = {CHUNK}",
+            );
+        }
+        (Err(_), Err(_)) => {}
+        (Ok(reference), Err(libz_rs_sys::Z_DATA_ERROR)) => {
+            // zlib-ng without INFLATE_STRICT can finish a stream by copying
+            // bytes from history that has never been initialized. Verify the
+            // input through the separate ordinary raw-DEFLATE inflate path
+            // before accepting this specific non-strict reference success.
+            // A valid stream rejected only by inflateBack remains a crash.
+            let mut ordinary_output = vec![0; reference.len().saturating_add(1)];
+            let (_, status) = zlib_rs::decompress_slice(
+                &mut ordinary_output,
+                input,
+                zlib_rs::InflateConfig { window_bits: -15 },
+            );
+            assert_eq!(
+                status,
+                zlib_rs::ReturnCode::DataError,
+                "inflateBack rejected an input not rejected by ordinary raw inflate; CHUNK={CHUNK}",
+            );
+        }
+        (reference, ours) => {
+            panic!(
+                "inflateBack success/failure mismatch for window_bits = {window_bits}, CHUNK = {CHUNK}: reference={reference:?}, ours={ours:?}",
+            );
         }
     }
-
-    assert_eq!(
-        ng_out, rs_out,
-        "inflateBack mismatch for window_bits = {window_bits}, CHUNK = {CHUNK}",
-    );
 }
 
 /// Shared input context for the inflateBack `in` callback.

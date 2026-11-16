@@ -1,247 +1,51 @@
-//! a binary just so we can look at the optimized assembly
+//! Native C ABI compression comparison with explicit, caller-owned output files.
 
-use std::ffi::{c_int, c_uint};
-use std::{collections::hash_map::DefaultHasher, env::temp_dir, hash::Hash};
+#[path = "shared/native_deflate.rs"]
+mod native_deflate;
 
-// we use the libz_sys but configure zlib-ng in zlib compat mode
-use libz_sys as libz_ng_sys;
+use native_deflate::{compress_ng, compress_rs, NativeResult};
 
-use zlib_rs::{DeflateFlush, ReturnCode};
+const OUTPUT_CAPACITY: usize = 1 << 28;
 
-fn main() {
-    let mut it = std::env::args();
+fn main() -> NativeResult<()> {
+    let mut args = std::env::args().skip(1);
+    let command = args.next().ok_or(
+        "usage: compress <ng|rs> <level> <input> <output> | compress compare <output-ng> <output-rs>",
+    )?;
 
-    let _ = it.next().unwrap();
-
-    let level: i32 = it.next().unwrap().parse().unwrap();
-
-    let mut hasher = DefaultHasher::new();
-    use std::hash::Hasher;
-
-    match it.next().unwrap().as_str() {
-        "ng" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(path).unwrap();
-
-            let mut dest_vec = vec![0u8; 1 << 28];
-            let mut dest_len = dest_vec.len();
-
-            let err = compress_ng(&mut dest_vec, &mut dest_len, &input, level);
-
-            if err != ReturnCode::Ok {
-                panic!("error {err:?}");
-            }
-
-            dest_vec.truncate(dest_len);
-
-            dest_vec.hash(&mut hasher);
-            dbg!(hasher.finish());
-
-            std::fs::write(temp_dir().join("ng.txt"), &dest_vec).unwrap();
-
-            drop(dest_vec)
+    if command == "compare" {
+        let ng = std::fs::read(args.next().ok_or("missing ng compressed file")?)?;
+        let rs = std::fs::read(args.next().ok_or("missing rs compressed file")?)?;
+        if args.next().is_some() {
+            return Err("unexpected extra arguments".into());
         }
-        "rs" => {
-            let path = it.next().unwrap();
-            let Ok(input) = std::fs::read(&path) else {
-                panic!("could not read file {path:?}");
-            };
-
-            let mut dest_vec = vec![0u8; 1 << 28];
-            let mut dest_len = dest_vec.len();
-
-            let err = compress_rs(&mut dest_vec, &mut dest_len, &input, level);
-
-            if err != ReturnCode::Ok {
-                panic!("error {err:?}");
-            }
-
-            dest_vec.truncate(dest_len);
-
-            dest_vec.hash(&mut hasher);
-            dbg!(hasher.finish());
-
-            std::fs::write(temp_dir().join("rs.txt"), &dest_vec).unwrap();
-
-            drop(dest_vec)
-        }
-        "qq" => {
-            let ng = std::fs::read(temp_dir().join("ng.txt")).unwrap();
-            let rs = std::fs::read(temp_dir().join("rs.txt")).unwrap();
-
-            for (i, (a, b)) in (ng.iter().zip(rs.iter())).enumerate() {
-                if a != b {
-                    panic!("index {i}");
-                }
-            }
-        }
-        other => panic!("invalid option '{other}', expected one of 'rs' or 'ng'"),
-    }
-}
-
-const METHOD: i32 = zlib_rs::c_api::Z_DEFLATED;
-const WINDOW_BITS: i32 = 15;
-const MEM_LEVEL: i32 = 8;
-const STRATEGY: i32 = zlib_rs::c_api::Z_DEFAULT_STRATEGY;
-
-fn compress_rs(
-    dest: &mut [u8],
-    dest_len: &mut usize,
-    source: &[u8],
-    //
-    level: i32,
-) -> ReturnCode {
-    use libz_rs_sys::{deflate, deflateEnd, deflateInit2_, z_stream, zlibVersion};
-
-    let mut stream = z_stream {
-        next_in: source.as_ptr() as *mut u8,
-        avail_in: 0, // for special logic in the first  iteration
-        total_in: 0,
-        next_out: dest.as_mut_ptr(),
-        avail_out: 0, // for special logic on the first iteration
-        total_out: 0,
-        msg: std::ptr::null_mut(),
-        state: std::ptr::null_mut(),
-        zalloc: Some(zlib_rs::allocate::C.zalloc),
-        zfree: Some(zlib_rs::allocate::C.zfree),
-        opaque: std::ptr::null_mut(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
-    };
-
-    let err = {
-        let strm: *mut z_stream = &mut stream;
-        unsafe {
-            deflateInit2_(
-                strm,
-                level,
-                METHOD,
-                WINDOW_BITS,
-                MEM_LEVEL,
-                STRATEGY,
-                zlibVersion(),
-                std::mem::size_of::<z_stream>() as c_int,
+        if ng != rs {
+            let mismatch = ng.iter().zip(&rs).position(|(left, right)| left != right);
+            return Err(format!(
+                "compressed streams differ: ng length {}, rs length {}, first mismatch {mismatch:?}",
+                ng.len(),
+                rs.len()
             )
+            .into());
         }
+        println!("identical compressed streams: {} bytes", ng.len());
+        return Ok(());
+    }
+
+    let level: i32 = args.next().ok_or("missing compression level")?.parse()?;
+    let input = std::fs::read(args.next().ok_or("missing input path")?)?;
+    let output_path = args.next().ok_or("missing output path")?;
+    if args.next().is_some() {
+        return Err("unexpected extra arguments".into());
+    }
+
+    let mut output = vec![0u8; OUTPUT_CAPACITY];
+    let produced = match command.as_str() {
+        "ng" => compress_ng(&mut output, &input, level)?,
+        "rs" => compress_rs(&mut output, &input, level)?,
+        _ => return Err(format!("unknown native compressor: {command}").into()),
     };
-
-    if ReturnCode::from(err) != ReturnCode::Ok {
-        return ReturnCode::from(err);
-    }
-
-    let max = c_uint::MAX as usize;
-
-    let mut left = dest.len();
-    let mut source_len = source.len();
-
-    loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, max) as _;
-            left -= stream.avail_out as usize;
-        }
-
-        if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(source_len, max) as _;
-            source_len -= stream.avail_in as usize;
-        }
-
-        let flush = if source_len > 0 {
-            DeflateFlush::NoFlush
-        } else {
-            DeflateFlush::Finish
-        };
-
-        let err = unsafe { deflate(&mut stream, flush as i32) };
-        if ReturnCode::from(err) != ReturnCode::Ok {
-            break;
-        }
-    }
-
-    *dest_len = stream.total_out as _;
-
-    unsafe { deflateEnd(&mut stream) };
-
-    ReturnCode::Ok
-}
-
-fn compress_ng(
-    dest: &mut [u8],
-    dest_len: &mut usize,
-    source: &[u8],
-    //
-    level: i32,
-) -> ReturnCode {
-    use libz_ng_sys::{deflate, deflateEnd, deflateInit2_, z_stream, zlibVersion};
-
-    let mut stream = z_stream {
-        next_in: source.as_ptr() as *mut u8,
-        avail_in: 0, // for special logic in the first  iteration
-        total_in: 0,
-        next_out: dest.as_mut_ptr(),
-        avail_out: 0, // for special logic on the first iteration
-        total_out: 0,
-        msg: std::ptr::null_mut(),
-        state: std::ptr::null_mut(),
-        zalloc: zlib_rs::allocate::C.zalloc,
-        zfree: zlib_rs::allocate::C.zfree,
-        opaque: std::ptr::null_mut(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
-    };
-
-    let err = {
-        let strm: *mut z_stream = &mut stream;
-        unsafe {
-            deflateInit2_(
-                strm,
-                level,
-                METHOD,
-                WINDOW_BITS,
-                MEM_LEVEL,
-                STRATEGY,
-                zlibVersion(),
-                std::mem::size_of::<z_stream>() as c_int,
-            )
-        }
-    };
-
-    if ReturnCode::from(err) != ReturnCode::Ok {
-        return ReturnCode::from(err);
-    }
-
-    let max = c_uint::MAX as usize;
-
-    let mut left = dest.len();
-    let mut source_len = source.len();
-
-    loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, max) as _;
-            left -= stream.avail_out as usize;
-        }
-
-        if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(source_len, max) as _;
-            source_len -= stream.avail_in as usize;
-        }
-
-        let flush = if source_len > 0 {
-            DeflateFlush::NoFlush
-        } else {
-            DeflateFlush::Finish
-        };
-
-        let err = unsafe { deflate(&mut stream, flush as i32) };
-        if ReturnCode::from(err) != ReturnCode::Ok {
-            break;
-        }
-    }
-
-    *dest_len = stream.total_out as _;
-
-    unsafe { deflateEnd(&mut stream) };
-
-    ReturnCode::Ok
+    std::fs::write(output_path, &output[..produced])?;
+    println!("compressed {produced} bytes");
+    Ok(())
 }

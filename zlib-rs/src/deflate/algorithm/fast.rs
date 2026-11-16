@@ -4,7 +4,9 @@ use super::{
     BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN,
 };
 use crate::deflate::hash_calc::StandardHashCalc;
-use crate::deflate::longest_match::{MatchSearchKind, MatchSearchResult, MatchSearchWork};
+use crate::deflate::longest_match::{
+    MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
+};
 use crate::deflate::{State, MIN_LOOKAHEAD, STD_MIN_MATCH, WANT_MIN_MATCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +27,7 @@ pub(super) struct FastProducer {
 }
 
 impl FastProducer {
-    pub(super) fn new(match_source: MatchSourceKind) -> Self {
+    pub(super) const fn new(match_source: MatchSourceKind) -> Self {
         Self {
             phase: FastPhase::Ready,
             match_source,
@@ -39,7 +41,7 @@ impl TokenProducer for FastProducer {
             if let FastPhase::SearchReady { literal, result } = self.phase {
                 self.phase = FastPhase::Ready;
                 state.match_start = result.start;
-                let mut match_len = result.length;
+                let mut match_len = usize::from(result.length);
 
                 if match_len >= WANT_MIN_MATCH {
                     let block_ready = state.tally_dist(
@@ -87,11 +89,9 @@ impl TokenProducer for FastProducer {
                 continue;
             }
 
-            assert_eq!(
-                self.phase,
-                FastPhase::Ready,
-                "fast producer cannot advance while match search is outstanding"
-            );
+            if self.phase != FastPhase::Ready {
+                return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
+            }
 
             if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
                 return ProduceStatus::NeedInput;
@@ -104,30 +104,27 @@ impl TokenProducer for FastProducer {
                     return ProduceStatus::MatchSearch(MatchSearchWork::external());
                 }
 
-                let value = u32::from_le_bytes(
-                    state.window.filled()[state.strstart..state.strstart + 4]
-                        .try_into()
-                        .expect("fast deflate probes four initialized bytes"),
-                );
+                let value =
+                    StandardHashCalc::first_four_bytes(&state.window.filled()[state.strstart..]);
+                // The low byte of this little-endian four-byte probe is exactly
+                // the literal at strstart; keep its byte identity explicit.
+                let literal = value.to_le_bytes()[0];
                 let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, value);
-                let distance = state.strstart as isize - hash_head as isize;
 
-                if (1..=state.max_dist() as isize).contains(&distance) && hash_head != 0 {
+                if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                     let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
                     if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
-                        let result = work.request(state).execute();
-                        self.phase = FastPhase::SearchReady {
-                            literal: value as u8,
-                            result,
+                        let result = match work.request(state) {
+                            Ok(request) => request.execute(),
+                            Err(error) => return ProduceStatus::MatchSearchError(error),
                         };
+                        self.phase = FastPhase::SearchReady { literal, result };
                         continue;
                     }
-                    self.phase = FastPhase::AwaitingSearch {
-                        literal: value as u8,
-                    };
+                    self.phase = FastPhase::AwaitingSearch { literal };
                     return ProduceStatus::MatchSearch(work);
                 }
-                value as u8
+                literal
             } else {
                 state.window.filled()[state.strstart]
             };
@@ -141,11 +138,16 @@ impl TokenProducer for FastProducer {
         }
     }
 
-    fn complete_match_search(&mut self, _state: &mut State<'_>, result: MatchSearchResult) {
+    fn complete_match_search(
+        &mut self,
+        _state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
         let FastPhase::AwaitingSearch { literal } = self.phase else {
-            panic!("fast producer received a match result without an outstanding search");
+            return Err(MatchSearchError::UnexpectedMatchResult);
         };
         self.phase = FastPhase::SearchReady { literal, result };
+        Ok(())
     }
 
     fn finish(&mut self, state: &mut State<'_>) -> usize {
@@ -155,5 +157,53 @@ impl TokenProducer for FastProducer {
             "fast producer cannot finish while match search is outstanding"
         );
         state.strstart.min(STD_MIN_MATCH - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_result_completion_rejects_wrong_phase_without_mutating_state(
+    ) -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(2))?;
+        let mut producer = FastProducer::new(MatchSourceKind::HashChain);
+        let result = MatchSearchResult::new(4, 1);
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        assert_eq!(producer.phase, FastPhase::Ready);
+
+        producer.phase = FastPhase::AwaitingSearch { literal: b'a' };
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Ok(())
+        );
+        assert!(matches!(
+            producer.phase,
+            FastPhase::SearchReady { literal: b'a', result: found } if found == result
+        ));
+        assert_eq!(
+            producer.complete_match_search(&mut stream.state, result),
+            Err(MatchSearchError::UnexpectedMatchResult)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unfinished_match_search_is_a_typed_error() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(2))?;
+        let mut producer = FastProducer::new(MatchSourceKind::HashChain);
+        producer.phase = FastPhase::AwaitingSearch { literal: b'a' };
+        assert!(matches!(
+            producer.produce(&mut stream.state, false),
+            ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch)
+        ));
+        Ok(())
     }
 }

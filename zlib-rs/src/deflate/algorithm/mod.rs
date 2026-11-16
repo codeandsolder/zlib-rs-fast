@@ -1,7 +1,9 @@
 use crate::{
     deflate::{
         drain_pending_output, fill_window_core, fill_window_core_with_hash_maintenance,
-        longest_match::{execute_match_search_batch, MatchSearchResult, MatchSearchWork},
+        longest_match::{
+            execute_match_search_batch, MatchSearchError, MatchSearchResult, MatchSearchWork,
+        },
         BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, StreamChecksum,
         MIN_LOOKAHEAD,
     },
@@ -69,7 +71,7 @@ pub(super) enum BlockContinuation {
 }
 
 impl BlockContinuation {
-    fn apply(self, state: &mut State<'_>) {
+    const fn apply(self, state: &mut State<'_>) {
         match self {
             Self::None => {}
             Self::AdvanceLazyMatch { match_len } => {
@@ -85,6 +87,7 @@ impl BlockContinuation {
 pub(super) enum ProduceStatus {
     NeedInput,
     MatchSearch(MatchSearchWork),
+    MatchSearchError(MatchSearchError),
     BlockReady(BlockContinuation),
 }
 
@@ -99,7 +102,7 @@ pub(super) struct TokenBlockWork {
 }
 
 impl TokenBlockWork {
-    fn new(continuation: BlockContinuation) -> Self {
+    const fn new(continuation: BlockContinuation) -> Self {
         Self { continuation }
     }
 
@@ -126,7 +129,7 @@ pub(super) struct EndOfInputWork {
 }
 
 impl EndOfInputWork {
-    fn new(insert: usize) -> Self {
+    const fn new(insert: usize) -> Self {
         Self { insert }
     }
 
@@ -164,8 +167,12 @@ pub(super) trait TokenProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus;
 
     /// Consume a scheduler-computed match-search result for a producer that yielded one.
-    fn complete_match_search(&mut self, _state: &mut State<'_>, _result: MatchSearchResult) {
-        panic!("producer received a match-search result it did not request");
+    fn complete_match_search(
+        &mut self,
+        _state: &mut State<'_>,
+        _result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
+        Err(MatchSearchError::UnexpectedMatchResult)
     }
 
     /// A refill may slide the window, invalidating speculative positions cached by a producer.
@@ -191,7 +198,7 @@ enum StandardProducerKind {
 }
 
 impl StandardProducer {
-    fn for_algorithm(
+    const fn for_algorithm(
         algorithm: Algorithm,
         state: &State<'_>,
         match_source: MatchSourceKind,
@@ -233,7 +240,11 @@ impl TokenProducer for StandardProducer {
         }
     }
 
-    fn complete_match_search(&mut self, state: &mut State<'_>, result: MatchSearchResult) {
+    fn complete_match_search(
+        &mut self,
+        state: &mut State<'_>,
+        result: MatchSearchResult,
+    ) -> Result<(), MatchSearchError> {
         match &mut self.0 {
             StandardProducerKind::Fast(producer) => producer.complete_match_search(state, result),
             StandardProducerKind::Medium(producer) => producer.complete_match_search(state, result),
@@ -351,14 +362,14 @@ impl StandardCore {
         &mut self,
         state: &mut State<'_>,
         result: MatchSearchResult,
-    ) {
-        assert_eq!(
-            self.phase,
-            StandardPhase::NeedsMatchSearch,
-            "match-search completion requires outstanding search work"
-        );
-        self.producer.complete_match_search(state, result);
+    ) -> Result<(), MatchSearchError> {
+        if self.phase != StandardPhase::NeedsMatchSearch {
+            return Err(MatchSearchError::UnexpectedMatchResult);
+        }
+        // Keep the core waiting if the concrete producer rejects this completion.
+        self.producer.complete_match_search(state, result)?;
         self.phase = StandardPhase::Producing;
+        Ok(())
     }
 
     pub(super) fn satisfy_input(
@@ -452,14 +463,14 @@ pub(super) enum StandardSegmentMode {
 }
 
 impl StandardSegmentMode {
-    fn input_completion(self) -> InputCompletion {
+    const fn input_completion(self) -> InputCompletion {
         match self {
             Self::Continue => InputCompletion::MoreMayArrive,
             Self::FlushBoundary | Self::Final => InputCompletion::EndOfSegment,
         }
     }
 
-    fn end_kind(self) -> Option<EndBlockKind> {
+    const fn end_kind(self) -> Option<EndBlockKind> {
         match self {
             Self::Continue => None,
             Self::FlushBoundary => Some(EndBlockKind::FlushBoundary),
@@ -485,8 +496,10 @@ struct PendingDrain {
 pub(super) enum StandardTurnOutcome {
     Progress,
     MatchSearch(MatchSearchWork),
+    MatchSearchError(MatchSearchError),
     NeedMoreCallerInput,
     NeedMoreOutput { final_block: bool },
+    InvalidSegmentMode,
     SegmentDone(EndBlockKind),
 }
 
@@ -527,7 +540,7 @@ impl StandardDriver {
         self.step_inner(state, input, output, checksum, mode)
     }
 
-    #[inline(always)]
+    #[inline]
     fn step_inner(
         &mut self,
         state: &mut State<'_>,
@@ -536,6 +549,18 @@ impl StandardDriver {
         checksum: &mut StreamChecksum,
         mode: StandardSegmentMode,
     ) -> StandardTurnOutcome {
+        enum OwnedCoreEvent {
+            NeedInput(InputDemand),
+            TokenBlockReady(TokenBlockWork),
+            EndOfInput(EndOfInputWork),
+        }
+
+        // Once a segment has reached its final tail, the same driver cannot
+        // resume that segment as an open-ended input stream.
+        if mode == StandardSegmentMode::Continue && self.core.input_phase == InputPhase::FinalTail {
+            return StandardTurnOutcome::InvalidSegmentMode;
+        }
+
         if let Some(pending) = self.pending_drain.take() {
             return match self.core.drain_output(state, output, pending.work) {
                 PendingOutputOutcome::Ready => match pending.after {
@@ -554,14 +579,11 @@ impl StandardDriver {
             };
         }
 
-        enum OwnedCoreEvent {
-            NeedInput(InputDemand),
-            TokenBlockReady(TokenBlockWork),
-            EndOfInput(EndOfInputWork),
-        }
-
         let event = match self.core.next_event(state) {
             CoreEvent::MatchSearch(request) => return StandardTurnOutcome::MatchSearch(request),
+            CoreEvent::MatchSearchError(error) => {
+                return StandardTurnOutcome::MatchSearchError(error)
+            }
             CoreEvent::NeedInput(demand) => OwnedCoreEvent::NeedInput(demand),
             CoreEvent::TokenBlockReady(work) => OwnedCoreEvent::TokenBlockReady(work),
             CoreEvent::EndOfInput(work) => OwnedCoreEvent::EndOfInput(work),
@@ -590,9 +612,9 @@ impl StandardDriver {
                 StandardTurnOutcome::Progress
             }
             OwnedCoreEvent::EndOfInput(work) => {
-                let kind = mode
-                    .end_kind()
-                    .expect("end-of-input requires a segment-ending scheduler mode");
+                let Some(kind) = mode.end_kind() else {
+                    return StandardTurnOutcome::InvalidSegmentMode;
+                };
                 match self.core.encode_end_of_input(state, work, kind) {
                     Some(work) => {
                         self.pending_drain = Some(PendingDrain {
@@ -611,8 +633,8 @@ impl StandardDriver {
         &mut self,
         state: &mut State<'_>,
         result: MatchSearchResult,
-    ) {
-        self.core.complete_match_search(state, result);
+    ) -> Result<(), MatchSearchError> {
+        self.core.complete_match_search(state, result)
     }
 }
 
@@ -623,13 +645,13 @@ pub(super) struct InputDemand {
 }
 
 impl InputDemand {
-    fn new(preferred_lookahead: usize) -> Self {
+    const fn new(preferred_lookahead: usize) -> Self {
         Self {
             preferred_lookahead,
         }
     }
 
-    fn is_satisfied(self, state: &State<'_>) -> bool {
+    const fn is_satisfied(self, state: &State<'_>) -> bool {
         state.lookahead >= self.preferred_lookahead
     }
 }
@@ -641,6 +663,8 @@ pub(super) enum CoreEvent {
     NeedInput(InputDemand),
     /// The producer has paused on immutable longest-match work that may execute elsewhere.
     MatchSearch(MatchSearchWork),
+    /// The producer saw an inconsistent hash-chain search snapshot.
+    MatchSearchError(MatchSearchError),
     /// A complete resident token block is ready to run as one owned block-encoding action.
     TokenBlockReady(TokenBlockWork),
     /// No more input remains for this call; orchestration must close this input segment.
@@ -657,6 +681,11 @@ fn next_core_event(
     input_phase: InputPhase,
     producer: &mut StandardProducer,
 ) -> CoreEvent {
+    enum OwnedProduceStatus {
+        NeedInput,
+        BlockReady(BlockContinuation),
+    }
+
     let preferred_lookahead = producer.preferred_lookahead();
 
     if state.lookahead < preferred_lookahead {
@@ -672,13 +701,9 @@ fn next_core_event(
     }
 
     let allow_short_tail = input_phase == InputPhase::FinalTail;
-    enum OwnedProduceStatus {
-        NeedInput,
-        BlockReady(BlockContinuation),
-    }
-
     let status = match producer.produce(state, allow_short_tail) {
         ProduceStatus::MatchSearch(request) => return CoreEvent::MatchSearch(request),
+        ProduceStatus::MatchSearchError(error) => return CoreEvent::MatchSearchError(error),
         ProduceStatus::NeedInput => OwnedProduceStatus::NeedInput,
         ProduceStatus::BlockReady(continuation) => OwnedProduceStatus::BlockReady(continuation),
     };
@@ -763,13 +788,20 @@ pub(super) fn drive_standard(
         match driver.step_inner(state, input, output, checksum, mode) {
             StandardTurnOutcome::Progress => {}
             StandardTurnOutcome::MatchSearch(work) => {
-                let request = work.request(state);
+                let Ok(request) = work.request(state) else {
+                    return BlockState::InvalidState;
+                };
                 let mut results = [MatchSearchResult {
                     length: 0,
                     start: 0,
                 }];
                 execute_match_search_batch(core::slice::from_ref(&request), &mut results);
-                driver.complete_match_search(state, results[0]);
+                if driver.complete_match_search(state, results[0]).is_err() {
+                    return BlockState::InvalidState;
+                }
+            }
+            StandardTurnOutcome::MatchSearchError(_) | StandardTurnOutcome::InvalidSegmentMode => {
+                return BlockState::InvalidState;
             }
             StandardTurnOutcome::NeedMoreCallerInput => return BlockState::NeedMore,
             StandardTurnOutcome::NeedMoreOutput { final_block: true } => {
@@ -789,7 +821,7 @@ pub(super) fn drive_standard(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Algorithm {
+pub enum Algorithm {
     Stored,
     Quick,
     Fast,
@@ -800,18 +832,19 @@ pub(crate) enum Algorithm {
 }
 
 impl Algorithm {
-    pub(super) fn for_stream(level: i8, strategy: Strategy) -> Self {
-        if level == 0 {
-            return Self::Stored;
-        }
-
-        match strategy {
-            Strategy::HuffmanOnly => Self::Huffman,
-            Strategy::Rle => Self::Rle,
-            Strategy::Default | Strategy::Filtered | Strategy::Fixed => {
-                level_config(level).algorithm
+    pub(super) fn for_stream(level: i8, strategy: Strategy) -> Option<Self> {
+        // Validate the compression level even for strategies that do not use
+        // its normal hash-chain algorithm.
+        let config = level_config(level)?;
+        Some(if level == 0 {
+            Self::Stored
+        } else {
+            match strategy {
+                Strategy::HuffmanOnly => Self::Huffman,
+                Strategy::Rle => Self::Rle,
+                Strategy::Default | Strategy::Filtered | Strategy::Fixed => config.algorithm,
             }
-        }
+        })
     }
 
     fn run(self, stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> BlockState {
@@ -819,13 +852,15 @@ impl Algorithm {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
             algorithm => {
-                let mut driver = StandardDriver::for_algorithm(algorithm, stream.state)
-                    .expect("ordinary algorithm must have a token producer");
+                let Some(mut driver) = StandardDriver::for_algorithm(algorithm, stream.state)
+                else {
+                    return BlockState::InvalidState;
+                };
                 drive_standard(
                     stream.state,
-                    &mut stream.input,
-                    &mut stream.output,
-                    &mut stream.checksum,
+                    stream.input,
+                    stream.output,
+                    stream.checksum,
                     flush,
                     &mut driver,
                 )
@@ -835,12 +870,14 @@ impl Algorithm {
 }
 
 pub(super) fn run(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> BlockState {
-    let algorithm = Algorithm::for_stream(stream.state.level, stream.state.strategy);
+    let Some(algorithm) = Algorithm::for_stream(stream.state.level, stream.state.strategy) else {
+        return BlockState::InvalidState;
+    };
     algorithm.run(stream, flush)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LevelConfig {
+pub struct LevelConfig {
     pub good_length: u16,
     pub max_lazy: u16,
     pub nice_length: u16,
@@ -879,23 +916,119 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
 ];
 
-pub(crate) fn level_config(level: i8) -> LevelConfig {
-    LEVEL_CONFIGS[level as usize]
+/// Resolve a compressor's signed level without permitting invalid table indices.
+pub fn level_config(level: i8) -> Option<LevelConfig> {
+    LEVEL_CONFIGS.get(usize::try_from(level).ok()?).copied()
 }
 
-pub(crate) fn change_requires_block_boundary(
+pub fn change_requires_block_boundary(
     current_level: i8,
     current_strategy: Strategy,
     next_level: i8,
     next_strategy: Strategy,
-) -> bool {
-    current_strategy != next_strategy
-        || level_config(current_level).algorithm != level_config(next_level).algorithm
+) -> Option<bool> {
+    let current = level_config(current_level)?;
+    let next = level_config(next_level)?;
+    Some(current_strategy != next_strategy || current.algorithm != next.algorithm)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_rejects_match_completion_without_pending_work() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let result = MatchSearchResult::new(4, 1);
+        for algorithm in [
+            Algorithm::Fast,
+            Algorithm::Medium,
+            Algorithm::Slow,
+            Algorithm::Huffman,
+            Algorithm::Rle,
+        ] {
+            let mut core = StandardCore::for_algorithm(algorithm, &stream.state)
+                .ok_or(crate::ReturnCode::StreamError)?;
+            assert_eq!(
+                core.complete_match_search(&mut stream.state, result),
+                Err(MatchSearchError::UnexpectedMatchResult)
+            );
+            assert_eq!(core.phase, StandardPhase::Producing);
+
+            // A scheduler may have a pending token while the producer has no matching
+            // pending state. Reject the completion and leave the core suspended.
+            core.phase = StandardPhase::NeedsMatchSearch;
+            assert_eq!(
+                core.complete_match_search(&mut stream.state, result),
+                Err(MatchSearchError::UnexpectedMatchResult)
+            );
+            assert_eq!(core.phase, StandardPhase::NeedsMatchSearch);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn continue_mode_cannot_resume_an_already_finalized_input_segment(
+    ) -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        let mut stream = DeflateStream::new(DeflateConfig::new(2))?;
+        let mut driver = StandardDriver::for_algorithm(Algorithm::Fast, &stream.state)
+            .ok_or(crate::ReturnCode::StreamError)?;
+        driver.core.input_phase = InputPhase::FinalTail;
+
+        let mut input = InputCursor::from_stream(&stream);
+        let mut output = crate::deflate::OutputCursor::from_stream(&stream);
+        let mut checksum = StreamChecksum::from_stream(&stream);
+        let before_start = stream.state.strstart;
+        let before_lookahead = stream.state.lookahead;
+        let before_phase = driver.core.phase;
+        assert_eq!(
+            driver.step(
+                &mut stream.state,
+                &mut input,
+                &mut output,
+                &mut checksum,
+                StandardSegmentMode::Continue,
+            ),
+            StandardTurnOutcome::InvalidSegmentMode,
+        );
+        assert_eq!(stream.state.strstart, before_start);
+        assert_eq!(stream.state.lookahead, before_lookahead);
+        assert_eq!(driver.core.phase, before_phase);
+        assert_eq!(driver.core.input_phase, InputPhase::FinalTail);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_signed_levels_are_rejected_for_all_strategies_and_transition_pairs() {
+        for raw in i8::MIN..=i8::MAX {
+            let expected_valid = (0..=9).contains(&raw);
+            assert_eq!(level_config(raw).is_some(), expected_valid, "level {raw}");
+            for strategy in [
+                Strategy::Default,
+                Strategy::Filtered,
+                Strategy::Fixed,
+                Strategy::Rle,
+                Strategy::HuffmanOnly,
+            ] {
+                assert_eq!(
+                    Algorithm::for_stream(raw, strategy).is_some(),
+                    expected_valid,
+                    "level {raw}, strategy {strategy:?}"
+                );
+                assert_eq!(
+                    change_requires_block_boundary(raw, strategy, 6, Strategy::Default).is_some(),
+                    expected_valid,
+                );
+                assert_eq!(
+                    change_requires_block_boundary(6, Strategy::Default, raw, strategy).is_some(),
+                    expected_valid,
+                );
+            }
+        }
+    }
 
     #[test]
     fn compression_levels_have_explicit_algorithm_families() {
@@ -912,8 +1045,11 @@ mod tests {
             Algorithm::Slow,
         ];
 
-        for (level, expected) in expected.into_iter().enumerate() {
-            assert_eq!(level_config(level as i8).algorithm, expected);
+        for (level, expected) in (0i8..).zip(expected) {
+            assert_eq!(
+                level_config(level).map(|config| config.algorithm),
+                Some(expected)
+            );
         }
     }
 
@@ -921,50 +1057,51 @@ mod tests {
     fn strategies_select_specialized_algorithms() {
         assert_eq!(
             Algorithm::for_stream(6, Strategy::Default),
-            Algorithm::Medium
+            Some(Algorithm::Medium)
         );
         assert_eq!(
             Algorithm::for_stream(6, Strategy::Filtered),
-            Algorithm::Medium
+            Some(Algorithm::Medium)
         );
-        assert_eq!(Algorithm::for_stream(6, Strategy::Fixed), Algorithm::Medium);
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::Fixed),
+            Some(Algorithm::Medium)
+        );
         assert_eq!(
             Algorithm::for_stream(6, Strategy::HuffmanOnly),
-            Algorithm::Huffman
+            Some(Algorithm::Huffman)
         );
-        assert_eq!(Algorithm::for_stream(6, Strategy::Rle), Algorithm::Rle);
+        assert_eq!(
+            Algorithm::for_stream(6, Strategy::Rle),
+            Some(Algorithm::Rle)
+        );
         assert_eq!(
             Algorithm::for_stream(0, Strategy::HuffmanOnly),
-            Algorithm::Stored
+            Some(Algorithm::Stored)
         );
-        assert_eq!(Algorithm::for_stream(0, Strategy::Rle), Algorithm::Stored);
+        assert_eq!(
+            Algorithm::for_stream(0, Strategy::Rle),
+            Some(Algorithm::Stored)
+        );
     }
 
     #[test]
     fn parameter_changes_flush_only_across_algorithm_or_strategy_boundaries() {
-        assert!(!change_requires_block_boundary(
-            3,
-            Strategy::Default,
-            6,
-            Strategy::Default
-        ));
-        assert!(!change_requires_block_boundary(
-            7,
-            Strategy::Default,
-            9,
-            Strategy::Default
-        ));
-        assert!(change_requires_block_boundary(
-            6,
-            Strategy::Default,
-            7,
-            Strategy::Default
-        ));
-        assert!(change_requires_block_boundary(
-            6,
-            Strategy::Default,
-            6,
-            Strategy::Fixed
-        ));
+        assert_eq!(
+            change_requires_block_boundary(3, Strategy::Default, 6, Strategy::Default),
+            Some(false)
+        );
+        assert_eq!(
+            change_requires_block_boundary(7, Strategy::Default, 9, Strategy::Default),
+            Some(false)
+        );
+        assert_eq!(
+            change_requires_block_boundary(6, Strategy::Default, 7, Strategy::Default),
+            Some(true)
+        );
+        assert_eq!(
+            change_requires_block_boundary(6, Strategy::Default, 6, Strategy::Fixed),
+            Some(true)
+        );
     }
 }

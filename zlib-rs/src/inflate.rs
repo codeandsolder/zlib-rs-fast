@@ -1,7 +1,4 @@
-#![allow(non_snake_case)] // TODO ultimately remove this
-#![allow(clippy::missing_safety_doc)] // obviously needs to be fixed long-term
-
-use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+use core::ffi::{c_char, c_int, c_long, c_void};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
@@ -15,7 +12,8 @@ mod inftrees;
 mod window;
 mod writer;
 
-use crate::allocate::Allocator;
+use crate::abi_cursor::{advance_abi_bytes, SliceBudget};
+use crate::allocate::{AlignedAllocationBlock, Allocator, ALLOCATION_BLOCK_BYTES};
 use crate::c_api::{in_func, internal_state, out_func};
 use crate::output_buffer::{assume_init_prefix, WritableBytes};
 use crate::state_ptr::StatePtr;
@@ -37,6 +35,45 @@ use self::{
 };
 
 const INFLATE_STRICT: bool = false;
+
+// RFC 1951 §3.2.7: the transmitted code-length alphabet uses this permutation.
+// Both ordinary and callback inflate must use the same layout.
+const CODE_LENGTH_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// Run-length instructions in the dynamic code-length alphabet (RFC 1951).
+/// Extra bits are still read by the owning input cursor, so an incomplete
+/// input chunk never partly mutates the decoder's code-length sequence.
+#[derive(Clone, Copy)]
+struct CodeLengthRepeat {
+    extra_bits: u8,
+    base_count: usize,
+    previous: bool,
+}
+
+impl CodeLengthRepeat {
+    const fn from_symbol(symbol: u16) -> Option<Self> {
+        match symbol {
+            16 => Some(Self {
+                extra_bits: 2,
+                base_count: 3,
+                previous: true,
+            }),
+            17 => Some(Self {
+                extra_bits: 3,
+                base_count: 3,
+                previous: false,
+            }),
+            18 => Some(Self {
+                extra_bits: 7,
+                base_count: 11,
+                previous: false,
+            }),
+            _ => None,
+        }
+    }
+}
 
 /// Initialize callback-driven inflate directly from caller-owned scratch storage.
 ///
@@ -136,8 +173,9 @@ const _: () = {
     assert!(offset_of!(I, reserved) == offset_of!(Z, reserved));
 };
 
-unsafe impl Sync for InflateStream<'_> {}
-unsafe impl Send for InflateStream<'_> {}
+// This C ABI view contains caller-owned pointers and mutable inflate state.
+// It deliberately does not claim Send or Sync; independent owned streams can
+// be scheduled concurrently without sharing this borrowed raw-pointer view.
 
 #[cfg(feature = "__internal-test")]
 #[doc(hidden)]
@@ -145,18 +183,26 @@ pub const INFLATE_STATE_SIZE: usize = core::mem::size_of::<crate::inflate::State
 
 #[cfg(feature = "__internal-test")]
 #[doc(hidden)]
+/// # Safety
+///
+/// The stream must be initialized for inflate, and its state pointer must
+/// refer to a live, exclusively borrowed inflate State allocation.
 pub unsafe fn set_mode_dict(strm: &mut z_stream) {
-    unsafe {
-        (*(strm.state as *mut State)).mode = Mode::Dict;
-    }
+    // SAFETY: the caller guarantees an initialized inflate state, exclusively
+    // borrowed through this z_stream for the duration of the assignment.
+    unsafe { (*strm.state.cast::<State>()).mode = Mode::Dict };
 }
 
 #[cfg(feature = "__internal-test")]
 #[doc(hidden)]
+/// # Safety
+///
+/// The pointer must be non-null, aligned, and valid for exclusive access
+/// to a live initialized inflate stream and its state allocation.
 pub unsafe fn set_mode_sync(strm: *mut z_stream) {
-    unsafe {
-        (*((*strm).state as *mut State)).mode = Mode::Sync;
-    }
+    // SAFETY: the caller guarantees a non-null, exclusive z_stream and its
+    // initialized inflate state, both live for the duration of this call.
+    unsafe { (*(*strm).state.cast::<State>()).mode = Mode::Sync };
 }
 
 impl<'a> InflateStream<'a> {
@@ -168,7 +214,7 @@ impl<'a> InflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
-    #[inline(always)]
+    #[inline]
     unsafe fn from_stream_ref_kind(
         strm: *const z_stream,
         kind: InflateStateKind,
@@ -191,60 +237,104 @@ impl<'a> InflateStream<'a> {
         unsafe { strm.cast::<InflateStream>().as_ref() }
     }
 
-    #[inline(always)]
+    #[inline]
     unsafe fn from_stream_mut_kind(
         strm: *mut z_stream,
         kind: InflateStateKind,
     ) -> Option<&'a mut Self> {
-        // Validate through a shared borrow before constructing the exclusive ABI view.
+        // SAFETY: the caller guarantees a live initialized stream and
+        // exclusive ownership; temporarily inspect its kind through a
+        // shared borrow before constructing the mutable ABI view.
         unsafe { Self::from_stream_ref_kind(strm.cast_const(), kind)? };
         // SAFETY: InflateStream has an equivalent layout as z_stream and the caller supplied a
         // mutable raw pointer satisfying `pointer::as_mut`.
         unsafe { strm.cast::<InflateStream>().as_mut() }
     }
 
-    /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
-    #[inline(always)]
+    /// Convert a regular `inflateInit*` stream. `BackInit` streams are deliberately rejected.
+    #[inline]
+    /// # Safety
+    ///
+    /// If non-null, the stream pointer must be valid, initialized for inflate,
+    /// and remain alive for the returned lifetime. There must be no concurrent
+    /// exclusive access to the returned stream view.
+    #[must_use]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
+        // SAFETY: the caller's validity and lifetime contract is passed
+        // unchanged to the kind-checking regular-inflate constructor.
         unsafe { Self::from_stream_ref_kind(strm, InflateStateKind::Regular) }
     }
 
-    /// Convert a regular `inflateInit*` stream. BackInit streams are deliberately rejected.
-    #[inline(always)]
+    /// Convert a regular `inflateInit*` stream. `BackInit` streams are deliberately rejected.
+    #[inline]
+    /// # Safety
+    ///
+    /// If non-null, the stream pointer must reference a live, initialized
+    /// inflate stream for which the caller guarantees exclusive access
+    /// throughout the returned lifetime.
     pub unsafe fn from_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
+        // SAFETY: the caller supplies an exclusive live stream for this
+        // borrow, and the kind-specific constructor rejects BackInit state.
         unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Regular) }
     }
 
     /// Convert an `inflateBackInit*` stream. Regular inflate streams are rejected.
-    #[inline(always)]
+    #[inline]
+    /// # Safety
+    ///
+    /// If non-null, the pointer must reference a valid initialized `BackInit`
+    /// stream and callback-owned window. The caller must preserve both
+    /// lifetimes and exclusive access while the returned view is borrowed.
     pub unsafe fn from_back_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
+        // SAFETY: the caller owns the live BackInit state and window for the
+        // returned borrow; the constructor checks the matching state kind.
         unsafe { Self::from_stream_mut_kind(strm, InflateStateKind::Back) }
     }
 
     fn as_z_stream_mut(&mut self) -> &mut z_stream {
-        // safety: a valid &mut InflateStream is also a valid &mut z_stream
-        unsafe { &mut *(self as *mut _ as *mut z_stream) }
+        // SAFETY: compile-time size, alignment and every field-offset
+        // assertion establish ABI layout equivalence. The exclusive borrow
+        // of Self permits exactly one mutable z_stream view.
+        unsafe { &mut *core::ptr::from_mut(self).cast::<z_stream>() }
     }
 
-    pub fn new(config: InflateConfig) -> Self {
-        let mut inner = crate::c_api::z_stream::default();
+    /// Allocate and initialize a regular inflate stream.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid configuration/allocator contracts or failed allocation.
+    pub fn new(config: InflateConfig) -> Result<Self, ReturnCode> {
+        Self::new_with_abi_stream(crate::c_api::z_stream::default(), config)
+    }
 
-        let ret = crate::inflate::init(&mut inner, config);
-        assert_eq!(ret, ReturnCode::Ok);
+    /// Initialize an owned stream from caller-selected allocator callbacks.
+    /// The public constructor uses the default callbacks; keeping this small
+    /// internal boundary also lets tests verify releases with a counted C allocator.
+    fn new_with_abi_stream(
+        mut inner: crate::c_api::z_stream,
+        config: InflateConfig,
+    ) -> Result<Self, ReturnCode> {
+        match crate::inflate::init(&mut inner, config) {
+            ReturnCode::Ok => {}
+            error => return Err(error),
+        }
 
-        let state = inner.state.cast::<State<'a>>();
+        // A successful init has selected both allocator callbacks and
+        // installed a live, regular inflate state.
+        let (Some(zalloc), Some(zfree)) = (inner.zalloc, inner.zfree) else {
+            return Err(ReturnCode::StreamError);
+        };
+        let Some(state) = core::ptr::NonNull::new(inner.state.cast::<State<'a>>()) else {
+            return Err(ReturnCode::StreamError);
+        };
         let alloc = Allocator {
-            zalloc: inner
-                .zalloc
-                .expect("initialized inflate stream has an allocator"),
-            zfree: inner
-                .zfree
-                .expect("initialized inflate stream has a deallocator"),
+            zalloc,
+            zfree,
             opaque: inner.opaque,
             _marker: PhantomData,
         };
 
-        Self {
+        Ok(Self {
             next_in: inner.next_in.cast_mut(),
             avail_in: inner.avail_in,
             total_in: inner.total_in,
@@ -252,12 +342,22 @@ impl<'a> InflateStream<'a> {
             avail_out: inner.avail_out,
             total_out: inner.total_out,
             msg: inner.msg,
-            // SAFETY: successful `init` created a live regular-inflate State allocation.
-            state: unsafe { StatePtr::from_raw(state) },
+            // SAFETY: successful init created a live regular-inflate State.
+            state: unsafe { StatePtr::from_raw(state.as_ptr()) },
             alloc,
             data_type: inner.data_type,
             adler: inner.adler,
             reserved: inner.reserved,
+        })
+    }
+}
+
+impl Drop for InflateStream<'_> {
+    fn drop(&mut self) {
+        // Explicit inflateEnd detaches the state pointer first, so dropping
+        // the typed owner afterwards cannot free the same allocation twice.
+        if !self.state.as_ptr().is_null() {
+            let _ = end(self);
         }
     }
 }
@@ -302,11 +402,14 @@ pub fn uncompress<'a>(
     (output, ret)
 }
 
+/// Decompress into caller-owned storage, returning the number of *input bytes consumed*.
+///
+/// Any bytes after the end of the compressed stream are excluded from the count.
 pub fn uncompress2<'a>(
     output: &'a mut [MaybeUninit<u8>],
     input: &[u8],
     config: InflateConfig,
-) -> (u64, &'a mut [u8], ReturnCode) {
+) -> (usize, &'a mut [u8], ReturnCode) {
     let (consumed, produced, ret) = uncompress2_into(output, input, config);
     // SAFETY: `uncompress2_into` reports only bytes initialized by the inflate output cursor.
     let output = unsafe { assume_init_prefix(output, produced) };
@@ -317,88 +420,66 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     output: &mut O,
     input: &[u8],
     config: InflateConfig,
-) -> (u64, usize, ReturnCode) {
+) -> (usize, usize, ReturnCode) {
     let output_len = output.len();
-    let mut dest_len = output_len as z_checksum;
 
-    // for detection of incomplete stream when *destLen == 0
-    let mut buf = [0u8];
-
-    let mut left;
-    let mut len = input.len() as u64;
-
+    // For zero-capacity output, zlib needs one scratch byte to distinguish an empty
+    // stream from a stream that would produce data. This byte is never exposed to Rust.
+    let mut scratch = [0u8];
+    let mut output_budget = SliceBudget::new(if output_len == 0 { 1 } else { output_len });
+    let mut input_budget = SliceBudget::new(input.len());
     let dest = if output_len == 0 {
-        left = 1;
-        buf.as_mut_ptr()
+        scratch.as_mut_ptr()
     } else {
-        left = output_len as u64;
-        dest_len = 0;
         output.byte_ptr()
     };
 
-    let mut stream = z_stream {
-        next_in: input.as_ptr() as *mut u8,
-        avail_in: 0,
-
-        zalloc: None,
-        zfree: None,
-        opaque: core::ptr::null_mut(),
-
-        ..z_stream::default()
+    // Use the owned constructor instead of constructing a raw C stream and
+    // reinterpreting it after initialization. Drop releases the decoder state
+    // on every return path; caller buffer borrows remain scoped to this call.
+    let mut stream = match InflateStream::new(config) {
+        Ok(stream) => stream,
+        Err(code) => return (0, 0, code),
     };
-
-    let err = init(&mut stream, config);
-    if err != ReturnCode::Ok {
-        return (0, 0, err);
-    }
-
+    stream.next_in = input.as_ptr().cast_mut();
+    stream.avail_in = 0;
     stream.next_out = dest;
     stream.avail_out = 0;
 
-    let Some(stream) = (unsafe { InflateStream::from_stream_mut(&mut stream) }) else {
-        return (0, 0, ReturnCode::StreamError);
-    };
-
     let err = loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, u32::MAX as u64) as u32;
-            left -= stream.avail_out as u64;
-        }
+        output_budget.refill(&mut stream.avail_out);
+        input_budget.refill(&mut stream.avail_in);
 
-        if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(len, u32::MAX as u64) as u32;
-            len -= stream.avail_in as u64;
-        }
-
-        let err = unsafe { inflate(stream, InflateFlush::NoFlush) };
+        // SAFETY: both live caller spans are advanced only by the SliceBudget,
+        // which caps each ABI count at its remaining readable/writable length.
+        let err = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
 
         if err != ReturnCode::Ok {
             break err;
         }
     };
 
-    let consumed = len + u64::from(stream.avail_in);
-    if output_len != 0 {
-        dest_len = stream.total_out;
-    } else if stream.total_out != 0 && err == ReturnCode::BufError {
-        left = 1;
-    }
+    // Unoffered or unconsumed input is not part of the processed prefix.
+    let consumed = input_budget.processed(stream.avail_in);
+    // Preserve full Rust slice lengths even if the C total_out counter wraps.
+    let produced = if output_len == 0 {
+        0
+    } else {
+        output_budget.processed(stream.avail_out)
+    };
 
-    let avail_out = stream.avail_out;
-    end(stream);
+    // A scratch byte means a zero-capacity caller destination was too small.
+    let scratch_overflow = output_len == 0 && stream.total_out != 0;
+    let capacity_left = output_budget.pending() != 0 || stream.avail_out != 0;
+    drop(stream);
 
     let ret = match err {
         ReturnCode::StreamEnd => ReturnCode::Ok,
         ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if (left + avail_out as u64) != 0 => ReturnCode::DataError,
+        ReturnCode::BufError if capacity_left || scratch_overflow => ReturnCode::DataError,
         _ => err,
     };
 
-    let produced = dest_len as usize;
-    assert!(
-        produced <= output_len,
-        "inflate reported output beyond caller storage"
-    );
     (consumed, produced, ret)
 }
 
@@ -439,11 +520,10 @@ pub enum Mode {
 }
 
 #[derive(Default, Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
 enum Codes {
     #[default]
     Fixed,
-    Codes,
+    CodeLengths,
     Len,
     Dist,
 }
@@ -474,13 +554,13 @@ impl Flags {
     const SANE: Self = Self(0b0000_0100);
 
     pub(crate) const fn contains(self, other: Self) -> bool {
-        debug_assert!(other.0.count_ones() == 1);
+        debug_assert!(other.0.is_power_of_two());
 
         self.0 & other.0 != 0
     }
 
-    #[inline(always)]
-    pub(crate) fn update(&mut self, other: Self, value: bool) {
+    #[inline]
+    pub(crate) const fn update(&mut self, other: Self, value: bool) {
         if value {
             *self = Self(self.0 | other.0);
         } else {
@@ -491,7 +571,7 @@ impl Flags {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InflateStateKind {
+pub enum InflateStateKind {
     Regular,
     Back,
 }
@@ -502,6 +582,12 @@ pub(crate) enum InflateStateKind {
 /// `inflateCopy()` shallow-copies the destination exactly like zlib. Each parser operation creates
 /// only the short mutable access it needs, and all nested extra/name/comment pointer writes are
 /// confined here.
+#[derive(Clone, Copy)]
+enum GzipStringField {
+    Name,
+    Comment,
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct GzipHeaderOutput(NonNull<gz_header>);
@@ -541,8 +627,8 @@ impl GzipHeaderOutput {
         });
     }
 
-    fn set_extra_len(&mut self, len: usize) {
-        self.with_header_mut(|head| head.extra_len = len as u32);
+    fn set_extra_len(&mut self, len: u16) {
+        self.with_header_mut(|head| head.extra_len = u32::from(len));
     }
 
     fn clear_extra(&mut self) {
@@ -564,75 +650,80 @@ impl GzipHeaderOutput {
         });
     }
 
-    fn write_extra(&mut self, remaining_before: usize, bytes: &[u8]) {
-        self.with_header_mut(|head| {
-            if head.extra.is_null() {
-                return;
-            }
-
-            let written = (head.extra_len as usize)
-                .checked_sub(remaining_before)
-                .expect("extra-field progress stays within declared length");
-            let capacity = head.extra_max as usize;
-            let count = Ord::min(bytes.len(), capacity.saturating_sub(written));
-            if count == 0 {
-                return;
-            }
-            let offset = Ord::min(written, capacity);
-
-            // SAFETY: `get_header` requires `extra` to be writable for `extra_max` bytes. `offset`
-            // and `count` are bounded to that capacity and `bytes` is readable for `count` bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.extra.add(offset), count)
-            };
-        });
+    /// Copy into a caller-owned gzip metadata field without crossing its capacity.
+    ///
+    /// The nested buffer contracts are established by the unsafe `get_header`
+    /// boundary, while this helper confines raw writes to one checked operation.
+    fn write_bounded(ptr: *mut u8, capacity: usize, offset: usize, bytes: &[u8]) -> usize {
+        if ptr.is_null() || offset >= capacity {
+            return 0;
+        }
+        let count = bytes.len().min(capacity - offset);
+        if count != 0 {
+            // SAFETY: get_header requires this nested destination to be writable for
+            // capacity bytes, disjoint from the caller input. The offset and count
+            // bound this copy to that allocation.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), count) };
+        }
+        count
     }
 
-    fn write_name(&mut self, offset: usize, bytes: &[u8]) -> usize {
+    fn write_extra(&mut self, remaining_before: usize, bytes: &[u8]) -> Result<(), ReturnCode> {
         self.with_header_mut(|head| {
-            if head.name.is_null() {
-                return 0;
+            // The wire length is u16. Reject inconsistent progress before
+            // touching caller-owned memory or consuming more compressed input.
+            let declared = usize::try_from(head.extra_len).map_err(|_| ReturnCode::StreamError)?;
+            let Some(written) = declared.checked_sub(remaining_before) else {
+                return Err(ReturnCode::StreamError);
+            };
+            if bytes.len() > remaining_before {
+                return Err(ReturnCode::StreamError);
             }
-
-            let remaining = (head.name_max as usize)
-                .checked_sub(offset)
-                .expect("name output offset stays within capacity");
-            let count = Ord::min(bytes.len(), remaining);
-            if count != 0 {
-                // SAFETY: `get_header` requires `name` writable for `name_max` bytes, and the
-                // checked offset plus bounded count stays within that allocation.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.name.add(offset), count)
-                };
-            }
-            count
+            Self::write_bounded(head.extra, head.extra_max as usize, written, bytes);
+            Ok(())
         })
     }
 
-    fn write_comment(&mut self, offset: usize, bytes: &[u8]) -> usize {
+    fn write_string(&mut self, field: GzipStringField, offset: usize, bytes: &[u8]) -> usize {
         self.with_header_mut(|head| {
-            if head.comment.is_null() {
-                return 0;
-            }
-
-            let remaining = (head.comm_max as usize)
-                .checked_sub(offset)
-                .expect("comment output offset stays within capacity");
-            let count = Ord::min(bytes.len(), remaining);
-            if count != 0 {
-                // SAFETY: `get_header` requires `comment` writable for `comm_max` bytes, and the
-                // checked offset plus bounded count stays within that allocation.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.comment.add(offset), count)
-                };
-            }
-            count
+            let (ptr, capacity) = match field {
+                GzipStringField::Name => (head.name, head.name_max as usize),
+                GzipStringField::Comment => (head.comment, head.comm_max as usize),
+            };
+            Self::write_bounded(ptr, capacity, offset, bytes)
         })
     }
 }
 
+/// Consume a gzip NUL-terminated metadata field across any number of caller
+/// input fragments. The stored count reflects only bytes that fit the destination,
+/// while the input cursor and optional header CRC always account for the entire field.
+fn consume_gzip_header_string(
+    reader: &mut BitReader<'_>,
+    header: Option<GzipHeaderOutput>,
+    field: GzipStringField,
+    stored: &mut usize,
+    checksum: &mut u32,
+    update_crc: bool,
+) -> bool {
+    let available = reader.as_slice();
+    let terminator = available.iter().position(|&byte| byte == 0);
+    let count = terminator.map_or(available.len(), |position| position + 1);
+    let bytes = &available[..count];
+
+    if let Some(mut header) = header {
+        *stored += header.write_string(field, *stored, bytes);
+    }
+    if update_crc {
+        *checksum = crc32(*checksum, bytes);
+    }
+    reader.advance(count);
+
+    terminator.is_some()
+}
+
 #[repr(C, align(64))]
-pub(crate) struct State<'a> {
+pub struct State<'a> {
     kind: InflateStateKind,
     /// Current inflate mode
     mode: Mode,
@@ -674,8 +765,8 @@ pub(crate) struct State<'a> {
     /// distance back to copy the string from
     offset: usize,
 
-    /// extra bits needed
-    extra: usize,
+    /// DEFLATE extra-bit count (at most 15 bits), stored in its native width.
+    extra: u8,
 
     /// bits back of last unprocessed length/lit
     back: usize,
@@ -710,7 +801,7 @@ pub(crate) struct State<'a> {
     /// work area for code table building
     work: [u16; 288],
 
-    allocation_start: *mut u8,
+    allocation_start: *mut AlignedAllocationBlock,
     total_allocation_size: usize,
 
     // Back-only state stays at the cold tail so regular decode field offsets do not move.
@@ -776,7 +867,7 @@ impl<'a> State<'a> {
     fn clone_rebound(
         &self,
         window: Window<'a>,
-        allocation_start: *mut u8,
+        allocation_start: *mut AlignedAllocationBlock,
         total_allocation_size: usize,
     ) -> Self {
         debug_assert!(self.back_window.is_empty());
@@ -818,29 +909,124 @@ impl<'a> State<'a> {
         }
     }
 
-    fn len_table_ref(&self) -> &[Code] {
+    /// Record one transmitted code-length-alphabet entry in RFC 1951 order.
+    const fn append_code_length_alphabet(&mut self, length: u16) {
+        self.lens[CODE_LENGTH_ORDER[self.have]] = length;
+        self.have += 1;
+    }
+
+    /// Append a decoded repeat instruction only if the complete run is valid.
+    /// No partially initialized code lengths become visible on failure.
+    fn append_code_length_repeat(
+        &mut self,
+        repeat: CodeLengthRepeat,
+        extra_value: u64,
+    ) -> Result<(), &'static str> {
+        const BAD_REPEAT: &str = "invalid bit length repeat\0";
+        let remaining = (self.nlen + self.ndist)
+            .checked_sub(self.have)
+            .ok_or(BAD_REPEAT)?;
+        let extra = usize::try_from(extra_value).map_err(|_| BAD_REPEAT)?;
+        let count = repeat.base_count.checked_add(extra).ok_or(BAD_REPEAT)?;
+        if count > remaining {
+            return Err(BAD_REPEAT);
+        }
+        let value = if repeat.previous {
+            if self.have == 0 {
+                return Err(BAD_REPEAT);
+            }
+            self.lens[self.have - 1]
+        } else {
+            0
+        };
+        self.lens[self.have..self.have + count].fill(value);
+        self.have += count;
+        Ok(())
+    }
+
+    /// Complete the code-length alphabet and construct its canonical table.
+    /// Both inflate front-ends use the same validation and table metadata.
+    fn finish_code_length_alphabet(&mut self) -> Result<(), &'static str> {
+        while self.have < CODE_LENGTH_ORDER.len() {
+            self.append_code_length_alphabet(0);
+        }
+
+        let InflateTable::Success { root, used } = inflate_table(
+            CodeType::Codes,
+            &self.lens[..CODE_LENGTH_ORDER.len()],
+            &mut self.codes_codes,
+            7,
+            &mut self.work,
+        ) else {
+            return Err("invalid code lengths set\0");
+        };
+
+        self.next = used;
+        self.len_table.codes = Codes::CodeLengths;
+        self.len_table.bits = root;
+        self.have = 0;
+        Ok(())
+    }
+
+    /// Build the dynamic literal/length and distance tables after both length
+    /// alphabets are decoded. The ordinary and callback decoders share the
+    /// exact same validation, code-table sizes and error strings.
+    fn finish_dynamic_trees(&mut self) -> Result<(), &'static str> {
+        if self.lens[256] == 0 {
+            return Err("invalid code -- missing end-of-block\0");
+        }
+
+        let InflateTable::Success { root, used } = inflate_table(
+            CodeType::Lens,
+            &self.lens[..self.nlen],
+            &mut self.len_codes,
+            10,
+            &mut self.work,
+        ) else {
+            return Err("invalid literal/lengths set\0");
+        };
+        self.len_table.codes = Codes::Len;
+        self.len_table.bits = root;
+        self.next = used;
+
+        let InflateTable::Success { root, used } = inflate_table(
+            CodeType::Dists,
+            &self.lens[self.nlen..][..self.ndist],
+            &mut self.dist_codes,
+            9,
+            &mut self.work,
+        ) else {
+            return Err("invalid distances set\0");
+        };
+        self.dist_table.codes = Codes::Dist;
+        self.dist_table.bits = root;
+        self.next += used;
+        Ok(())
+    }
+
+    const fn len_table_ref(&self) -> &[Code] {
         match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX,
-            Codes::Codes => &self.codes_codes,
+            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         }
     }
 
-    fn dist_table_ref(&self) -> &[Code] {
+    const fn dist_table_ref(&self) -> &[Code] {
         match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX,
-            Codes::Codes => &self.codes_codes,
+            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         }
     }
 
-    fn len_table_get(&self, index: usize) -> Code {
+    const fn len_table_get(&self, index: usize) -> Code {
         self.len_table_ref()[index]
     }
 
-    fn dist_table_get(&self, index: usize) -> Code {
+    const fn dist_table_get(&self, index: usize) -> Code {
         self.dist_table_ref()[index]
     }
 }
@@ -864,32 +1050,34 @@ struct InflateOutput<'a> {
     accounted_remaining: usize,
 }
 
-impl<'a> InflateOutput<'a> {
-    unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
+impl InflateOutput<'_> {
+    const unsafe fn new_uninit(ptr: *mut u8, len: usize) -> Self {
         Self {
+            // SAFETY: this private unsafe constructor carries the same live,
+            // exclusive writable buffer contract as Writer::new_uninit.
             writer: unsafe { Writer::new_uninit(ptr, len) },
             accounted_remaining: len,
         }
     }
 
     #[inline]
-    fn mark_accounted(&mut self) {
+    const fn mark_accounted(&mut self) {
         self.accounted_remaining = self.writer.remaining();
     }
     #[inline]
-    fn written_since_accounted(&self) -> usize {
+    const fn written_since_accounted(&self) -> usize {
         self.accounted_remaining - self.writer.remaining()
     }
     #[inline]
-    fn remaining(&self) -> usize {
+    const fn remaining(&self) -> usize {
         self.writer.remaining()
     }
     #[inline]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.writer.len()
     }
     #[inline]
-    fn is_full(&self) -> bool {
+    const fn is_full(&self) -> bool {
         self.writer.is_full()
     }
     #[inline]
@@ -897,24 +1085,28 @@ impl<'a> InflateOutput<'a> {
         self.writer.filled()
     }
     #[inline]
-    fn next_out(&mut self) -> *mut core::mem::MaybeUninit<u8> {
+    const fn next_out(&mut self) -> *mut core::mem::MaybeUninit<u8> {
         self.writer.next_out()
     }
     #[inline]
-    fn push(&mut self, byte: u8) {
-        self.writer.push(byte)
+    const fn push(&mut self, byte: u8) {
+        self.writer.push(byte);
     }
     #[inline]
     fn extend(&mut self, bytes: &[u8]) {
-        self.writer.extend(bytes)
+        self.writer.extend(bytes);
+    }
+    #[inline]
+    fn fill_zero(&mut self, len: usize) {
+        self.writer.fill_zero(len);
     }
     #[inline]
     fn extend_from_window(&mut self, window: &Window<'_>, range: core::ops::Range<usize>) {
-        self.writer.extend_from_window(window, range)
+        self.writer.extend_from_window(window, range);
     }
     #[inline]
     fn copy_match(&mut self, offset_from_end: usize, length: usize) {
-        self.writer.copy_match(offset_from_end, length)
+        self.writer.copy_match(offset_from_end, length);
     }
 }
 
@@ -922,6 +1114,14 @@ impl<'a> InflateOutput<'a> {
 struct DispatchExit {
     mode: Mode,
     code: ReturnCode,
+}
+
+/// Outcome of wrapper-only decoding. A paused header retains its exact
+/// submode without leaking a partial transition to the DEFLATE body.
+#[derive(Debug, Clone, Copy)]
+enum WrapperProgress {
+    Ready(Mode),
+    Paused(Mode),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -932,7 +1132,7 @@ struct LenDecodeOutcome<'input> {
 }
 
 impl<'input> LenDecodeOutcome<'input> {
-    fn continue_with(mode: Mode, reader: BitReader<'input>) -> Self {
+    const fn continue_with(mode: Mode, reader: BitReader<'input>) -> Self {
         Self {
             mode,
             reader,
@@ -940,7 +1140,7 @@ impl<'input> LenDecodeOutcome<'input> {
         }
     }
 
-    fn break_with(mode: Mode, reader: BitReader<'input>, code: ReturnCode) -> Self {
+    const fn break_with(mode: Mode, reader: BitReader<'input>, code: ReturnCode) -> Self {
         Self {
             mode,
             reader,
@@ -949,7 +1149,7 @@ impl<'input> LenDecodeOutcome<'input> {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn need_bits_for_mode(
     reader: &mut BitReader<'_>,
     count: usize,
@@ -960,7 +1160,7 @@ fn need_bits_for_mode(
         .map_err(|code| DispatchExit { mode, code })
 }
 
-#[inline(always)]
+#[inline]
 fn pull_byte_for_mode(reader: &mut BitReader<'_>, mode: Mode) -> Result<u8, DispatchExit> {
     reader
         .pull_byte()
@@ -976,78 +1176,179 @@ enum DistanceDecodeError {
 #[derive(Debug, Clone, Copy)]
 struct DecodedDistance {
     offset: usize,
-    extra: usize,
+    extra: u8,
     back_bits: usize,
 }
 
-#[inline(always)]
-fn emit_literal(output: &mut InflateOutput<'_>, literal: u8) -> bool {
+/// Emit a DEFLATE literal only if the decoded code is a real byte.
+/// Malformed tables must not silently truncate a value above 255.
+#[inline]
+fn emit_literal(output: &mut InflateOutput<'_>, value: usize) -> Result<bool, &'static str> {
+    let literal = u8::try_from(value).map_err(|_| "invalid literal/length code\0")?;
     if output.is_full() {
-        return false;
+        return Ok(false);
     }
     output.push(literal);
-    true
+    Ok(true)
 }
 
-#[inline(always)]
+#[inline]
 fn consume_extra_bits(
     reader: &mut BitReader<'_>,
-    extra: usize,
+    extra: u8,
     value: &mut usize,
     back: &mut usize,
 ) -> Result<(), ReturnCode> {
     if extra != 0 {
-        reader.need_bits(extra)?;
-        *value += reader.bits(extra) as usize;
-        reader.drop_bits(extra as u8);
-        *back += extra;
+        let width = usize::from(extra);
+        reader.need_bits(width)?;
+        *value += reader.bits_usize(width);
+        reader.drop_bits(extra);
+        *back += width;
     }
     Ok(())
 }
 
-#[inline(always)]
+/// Finish the optional length extra bits once, then remember the full match
+/// length for inflateMark. Both decoder paths use this exact transition.
+#[inline]
+fn decode_length_extension(
+    reader: &mut BitReader<'_>,
+    extra: u8,
+    length: &mut usize,
+    was: &mut usize,
+    back: &mut usize,
+) -> Result<Mode, ReturnCode> {
+    consume_extra_bits(reader, extra, length, back)?;
+    traceln!("inflate: length {}", *length);
+    *was = *length;
+    Ok(Mode::Dist)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DistanceExtensionError {
+    Input(ReturnCode),
+    TooFarBack,
+}
+
+/// Finish the distance extra bits and validate the DEFLATE window bound.
+#[inline]
+fn decode_distance_extension(
+    reader: &mut BitReader<'_>,
+    extra: u8,
+    offset: &mut usize,
+    back: &mut usize,
+    dmax: usize,
+) -> Result<Mode, DistanceExtensionError> {
+    consume_extra_bits(reader, extra, offset, back).map_err(DistanceExtensionError::Input)?;
+    if INFLATE_STRICT && *offset > dmax {
+        return Err(DistanceExtensionError::TooFarBack);
+    }
+    traceln!("inflate: distance {}", *offset);
+    Ok(Mode::Match)
+}
+
+/// Validate the two little-endian 16-bit words that prefix a stored
+/// DEFLATE block. A failed complement check is a format error, not a
+/// truncated or partially accepted length.
+#[inline]
+pub(super) fn stored_block_length(header: u32) -> Option<u16> {
+    let bytes = header.to_le_bytes();
+    let len = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let complement = u16::from_le_bytes([bytes[2], bytes[3]]);
+    (len == !complement).then_some(len)
+}
+
+/// gzip's ISIZE trailer is defined modulo 2^32, even when a decompression
+/// has produced more than 4 GiB. Preserve the low four bytes explicitly on
+/// both 32- and 64-bit hosts rather than requiring a fallible cast.
+#[inline]
+const fn gzip_isize(total: usize) -> u32 {
+    let bytes = total.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// One complete Huffman symbol and the number of bits consumed to reach it.
+/// Length alphabets have literal entries with op=0; distance alphabets use
+/// op=0 for subtable links. All other lookup mechanics are identical.
+#[derive(Debug, Clone, Copy)]
+struct DecodedHuffmanCode {
+    entry: Code,
+    bits: usize,
+}
+
+#[inline]
+fn decode_huffman_code<const LITERAL_LENGTH: bool>(
+    reader: &mut BitReader<'_>,
+    table: &[Code],
+    table_bits: usize,
+) -> Result<DecodedHuffmanCode, ReturnCode> {
+    let mut here = loop {
+        let here = table[reader.bits_usize(table_bits)];
+        if here.bits <= reader.bits_in_buffer() {
+            break here;
+        }
+        reader.pull_byte()?;
+    };
+
+    let prefix_bits = if here.op & 0xf0 == 0 && (!LITERAL_LENGTH || here.op != 0) {
+        let last = here;
+        here = loop {
+            let bits = reader.bits_u16(usize::from(last.bits + last.op));
+            let here = table[usize::from(last.val) + usize::from(bits >> last.bits)];
+            if last.bits + here.bits <= reader.bits_in_buffer() {
+                break here;
+            }
+            reader.pull_byte()?;
+        };
+        reader.drop_bits(last.bits);
+        usize::from(last.bits)
+    } else {
+        0
+    };
+
+    reader.drop_bits(here.bits);
+    Ok(DecodedHuffmanCode {
+        entry: here,
+        bits: prefix_bits + usize::from(here.bits),
+    })
+}
+
+#[inline]
 fn decode_distance_code(
     reader: &mut BitReader<'_>,
     table: &[Code],
     table_bits: usize,
 ) -> Result<DecodedDistance, DistanceDecodeError> {
-    let mut here;
-    loop {
-        here = table[reader.bits(table_bits) as usize];
-        if here.bits <= reader.bits_in_buffer() {
-            break;
-        }
-        reader.pull_byte().map_err(DistanceDecodeError::Input)?;
-    }
-
-    let mut back_bits = 0;
-    if here.op & 0xf0 == 0 {
-        let last = here;
-        loop {
-            let bits = reader.bits((last.bits + last.op) as usize) as usize;
-            here = table[last.val as usize + (bits >> last.bits)];
-            if last.bits + here.bits <= reader.bits_in_buffer() {
-                break;
-            }
-            reader.pull_byte().map_err(DistanceDecodeError::Input)?;
-        }
-        reader.drop_bits(last.bits);
-        back_bits = last.bits as usize;
-    }
-
-    reader.drop_bits(here.bits);
-    if here.op & 64 != 0 {
+    let decoded = decode_huffman_code::<false>(reader, table, table_bits)
+        .map_err(DistanceDecodeError::Input)?;
+    if decoded.entry.op & 64 != 0 {
         return Err(DistanceDecodeError::InvalidCode);
     }
 
     Ok(DecodedDistance {
-        offset: here.val as usize,
-        extra: (here.op & MAX_BITS) as usize,
-        back_bits,
+        offset: usize::from(decoded.entry.val),
+        extra: decoded.entry.op & MAX_BITS,
+        back_bits: decoded.bits,
     })
 }
 
-#[inline(always)]
+/// Commit a fully decoded distance symbol. The lookup's Huffman-table
+/// borrow has ended before these mutable state fields are updated.
+#[inline]
+const fn accept_distance_code(
+    decoded: DecodedDistance,
+    back: &mut usize,
+    offset: &mut usize,
+    extra: &mut u8,
+) -> Mode {
+    *back += decoded.back_bits;
+    *offset = decoded.offset;
+    *extra = decoded.extra;
+    Mode::DistExt
+}
+
+#[inline]
 fn copy_match_bytes(
     window: &Window<'_>,
     sane: bool,
@@ -1064,7 +1365,14 @@ fn copy_match_bytes(
             if sane {
                 return Err("invalid distance too far back\0");
             }
-            panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
+            // Non-strict inflateUndermine is defined to synthesize zero
+            // bytes for the history that precedes the initialized window.
+            // The resumed Match state re-enters here with the remaining length.
+            let missing = from_end - window.have();
+            let copied = missing.min(*length).min(left);
+            output.fill_zero(copied);
+            *length -= copied;
+            return Ok(*length == 0);
         }
 
         let wnext = window.next();
@@ -1089,6 +1397,58 @@ fn copy_match_bytes(
     Ok(*length == 0)
 }
 
+/// Copy a pending match until it finishes, the current output buffer fills,
+/// or history validation fails. Narrow borrows preserve the slow decoder's
+/// separately cached Huffman table references.
+#[inline]
+fn copy_pending_match(
+    window: &Window<'_>,
+    sane: bool,
+    offset: usize,
+    length: &mut usize,
+    output: &mut InflateOutput<'_>,
+) -> Result<bool, &'static str> {
+    loop {
+        if output.is_full() {
+            traceln!(
+                "BufError: writer is full ({} bytes)",
+                output.writer.capacity()
+            );
+            return Ok(false);
+        }
+        if copy_match_bytes(window, sane, offset, length, output)? {
+            return Ok(true);
+        }
+    }
+}
+
+/// Interpret a complete length-table symbol without mutating the Huffman
+/// table storage or touching the caller's buffered input cursor.
+#[inline]
+fn accept_length_code(
+    decoded: DecodedHuffmanCode,
+    back: &mut usize,
+    length: &mut usize,
+    extra: &mut u8,
+) -> Result<Mode, &'static str> {
+    *back = decoded.bits;
+    let here = decoded.entry;
+    *length = usize::from(here.val);
+    if here.op == 0 {
+        return Ok(Mode::Lit);
+    }
+    if here.op & 32 != 0 {
+        traceln!("inflate:         end of block");
+        *back = usize::MAX;
+        return Ok(Mode::Type);
+    }
+    if here.op & 64 != 0 {
+        return Err("invalid literal/length code\0");
+    }
+    *extra = here.op & MAX_BITS;
+    Ok(Mode::LenExt)
+}
+
 impl State<'_> {
     // This logic is split into its own function for two reasons
     //
@@ -1109,7 +1469,7 @@ impl State<'_> {
         let avail_out = output.remaining();
 
         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
-            inflate_fast_help(self, reader, output);
+            inflate_fast_help_impl::<true, _>(self, reader, output);
             match self.mode {
                 Mode::Len => {}
                 _ => return ControlFlow::Continue(()),
@@ -1122,26 +1482,98 @@ impl State<'_> {
         outcome.flow
     }
 
+    /// Decode an entire length symbol before committing its resumable state.
+    fn decode_slow_length_code(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        let len_table = match self.len_table.codes {
+            Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
+            Codes::CodeLengths => &self.codes_codes,
+            Codes::Len => &self.len_codes,
+            Codes::Dist => &self.dist_codes,
+        };
+        self.back = 0;
+        let decoded = decode_huffman_code::<true>(bit_reader, len_table, self.len_table.bits)
+            .map_err(|code| DispatchExit {
+                mode: Mode::Len,
+                code,
+            })?;
+        match accept_length_code(decoded, &mut self.back, &mut self.length, &mut self.extra) {
+            Ok(next) => Ok(next),
+            Err(msg) => {
+                self.error_message = Some(msg);
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: ReturnCode::DataError,
+                })
+            }
+        }
+    }
+
+    fn decode_slow_distance_code(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        let dist_table = match self.dist_table.codes {
+            Codes::Fixed => &self::inffixed_tbl::DISTFIX[..],
+            Codes::CodeLengths => &self.codes_codes,
+            Codes::Len => &self.len_codes,
+            Codes::Dist => &self.dist_codes,
+        };
+        match decode_distance_code(bit_reader, dist_table, self.dist_table.bits) {
+            Ok(decoded) => Ok(accept_distance_code(
+                decoded,
+                &mut self.back,
+                &mut self.offset,
+                &mut self.extra,
+            )),
+            Err(DistanceDecodeError::Input(code)) => Err(DispatchExit {
+                mode: Mode::Dist,
+                code,
+            }),
+            Err(DistanceDecodeError::InvalidCode) => {
+                self.error_message = Some("invalid distance code\0");
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: ReturnCode::DataError,
+                })
+            }
+        }
+    }
+
+    fn decode_slow_distance_extension(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        match decode_distance_extension(
+            bit_reader,
+            self.extra,
+            &mut self.offset,
+            &mut self.back,
+            self.dmax,
+        ) {
+            Ok(next) => Ok(next),
+            Err(DistanceExtensionError::Input(code)) => Err(DispatchExit {
+                mode: Mode::DistExt,
+                code,
+            }),
+            Err(DistanceExtensionError::TooFarBack) => {
+                self.error_message = Some("invalid distance code too far back\0");
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: ReturnCode::DataError,
+                })
+            }
+        }
+    }
+
     fn len_and_friends_inner<'input>(
         &mut self,
         mut bit_reader: BitReader<'input>,
         output: &mut InflateOutput<'_>,
     ) -> LenDecodeOutcome<'input> {
         let mut mode = self.mode;
-
-        let len_table = match self.len_table.codes {
-            Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
-            Codes::Codes => &self.codes_codes,
-            Codes::Len => &self.len_codes,
-            Codes::Dist => &self.dist_codes,
-        };
-
-        let dist_table = match self.dist_table.codes {
-            Codes::Fixed => &self::inffixed_tbl::DISTFIX[..],
-            Codes::Codes => &self.codes_codes,
-            Codes::Len => &self.len_codes,
-            Codes::Dist => &self.dist_codes,
-        };
 
         loop {
             mode = 'top: {
@@ -1154,85 +1586,25 @@ impl State<'_> {
                         // rechecks output space, so keep the complete fast-path reserve available.
                         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
                             self.mode = mode;
-                            inflate_fast_help(self, &mut bit_reader, output);
+                            inflate_fast_help_impl::<true, _>(self, &mut bit_reader, output);
                             return LenDecodeOutcome::continue_with(self.mode, bit_reader);
                         }
 
-                        self.back = 0;
-
-                        // get a literal, length, or end-of-block code
-                        let mut here;
-                        loop {
-                            let bits = bit_reader.bits(self.len_table.bits);
-                            here = len_table[bits as usize];
-
-                            if here.bits <= bit_reader.bits_in_buffer() {
-                                break;
+                        match self.decode_slow_length_code(&mut bit_reader) {
+                            Ok(Mode::Type) => {
+                                return LenDecodeOutcome::continue_with(Mode::Type, bit_reader);
                             }
-
-                            if let Err(return_code) = bit_reader.pull_byte() {
-                                return LenDecodeOutcome::break_with(mode, bit_reader, return_code);
-                            };
-                        }
-
-                        if here.op != 0 && here.op & 0xf0 == 0 {
-                            let last = here;
-                            loop {
-                                let bits = bit_reader.bits((last.bits + last.op) as usize) as u16;
-                                here = len_table[(last.val + (bits >> last.bits)) as usize];
-                                if last.bits + here.bits <= bit_reader.bits_in_buffer() {
-                                    break;
-                                }
-
-                                if let Err(return_code) = bit_reader.pull_byte() {
-                                    return LenDecodeOutcome::break_with(
-                                        mode,
-                                        bit_reader,
-                                        return_code,
-                                    );
-                                };
-                            }
-
-                            bit_reader.drop_bits(last.bits);
-                            self.back += last.bits as usize;
-                        }
-
-                        bit_reader.drop_bits(here.bits);
-                        self.back += here.bits as usize;
-                        self.length = here.val as usize;
-
-                        if here.op == 0 {
-                            break 'top Mode::Lit;
-                        } else if here.op & 32 != 0 {
-                            // end of block
-
-                            traceln!("inflate:         end of block");
-
-                            self.back = usize::MAX;
-                            mode = Mode::Type;
-
-                            return LenDecodeOutcome::continue_with(mode, bit_reader);
-                        } else if here.op & 64 != 0 {
-                            mode = Mode::Bad;
-                            {
-                                let msg: &'static str = "invalid literal/length code\0";
-                                #[cfg(all(feature = "std", test))]
-                                dbg!(msg);
-                                self.error_message = Some(msg);
+                            Ok(next) => break 'top next,
+                            Err(exit) => {
                                 return LenDecodeOutcome::break_with(
-                                    mode,
-                                    bit_reader,
-                                    ReturnCode::DataError,
+                                    exit.mode, bit_reader, exit.code,
                                 );
                             }
-                        } else {
-                            // length code
-                            self.extra = (here.op & MAX_BITS) as usize;
-                            break 'top Mode::LenExt;
                         }
                     }
-                    Mode::Lit => {
-                        if !emit_literal(output, self.length as u8) {
+                    Mode::Lit => match emit_literal(output, self.length) {
+                        Ok(true) => break 'top Mode::Len,
+                        Ok(false) => {
                             traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
                             return LenDecodeOutcome::break_with(
                                 Mode::Lit,
@@ -1240,101 +1612,288 @@ impl State<'_> {
                                 ReturnCode::Ok,
                             );
                         }
-                        break 'top Mode::Len;
-                    }
-                    Mode::LenExt => {
-                        if let Err(code) = consume_extra_bits(
-                            &mut bit_reader,
-                            self.extra,
-                            &mut self.length,
-                            &mut self.back,
-                        ) {
-                            return LenDecodeOutcome::break_with(Mode::LenExt, bit_reader, code);
-                        }
-                        traceln!("inflate: length {}", self.length);
-                        self.was = self.length;
-                        break 'top Mode::Dist;
-                    }
-                    Mode::Dist => {
-                        match decode_distance_code(
-                            &mut bit_reader,
-                            dist_table,
-                            self.dist_table.bits,
-                        ) {
-                            Ok(decoded) => {
-                                self.back += decoded.back_bits;
-                                self.offset = decoded.offset;
-                                self.extra = decoded.extra;
-                                break 'top Mode::DistExt;
-                            }
-                            Err(DistanceDecodeError::Input(code)) => {
-                                return LenDecodeOutcome::break_with(Mode::Dist, bit_reader, code);
-                            }
-                            Err(DistanceDecodeError::InvalidCode) => {
-                                self.error_message = Some("invalid distance code\0");
-                                return LenDecodeOutcome::break_with(
-                                    Mode::Bad,
-                                    bit_reader,
-                                    ReturnCode::DataError,
-                                );
-                            }
-                        }
-                    }
-                    Mode::DistExt => {
-                        if let Err(code) = consume_extra_bits(
-                            &mut bit_reader,
-                            self.extra,
-                            &mut self.offset,
-                            &mut self.back,
-                        ) {
-                            return LenDecodeOutcome::break_with(Mode::DistExt, bit_reader, code);
-                        }
-                        if INFLATE_STRICT && self.offset > self.dmax {
-                            self.error_message = Some("invalid distance code too far back\0");
+                        Err(msg) => {
+                            self.error_message = Some(msg);
                             return LenDecodeOutcome::break_with(
                                 Mode::Bad,
                                 bit_reader,
                                 ReturnCode::DataError,
                             );
                         }
-                        traceln!("inflate: distance {}", self.offset);
-                        break 'top Mode::Match;
-                    }
-                    Mode::Match => {
-                        if output.is_full() {
-                            traceln!(
-                                "BufError: writer is full ({} bytes)",
-                                output.writer.capacity()
-                            );
+                    },
+                    Mode::LenExt => match decode_length_extension(
+                        &mut bit_reader,
+                        self.extra,
+                        &mut self.length,
+                        &mut self.was,
+                        &mut self.back,
+                    ) {
+                        Ok(next) => break 'top next,
+                        Err(code) => {
+                            return LenDecodeOutcome::break_with(Mode::LenExt, bit_reader, code);
+                        }
+                    },
+                    Mode::Dist => match self.decode_slow_distance_code(&mut bit_reader) {
+                        Ok(next) => break 'top next,
+                        Err(exit) => {
+                            return LenDecodeOutcome::break_with(exit.mode, bit_reader, exit.code);
+                        }
+                    },
+                    Mode::DistExt => match self.decode_slow_distance_extension(&mut bit_reader) {
+                        Ok(next) => break 'top next,
+                        Err(exit) => {
+                            return LenDecodeOutcome::break_with(exit.mode, bit_reader, exit.code);
+                        }
+                    },
+                    Mode::Match => match copy_pending_match(
+                        &self.window,
+                        self.flags.contains(Flags::SANE),
+                        self.offset,
+                        &mut self.length,
+                        output,
+                    ) {
+                        Ok(true) => break 'top Mode::Len,
+                        Ok(false) => {
                             return LenDecodeOutcome::break_with(
                                 Mode::Match,
                                 bit_reader,
                                 ReturnCode::Ok,
                             );
                         }
-                        match copy_match_bytes(
-                            &self.window,
-                            self.flags.contains(Flags::SANE),
-                            self.offset,
-                            &mut self.length,
-                            output,
-                        ) {
-                            Ok(true) => break 'top Mode::Len,
-                            Ok(false) => break 'top Mode::Match,
-                            Err(msg) => {
-                                self.error_message = Some(msg);
-                                return LenDecodeOutcome::break_with(
-                                    Mode::Bad,
-                                    bit_reader,
-                                    ReturnCode::DataError,
-                                );
-                            }
+                        Err(msg) => {
+                            self.error_message = Some(msg);
+                            return LenDecodeOutcome::break_with(
+                                Mode::Bad,
+                                bit_reader,
+                                ReturnCode::DataError,
+                            );
                         }
-                    }
+                    },
                     other => unreachable!("len decoder entered non-literal/match state: {other:?}"),
                 }
             }
         }
+    }
+
+    /// Header errors must publish the Bad mode on return, including when
+    /// parsing is resumed after a partial input chunk.
+    const fn invalid_header(&mut self, msg: &'static str) -> DispatchExit {
+        DispatchExit {
+            mode: Mode::Bad,
+            code: self.bad(msg),
+        }
+    }
+
+    /// Read the wrapper's leading two bytes, dispatching zlib or gzip without
+    /// touching payload input. Header-only work remains off the inflate hot path.
+    fn decode_wrapper_head(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        if self.wrap == 0 {
+            return Ok(Mode::TypeDo);
+        }
+        need_bits_for_mode(bit_reader, 16, Mode::Head)?;
+
+        if (self.wrap & 2) != 0 && bit_reader.hold() == 0x8b1f {
+            if self.wbits == 0 {
+                self.wbits = 15;
+            }
+            self.checksum = crc32(
+                crate::CRC32_INITIAL_VALUE,
+                &bit_reader.bits_u16(16).to_le_bytes(),
+            );
+            bit_reader.init_bits();
+            return Ok(Mode::Flags);
+        }
+
+        if let Some(mut header) = self.head {
+            header.set_done(-1);
+        }
+
+        if (self.wrap & 1) == 0 || ((bit_reader.bits(8) << 8) + (bit_reader.hold() >> 8)) % 31 != 0
+        {
+            return Err(self.invalid_header("incorrect header check\0"));
+        }
+        if i32::from(bit_reader.bits_u16(4)) != Z_DEFLATED {
+            return Err(self.invalid_header("unknown compression method\0"));
+        }
+
+        bit_reader.drop_bits(4);
+        let len = bit_reader.bits_u16(4).to_le_bytes()[0] + 8;
+        if self.wbits == 0 {
+            self.wbits = len;
+        }
+        if i32::from(len) > MAX_WBITS || len > self.wbits {
+            return Err(self.invalid_header("invalid window size\0"));
+        }
+
+        self.dmax = 1 << len;
+        self.gzip_flags = 0;
+        self.checksum = crate::ADLER32_INITIAL_VALUE;
+        let has_dictionary = bit_reader.hold() & 0x200 != 0;
+        bit_reader.init_bits();
+        Ok(if has_dictionary {
+            Mode::DictId
+        } else {
+            Mode::Type
+        })
+    }
+
+    fn decode_gzip_flags(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(bit_reader, 16, Mode::Flags)?;
+        let bytes = bit_reader.bits_u16(16).to_le_bytes();
+        self.gzip_flags = i32::from(u16::from_le_bytes(bytes));
+        if self.gzip_flags & 0xff != Z_DEFLATED {
+            return Err(self.invalid_header("unknown compression method\0"));
+        }
+        if self.gzip_flags & 0xe000 != 0 {
+            return Err(self.invalid_header("unknown header flags set\0"));
+        }
+
+        if let Some(mut head) = self.head {
+            head.set_text(i32::from(bytes[1] & 1));
+        }
+        if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+            self.checksum = crc32(self.checksum, &bytes);
+        }
+        bit_reader.init_bits();
+        Ok(Mode::Time)
+    }
+
+    fn decode_gzip_time(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(bit_reader, 32, Mode::Time)?;
+        let timestamp = bit_reader.bits_u32(32);
+        if let Some(mut head) = self.head {
+            head.set_time(z_size::from(timestamp));
+        }
+        if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+            self.checksum = crc32(self.checksum, &timestamp.to_le_bytes());
+        }
+        bit_reader.init_bits();
+        Ok(Mode::Os)
+    }
+
+    fn decode_gzip_os(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(bit_reader, 16, Mode::Os)?;
+        let bytes = bit_reader.bits_u16(16).to_le_bytes();
+        if let Some(mut head) = self.head {
+            head.set_os(i32::from(bytes[0]), i32::from(bytes[1]));
+        }
+        if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+            self.checksum = crc32(self.checksum, &bytes);
+        }
+        bit_reader.init_bits();
+        Ok(Mode::ExLen)
+    }
+
+    fn decode_gzip_extra_length(
+        &mut self,
+        reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        if self.gzip_flags & 0x0400 != 0 {
+            need_bits_for_mode(reader, 16, Mode::ExLen)?;
+            let extra_len = reader.bits_u16(16);
+            self.length = usize::from(extra_len);
+            if let Some(mut head) = self.head {
+                head.set_extra_len(extra_len);
+            }
+            if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+                self.checksum = crc32(self.checksum, &extra_len.to_le_bytes());
+            }
+            reader.init_bits();
+        } else if let Some(mut head) = self.head {
+            head.clear_extra();
+        }
+        Ok(Mode::Extra)
+    }
+
+    /// None means the field is still incomplete, so the caller must return
+    /// Ok without advancing the persistent gzip header mode.
+    fn decode_gzip_extra(
+        &mut self,
+        reader: &mut BitReader<'_>,
+    ) -> Result<Option<Mode>, DispatchExit> {
+        if self.gzip_flags & 0x0400 != 0 {
+            let available = self.length.min(reader.bytes_remaining());
+            if available > 0 {
+                let bytes = &reader.as_slice()[..available];
+                if let Some(mut head) = self.head {
+                    head.write_extra(self.length, bytes)
+                        .map_err(|code| DispatchExit {
+                            mode: Mode::Extra,
+                            code,
+                        })?;
+                }
+                if self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0 {
+                    self.checksum = crc32(self.checksum, bytes);
+                }
+                reader.advance(available);
+                self.length -= available;
+            }
+            if self.length != 0 {
+                return Ok(None);
+            }
+        }
+        self.length = 0;
+        Ok(Some(Mode::Name))
+    }
+
+    /// Consume the optional name or comment until its NUL byte appears.
+    /// Incomplete metadata yields None with its mode and cursor intact.
+    fn decode_gzip_string(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        field: GzipStringField,
+    ) -> Option<Mode> {
+        let (flag, next) = match field {
+            GzipStringField::Name => (0x0800, Mode::Comment),
+            GzipStringField::Comment => (0x1000, Mode::HCrc),
+        };
+        if self.gzip_flags & flag != 0 {
+            if !consume_gzip_header_string(
+                reader,
+                self.head,
+                field,
+                &mut self.length,
+                &mut self.checksum,
+                self.gzip_flags & 0x0200 != 0 && self.wrap & 4 != 0,
+            ) {
+                return None;
+            }
+        } else if let Some(mut head) = self.head {
+            match field {
+                GzipStringField::Name => head.clear_name(),
+                GzipStringField::Comment => head.clear_comment(),
+            }
+        }
+        if matches!(field, GzipStringField::Name) {
+            self.length = 0;
+        }
+        Some(next)
+    }
+
+    fn decode_gzip_header_crc(&mut self, reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        if self.gzip_flags & 0x0200 != 0 {
+            need_bits_for_mode(reader, 16, Mode::HCrc)?;
+            let checksum_bytes = self.checksum.to_le_bytes();
+            let expected = u16::from_le_bytes([checksum_bytes[0], checksum_bytes[1]]);
+            if self.wrap & 4 != 0 && reader.bits_u16(16) != expected {
+                return Err(self.invalid_header("header crc mismatch\0"));
+            }
+            reader.init_bits();
+        }
+
+        if let Some(mut head) = self.head {
+            head.finish((self.gzip_flags >> 9) & 1);
+        }
+
+        // Header CRC accumulation ends here; initialize data CRC state.
+        if self.wrap & 4 != 0 && self.gzip_flags != 0 {
+            self.crc_fold = Crc32Fold::new();
+            self.checksum = crate::CRC32_INITIAL_VALUE;
+        }
+        Ok(Mode::Type)
     }
 
     fn dispatch(
@@ -1345,14 +1904,383 @@ impl State<'_> {
     ) -> ReturnCode {
         let mode = self.mode;
         match self.dispatch_inner(bit_reader, output, flush, mode) {
-            Ok((mode, code)) => {
+            Ok((mode, code)) | Err(DispatchExit { mode, code }) => {
                 self.mode = mode;
                 code
             }
-            Err(DispatchExit { mode, code }) => {
-                self.mode = mode;
-                code
+        }
+    }
+
+    /// Decode the next DEFLATE block header. The final-block marker and
+    /// Huffman table selection belong to this state transition, not its caller.
+    fn decode_block_type(&mut self, bit_reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        if self.flags.contains(Flags::IS_LAST_BLOCK) {
+            bit_reader.next_byte_boundary();
+            return Ok(Mode::Check);
+        }
+
+        need_bits_for_mode(bit_reader, 3, Mode::TypeDo)?;
+        let last = bit_reader.bits(1) != 0;
+        self.flags.update(Flags::IS_LAST_BLOCK, last);
+        bit_reader.drop_bits(1);
+        let block_type = bit_reader.bits(2);
+        bit_reader.drop_bits(2);
+
+        match block_type {
+            0b00 => {
+                traceln!("inflate:     stored block (last = {last})");
+                Ok(Mode::Stored)
             }
+            0b01 => {
+                traceln!("inflate:     fixed codes block (last = {last})");
+                self.len_table = Table {
+                    codes: Codes::Fixed,
+                    bits: 9,
+                };
+                self.dist_table = Table {
+                    codes: Codes::Fixed,
+                    bits: 5,
+                };
+                Ok(Mode::Len_)
+            }
+            0b10 => {
+                traceln!("inflate:     dynamic codes block (last = {last})");
+                Ok(Mode::Table)
+            }
+            0b11 => {
+                traceln!("inflate:     invalid block type");
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: self.bad("invalid block type\0"),
+                })
+            }
+            _ => unreachable!("two buffered bits yield only values 0..=3"),
+        }
+    }
+
+    /// Verify the trailer checksum only after its complete 32-bit field is
+    /// available. Account for the current output exactly once on resume.
+    fn decode_data_checksum(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+        output: &mut InflateOutput<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        if self.wrap != 0 {
+            need_bits_for_mode(bit_reader, 32, Mode::Check)?;
+            let verify_checksum =
+                self.wrap & 4 != 0 && !cfg!(feature = "__internal-fuzz-disable-checksum");
+            // Even without verification, the trailer and output count must advance.
+            self.total = self.total.wrapping_add(output.len());
+
+            if verify_checksum {
+                if self.gzip_flags != 0 {
+                    self.crc_fold.fold(output.filled());
+                    self.checksum = self.crc_fold.finish();
+                } else {
+                    self.checksum = adler32(self.checksum, output.filled());
+                }
+            }
+
+            let given_checksum = if self.gzip_flags != 0 {
+                bit_reader.bits_u32(32)
+            } else {
+                zswap32(bit_reader.bits_u32(32))
+            };
+            output.mark_accounted();
+
+            if verify_checksum && given_checksum != self.checksum {
+                return Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: self.bad("incorrect data check\0"),
+                });
+            }
+            bit_reader.init_bits();
+        }
+        Ok(Mode::Length)
+    }
+
+    /// Read and validate the complete stored block LEN/NLEN header before
+    /// advancing to the payload. A short header remains in Stored.
+    fn decode_stored_header(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        bit_reader.next_byte_boundary();
+        need_bits_for_mode(bit_reader, 32, Mode::Stored)?;
+        let hold = bit_reader.bits_u32(32);
+        let Some(length) = stored_block_length(hold) else {
+            return Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad("invalid stored block lengths\0"),
+            });
+        };
+        self.length = usize::from(length);
+        traceln!("inflate:     stored length {}", self.length);
+        bit_reader.init_bits();
+        Ok(Mode::CopyBlock)
+    }
+
+    /// A stored payload is byte-aligned and needs at most one contiguous copy
+    /// per public inflate call. None signals input/output exhaustion.
+    fn copy_stored_payload(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        output: &mut InflateOutput<'_>,
+    ) -> Option<Mode> {
+        if self.length == 0 {
+            return Some(Mode::Type);
+        }
+        let count = self
+            .length
+            .min(output.remaining())
+            .min(reader.bytes_remaining());
+        if count == 0 {
+            return None;
+        }
+
+        output.extend(&reader.as_slice()[..count]);
+        reader.advance(count);
+        self.length -= count;
+        (self.length == 0).then_some(Mode::Type)
+    }
+
+    /// Decode a complete dynamic Huffman table header or keep Table on
+    /// starvation. Check symbol-count limits before altering table storage.
+    fn decode_dynamic_table_header(
+        &mut self,
+        reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(reader, 14, Mode::Table)?;
+        self.nlen = reader.bits_usize(5) + 257;
+        reader.drop_bits(5);
+        self.ndist = reader.bits_usize(5) + 1;
+        reader.drop_bits(5);
+        self.ncode = reader.bits_usize(4) + 4;
+        reader.drop_bits(4);
+
+        if self.nlen > 286 || self.ndist > 30 {
+            return Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad("too many length or distance symbols\0"),
+            });
+        }
+        self.have = 0;
+        Ok(Mode::LenLens)
+    }
+
+    /// Read the code-length alphabet incrementally, publishing the next mode
+    /// only once all symbols and their Huffman table are validated.
+    fn decode_code_length_alphabet(
+        &mut self,
+        reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        while self.have < self.ncode {
+            need_bits_for_mode(reader, 3, Mode::LenLens)?;
+            self.append_code_length_alphabet(reader.bits_u16(3));
+            reader.drop_bits(3);
+        }
+        if let Err(msg) = self.finish_code_length_alphabet() {
+            return Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad(msg),
+            });
+        }
+        Ok(Mode::CodeLens)
+    }
+
+    /// Complete the dynamic literal/length and distance alphabets. Input
+    /// starvation preserves the `CodeLens` mode and the partial symbol count.
+    fn decode_code_lengths(&mut self, bit_reader: &mut BitReader<'_>) -> Result<(), DispatchExit> {
+        while self.have < self.nlen + self.ndist {
+            let here = loop {
+                let bits = bit_reader.bits_usize(self.len_table.bits);
+                let here = self.len_table_get(bits);
+                if here.bits <= bit_reader.bits_in_buffer() {
+                    break here;
+                }
+
+                pull_byte_for_mode(bit_reader, Mode::CodeLens)?;
+            };
+
+            let here_bits = here.bits;
+            match here.val {
+                0..=15 => {
+                    bit_reader.drop_bits(here_bits);
+                    self.lens[self.have] = here.val;
+                    self.have += 1;
+                }
+                symbol => {
+                    let Some(repeat) = CodeLengthRepeat::from_symbol(symbol) else {
+                        return Err(DispatchExit {
+                            mode: Mode::Bad,
+                            code: self.bad("invalid bit length repeat\0"),
+                        });
+                    };
+                    need_bits_for_mode(
+                        bit_reader,
+                        usize::from(here_bits) + usize::from(repeat.extra_bits),
+                        Mode::CodeLens,
+                    )?;
+                    bit_reader.drop_bits(here_bits);
+                    let extra = bit_reader.bits(usize::from(repeat.extra_bits));
+                    bit_reader.drop_bits(repeat.extra_bits);
+                    if let Err(msg) = self.append_code_length_repeat(repeat, extra) {
+                        return Err(DispatchExit {
+                            mode: Mode::Bad,
+                            code: self.bad(msg),
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Err(msg) = self.finish_dynamic_trees() {
+            return Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad(msg),
+            });
+        }
+        Ok(())
+    }
+
+    /// Read the RFC 1950 dictionary Adler-32 without exposing a partially
+    /// consumed identifier to callers. A short read retains `DictId`.
+    fn decode_dictionary_id(&mut self, reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        need_bits_for_mode(reader, 32, Mode::DictId)?;
+        self.checksum = zswap32(reader.bits_u32(32));
+        reader.init_bits();
+        Ok(Mode::Dict)
+    }
+
+    /// Verify a gzip ISIZE trailer only after its entire field is available.
+    /// RFC 1952 stores the decoded byte count modulo 2^32.
+    fn decode_output_length(&mut self, reader: &mut BitReader<'_>) -> Result<Mode, DispatchExit> {
+        if self.wrap != 0 && self.gzip_flags != 0 {
+            need_bits_for_mode(reader, 32, Mode::Length)?;
+            if self.wrap & 4 != 0 && reader.bits_u32(32) != gzip_isize(self.total) {
+                return Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: self.bad("incorrect length check\0"),
+                });
+            }
+            reader.init_bits();
+        }
+        Ok(Mode::Done)
+    }
+
+    /// Complete the RFC 1950/1952 header state machine before dispatching
+    /// payload blocks. A partially received gzip extra/name/comment field
+    /// remains in the same mode with its input position preserved.
+    fn decode_wrapper_states(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mut mode: Mode,
+    ) -> Result<WrapperProgress, DispatchExit> {
+        loop {
+            mode = match mode {
+                Mode::Head => self.decode_wrapper_head(reader)?,
+                Mode::Flags => self.decode_gzip_flags(reader)?,
+                Mode::Time => self.decode_gzip_time(reader)?,
+                Mode::Os => self.decode_gzip_os(reader)?,
+                Mode::ExLen => self.decode_gzip_extra_length(reader)?,
+                Mode::Extra => match self.decode_gzip_extra(reader)? {
+                    Some(next) => next,
+                    None => return Ok(WrapperProgress::Paused(Mode::Extra)),
+                },
+                Mode::Name => {
+                    let Some(next) = self.decode_gzip_string(reader, GzipStringField::Name) else {
+                        return Ok(WrapperProgress::Paused(Mode::Name));
+                    };
+                    next
+                }
+                Mode::Comment => {
+                    let Some(next) = self.decode_gzip_string(reader, GzipStringField::Comment)
+                    else {
+                        return Ok(WrapperProgress::Paused(Mode::Comment));
+                    };
+                    next
+                }
+                Mode::HCrc => self.decode_gzip_header_crc(reader)?,
+                next => return Ok(WrapperProgress::Ready(next)),
+            };
+        }
+    }
+
+    /// Block framing can either enter the next state or pause at a flush
+    /// boundary; in the latter case the caller publishes the exact pending mode.
+    fn dispatch_block_mode(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+        output: &mut InflateOutput<'_>,
+        flush: InflateFlush,
+        mode: Mode,
+    ) -> Result<ControlFlow<(Mode, ReturnCode), Mode>, DispatchExit> {
+        match mode {
+            Mode::Type => match flush {
+                InflateFlush::Block | InflateFlush::Trees => {
+                    Ok(ControlFlow::Break((Mode::Type, ReturnCode::Ok)))
+                }
+                InflateFlush::NoFlush | InflateFlush::SyncFlush | InflateFlush::Finish => {
+                    Ok(ControlFlow::Continue(Mode::TypeDo))
+                }
+            },
+            Mode::TypeDo => {
+                let next = self.decode_block_type(bit_reader)?;
+                if flush == InflateFlush::Trees && matches!(next, Mode::Len_) {
+                    Ok(ControlFlow::Break((next, ReturnCode::Ok)))
+                } else {
+                    Ok(ControlFlow::Continue(next))
+                }
+            }
+            Mode::Stored => {
+                let next = self.decode_stored_header(bit_reader)?;
+                if flush == InflateFlush::Trees {
+                    Ok(ControlFlow::Break((next, ReturnCode::Ok)))
+                } else {
+                    Ok(ControlFlow::Continue(next))
+                }
+            }
+            Mode::CopyBlock => Ok(self.copy_stored_payload(bit_reader, output).map_or(
+                ControlFlow::Break((Mode::CopyBlock, ReturnCode::Ok)),
+                ControlFlow::Continue,
+            )),
+            Mode::Check => self
+                .decode_data_checksum(bit_reader, output)
+                .map(ControlFlow::Continue),
+            _ => unreachable!("only block framing states enter dispatch_block_mode"),
+        }
+    }
+
+    /// Both literal and back-reference emission may pause when caller output
+    /// fills; an incomplete emission retains its precise mode and cursor.
+    fn emit_pending_payload(
+        &mut self,
+        output: &mut InflateOutput<'_>,
+        mode: Mode,
+    ) -> Result<Option<Mode>, DispatchExit> {
+        let written = match mode {
+            Mode::Lit => emit_literal(output, self.length),
+            Mode::Match => copy_pending_match(
+                &self.window,
+                self.flags.contains(Flags::SANE),
+                self.offset,
+                &mut self.length,
+                output,
+            ),
+            _ => unreachable!("only pending payload states enter emit_pending_payload"),
+        };
+        match written {
+            Ok(true) => Ok(Some(Mode::Len)),
+            Ok(false) => {
+                if matches!(mode, Mode::Lit) {
+                    traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
+                }
+                Ok(None)
+            }
+            Err(msg) => Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad(msg),
+            }),
         }
     }
 
@@ -1366,445 +2294,29 @@ impl State<'_> {
         let ret = 'label: loop {
             mode = 'blk: {
                 match mode {
-                    Mode::Head => {
-                        if self.wrap == 0 {
-                            break 'blk Mode::TypeDo;
-                        }
-
-                        need_bits_for_mode(bit_reader, 16, mode)?;
-
-                        // Gzip
-                        if (self.wrap & 2) != 0 && bit_reader.hold() == 0x8b1f {
-                            if self.wbits == 0 {
-                                self.wbits = 15;
-                            }
-
-                            let b0 = bit_reader.bits(8) as u8;
-                            let b1 = (bit_reader.hold() >> 8) as u8;
-                            self.checksum = crc32(crate::CRC32_INITIAL_VALUE, &[b0, b1]);
-                            bit_reader.init_bits();
-
-                            break 'blk Mode::Flags;
-                        }
-
-                        if let Some(mut header) = self.head {
-                            header.set_done(-1);
-                        }
-
-                        // check if zlib header is allowed
-                        if (self.wrap & 1) == 0
-                            || ((bit_reader.bits(8) << 8) + (bit_reader.hold() >> 8)) % 31 != 0
-                        {
-                            mode = Mode::Bad;
-                            break 'label self.bad("incorrect header check\0");
-                        }
-
-                        if bit_reader.bits(4) != Z_DEFLATED as u64 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("unknown compression method\0");
-                        }
-
-                        bit_reader.drop_bits(4);
-                        let len = bit_reader.bits(4) as u8 + 8;
-
-                        if self.wbits == 0 {
-                            self.wbits = len;
-                        }
-
-                        if len as i32 > MAX_WBITS || len > self.wbits {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid window size\0");
-                        }
-
-                        self.dmax = 1 << len;
-                        self.gzip_flags = 0; // indicate zlib header
-                        self.checksum = crate::ADLER32_INITIAL_VALUE as _;
-
-                        if bit_reader.hold() & 0x200 != 0 {
-                            bit_reader.init_bits();
-
-                            break 'blk Mode::DictId;
-                        } else {
-                            bit_reader.init_bits();
-
-                            break 'blk Mode::Type;
-                        }
-                    }
-                    Mode::Flags => {
-                        need_bits_for_mode(bit_reader, 16, mode)?;
-                        self.gzip_flags = bit_reader.hold() as i32;
-
-                        // Z_DEFLATED = 8 is the only supported method
-                        if self.gzip_flags & 0xff != Z_DEFLATED {
-                            mode = Mode::Bad;
-                            break 'label self.bad("unknown compression method\0");
-                        }
-
-                        if self.gzip_flags & 0xe000 != 0 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("unknown header flags set\0");
-                        }
-
-                        if let Some(mut head) = self.head {
-                            head.set_text(((bit_reader.hold() >> 8) & 1) as i32);
-                        }
-
-                        if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let b0 = bit_reader.bits(8) as u8;
-                            let b1 = (bit_reader.hold() >> 8) as u8;
-                            self.checksum = crc32(self.checksum, &[b0, b1]);
-                        }
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::Time;
-                    }
-                    Mode::Time => {
-                        need_bits_for_mode(bit_reader, 32, mode)?;
-                        if let Some(mut head) = self.head {
-                            head.set_time(bit_reader.hold() as z_size);
-                        }
-
-                        if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let bytes = (bit_reader.hold() as u32).to_le_bytes();
-                            self.checksum = crc32(self.checksum, &bytes);
-                        }
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::Os;
-                    }
-                    Mode::Os => {
-                        need_bits_for_mode(bit_reader, 16, mode)?;
-                        if let Some(mut head) = self.head {
-                            head.set_os(
-                                (bit_reader.hold() & 0xff) as i32,
-                                (bit_reader.hold() >> 8) as i32,
-                            );
-                        }
-
-                        if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                            let bytes = (bit_reader.hold() as u16).to_le_bytes();
-                            self.checksum = crc32(self.checksum, &bytes);
-                        }
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::ExLen;
-                    }
-                    Mode::ExLen => {
-                        if (self.gzip_flags & 0x0400) != 0 {
-                            need_bits_for_mode(bit_reader, 16, mode)?;
-
-                            // self.length (and head.extra_len) represent the length of the extra field
-                            self.length = bit_reader.hold() as usize;
-                            if let Some(mut head) = self.head {
-                                head.set_extra_len(self.length);
-                            }
-
-                            if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                let bytes = (bit_reader.hold() as u16).to_le_bytes();
-                                self.checksum = crc32(self.checksum, &bytes);
-                            }
-                            bit_reader.init_bits();
-                        } else if let Some(mut head) = self.head {
-                            head.clear_extra();
-                        }
-
-                        break 'blk Mode::Extra;
-                    }
-                    Mode::Extra => {
-                        if (self.gzip_flags & 0x0400) != 0 {
-                            // self.length is the number of remaining `extra` bytes. But they may not all be available
-                            let extra_available =
-                                Ord::min(self.length, bit_reader.bytes_remaining());
-
-                            if extra_available > 0 {
-                                if let Some(mut head) = self.head {
-                                    head.write_extra(
-                                        self.length,
-                                        &bit_reader.as_slice()[..extra_available],
-                                    );
-                                }
-
-                                // Checksum
-                                if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                    let extra_slice = &bit_reader.as_slice()[..extra_available];
-                                    self.checksum = crc32(self.checksum, extra_slice)
-                                }
-
-                                bit_reader.advance(extra_available);
-                                self.length -= extra_available;
-                            }
-
-                            // Checks for errors occur after returning
-                            if self.length != 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-                        }
-
-                        self.length = 0;
-
-                        break 'blk Mode::Name;
-                    }
-                    Mode::Name => {
-                        if (self.gzip_flags & 0x0800) != 0 {
-                            if bit_reader.bytes_remaining() == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-
-                            // the name string will always be null-terminated, but might be longer than we have
-                            // space for in the header struct. Nonetheless, we read the whole thing.
-                            let slice = bit_reader.as_slice();
-                            let null_terminator_index = slice.iter().position(|c| *c == 0);
-
-                            // we include the null terminator if it exists
-                            let name_slice = match null_terminator_index {
-                                Some(i) => &slice[..=i],
-                                None => slice,
-                            };
-
-                            // if the header has space, store as much as possible in there
-                            if let Some(mut head) = self.head {
-                                self.length += head.write_name(self.length, name_slice);
-                            }
-
-                            if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                self.checksum = crc32(self.checksum, name_slice);
-                            }
-
-                            let reached_end = name_slice.last() == Some(&0);
-                            bit_reader.advance(name_slice.len());
-
-                            if !reached_end && bit_reader.bytes_remaining() == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-                        } else if let Some(mut head) = self.head {
-                            head.clear_name();
-                        }
-
-                        self.length = 0;
-
-                        break 'blk Mode::Comment;
-                    }
-                    Mode::Comment => {
-                        if (self.gzip_flags & 0x01000) != 0 {
-                            if bit_reader.bytes_remaining() == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-
-                            // the comment string will always be null-terminated, but might be longer than we have
-                            // space for in the header struct. Nonetheless, we read the whole thing.
-                            let slice = bit_reader.as_slice();
-                            let null_terminator_index = slice.iter().position(|c| *c == 0);
-
-                            // we include the null terminator if it exists
-                            let comment_slice = match null_terminator_index {
-                                Some(i) => &slice[..=i],
-                                None => slice,
-                            };
-
-                            // if the header has space, store as much as possible in there
-                            if let Some(mut head) = self.head {
-                                self.length += head.write_comment(self.length, comment_slice);
-                            }
-
-                            if (self.gzip_flags & 0x0200) != 0 && (self.wrap & 4) != 0 {
-                                self.checksum = crc32(self.checksum, comment_slice);
-                            }
-
-                            let reached_end = comment_slice.last() == Some(&0);
-                            bit_reader.advance(comment_slice.len());
-
-                            if !reached_end && bit_reader.bytes_remaining() == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-                        } else if let Some(mut head) = self.head {
-                            head.clear_comment();
-                        }
-
-                        break 'blk Mode::HCrc;
-                    }
-                    Mode::HCrc => {
-                        if (self.gzip_flags & 0x0200) != 0 {
-                            need_bits_for_mode(bit_reader, 16, mode)?;
-
-                            if (self.wrap & 4) != 0
-                                && bit_reader.hold() as u32 != (self.checksum & 0xffff)
-                            {
-                                mode = Mode::Bad;
-                                break 'label self.bad("header crc mismatch\0");
-                            }
-
-                            bit_reader.init_bits();
-                        }
-
-                        if let Some(mut head) = self.head {
-                            head.finish((self.gzip_flags >> 9) & 1);
-                        }
-
-                        // compute crc32 checksum if not in raw mode
-                        if (self.wrap & 4 != 0) && self.gzip_flags != 0 {
-                            self.crc_fold = Crc32Fold::new();
-                            self.checksum = crate::CRC32_INITIAL_VALUE;
-                        }
-
-                        break 'blk Mode::Type;
-                    }
-                    Mode::Type => {
-                        use InflateFlush::*;
-
-                        match flush {
-                            Block | Trees => break 'label ReturnCode::Ok,
-                            NoFlush | SyncFlush | Finish => {
-                                // NOTE: this is slightly different to what zlib-rs does!
-                                break 'blk Mode::TypeDo;
-                            }
-                        }
-                    }
-                    Mode::TypeDo => {
-                        if self.flags.contains(Flags::IS_LAST_BLOCK) {
-                            bit_reader.next_byte_boundary();
-                            break 'blk Mode::Check;
-                        }
-
-                        need_bits_for_mode(bit_reader, 3, mode)?;
-                        let last = bit_reader.bits(1) != 0;
-                        self.flags.update(Flags::IS_LAST_BLOCK, last);
-                        bit_reader.drop_bits(1);
-
-                        match bit_reader.bits(2) {
-                            0b00 => {
-                                traceln!("inflate:     stored block (last = {last})");
-
-                                bit_reader.drop_bits(2);
-
-                                break 'blk Mode::Stored;
-                            }
-                            0b01 => {
-                                traceln!("inflate:     fixed codes block (last = {last})");
-
-                                self.len_table = Table {
-                                    codes: Codes::Fixed,
-                                    bits: 9,
-                                };
-
-                                self.dist_table = Table {
-                                    codes: Codes::Fixed,
-                                    bits: 5,
-                                };
-
-                                mode = Mode::Len_;
-
-                                bit_reader.drop_bits(2);
-
-                                if let InflateFlush::Trees = flush {
-                                    break 'label ReturnCode::Ok;
-                                } else {
-                                    break 'blk Mode::Len_;
-                                }
-                            }
-                            0b10 => {
-                                traceln!("inflate:     dynamic codes block (last = {last})");
-
-                                bit_reader.drop_bits(2);
-
-                                break 'blk Mode::Table;
-                            }
-                            0b11 => {
-                                traceln!("inflate:     invalid block type");
-
-                                bit_reader.drop_bits(2);
-
-                                mode = Mode::Bad;
-                                break 'label self.bad("invalid block type\0");
-                            }
-                            _ => {
-                                // LLVM will optimize this branch away
-                                unreachable!("BitReader::bits(2) only yields a value of two bits, so this match is already exhaustive")
-                            }
-                        }
-                    }
-                    Mode::Stored => {
-                        bit_reader.next_byte_boundary();
-
-                        need_bits_for_mode(bit_reader, 32, mode)?;
-
-                        let hold = bit_reader.bits(32) as u32;
-
-                        traceln!("hold {hold:#x}");
-
-                        if hold as u16 != !((hold >> 16) as u16) {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid stored block lengths\0");
-                        }
-
-                        self.length = hold as usize & 0xFFFF;
-                        traceln!("inflate:     stored length {}", self.length);
-
-                        bit_reader.init_bits();
-
-                        if let InflateFlush::Trees = flush {
+                    Mode::Head
+                    | Mode::Flags
+                    | Mode::Time
+                    | Mode::Os
+                    | Mode::ExLen
+                    | Mode::Extra
+                    | Mode::Name
+                    | Mode::Comment
+                    | Mode::HCrc => match self.decode_wrapper_states(bit_reader, mode)? {
+                        WrapperProgress::Ready(next) => break 'blk next,
+                        WrapperProgress::Paused(pending) => {
+                            mode = pending;
                             break 'label ReturnCode::Ok;
-                        } else {
-                            break 'blk Mode::CopyBlock;
                         }
-                    }
-                    Mode::CopyBlock => {
-                        loop {
-                            let mut copy = self.length;
-
-                            if copy == 0 {
-                                break;
+                    },
+                    Mode::Type | Mode::TypeDo | Mode::Stored | Mode::CopyBlock | Mode::Check => {
+                        match self.dispatch_block_mode(bit_reader, output, flush, mode)? {
+                            ControlFlow::Continue(next) => break 'blk next,
+                            ControlFlow::Break((paused, code)) => {
+                                mode = paused;
+                                break 'label code;
                             }
-
-                            copy = Ord::min(copy, output.remaining());
-                            copy = Ord::min(copy, bit_reader.bytes_remaining());
-
-                            if copy == 0 {
-                                break 'label ReturnCode::Ok;
-                            }
-
-                            output.extend(&bit_reader.as_slice()[..copy]);
-                            bit_reader.advance(copy);
-
-                            self.length -= copy;
                         }
-
-                        break 'blk Mode::Type;
-                    }
-                    Mode::Check => {
-                        if !cfg!(feature = "__internal-fuzz-disable-checksum") && self.wrap != 0 {
-                            need_bits_for_mode(bit_reader, 32, mode)?;
-
-                            self.total += output.len();
-
-                            if self.wrap & 4 != 0 {
-                                if self.gzip_flags != 0 {
-                                    self.crc_fold.fold(output.filled());
-                                    self.checksum = self.crc_fold.finish();
-                                } else {
-                                    self.checksum = adler32(self.checksum, output.filled());
-                                }
-                            }
-
-                            let given_checksum = if self.gzip_flags != 0 {
-                                bit_reader.hold() as u32
-                            } else {
-                                zswap32(bit_reader.hold() as u32)
-                            };
-
-                            output.mark_accounted();
-
-                            if self.wrap & 4 != 0 && given_checksum != self.checksum {
-                                mode = Mode::Bad;
-                                break 'label self.bad("incorrect data check\0");
-                            }
-
-                            bit_reader.init_bits();
-                        }
-
-                        break 'blk Mode::Length;
                     }
                     Mode::Len_ => {
                         break 'blk Mode::Len;
@@ -1819,277 +2331,34 @@ impl State<'_> {
                         }
                     }
                     Mode::LenExt => {
-                        if let Err(code) = consume_extra_bits(
+                        break 'blk decode_length_extension(
                             bit_reader,
                             self.extra,
                             &mut self.length,
+                            &mut self.was,
                             &mut self.back,
-                        ) {
-                            return Err(DispatchExit {
-                                mode: Mode::LenExt,
-                                code,
-                            });
-                        }
-                        traceln!("inflate: length {}", self.length);
-                        self.was = self.length;
-                        break 'blk Mode::Dist;
+                        )
+                        .map_err(|code| DispatchExit {
+                            mode: Mode::LenExt,
+                            code,
+                        })?;
                     }
-                    Mode::Lit => {
-                        if !emit_literal(output, self.length as u8) {
-                            traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
-                            break 'label ReturnCode::Ok;
-                        }
-                        break 'blk Mode::Len;
-                    }
-                    Mode::Dist => {
-                        let decoded = {
-                            let table = self.dist_table_ref();
-                            decode_distance_code(bit_reader, table, self.dist_table.bits)
-                        };
-                        match decoded {
-                            Ok(decoded) => {
-                                self.back += decoded.back_bits;
-                                self.offset = decoded.offset;
-                                self.extra = decoded.extra;
-                                break 'blk Mode::DistExt;
-                            }
-                            Err(DistanceDecodeError::Input(code)) => {
-                                return Err(DispatchExit {
-                                    mode: Mode::Dist,
-                                    code,
-                                });
-                            }
-                            Err(DistanceDecodeError::InvalidCode) => {
-                                mode = Mode::Bad;
-                                break 'label self.bad("invalid distance code\0");
-                            }
-                        }
-                    }
-                    Mode::DistExt => {
-                        if let Err(code) = consume_extra_bits(
-                            bit_reader,
-                            self.extra,
-                            &mut self.offset,
-                            &mut self.back,
-                        ) {
-                            return Err(DispatchExit {
-                                mode: Mode::DistExt,
-                                code,
-                            });
-                        }
-                        if INFLATE_STRICT && self.offset > self.dmax {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid distance code too far back\0");
-                        }
-                        traceln!("inflate: distance {}", self.offset);
-                        break 'blk Mode::Match;
-                    }
-                    Mode::Match => 'match_: loop {
-                        if output.is_full() {
-                            traceln!(
-                                "BufError: writer is full ({} bytes)",
-                                output.writer.capacity()
-                            );
-                            break 'label ReturnCode::Ok;
-                        }
-                        match copy_match_bytes(
-                            &self.window,
-                            self.flags.contains(Flags::SANE),
-                            self.offset,
-                            &mut self.length,
-                            output,
-                        ) {
-                            Ok(true) => break 'blk Mode::Len,
-                            Ok(false) => continue 'match_,
-                            Err(msg) => {
-                                mode = Mode::Bad;
-                                break 'label self.bad(msg);
-                            }
-                        }
+                    Mode::Lit | Mode::Match => match self.emit_pending_payload(output, mode)? {
+                        Some(next) => break 'blk next,
+                        None => break 'label ReturnCode::Ok,
                     },
-                    Mode::Table => {
-                        need_bits_for_mode(bit_reader, 14, mode)?;
-                        self.nlen = bit_reader.bits(5) as usize + 257;
-                        bit_reader.drop_bits(5);
-                        self.ndist = bit_reader.bits(5) as usize + 1;
-                        bit_reader.drop_bits(5);
-                        self.ncode = bit_reader.bits(4) as usize + 4;
-                        bit_reader.drop_bits(4);
-
-                        // TODO pkzit_bug_workaround
-                        if self.nlen > 286 || self.ndist > 30 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("too many length or distance symbols\0");
-                        }
-
-                        self.have = 0;
-
-                        break 'blk Mode::LenLens;
-                    }
+                    Mode::Dist => break 'blk self.decode_slow_distance_code(bit_reader)?,
+                    Mode::DistExt => break 'blk self.decode_slow_distance_extension(bit_reader)?,
+                    Mode::Table => break 'blk self.decode_dynamic_table_header(bit_reader)?,
                     Mode::LenLens => {
-                        // permutation of code lengths ;
-                        const ORDER: [u8; 19] = [
-                            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-                        ];
-
-                        while self.have < self.ncode {
-                            need_bits_for_mode(bit_reader, 3, mode)?;
-                            self.lens[usize::from(ORDER[self.have])] = bit_reader.bits(3) as u16;
-                            self.have += 1;
-                            bit_reader.drop_bits(3);
-                        }
-
-                        while self.have < 19 {
-                            self.lens[usize::from(ORDER[self.have])] = 0;
-                            self.have += 1;
-                        }
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Codes,
-                            &self.lens[..19],
-                            &mut self.codes_codes,
-                            7,
-                            &mut self.work,
-                        ) else {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid code lengths set\0");
-                        };
-
-                        self.next = used;
-                        self.len_table.codes = Codes::Codes;
-                        self.len_table.bits = root;
-
-                        self.have = 0;
-
-                        break 'blk Mode::CodeLens;
+                        break 'blk self.decode_code_length_alphabet(bit_reader)?;
                     }
                     Mode::CodeLens => {
-                        while self.have < self.nlen + self.ndist {
-                            let here = loop {
-                                let bits = bit_reader.bits(self.len_table.bits);
-                                let here = self.len_table_get(bits as usize);
-                                if here.bits <= bit_reader.bits_in_buffer() {
-                                    break here;
-                                }
-
-                                pull_byte_for_mode(bit_reader, mode)?;
-                            };
-
-                            let here_bits = here.bits;
-
-                            match here.val {
-                                0..=15 => {
-                                    bit_reader.drop_bits(here_bits);
-                                    self.lens[self.have] = here.val;
-                                    self.have += 1;
-                                }
-                                16 => {
-                                    need_bits_for_mode(
-                                        bit_reader,
-                                        usize::from(here_bits) + 2,
-                                        mode,
-                                    )?;
-                                    bit_reader.drop_bits(here_bits);
-                                    if self.have == 0 {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    let len = self.lens[self.have - 1];
-                                    let copy = 3 + bit_reader.bits(2) as usize;
-                                    bit_reader.drop_bits(2);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(len);
-                                    self.have += copy;
-                                }
-                                17 => {
-                                    need_bits_for_mode(
-                                        bit_reader,
-                                        usize::from(here_bits) + 3,
-                                        mode,
-                                    )?;
-                                    bit_reader.drop_bits(here_bits);
-                                    let copy = 3 + bit_reader.bits(3) as usize;
-                                    bit_reader.drop_bits(3);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(0);
-                                    self.have += copy;
-                                }
-                                18.. => {
-                                    need_bits_for_mode(
-                                        bit_reader,
-                                        usize::from(here_bits) + 7,
-                                        mode,
-                                    )?;
-                                    bit_reader.drop_bits(here_bits);
-                                    let copy = 11 + bit_reader.bits(7) as usize;
-                                    bit_reader.drop_bits(7);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(0);
-                                    self.have += copy;
-                                }
-                            }
-                        }
-
-                        // check for end-of-block code (better have one)
-                        if self.lens[256] == 0 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid code -- missing end-of-block\0");
-                        }
-
-                        // build code tables
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Lens,
-                            &self.lens[..self.nlen],
-                            &mut self.len_codes,
-                            10,
-                            &mut self.work,
-                        ) else {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid literal/lengths set\0");
-                        };
-
-                        self.len_table.codes = Codes::Len;
-                        self.len_table.bits = root;
-                        self.next = used;
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Dists,
-                            &self.lens[self.nlen..][..self.ndist],
-                            &mut self.dist_codes,
-                            9,
-                            &mut self.work,
-                        ) else {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid distances set\0");
-                        };
-
-                        self.dist_table.bits = root;
-                        self.dist_table.codes = Codes::Dist;
-                        self.next += used;
-
+                        self.decode_code_lengths(bit_reader)?;
                         mode = Mode::Len_;
-
-                        if matches!(flush, InflateFlush::Trees) {
+                        if flush == InflateFlush::Trees {
                             break 'label ReturnCode::Ok;
                         }
-
                         break 'blk Mode::Len_;
                     }
                     Mode::Dict => {
@@ -2097,27 +2366,17 @@ impl State<'_> {
                             break 'label ReturnCode::NeedDict;
                         }
 
-                        self.checksum = crate::ADLER32_INITIAL_VALUE as _;
+                        self.checksum = crate::ADLER32_INITIAL_VALUE;
 
                         break 'blk Mode::Type;
                     }
-                    Mode::DictId => {
-                        need_bits_for_mode(bit_reader, 32, mode)?;
-
-                        self.checksum = zswap32(bit_reader.hold() as u32);
-
-                        bit_reader.init_bits();
-
-                        break 'blk Mode::Dict;
-                    }
+                    Mode::DictId => break 'blk self.decode_dictionary_id(bit_reader)?,
                     Mode::Done => {
                         // Inflate stream terminated properly.
                         break 'label ReturnCode::StreamEnd;
                     }
                     Mode::Bad => {
                         let msg = "repeated call with bad state\0";
-                        #[cfg(all(feature = "std", test))]
-                        dbg!(msg);
                         self.error_message = Some(msg);
 
                         break 'label ReturnCode::DataError;
@@ -2129,21 +2388,7 @@ impl State<'_> {
                         break 'label ReturnCode::StreamError;
                     }
                     Mode::Length => {
-                        // for gzip, last bytes contain LENGTH
-                        if self.wrap != 0 && self.gzip_flags != 0 {
-                            need_bits_for_mode(bit_reader, 32, mode)?;
-                            if (self.wrap & 0b100) != 0
-                                && bit_reader.hold() as u32 != self.total as u32
-                            {
-                                mode = Mode::Bad;
-                                break 'label self.bad("incorrect length check\0");
-                            }
-
-                            bit_reader.init_bits();
-                        }
-
-                        mode = Mode::Done;
-                        // Inflate stream terminated properly.
+                        mode = self.decode_output_length(bit_reader)?;
                         break 'label ReturnCode::StreamEnd;
                     }
                 };
@@ -2153,16 +2398,14 @@ impl State<'_> {
         Ok((mode, ret))
     }
 
-    fn bad(&mut self, msg: &'static str) -> ReturnCode {
-        #[cfg(all(feature = "std", test))]
-        dbg!(msg);
+    const fn bad(&mut self, msg: &'static str) -> ReturnCode {
         self.error_message = Some(msg);
         ReturnCode::DataError
     }
 
     /// Stored in the `z_stream.data_type` field
     fn decoding_state(&self) -> i32 {
-        let bit_reader_bits = self.bit_buffer.bits_in_buffer() as i32;
+        let bit_reader_bits = i32::from(self.bit_buffer.bits_in_buffer());
         debug_assert!(bit_reader_bits < 64);
 
         let last = if self.flags.contains(Flags::IS_LAST_BLOCK) {
@@ -2181,36 +2424,205 @@ impl State<'_> {
     }
 }
 
+/// Compile-time output policy for the shared DEFLATE fast decoder.
+///
+/// Ordinary inflate may consult circular history, while inflateBack uses the
+/// caller's previous full output window. Generic dispatch specializes the hot loop.
+trait FastDecodeOutput {
+    fn push(&mut self, byte: u8);
+    fn remaining(&self) -> usize;
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        distance: usize,
+        length: usize,
+    ) -> Result<(), &'static str>;
+}
+
+impl FastDecodeOutput for InflateOutput<'_> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        self.writer.push(byte);
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.writer.remaining()
+    }
+
+    #[inline]
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        dist: usize,
+        mut len: usize,
+    ) -> Result<(), &'static str> {
+        let window_size = state.window.size();
+        // max distance in output
+        let written = self.len();
+
+        if dist > written {
+            // Copy from the circular history window
+            if (dist - written) > state.window.have() {
+                if state.flags.contains(Flags::SANE) {
+                    return Err("invalid distance too far back\0");
+                }
+
+                // This cold branch follows the same initialized-history
+                // reconstruction as the ordinary Match decoder. Fast inflate
+                // reserves sufficient output for a whole DEFLATE match.
+                let mut remaining = len;
+                while remaining != 0 {
+                    copy_match_bytes(&state.window, false, dist, &mut remaining, self)?;
+                }
+                return Ok(());
+            }
+
+            let mut op = dist - written;
+            let mut from;
+
+            let window_next = state.window.next();
+
+            if window_next == 0 {
+                // This case is hit when the window has just wrapped around
+                // by logic in `Window::extend`. It is special-cased because
+                // apparently this is quite common.
+                //
+                // the match is at the end of the window, even though the next
+                // position has now wrapped around.
+                from = window_size - op;
+            } else if window_next >= op {
+                // the standard case: a contiguous copy from the window, no wrapping
+                from = window_next - op;
+            } else {
+                // This case is hit when the window has recently wrapped around
+                // by logic in `Window::extend`.
+                //
+                // The match is (partially) at the end of the window
+                op -= window_next;
+                from = window_size - op;
+
+                if op < len {
+                    // This case is hit when part of the match is at the end of the
+                    // window, and part of it has wrapped around to the start. Copy
+                    // the end section here, the start section will be copied below.
+                    len -= op;
+                    self.extend_from_window(&state.window, from..from + op);
+                    from = 0;
+                    op = window_next;
+                }
+            }
+
+            let copy = Ord::min(op, len);
+            self.extend_from_window(&state.window, from..from + copy);
+
+            if op < len {
+                // here we need some bytes from the output itself
+                self.copy_match(dist, len - op);
+            }
+        } else {
+            self.copy_match(dist, len);
+        }
+        Ok(())
+    }
+}
+
+impl FastDecodeOutput for writer::BackWriter<'_> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        writer::BackWriter::push(self, byte);
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        writer::BackWriter::remaining(self)
+    }
+
+    #[inline]
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        distance: usize,
+        length: usize,
+    ) -> Result<(), &'static str> {
+        self.copy_match(state.flags.contains(Flags::SANE), distance, length)
+    }
+}
+
+/// Decode a complete distance code and copy its match before leaving the fast path.
+#[inline]
+fn decode_fast_distance<O: FastDecodeOutput>(
+    state: &State,
+    bit_reader: &mut BitReader<'_>,
+    output: &mut O,
+    dcode: &[Code],
+    dmask: u16,
+    len: u16,
+) -> Result<(), &'static str> {
+    let mut here = dcode[BitBuffer::lookup_index(bit_reader.hold(), dmask)];
+
+    // The preceding fast literal/length read guarantees eight input bytes
+    // for a refill, even when the distance needs its maximum extra bits.
+    if bit_reader.bits_in_buffer() < MAX_BITS + MAX_DIST_EXTRA_BITS {
+        debug_assert!(bit_reader.bytes_remaining() >= 8);
+        bit_reader.refill();
+    }
+
+    loop {
+        bit_reader.drop_bits(here.bits);
+        let op = here.op;
+        if op & 16 != 0 {
+            let op = op & MAX_BITS;
+            let dist = here.val + bit_reader.bits_u16(usize::from(op));
+            if INFLATE_STRICT && usize::from(dist) > state.dmax {
+                return Err("invalid distance too far back\0");
+            }
+            bit_reader.drop_bits(op);
+            output.copy_back_reference(state, usize::from(dist), usize::from(len))?;
+            return Ok(());
+        }
+        if op & 64 != 0 {
+            return Err("invalid distance code\0");
+        }
+        // A second-level distance code is followed without advancing the
+        // bit reader twice: the next loop iteration drops the entry width.
+        here = dcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
+    }
+}
+
+/// The code-width checks are shared by both fast decoder lookup tables.
+#[inline]
+fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
+    Some((
+        BitBuffer::huffman_mask(state.len_table.bits)?,
+        BitBuffer::huffman_mask(state.dist_table.bits)?,
+    ))
+}
+
 /// Fast literal/length/distance decoder.
 ///
 /// Callers enter only when at least `INFLATE_FAST_MIN_HAVE` bytes and
 /// `INFLATE_FAST_MIN_LEFT` output bytes are available. The helper retains those fast-path
 /// invariants with assertions in the checked reader/output primitives rather than an unsafe
 /// caller contract.
-fn inflate_fast_help(
+#[inline]
+fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
     state: &mut State,
     bit_reader: &mut BitReader<'_>,
-    output: &mut InflateOutput<'_>,
-) {
-    inflate_fast_help_impl(state, bit_reader, output);
-}
-
-#[inline(always)]
-fn inflate_fast_help_impl(
-    state: &mut State,
-    bit_reader: &mut BitReader<'_>,
-    output: &mut InflateOutput<'_>,
+    output: &mut O,
 ) {
     debug_assert!(bit_reader.bytes_remaining() >= 15);
 
     let lcode = state.len_table_ref();
     let dcode = state.dist_table_ref();
 
-    // IDEA: use const generics for the bits here?
-    let lmask = (1u64 << state.len_table.bits) - 1;
-    let dmask = (1u64 << state.dist_table.bits) - 1;
-
-    let window_size = state.window.size();
+    // Validate table widths once per decoder invocation; retain bounded
+    // u16 masks for the entire hot loop, avoiding per-symbol validation.
+    let Some((lmask, dmask)) = fast_huffman_masks(state) else {
+        state.mode = Mode::Bad;
+        state.error_message = Some("invalid Huffman decode table width\0");
+        return;
+    };
 
     let mut bad = None;
 
@@ -2253,21 +2665,31 @@ fn inflate_fast_help_impl(
             // in most cases, the read can be interleaved with the logic
             // based on benchmarks this matters in practice. wild.
             if bits as usize >= state.len_table.bits {
-                lcode[(hold & lmask) as usize]
+                lcode[BitBuffer::lookup_index(hold, lmask)]
             } else {
-                lcode[(bit_reader.hold() & lmask) as usize]
+                lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)]
             }
         };
 
         if here.op == 0 {
-            output.push(here.val as u8);
+            let Ok(literal) = u8::try_from(here.val) else {
+                bad = Some("invalid literal/length code\0");
+                state.mode = Mode::Bad;
+                break 'outer;
+            };
+            output.push(literal);
             bit_reader.drop_bits(here.bits);
-            here = lcode[(bit_reader.hold() & lmask) as usize];
+            here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
 
             if here.op == 0 {
-                output.push(here.val as u8);
+                let Ok(literal) = u8::try_from(here.val) else {
+                    bad = Some("invalid literal/length code\0");
+                    state.mode = Mode::Bad;
+                    break 'outer;
+                };
+                output.push(literal);
                 bit_reader.drop_bits(here.bits);
-                here = lcode[(bit_reader.hold() & lmask) as usize];
+                here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
             }
         }
 
@@ -2276,118 +2698,26 @@ fn inflate_fast_help_impl(
             let op = here.op;
 
             if op == 0 {
-                output.push(here.val as u8);
+                let Ok(literal) = u8::try_from(here.val) else {
+                    bad = Some("invalid literal/length code\0");
+                    state.mode = Mode::Bad;
+                    break 'outer;
+                };
+                output.push(literal);
             } else if op & 16 != 0 {
                 let op = op & MAX_BITS;
-                let mut len = here.val + bit_reader.bits(op as usize) as u16;
+                let len = here.val + bit_reader.bits_u16(usize::from(op));
                 bit_reader.drop_bits(op);
 
-                here = dcode[(bit_reader.hold() & dmask) as usize];
-
-                // we have two fast-path loads: 10+10 + 15+5 = 40,
-                // but we may need to refill here in the worst case
-                if bit_reader.bits_in_buffer() < MAX_BITS + MAX_DIST_EXTRA_BITS {
-                    debug_assert!(bit_reader.bytes_remaining() >= 8);
-                    // Safety: On the first iteration of the `dolen` loop, we can rely on the
-                    // invariant documented for the previous `refill` call above: after that
-                    // operation, `bit_reader.bytes_remining >= 8`, which satisfies the safety
-                    // requirement for this call. For subsequent iterations, this invariant
-                    // remains true because nothing else within the `dolen` loop consumes data
-                    // from the slice.
-                    bit_reader.refill();
-                }
-
-                'dodist: loop {
-                    bit_reader.drop_bits(here.bits);
-                    let op = here.op;
-
-                    if op & 16 != 0 {
-                        let op = op & MAX_BITS;
-                        let dist = here.val + bit_reader.bits(op as usize) as u16;
-
-                        if INFLATE_STRICT && dist as usize > state.dmax {
-                            bad = Some("invalid distance too far back\0");
-                            state.mode = Mode::Bad;
-                            break 'outer;
-                        }
-
-                        bit_reader.drop_bits(op);
-
-                        // max distance in output
-                        let written = output.len();
-
-                        if dist as usize > written {
-                            // copy fropm the window
-                            if (dist as usize - written) > state.window.have() {
-                                if state.flags.contains(Flags::SANE) {
-                                    bad = Some("invalid distance too far back\0");
-                                    state.mode = Mode::Bad;
-                                    break 'outer;
-                                }
-
-                                panic!("INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR")
-                            }
-
-                            let mut op = dist as usize - written;
-                            let mut from;
-
-                            let window_next = state.window.next();
-
-                            if window_next == 0 {
-                                // This case is hit when the window has just wrapped around
-                                // by logic in `Window::extend`. It is special-cased because
-                                // apparently this is quite common.
-                                //
-                                // the match is at the end of the window, even though the next
-                                // position has now wrapped around.
-                                from = window_size - op;
-                            } else if window_next >= op {
-                                // the standard case: a contiguous copy from the window, no wrapping
-                                from = window_next - op;
-                            } else {
-                                // This case is hit when the window has recently wrapped around
-                                // by logic in `Window::extend`.
-                                //
-                                // The match is (partially) at the end of the window
-                                op -= window_next;
-                                from = window_size - op;
-
-                                if op < len as usize {
-                                    // This case is hit when part of the match is at the end of the
-                                    // window, and part of it has wrapped around to the start. Copy
-                                    // the end section here, the start section will be copied below.
-                                    len -= op as u16;
-                                    output.extend_from_window(&state.window, from..from + op);
-                                    from = 0;
-                                    op = window_next;
-                                }
-                            }
-
-                            let copy = Ord::min(op, len as usize);
-                            output.extend_from_window(&state.window, from..from + copy);
-
-                            if op < len as usize {
-                                // here we need some bytes from the output itself
-                                output.copy_match(dist as usize, len as usize - op);
-                            }
-                        } else {
-                            output.copy_match(dist as usize, len as usize)
-                        }
-                    } else if (op & 64) == 0 {
-                        // 2nd level distance code
-                        here = dcode[(here.val + bit_reader.bits(op as usize) as u16) as usize];
-                        continue 'dodist;
-                    } else {
-                        bad = Some("invalid distance code\0");
-                        state.mode = Mode::Bad;
-                        break 'outer;
-                    }
-
-                    break 'dodist;
+                if let Err(msg) = decode_fast_distance(state, bit_reader, output, dcode, dmask, len)
+                {
+                    bad = Some(msg);
+                    state.mode = Mode::Bad;
+                    break 'outer;
                 }
             } else if (op & 64) == 0 {
                 // 2nd level length code
-                here = lcode[(here.val + bit_reader.bits(op as usize) as u16) as usize];
+                here = lcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
                 continue 'dolen;
             } else if op & 32 != 0 {
                 // end of block
@@ -2403,7 +2733,14 @@ fn inflate_fast_help_impl(
         }
 
         // For normal `inflate`, include the bits in the bit_reader buffer in the count of available bytes.
-        let remaining = bit_reader.bytes_remaining_including_buffer();
+        // Ordinary inflate considers retained bytes in the bit reservoir for
+        // its fast-loop threshold, while the callback decoder counts only the
+        // unread callback span. Specialize that input policy at compile time.
+        let remaining = if COUNT_BUFFERED_INPUT {
+            bit_reader.bytes_remaining_including_buffer()
+        } else {
+            bit_reader.bytes_remaining()
+        };
         if remaining >= INFLATE_FAST_MIN_HAVE && output.remaining() >= INFLATE_FAST_MIN_LEFT {
             continue;
         }
@@ -2421,27 +2758,39 @@ fn inflate_fast_help_impl(
 }
 
 pub fn prime(stream: &mut InflateStream, bits: i32, value: i32) -> ReturnCode {
-    if bits == 0 {
-        /* fall through */
-    } else if bits < 0 {
+    if bits < 0 {
         stream.state.bit_buffer.init_bits();
-    } else if bits > 16 || stream.state.bit_buffer.bits_in_buffer() + bits as u8 > 32 {
-        return ReturnCode::StreamError;
-    } else {
-        stream.state.bit_buffer.prime(bits as u8, value as u64);
+    } else if bits != 0 {
+        let Ok(width) = u8::try_from(bits) else {
+            return ReturnCode::StreamError;
+        };
+        if width > 16
+            || usize::from(stream.state.bit_buffer.bits_in_buffer()) + usize::from(width) > 32
+        {
+            return ReturnCode::StreamError;
+        }
+        // Preserve the signed C argument's bit pattern before extending it
+        // to the unsigned bit-reservoir representation.
+        stream
+            .state
+            .bit_buffer
+            .prime(width, u64::from(value.cast_unsigned()));
     }
 
     ReturnCode::Ok
 }
 
+// Future changes to Inflate State alignment must remain compatible with the
+// common typed allocation unit used for both regular and callback modes.
+const _: () = assert!(core::mem::align_of::<State<'static>>() <= ALLOCATION_BLOCK_BYTES);
+
 struct InflateAllocOffsets {
     total_size: usize,
-    state_pos: usize,
     window_pos: Option<usize>,
 }
 
 impl InflateAllocOffsets {
-    const ALIGN_SIZE: usize = 64;
+    const ALIGN_SIZE: usize = ALLOCATION_BLOCK_BYTES;
 
     fn with_window() -> Self {
         Self::new(true)
@@ -2454,9 +2803,9 @@ impl InflateAllocOffsets {
     fn new(with_window: bool) -> Self {
         use core::mem::size_of;
 
-        let mut curr_size = 0usize;
-        let state_pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
-        curr_size = state_pos + size_of::<State>();
+        // State occupies byte offset zero of the typed aligned allocation.
+        // The optional history window follows at the next aligned offset.
+        let mut curr_size = size_of::<State>();
 
         let window_pos = with_window.then(|| {
             let pos = curr_size.next_multiple_of(Self::ALIGN_SIZE);
@@ -2464,33 +2813,19 @@ impl InflateAllocOffsets {
             pos
         });
 
-        // Reserve enough headroom to align the allocation start to 64 bytes, then round the whole
-        // allocation up to the same granularity.
-        let total_size = (curr_size + (Self::ALIGN_SIZE - 1)).next_multiple_of(Self::ALIGN_SIZE);
+        // Typed storage supplies the required alignment; reserve no leading slack.
+        let total_size = curr_size.next_multiple_of(Self::ALIGN_SIZE);
 
         Self {
             total_size,
-            state_pos,
             window_pos,
         }
     }
 
-    fn window_pos(&self) -> usize {
-        self.window_pos
-            .expect("inflate allocation layout includes an owned window")
-    }
-
-    /// Allocate raw storage and return both the original allocation pointer (needed for freeing)
-    /// and its 64-byte-aligned interior base used by this layout.
-    fn allocate_storage<'a>(&self, alloc: &Allocator<'a>) -> Option<(NonNull<u8>, NonNull<u8>)> {
-        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
-        let address = allocation_start.as_ptr() as usize;
-        let align_offset = address.next_multiple_of(Self::ALIGN_SIZE) - address;
-        // SAFETY: `total_size` reserves `ALIGN_SIZE - 1` bytes of alignment headroom, and offsetting
-        // a non-null allocation pointer within that allocation cannot produce null.
-        let aligned =
-            unsafe { NonNull::new_unchecked(allocation_start.as_ptr().add(align_offset)) };
-        Some((allocation_start, aligned))
+    /// Allocate typed, cache-line-aligned storage using the common allocator.
+    /// Custom C allocators are aligned within the allocator itself.
+    fn allocate_storage(&self, alloc: &Allocator<'_>) -> Option<NonNull<AlignedAllocationBlock>> {
+        alloc.allocate_slice_raw::<AlignedAllocationBlock>(self.total_size / Self::ALIGN_SIZE)
     }
 
     /// Allocate and place one inflate state using this layout.
@@ -2503,24 +2838,27 @@ impl InflateAllocOffsets {
         alloc: &Allocator<'a>,
         mut state: State<'a>,
     ) -> Option<NonNull<State<'a>>> {
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        let allocation_start = self.allocate_storage(alloc)?;
 
         if let Some(window_pos) = self.window_pos {
             // SAFETY: `window_pos` is computed inside this allocation and leaves enough room for
             // the complete regular history window. The backing bytes begin uninitialized; Window
             // exposes only history proven initialized by `extend`.
-            let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
+            let window_allocation =
+                unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
+            // SAFETY: allocation layout reserves 1 << MAX_WBITS writable bytes
+            // at window_pos; Window never exposes uninitialized history.
             state.window = unsafe { Window::from_raw_parts(window_allocation, 1 << MAX_WBITS) };
         }
 
         state.allocation_start = allocation_start.as_ptr();
         state.total_allocation_size = self.total_size;
 
-        // SAFETY: `state_pos` is aligned for `State`, lies inside this fresh allocation, and no
-        // `State` has previously been materialized there.
-        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
-        unsafe { state_ptr.write(state) };
-        NonNull::new(state_ptr)
+        let state_ptr = allocation_start.cast::<State<'a>>();
+        // SAFETY: this fresh typed allocation starts at a valid State-aligned
+        // address and has room for the full State. No State has been placed here.
+        unsafe { state_ptr.as_ptr().write(state) };
+        Some(state_ptr)
     }
 
     /// Snapshot a live regular inflate state into independent state + window storage.
@@ -2528,34 +2866,33 @@ impl InflateAllocOffsets {
         &self,
         alloc: &Allocator<'a>,
         source: &State<'a>,
-    ) -> Option<NonNull<State<'a>>> {
-        debug_assert_eq!(source.kind, InflateStateKind::Regular);
-        debug_assert_eq!(self.total_size, source.total_allocation_size);
-        debug_assert!(source.back_window.is_empty());
+    ) -> Result<NonNull<State<'a>>, ReturnCode> {
+        // The clone below reads the source history through a raw allocation-backed view.
+        // Reject inconsistent state before acquiring destination storage or copying bytes.
+        let window_pos = self.window_pos.ok_or(ReturnCode::StreamError)?;
+        if source.kind != InflateStateKind::Regular
+            || source.total_allocation_size != self.total_size
+            || !source.back_window.is_empty()
+            || source.window.size() != 1 << MAX_WBITS
+        {
+            return Err(ReturnCode::StreamError);
+        }
 
-        // A regular inflate state always owns the canonical MAX_WBITS backing window. This is a
-        // memory-safety invariant for the raw copy below, so keep it as a release assertion rather
-        // than a debug-only check.
-        assert_eq!(
-            source.window.size(),
-            1 << MAX_WBITS,
-            "regular inflate state owns the canonical history window"
-        );
-
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
-        let window_pos = self.window_pos();
+        let allocation_start = self.allocate_storage(alloc).ok_or(ReturnCode::MemError)?;
         // SAFETY: the ordinary layout reserves exactly the source window backing length at
         // `window_pos`, and the fresh destination allocation cannot overlap the source.
-        let window_allocation = unsafe { aligned.as_ptr().add(window_pos) };
+        let window_allocation = unsafe { allocation_start.as_ptr().cast::<u8>().add(window_pos) };
+        // SAFETY: the independent destination allocation has sufficient
+        // window capacity; clone_to copies only initialized history bytes.
         let window = unsafe { source.window.clone_to(window_allocation) };
 
         let state = source.clone_rebound(window, allocation_start.as_ptr(), self.total_size);
 
-        // SAFETY: `state_pos` is aligned and in-bounds in this fresh allocation, and no State has
-        // previously been materialized there.
-        let state_ptr = unsafe { aligned.as_ptr().add(self.state_pos).cast::<State<'a>>() };
-        unsafe { state_ptr.write(state) };
-        NonNull::new(state_ptr)
+        let state_ptr = allocation_start.cast::<State<'a>>();
+        // SAFETY: this fresh typed allocation starts at a valid State-aligned
+        // address and has room for the full State. No State has been placed here.
+        unsafe { state_ptr.as_ptr().write(state) };
+        Ok(state_ptr)
     }
 }
 
@@ -2575,32 +2912,62 @@ impl Default for InflateConfig {
     }
 }
 
+/// Validated DEFLATE window selection, including the zlib wrapper mode.
+/// Four wrapper modes exist: raw (0), zlib (5), gzip (6),
+/// and zlib/gzip autodetection (7). The gzip and autodetect flag forms
+/// each encode their window size in the low four bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InflateWindowSelection {
+    wrap: u8,
+    wbits: u8,
+}
+
+fn parse_inflate_window_bits(bits: i32) -> Option<InflateWindowSelection> {
+    let (wrap, width) = match bits {
+        -15..=-8 => (0, -bits),
+        0 | 8..=15 => (5, bits),
+        24..=31 => (6, bits - 16),
+        // 32 is zlib's autodetect form with window size inferred from the header.
+        32 | 40..=47 => (7, bits - 32),
+        _ => return None,
+    };
+    Some(InflateWindowSelection {
+        wrap,
+        wbits: u8::try_from(width).ok()?,
+    })
+}
+
 /// Initialize the stream in an inflate state
 pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     stream.msg = core::ptr::null_mut();
+
+    // Reject invalid formats before selecting allocators or allocating state.
+    if parse_inflate_window_bits(config.window_bits).is_none() {
+        return ReturnCode::StreamError;
+    }
 
     // for safety we must really make sure that alloc and free are consistent
     // this is a (slight) deviation from stock zlib. In this crate we pick the rust
     // allocator as the default, but `libz-rs-sys` configures the C allocator
     #[cfg(feature = "rust-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_rust_allocator()
+        stream.configure_default_rust_allocator();
     }
 
     #[cfg(feature = "c-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_c_allocator()
+        stream.configure_default_c_allocator();
     }
 
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
+    let (Some(zalloc), Some(zfree)) = (stream.zalloc, stream.zfree) else {
         return ReturnCode::StreamError;
-    }
+    };
 
     let state = State::new(InflateStateKind::Regular);
 
     let alloc = Allocator {
-        zalloc: stream.zalloc.unwrap(),
-        zfree: stream.zfree.unwrap(),
+        zalloc,
+        zfree,
         opaque: stream.opaque,
         _marker: PhantomData,
     };
@@ -2611,46 +2978,25 @@ pub fn init(stream: &mut z_stream, config: InflateConfig) -> ReturnCode {
     stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
     // SAFETY: `allocate_state` initialized a regular `State` behind the ABI state pointer.
-    if let Some(stream) = unsafe { InflateStream::from_stream_mut(stream) } {
-        let ret = reset_with_config(stream, config);
-
-        if ret != ReturnCode::Ok {
-            end(stream);
-        }
-
-        ret
-    } else {
-        ReturnCode::StreamError
+    let Some(stream) = (unsafe { InflateStream::from_stream_mut(stream) }) else {
+        return ReturnCode::StreamError;
+    };
+    let ret = reset_with_config(stream, config);
+    if ret != ReturnCode::Ok {
+        end(stream);
     }
+    ret
 }
 
 pub fn reset_with_config(stream: &mut InflateStream, config: InflateConfig) -> ReturnCode {
-    let mut window_bits = config.window_bits;
-    let wrap;
-
-    if window_bits < 0 {
-        wrap = 0;
-
-        if window_bits < -MAX_WBITS {
-            return ReturnCode::StreamError;
-        }
-
-        window_bits = -window_bits;
-    } else {
-        wrap = (window_bits >> 4) + 5; // TODO wth?
-
-        if window_bits < 48 {
-            window_bits &= MAX_WBITS;
-        }
-    }
-
-    if window_bits != 0 && !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
-        traceln!("invalid windowBits");
+    let Some(window) = parse_inflate_window_bits(config.window_bits) else {
         return ReturnCode::StreamError;
-    }
+    };
 
-    stream.state.wrap = wrap as u8;
-    stream.state.wbits = window_bits as _;
+    // Do not mutate either field until both the wrapper kind and its
+    // encoded history-window width have been fully validated.
+    stream.state.wrap = window.wrap;
+    stream.state.wbits = window.wbits;
 
     reset(stream)
 }
@@ -2675,11 +3021,11 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
 
     if state.wrap != 0 {
         // to support ill-conceived Java test suite
-        stream.adler = (state.wrap & 1) as _;
+        stream.adler = (state.wrap & 1).into();
     }
 
     state.mode = Mode::Head;
-    state.checksum = crate::ADLER32_INITIAL_VALUE as u32;
+    state.checksum = crate::ADLER32_INITIAL_VALUE;
 
     state.flags.update(Flags::IS_LAST_BLOCK, false);
     state.flags.update(Flags::HAVE_DICT, false);
@@ -2698,8 +3044,28 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
+#[must_use]
 pub fn codes_used(stream: &InflateStream) -> usize {
     stream.state.next
+}
+
+/// Bind a caller-owned input span; null-and-empty is a valid C representation.
+///
+/// # Safety
+/// A nonnull pointer with a nonzero length must remain readable for the
+/// returned borrow, whose lifetime belongs to the caller.
+const unsafe fn caller_input<'a>(
+    pointer: *const u8,
+    available: crate::c_api::uInt,
+) -> Option<&'a [u8]> {
+    if available == 0 {
+        return Some(&[]);
+    }
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the caller supplies readable input of the advertised length.
+    Some(unsafe { core::slice::from_raw_parts(pointer, available as usize) })
 }
 
 /// Bind one zlib ABI input/output pair and run ordinary inflate.
@@ -2710,18 +3076,14 @@ pub fn codes_used(stream: &InflateStream) -> usize {
 /// or the live stream/state objects. Null input with zero length is valid; null output is rejected
 /// before it is dereferenced.
 pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> ReturnCode {
-    if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
+    if stream.next_out.is_null() {
         return ReturnCode::StreamError;
     }
-
-    let input = if stream.avail_in == 0 {
-        &[][..]
-    } else {
-        // SAFETY: `inflate` requires `next_in` to address `avail_in` readable bytes. The slice is
-        // call-local and cannot survive this invocation.
-        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
+    // SAFETY: the public inflate contract guarantees a live readable input span.
+    let Some(input) = (unsafe { caller_input(stream.next_in, stream.avail_in) }) else {
+        return ReturnCode::StreamError;
     };
-    // SAFETY: `stream.next_out` is non-null and points to at least `stream.avail_out` writable bytes.
+    // SAFETY: the public inflate contract guarantees a live writable output span.
     let output =
         unsafe { InflateOutput::new_uninit(stream.next_out.cast(), stream.avail_out as usize) };
 
@@ -2741,35 +3103,36 @@ fn inflate_bound_io(
     let state = &mut *stream.state;
 
     // skip check
-    if let Mode::Type = state.mode {
+    if matches!(state.mode, Mode::Type) {
         state.mode = Mode::TypeDo;
     }
 
     let mut bit_reader = BitReader::from_buffer(state.bit_buffer, input);
     let err = state.dispatch(&mut bit_reader, &mut output, flush);
 
-    let avail_in = bit_reader.bytes_remaining();
-    let in_read = initial_avail_in - avail_in;
-    // Preserve the exact caller pointer when no input was consumed. This matters for zlib's legal
-    // NULL + zero-length input representation; Rust's canonical empty slice has a non-null sentinel
-    // pointer that must not leak back through the C ABI.
-    let next_in = (in_read != 0).then(|| bit_reader.next_input_ptr());
+    let in_read = initial_avail_in - bit_reader.bytes_remaining();
     let out_written = output.written_since_accounted();
-
-    stream.total_in += in_read as z_size;
+    // The shared ABI cursor preserves null input on zero consumption and wraps C totals.
+    advance_abi_bytes(
+        &mut stream.next_in,
+        &mut stream.avail_in,
+        &mut stream.total_in,
+        in_read,
+    );
     state.total = state.total.wrapping_add(out_written);
     stream.total_out = state.total as _;
 
-    stream.avail_in = avail_in as u32;
-    if let Some(next_in) = next_in {
-        stream.next_in = next_in as *mut u8;
-    }
     state.bit_buffer = bit_reader.into_buffer();
 
-    stream.avail_out = output.remaining() as u32;
-    stream.next_out = output.next_out() as *mut u8;
+    // The output cursor was constructed from a C uInt count. Preserve that range
+    // even if a future internal caller supplies a larger independent cursor.
+    let Ok(remaining) = u32::try_from(output.remaining()) else {
+        return ReturnCode::StreamError;
+    };
+    stream.avail_out = remaining;
+    stream.next_out = output.next_out().cast::<u8>();
 
-    stream.adler = state.checksum as z_checksum;
+    stream.adler = z_checksum::from(state.checksum);
 
     let valid_mode = |mode| !matches!(mode, Mode::Bad | Mode::Mem | Mode::Sync);
     let not_done = |mode| {
@@ -2784,7 +3147,8 @@ fn inflate_bound_io(
             && valid_mode(state.mode)
             && (not_done(state.mode) || !matches!(flush, InflateFlush::Finish)));
 
-    let update_checksum = state.wrap & 4 != 0;
+    let update_checksum =
+        state.wrap & 4 != 0 && !cfg!(feature = "__internal-fuzz-disable-checksum");
 
     if must_update_window {
         state.window.extend(
@@ -2798,7 +3162,7 @@ fn inflate_bound_io(
 
     if let Some(msg) = state.error_message {
         assert!(msg.ends_with('\0'));
-        stream.msg = msg.as_ptr() as *mut u8 as *mut core::ffi::c_char;
+        stream.msg = msg.as_ptr().cast_mut().cast::<core::ffi::c_char>();
     }
 
     stream.data_type = state.decoding_state();
@@ -2812,7 +3176,7 @@ fn inflate_bound_io(
     }
 }
 
-fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
+const fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
     let len = buf.len();
     let mut next = 0;
 
@@ -2830,13 +3194,19 @@ fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
     (got, next)
 }
 
-pub fn sync(stream: &mut InflateStream) -> ReturnCode {
+/// Find a recoverable full-flush marker in the caller's raw input.
+///
+/// # Safety
+/// If `avail_in` is nonzero, `next_in` must point to that many readable bytes.
+/// Buffers may be replaced between calls.
+pub unsafe fn sync(stream: &mut InflateStream) -> ReturnCode {
     let state = &mut *stream.state;
 
-    if stream.next_in.is_null() && stream.avail_in != 0 {
+    // SAFETY: the caller supplies a live readable input span.
+    let Some(input) = (unsafe { caller_input(stream.next_in, stream.avail_in) }) else {
         return ReturnCode::StreamError;
-    }
-    if stream.avail_in == 0 && state.bit_buffer.bits_in_buffer() < 8 {
+    };
+    if input.is_empty() && state.bit_buffer.bits_in_buffer() < 8 {
         return ReturnCode::BufError;
     }
     /* if first time, start search in bit buffer */
@@ -2848,26 +3218,14 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
         (state.have, _) = syncsearch(0, &buf[..len]);
     }
 
-    // Search available input. A zlib caller may legitimately provide NULL when `avail_in == 0`;
-    // Rust slices still require a non-null pointer even at length zero, so represent that case with
-    // the canonical empty slice instead of materializing `from_raw_parts(NULL, 0)`.
-    let slice = if stream.avail_in == 0 {
-        &[][..]
-    } else {
-        // SAFETY: the public FFI contract requires the non-null input span to be readable for
-        // `avail_in` bytes, and the null/nonzero case was rejected above.
-        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
-    };
-
     let len;
-    (state.have, len) = syncsearch(state.have, slice);
-    if len != 0 {
-        // SAFETY: `syncsearch` returns an in-bounds consumed prefix; `len != 0` also proves the
-        // source pointer came from the non-empty, non-null branch above.
-        stream.next_in = unsafe { stream.next_in.add(len) };
-    }
-    stream.avail_in -= len as u32;
-    stream.total_in += len as z_size;
+    (state.have, len) = syncsearch(state.have, input);
+    advance_abi_bytes(
+        &mut stream.next_in,
+        &mut stream.avail_in,
+        &mut stream.total_in,
+        len,
+    );
 
     /* return no joy or set up to restart inflate() on a new block */
     if state.have != 4 {
@@ -2881,6 +3239,9 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
     }
 
     let flags = state.gzip_flags;
+    // The next inflate call reconstructs total_out from this full-width count.
+    // reset() clears it, so preserve it alongside the public ABI counters.
+    let total = state.total;
     let total_in = stream.total_in;
     let total_out = stream.total_out;
 
@@ -2888,6 +3249,7 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
 
     stream.total_in = total_in;
     stream.total_out = total_out;
+    stream.state.total = total;
 
     stream.state.gzip_flags = flags;
     stream.state.mode = Mode::Type;
@@ -2903,6 +3265,7 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
   block. When decompressing, PPP checks that at the end of input packet,
   inflate is waiting for these length bytes.
 */
+#[must_use]
 pub fn sync_point(stream: &InflateStream) -> bool {
     matches!(stream.state.mode, Mode::Stored) && stream.state.bit_buffer.bits_in_buffer() == 0
 }
@@ -2919,8 +3282,9 @@ pub fn copy<'a>(
     // The allocation helper keeps the transient duplicated raw window handle private and returns
     // only after the copied state owns independent window storage.
     let allocs = InflateAllocOffsets::with_window();
-    let Some(copy) = allocs.clone_state(&source.alloc, &source.state) else {
-        return ReturnCode::MemError;
+    let copy = match allocs.clone_state(&source.alloc, &source.state) {
+        Ok(copy) => copy,
+        Err(code) => return code,
     };
 
     // Build the destination ABI shell explicitly around the cloned state allocation.
@@ -2945,7 +3309,7 @@ pub fn copy<'a>(
 }
 
 pub fn undermine(stream: &mut InflateStream, subvert: i32) -> ReturnCode {
-    stream.state.flags.update(Flags::SANE, (!subvert) != 0);
+    stream.state.flags.update(Flags::SANE, subvert == 0);
 
     ReturnCode::Ok
 }
@@ -2961,11 +3325,10 @@ pub fn validate(stream: &mut InflateStream, check: bool) -> ReturnCode {
     ReturnCode::Ok
 }
 
+#[must_use]
 pub fn mark(stream: &InflateStream) -> c_long {
-    if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
-        return c_long::MIN;
-    }
-
+    // inflateMark inspects only the initialized state machine. The caller may
+    // legitimately detach or replace input/output buffers between inflate calls.
     let state = &*stream.state;
 
     let length = match state.mode {
@@ -2974,7 +3337,21 @@ pub fn mark(stream: &InflateStream) -> c_long {
         _ => 0,
     };
 
-    (((state.back as c_long) as c_ulong) << 16) as c_long + length as c_long
+    // The high part is a count of bits back, with usize::MAX representing -1
+    // before the first block. Valid code lengths and stored-block lengths fit
+    // in the low 16 bits, regardless of the platform's C long width.
+    let back = if state.back == usize::MAX {
+        -1
+    } else {
+        let Ok(back) = c_long::try_from(state.back) else {
+            return -65_536;
+        };
+        back
+    };
+    let Ok(length) = c_long::try_from(length) else {
+        return -65_536;
+    };
+    back.wrapping_shl(16).wrapping_add(length)
 }
 
 pub fn set_dictionary(stream: &mut InflateStream, dictionary: &[u8]) -> ReturnCode {
@@ -3020,7 +3397,14 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
     let stream = stream.as_z_stream_mut();
     let _ = core::mem::replace(&mut stream.state, core::ptr::null_mut());
 
-    unsafe { alloc.deallocate(allocation_start, total_allocation_size) };
+    // SAFETY: the state retains the original typed allocation and its exact byte
+    // count; it is detached before this matching deallocation.
+    unsafe {
+        alloc.deallocate(
+            allocation_start,
+            total_allocation_size / InflateAllocOffsets::ALIGN_SIZE,
+        );
+    }
 
     stream
 }
@@ -3036,6 +3420,8 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
 ///     - If `head.extra` is not NULL, it must be writable for at least `head.extra_max` bytes
 ///     - if `head.name` is not NULL, it must be writable for at least `head.name_max` bytes
 ///     - if `head.comment` is not NULL, it must be writable for at least `head.comm_max` bytes
+/// * The nested output buffers must not overlap the compressed input span of any inflate call
+///   that writes into them: metadata copies use non-overlapping memory semantics.
 pub unsafe fn get_header(
     stream: &mut InflateStream<'_>,
     head: Option<&mut gz_header>,
@@ -3056,6 +3442,7 @@ pub unsafe fn get_header(
 ///
 /// Raw caller-buffer handling belongs to the C ABI layer; the inflate core exposes only checked
 /// slices over the initialized circular window.
+#[must_use]
 pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8], &'stream [u8]) {
     stream.state.window.dictionary_segments()
 }
@@ -3063,28 +3450,1317 @@ pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocate::{misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc};
 
     #[test]
-    fn end_leaves_null_abi_state_pointer() {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+    fn fast_decoder_rejects_invalid_table_width_before_consuming_input_or_output() {
+        let input = [0xa5u8; 32];
+        let mut output_bytes = [core::mem::MaybeUninit::<u8>::uninit(); 260];
 
-        assert!(end(stream).state.is_null());
-        assert!(end(stream).state.is_null());
+        for (len_bits, dist_bits) in [(16, 5), (9, 16), (usize::MAX, 5)] {
+            let mut state = State::new(InflateStateKind::Regular);
+            state.len_table = Table {
+                codes: Codes::Fixed,
+                bits: len_bits,
+            };
+            state.dist_table = Table {
+                codes: Codes::Fixed,
+                bits: dist_bits,
+            };
+            let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
+            // SAFETY: the stack array is writable for exactly its declared length;
+            // InflateOutput tracks the initialized prefix and no other borrow exists.
+            let mut output = unsafe {
+                InflateOutput::new_uninit(output_bytes.as_mut_ptr().cast(), output_bytes.len())
+            };
+
+            inflate_fast_help_impl::<true, _>(&mut state, &mut reader, &mut output);
+
+            assert!(matches!(state.mode, Mode::Bad));
+            assert_eq!(
+                state.error_message,
+                Some("invalid Huffman decode table width\0")
+            );
+            assert_eq!(reader.bytes_remaining(), input.len());
+            assert_eq!(reader.bits_in_buffer(), 0);
+            assert_eq!(output.len(), 0);
+        }
     }
 
     #[test]
-    fn inflate_copy_owns_independent_state_and_window_storage() {
+    fn fast_decoder_rejects_invalid_literal_in_each_decode_branch() {
+        let mut output_storage = [core::mem::MaybeUninit::<u8>::uninit(); 260];
+
+        // First literal, second consecutive literal, and an indirect literal
+        // reached through a subtable all must reject out-of-byte-range values.
+        for (case, invalid_literal) in [(0, 256), (0, u16::MAX), (1, 256), (2, u16::MAX)] {
+            let mut state = State::new(InflateStateKind::Regular);
+            state.len_table = Table {
+                codes: Codes::Len,
+                bits: 1,
+            };
+            state.dist_table = Table {
+                codes: Codes::Fixed,
+                bits: 5,
+            };
+            let invalid = Code {
+                op: 0,
+                bits: 1,
+                val: invalid_literal,
+            };
+            let mut input = [0u8; 32];
+            state.len_codes[..4].fill(invalid);
+            match case {
+                0 => {}
+                1 => {
+                    // First symbol is a literal 'A'; second is invalid.
+                    state.len_codes[0].val = u16::from(b'A');
+                    input[0] = 0b10;
+                }
+                2 => {
+                    // First lookup redirects to a subtable containing the
+                    // invalid literal rather than a normal primary leaf.
+                    state.len_codes[0] = Code {
+                        op: 1,
+                        bits: 1,
+                        val: 2,
+                    };
+                }
+                _ => unreachable!("the test defines only three lookup scenarios"),
+            }
+
+            let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
+            // SAFETY: the stack array is exclusively writable for 260 bytes;
+            // the output cursor tracks initialized bytes in its prefix.
+            let mut output = unsafe {
+                InflateOutput::new_uninit(output_storage.as_mut_ptr().cast(), output_storage.len())
+            };
+
+            inflate_fast_help_impl::<true, _>(&mut state, &mut reader, &mut output);
+
+            assert!(matches!(state.mode, Mode::Bad));
+            assert_eq!(state.error_message, Some("invalid literal/length code\0"));
+            assert_eq!(output.len(), usize::from(case == 1));
+        }
+    }
+
+    #[test]
+    fn slow_huffman_lookup_retains_prefix_on_partial_subtable_input() -> Result<(), ReturnCode> {
+        let invalid = Code {
+            op: 64,
+            bits: 1,
+            val: 0,
+        };
+        let mut table = [invalid; 4];
+        table[0] = Code {
+            op: 1,
+            bits: 1,
+            val: 2,
+        };
+        table[2] = Code {
+            op: 16,
+            bits: 8,
+            val: 1,
+        };
+
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &[0]);
+        assert_eq!(
+            decode_huffman_code::<false>(&mut first, &table, 1).err(),
+            Some(ReturnCode::Ok)
+        );
+        assert_eq!(first.bits_in_buffer(), 8);
+        assert_eq!(first.bytes_remaining(), 0);
+
+        let next_byte = [0u8];
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &next_byte);
+        let decoded = decode_huffman_code::<false>(&mut resumed, &table, 1)?;
+        assert_eq!(decoded.entry.val, 1);
+        assert_eq!(decoded.bits, 9);
+        assert_eq!(resumed.bits_in_buffer(), 7);
+        assert_eq!(resumed.bytes_remaining(), 0);
+
+        // In a literal/length alphabet, op=0 is a literal rather than
+        // a subtable pointer; it must consume only the root code bits.
+        let literals = [Code {
+            op: 0,
+            bits: 1,
+            val: 255,
+        }; 2];
+        let literal_input = [0u8];
+        let mut literal_reader = BitReader::from_buffer(BitBuffer::default(), &literal_input);
+        let literal = decode_huffman_code::<true>(&mut literal_reader, &literals, 1)?;
+        assert_eq!(literal.entry.val, 255);
+        assert_eq!(literal.bits, 1);
+        assert_eq!(literal_reader.bits_in_buffer(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_literal_value_cannot_truncate_to_a_byte() {
+        let mut bytes = [0xa5u8; 4];
+        // SAFETY: the stack array remains live, uniquely writable, and
+        // the output cursor tracks the initialized prefix.
+        let mut output = unsafe { InflateOutput::new_uninit(bytes.as_mut_ptr(), bytes.len()) };
+        assert_eq!(
+            emit_literal(&mut output, 256),
+            Err("invalid literal/length code\0")
+        );
+        assert_eq!(output.len(), 0);
+        assert_eq!(bytes, [0xa5; 4]);
+        assert_eq!(emit_literal(&mut output, 255), Ok(true));
+        assert_eq!(output.filled(), &[255]);
+        assert_eq!(&bytes[1..], &[0xa5; 3]);
+    }
+
+    #[test]
+    fn stored_payload_copy_preserves_all_chunk_boundaries_and_output_canaries() {
+        for size in [0usize, 1, 3, 257, 65_535] {
+            let source: Vec<u8> = (0u8..=250).cycle().take(size).collect();
+            for chunk in [1usize, 2, 7, 53, 4096] {
+                let mut state = State::new(InflateStateKind::Regular);
+                state.length = size;
+                let mut copied = Vec::with_capacity(size);
+                loop {
+                    let count = (size - copied.len()).min(chunk);
+                    let mut input = BitReader::from_buffer(
+                        BitBuffer::default(),
+                        &source[copied.len()..copied.len() + count],
+                    );
+                    let mut destination = vec![0xa5; chunk + 3];
+                    let (step, written) = {
+                        // SAFETY: destination is exclusively writable for chunk bytes,
+                        // and the three canary bytes are outside the output span.
+                        let mut output =
+                            unsafe { InflateOutput::new_uninit(destination.as_mut_ptr(), chunk) };
+                        let step = state.copy_stored_payload(&mut input, &mut output);
+                        (step, output.filled().to_vec())
+                    };
+                    assert_eq!(input.bytes_remaining(), 0);
+                    assert_eq!(written.len(), count);
+                    assert_eq!(&destination[chunk..], &[0xa5; 3]);
+                    copied.extend_from_slice(&written);
+                    assert_eq!(state.length, size - copied.len());
+                    if copied.len() == size {
+                        assert!(matches!(step, Some(Mode::Type)));
+                        break;
+                    }
+                    assert!(step.is_none());
+                }
+                assert_eq!(copied, source, "size={size} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_table_header_requires_complete_bits_before_updating_counts() {
+        let mut state = State::new(InflateStateKind::Regular);
+        state.nlen = 999;
+        state.ndist = 999;
+        state.ncode = 999;
+        state.have = 42;
+
+        let first_byte = [0u8];
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &first_byte);
+        assert!(matches!(
+            state.decode_dynamic_table_header(&mut first),
+            Err(DispatchExit {
+                mode: Mode::Table,
+                code: ReturnCode::Ok
+            })
+        ));
+        assert_eq!(
+            (state.nlen, state.ndist, state.ncode, state.have),
+            (999, 999, 999, 42)
+        );
+
+        let next_byte = [0u8];
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &next_byte);
+        assert!(matches!(
+            state.decode_dynamic_table_header(&mut resumed),
+            Ok(Mode::LenLens)
+        ));
+        assert_eq!(
+            (state.nlen, state.ndist, state.ncode, state.have),
+            (257, 1, 4, 0)
+        );
+
+        let invalid_header = [30u8, 0];
+        let mut invalid = BitReader::from_buffer(BitBuffer::default(), &invalid_header);
+        assert!(matches!(
+            state.decode_dynamic_table_header(&mut invalid),
+            Err(DispatchExit {
+                mode: Mode::Bad,
+                code: ReturnCode::DataError
+            })
+        ));
+        assert_eq!(
+            state.error_message,
+            Some("too many length or distance symbols\0")
+        );
+    }
+
+    #[test]
+    fn wrapper_states_resume_incomplete_extra_name_and_comment_fields() {
+        for (mode, flag, remaining, first, second) in [
+            (Mode::Extra, 0x0400, 4usize, &b"ab"[..], &b"cd"[..]),
+            (Mode::Name, 0x0800, 0, &b"header"[..], &b"\0"[..]),
+            (Mode::Comment, 0x1000, 0, &b"comment"[..], &b"\0"[..]),
+        ] {
+            let mut state = State::new(InflateStateKind::Regular);
+            state.gzip_flags = flag;
+            state.length = remaining;
+            let mut first_reader = BitReader::from_buffer(BitBuffer::default(), first);
+            assert!(
+                matches!(
+                    state.decode_wrapper_states(&mut first_reader, mode),
+                    Ok(WrapperProgress::Paused(pending)) if core::mem::discriminant(&pending) == core::mem::discriminant(&mode)
+                ),
+                "incomplete field must retain its gzip header mode"
+            );
+            assert_eq!(first_reader.bytes_remaining(), 0);
+            if remaining != 0 {
+                assert_eq!(state.length, remaining - first.len());
+            }
+
+            let mut resumed = BitReader::from_buffer(first_reader.into_buffer(), second);
+            assert!(matches!(
+                state.decode_wrapper_states(&mut resumed, mode),
+                Ok(WrapperProgress::Ready(Mode::Type))
+            ));
+            assert_eq!(resumed.bytes_remaining(), 0);
+            assert_eq!(state.length, 0);
+        }
+    }
+
+    #[test]
+    fn dictionary_identifier_split_preserves_previous_checksum_until_complete() {
+        let mut state = State::new(InflateStateKind::Regular);
+        state.checksum = 0xfeed_cafe;
+        let first_bytes = [0x12, 0x34, 0x56];
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &first_bytes);
+        assert!(matches!(
+            state.decode_dictionary_id(&mut first),
+            Err(DispatchExit {
+                mode: Mode::DictId,
+                code: ReturnCode::Ok
+            })
+        ));
+        assert_eq!(state.checksum, 0xfeed_cafe);
+
+        let last_byte = [0x78];
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &last_byte);
+        assert!(matches!(
+            state.decode_dictionary_id(&mut resumed),
+            Ok(Mode::Dict)
+        ));
+        assert_eq!(state.checksum, 0x1234_5678);
+        assert_eq!(resumed.bits_in_buffer(), 0);
+        assert_eq!(resumed.bytes_remaining(), 0);
+    }
+
+    #[test]
+    fn gzip_size_trailer_handles_partial_input_mismatch_and_unchecked_mode() {
+        let total = 0x1234_5678usize;
+        let first_bytes = [0x78, 0x56];
+        let second_bytes = [0x34, 0x12];
+        let mut state = State::new(InflateStateKind::Regular);
+        state.wrap = 4;
+        state.gzip_flags = 1;
+        state.total = total;
+        let mut first = BitReader::from_buffer(BitBuffer::default(), &first_bytes);
+        assert!(matches!(
+            state.decode_output_length(&mut first),
+            Err(DispatchExit {
+                mode: Mode::Length,
+                code: ReturnCode::Ok
+            })
+        ));
+        assert!(state.error_message.is_none());
+        assert_eq!(first.bits_in_buffer(), 16);
+
+        let mut resumed = BitReader::from_buffer(first.into_buffer(), &second_bytes);
+        assert!(matches!(
+            state.decode_output_length(&mut resumed),
+            Ok(Mode::Done)
+        ));
+        assert_eq!(resumed.bits_in_buffer(), 0);
+        assert_eq!(resumed.bytes_remaining(), 0);
+
+        let corrupt = [0x79, 0x56, 0x34, 0x12];
+        let mut invalid = BitReader::from_buffer(BitBuffer::default(), &corrupt);
+        assert!(matches!(
+            state.decode_output_length(&mut invalid),
+            Err(DispatchExit {
+                mode: Mode::Bad,
+                code: ReturnCode::DataError
+            })
+        ));
+        assert_eq!(state.error_message, Some("incorrect length check\0"));
+
+        state.wrap = 1;
+        state.error_message = None;
+        let mut unchecked = BitReader::from_buffer(BitBuffer::default(), &corrupt);
+        assert!(matches!(
+            state.decode_output_length(&mut unchecked),
+            Ok(Mode::Done)
+        ));
+        assert_eq!(unchecked.bits_in_buffer(), 0);
+    }
+
+    #[test]
+    fn stored_block_length_matches_all_65536_wire_lengths() {
+        for value in u16::MIN..=u16::MAX {
+            let header = u32::from(value) | (u32::from(!value) << 16);
+            assert_eq!(stored_block_length(header), Some(value));
+            assert_eq!(stored_block_length(header ^ (1 << 16)), None);
+            assert_eq!(stored_block_length(header ^ 1), None);
+        }
+    }
+
+    #[test]
+    fn trees_flush_resumes_stored_payload_after_length_header() {
+        let input = [3, 0, 0xfc, 0xff, b'a', b'b', b'c'];
+        let mut state = State::new(InflateStateKind::Regular);
+        state.mode = Mode::Stored;
+        let mut reader = BitReader::from_buffer(BitBuffer::default(), &input);
+        let mut destination = [0u8; 8];
+        // SAFETY: destination is exclusively writable for its full stack allocation;
+        // only its initialized prefix is observed before returning.
+        let mut output =
+            unsafe { InflateOutput::new_uninit(destination.as_mut_ptr(), destination.len()) };
+
+        assert_eq!(
+            state.dispatch(&mut reader, &mut output, InflateFlush::Trees),
+            ReturnCode::Ok
+        );
+        assert!(matches!(state.mode, Mode::CopyBlock));
+        assert_eq!(state.length, 3);
+        assert_eq!(reader.as_slice(), b"abc");
+        assert_eq!(output.len(), 0);
+
+        assert_eq!(
+            state.dispatch(&mut reader, &mut output, InflateFlush::NoFlush),
+            ReturnCode::Ok
+        );
+        assert_eq!(output.filled(), b"abc");
+        assert_eq!(state.length, 0);
+    }
+
+    #[test]
+    fn trees_flush_stored_payload_resumes_through_stream_api() -> Result<(), &'static str> {
+        // A final raw stored block containing abc, delivered in two input spans.
+        let mut prefix = [0x01u8];
+        let mut payload = [3, 0, 0xfc, 0xff, b'a', b'b', b'c'];
+        let mut destination = [0xa5u8; 8];
+        let mut raw = z_stream::default();
+        assert_eq!(
+            init(&mut raw, InflateConfig { window_bits: -15 }),
+            ReturnCode::Ok
+        );
+        // SAFETY: init created an exclusively borrowed regular inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("raw inflate stream was not initialized")?;
+        stream.next_out = destination.as_mut_ptr();
+        stream.avail_out = 8;
+
+        stream.next_in = prefix.as_mut_ptr();
+        stream.avail_in = 1;
+        // SAFETY: both input spans and output allocation stay live and disjoint.
+        let status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+        assert_eq!(status, ReturnCode::Ok);
+        assert!(matches!(stream.state.mode, Mode::Stored));
+        assert_eq!(stream.avail_in, 0);
+
+        stream.next_in = payload.as_mut_ptr();
+        stream.avail_in = 7;
+        // SAFETY: payload and destination are live, disjoint, and lengths are exact.
+        let status = unsafe { inflate(stream, InflateFlush::Trees) };
+        assert_eq!(status, ReturnCode::Ok);
+        assert!(matches!(stream.state.mode, Mode::CopyBlock));
+        assert_eq!(stream.avail_in, 3);
+        assert_eq!(stream.total_out, 0);
+
+        // SAFETY: the ABI pointers now address the valid unconsumed payload suffix.
+        let status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+        assert_eq!(status, ReturnCode::StreamEnd);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.total_out, 3);
+        assert_eq!(&destination[..3], b"abc");
+        assert_eq!(&destination[3..], &[0xa5; 5]);
+        assert!(end(stream).state.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_isize_uses_modulo_32_bit_wire_length() {
+        assert_eq!(gzip_isize(0), 0);
+        assert_eq!(gzip_isize(usize::from(u16::MAX)), u32::from(u16::MAX));
+        #[cfg(target_pointer_width = "64")]
+        {
+            let over_4gib = u64::from(u32::MAX) + 4097;
+            assert_eq!(usize::try_from(over_4gib).ok().map(gzip_isize), Some(4096));
+        }
+    }
+
+    #[test]
+    fn dynamic_code_length_runs_validate_without_partial_writes() -> Result<(), &'static str> {
+        let mut state = State::new(InflateStateKind::Regular);
+        state.nlen = 257;
+        state.ndist = 1;
+        state.lens[0] = 7;
+        state.have = 1;
+
+        let previous = CodeLengthRepeat::from_symbol(16).ok_or("missing previous repeat")?;
+        let short_zero = CodeLengthRepeat::from_symbol(17).ok_or("missing short zero repeat")?;
+        let long_zero = CodeLengthRepeat::from_symbol(18).ok_or("missing long zero repeat")?;
+
+        state.append_code_length_repeat(previous, 0)?;
+        assert_eq!(&state.lens[..4], &[7, 7, 7, 7]);
+        state.append_code_length_repeat(previous, 3)?;
+        assert_eq!(&state.lens[4..10], &[7; 6]);
+
+        state.append_code_length_repeat(short_zero, 7)?;
+        assert_eq!(&state.lens[10..20], &[0; 10]);
+        state.append_code_length_repeat(long_zero, 127)?;
+        assert_eq!(&state.lens[20..158], &[0; 138]);
+        assert_eq!(state.have, 158);
+
+        // Both long and short repeats reject a run crossing the alphabet
+        // boundary without changing the preceding decoded prefix or cursor.
+        state.have = 257;
+        state.lens[257] = 0xa5;
+        assert_eq!(
+            state.append_code_length_repeat(short_zero, 0),
+            Err("invalid bit length repeat\0")
+        );
+        assert_eq!(
+            state.append_code_length_repeat(long_zero, 0),
+            Err("invalid bit length repeat\0")
+        );
+        assert_eq!(state.have, 257);
+        assert_eq!(state.lens[257], 0xa5);
+
+        state.have = 0;
+        assert_eq!(
+            state.append_code_length_repeat(previous, 0),
+            Err("invalid bit length repeat\0")
+        );
+        assert_eq!(state.have, 0);
+        assert!(CodeLengthRepeat::from_symbol(19).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_prime_keeps_signed_bit_patterns_and_rejects_overflow_without_mutation(
+    ) -> Result<(), &'static str> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let source = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+        // SAFETY: init succeeded and the state is exclusively borrowed for this test.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+
+        for width in [17, 32, 256, i32::MAX] {
+            let before = stream.state.bit_buffer;
+            assert_eq!(prime(stream, width, -1), ReturnCode::StreamError);
+            assert_eq!(stream.state.bit_buffer, before);
+        }
+
+        assert_eq!(prime(stream, 16, -1), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer.hold(), 0xffff);
+        assert_eq!(stream.state.bit_buffer.bits_in_buffer(), 16);
+
+        assert_eq!(prime(stream, 16, i32::MIN), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer.hold(), 0xffff);
+        assert_eq!(stream.state.bit_buffer.bits_in_buffer(), 32);
+
+        let before = stream.state.bit_buffer;
+        assert_eq!(prime(stream, 1, 1), ReturnCode::StreamError);
+        assert_eq!(stream.state.bit_buffer, before);
+        assert_eq!(prime(stream, 0, 5), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer, before);
+
+        assert_eq!(prime(stream, -1, 0), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer, BitBuffer::default());
+        assert_eq!(prime(stream, 16, i32::MIN), ReturnCode::Ok);
+        assert_eq!(stream.state.bit_buffer.hold(), 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_window_selection_accepts_only_complete_format_encodings() {
+        for bits in -64..=100 {
+            let expected = matches!(bits, -15..=-8 | 0 | 8..=15 | 24..=31 | 32 | 40..=47);
+            assert_eq!(
+                parse_inflate_window_bits(bits).is_some(),
+                expected,
+                "window bits {bits}",
+            );
+
+            if !expected {
+                let mut raw = z_stream::default();
+                // z_stream::default may already select an allocator under
+                // rust-allocator/c-allocator features. Rejection must not
+                // replace that choice, or allocate a new state.
+                let alloc_before = (raw.zalloc.is_some(), raw.zfree.is_some(), raw.opaque);
+                assert_eq!(
+                    init(&mut raw, InflateConfig { window_bits: bits }),
+                    ReturnCode::StreamError,
+                );
+                assert!(raw.state.is_null());
+                assert_eq!(
+                    (raw.zalloc.is_some(), raw.zfree.is_some(), raw.opaque),
+                    alloc_before
+                );
+                assert!(matches!(
+                    InflateStream::new(InflateConfig { window_bits: bits }),
+                    Err(ReturnCode::StreamError)
+                ));
+            }
+        }
+
+        for (bits, wrap, wbits) in [
+            (-15, 0, 15),
+            (-8, 0, 8),
+            (0, 5, 0),
+            (8, 5, 8),
+            (15, 5, 15),
+            (24, 6, 8),
+            (31, 6, 15),
+            (32, 7, 0),
+            (40, 7, 8),
+            (47, 7, 15),
+        ] {
+            assert_eq!(
+                parse_inflate_window_bits(bits),
+                Some(InflateWindowSelection { wrap, wbits }),
+            );
+        }
+        assert!(parse_inflate_window_bits(i32::MIN).is_none());
+        assert!(parse_inflate_window_bits(i32::MAX).is_none());
+    }
+
+    #[test]
+    fn inflate_init_reports_allocator_failure_without_exposing_state() {
+        unsafe extern "C" fn reject(
+            _context: *mut c_void,
+            _count: core::ffi::c_uint,
+            _size: core::ffi::c_uint,
+        ) -> *mut c_void {
+            core::ptr::null_mut()
+        }
+        unsafe extern "C" fn unused_free(_context: *mut c_void, _ptr: *mut c_void) {}
+
+        let mut raw = z_stream {
+            zalloc: Some(reject),
+            zfree: Some(unused_free),
+            ..z_stream::default()
+        };
+
+        assert_eq!(
+            init(&mut raw, InflateConfig::default()),
+            ReturnCode::MemError
+        );
+        assert!(raw.state.is_null());
+        assert!(raw.msg.is_null());
+    }
+
+    #[test]
+    fn successful_fallible_inflate_stream_construction_can_be_ended() -> Result<(), ReturnCode> {
+        let mut stream = InflateStream::new(InflateConfig::default())?;
+        assert_eq!(end(&mut stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_inflate_stream_releases_custom_allocation_exactly_once() -> Result<(), ReturnCode> {
+        // Test both unconditional Drop and explicit inflateEnd followed by
+        // Drop. Misaligned callbacks also exercise the generic C allocator's
+        // alignment-prefix path, not just its normal Rust allocator fast path.
+        for (remainder, explicit_end) in [(1usize, false), (1, true), (31, false), (63, true)] {
+            let mut context = MisalignedAlloc {
+                remainder,
+                modulus: ALLOCATION_BLOCK_BYTES,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut context).cast(),
+                ..z_stream::default()
+            };
+            let mut owned = InflateStream::new_with_abi_stream(raw, InflateConfig::default())?;
+            assert_eq!(context.allocations, 1);
+            assert_eq!(context.frees, 0);
+            assert_eq!(context.buffers.len(), 1);
+            if explicit_end {
+                assert!(end(&mut owned).state.is_null());
+                assert_eq!(context.frees, 1);
+            }
+            drop(owned);
+            assert_eq!(context.frees, 1);
+            assert_eq!(context.buffers, []);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_inflate_reconfiguration_preserves_existing_state() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init succeeded and the state is exclusively borrowed for this test.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+        let initial_wrap = stream.state.wrap;
+        let initial_window_bits = stream.state.wbits;
+        let initial_buffer = stream.state.bit_buffer;
+
+        for window_bits in [
+            -16,
+            -7,
+            -1,
+            1,
+            7,
+            16,
+            17,
+            23,
+            33,
+            39,
+            48,
+            64,
+            i32::MIN,
+            i32::MAX,
+        ] {
+            assert_eq!(
+                reset_with_config(stream, InflateConfig { window_bits }),
+                ReturnCode::StreamError,
+                "invalid window bits {window_bits}",
+            );
+            assert_eq!(stream.state.wrap, initial_wrap);
+            assert_eq!(stream.state.wbits, initial_window_bits);
+            assert_eq!(stream.state.bit_buffer, initial_buffer);
+        }
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_header_fields_clip_storage_but_consume_all_fragments() {
+        let mut extra = [0xa5_u8; 6];
+        let mut name = [0xa5_u8; 5];
+        let mut comment = [0xa5_u8; 6];
+        let mut header = gz_header {
+            extra: extra.as_mut_ptr(),
+            extra_len: 8,
+            extra_max: 4,
+            name: name.as_mut_ptr(),
+            name_max: 3,
+            comment: comment.as_mut_ptr(),
+            comm_max: 4,
+            ..gz_header::default()
+        };
+
+        // SAFETY: every nested pointer refers to its independent, uniquely
+        // writable stack buffer, with capacities no larger than those buffers.
+        let mut destination = unsafe { GzipHeaderOutput::new(&mut header) };
+        assert_eq!(destination.write_extra(8, b"abc"), Ok(()));
+        assert_eq!(destination.write_extra(5, b"defgh"), Ok(()));
+        // Invalid fragment ordering and overlong fragments must leave the
+        // already-written caller buffer untouched.
+        assert_eq!(
+            destination.write_extra(9, b"x"),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(
+            destination.write_extra(1, b"xy"),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(extra, *b"abcd\xa5\xa5");
+        assert_eq!(header.extra_len, 8);
+
+        let mut checksum = crate::CRC32_INITIAL_VALUE;
+        let mut stored = 0;
+        let mut first = BitReader::from_buffer(BitBuffer::default(), b"abc");
+        assert!(!consume_gzip_header_string(
+            &mut first,
+            Some(destination),
+            GzipStringField::Name,
+            &mut stored,
+            &mut checksum,
+            true,
+        ));
+        assert_eq!(first.as_slice(), []);
+        assert_eq!(stored, 3);
+
+        let mut second = BitReader::from_buffer(BitBuffer::default(), b"def\0trailing");
+        assert!(consume_gzip_header_string(
+            &mut second,
+            Some(destination),
+            GzipStringField::Name,
+            &mut stored,
+            &mut checksum,
+            true,
+        ));
+        assert_eq!(second.as_slice(), b"trailing");
+        assert_eq!(stored, 3);
+        assert_eq!(name, *b"abc\xa5\xa5");
+        assert_eq!(checksum, crc32(crate::CRC32_INITIAL_VALUE, b"abcdef\0"));
+
+        stored = 0;
+        let mut third = BitReader::from_buffer(BitBuffer::default(), b"you\0unused");
+        assert!(consume_gzip_header_string(
+            &mut third,
+            Some(destination),
+            GzipStringField::Comment,
+            &mut stored,
+            &mut checksum,
+            false,
+        ));
+        assert_eq!(third.as_slice(), b"unused");
+        assert_eq!(stored, 4);
+        assert_eq!(comment, *b"you\0\xa5\xa5");
+        assert_eq!(checksum, crc32(crate::CRC32_INITIAL_VALUE, b"abcdef\0"));
+
+        // The same bounded write must handle a missing destination without
+        // touching memory or losing the input cursor's progress.
+        destination.clear_comment();
+        let mut missing = BitReader::from_buffer(BitBuffer::default(), b"skip\0rest");
+        stored = 0;
+        assert!(consume_gzip_header_string(
+            &mut missing,
+            Some(destination),
+            GzipStringField::Comment,
+            &mut stored,
+            &mut checksum,
+            false,
+        ));
+        assert_eq!(stored, 0);
+        assert_eq!(missing.as_slice(), b"rest");
+    }
+
+    #[test]
+    fn non_strict_missing_history_is_initialized_as_zero_without_panic() -> Result<(), &'static str>
+    {
+        let mut output_bytes = [0xa5u8; 32];
+        // SAFETY: the stack array is valid and uniquely writable for 32 bytes.
+        let mut output = unsafe { InflateOutput::new_uninit(output_bytes.as_mut_ptr(), 32) };
+        let window = Window::empty();
+        let mut remaining = 10;
+        assert_eq!(
+            copy_match_bytes(&window, true, 3, &mut remaining, &mut output),
+            Err("invalid distance too far back\0"),
+        );
+        assert_eq!(output.len(), 0);
+
+        while remaining != 0 {
+            copy_match_bytes(&window, false, 3, &mut remaining, &mut output)?;
+        }
+        assert_eq!(output.filled(), &[0; 10]);
+        assert_eq!(&output_bytes[10..], &[0xa5; 22]);
+        Ok(())
+    }
+
+    #[test]
+    fn non_strict_missing_history_rejoins_initialized_window_and_output() -> Result<(), &'static str>
+    {
+        let mut window_storage = [0xa5u8; 8];
+        let mut window = Window::from_initialized_slice(&mut window_storage);
+        let mut checksum = 1;
+        window.extend(
+            &[10, 11, 12, 13],
+            0,
+            false,
+            &mut checksum,
+            &mut Crc32Fold::new(),
+        );
+        let mut output_bytes = [0xa5u8; 16];
+        // SAFETY: the stack array is valid and uniquely writable for 16 bytes.
+        let mut output = unsafe { InflateOutput::new_uninit(output_bytes.as_mut_ptr(), 16) };
+        let mut remaining = 9;
+        while remaining != 0 {
+            copy_match_bytes(&window, false, 6, &mut remaining, &mut output)?;
+        }
+        assert_eq!(output.filled(), &[0, 0, 10, 11, 12, 13, 0, 0, 10]);
+        assert_eq!(&output_bytes[9..], &[0xa5; 7]);
+        Ok(())
+    }
+
+    #[test]
+    fn uncompress2_reports_bytes_consumed_including_with_trailing_input() {
+        let plain = b"input accounting must report bytes consumed, not bytes remaining";
+        let mut storage = vec![0; crate::compress_bound(plain.len())];
+        let (compressed, code) =
+            crate::compress_slice(&mut storage, plain, crate::DeflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        let compressed = compressed.to_vec();
+
+        for trailing in [0, 3, 13] {
+            let mut input = compressed.clone();
+            input.extend(core::iter::repeat_n(0xa5, trailing));
+            let mut storage = vec![MaybeUninit::<u8>::uninit(); plain.len()];
+            let (consumed, decoded, code) =
+                uncompress2(&mut storage, &input, InflateConfig::default());
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(decoded, plain);
+            assert_eq!(consumed, compressed.len(), "trailing {trailing} bytes");
+        }
+    }
+
+    #[test]
+    fn whole_slice_invalid_configuration_preserves_caller_storage() {
+        for window_bits in [16, 17, 48, i32::MIN, i32::MAX] {
+            let config = InflateConfig { window_bits };
+            let mut destination = [0xa5u8; 64];
+            let (decoded, status) = decompress_slice(&mut destination, b"invalid", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(decoded, &[]);
+            assert_eq!(destination, [0xa5; 64]);
+
+            let mut uninitialized = [MaybeUninit::new(0xa5u8); 64];
+            let (consumed, decoded, status) = uncompress2(&mut uninitialized, b"invalid", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(consumed, 0);
+            assert_eq!(decoded, &[]);
+            // SAFETY: every slot was initialized to 0xa5 before calling
+            // uncompress2; the failed initializer cannot uninitialize it.
+            let untouched = uninitialized.map(|byte| unsafe { byte.assume_init() });
+            assert_eq!(untouched, [0xa5; 64]);
+        }
+    }
+
+    #[test]
+    fn whole_slice_inflate_distinguishes_empty_stream_from_exhausted_output() {
+        // RFC1950 stream containing no uncompressed bytes.
+        const EMPTY_STREAM: &[u8] = &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut empty_dest: [MaybeUninit<u8>; 0] = [];
+        let (consumed, decoded, code) =
+            uncompress2(&mut empty_dest, EMPTY_STREAM, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(consumed, EMPTY_STREAM.len());
+        assert_eq!(decoded, []);
+
+        let mut compressed = [0u8; 128];
+        let (encoded, code) = crate::compress_slice(
+            &mut compressed,
+            b"nonempty",
+            crate::DeflateConfig::default(),
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        let (consumed, decoded, code) =
+            uncompress2(&mut empty_dest, encoded, InflateConfig::default());
+        assert_eq!(code, ReturnCode::DataError);
+        assert!(consumed <= encoded.len());
+        assert_eq!(decoded, []);
+    }
+
+    #[test]
+    fn inflate_sync_total_in_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let mut marker = [0u8, 0, 0xff, 0xff];
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+        stream.next_in = marker.as_mut_ptr();
+        stream.avail_in = 4; // Four-byte stored-block sync marker.
+        stream.total_in = z_size::MAX - 1;
+
+        // SAFETY: the marker is a live, readable caller input span.
+        assert_eq!(unsafe { sync(stream) }, ReturnCode::Ok);
+        assert_eq!(stream.total_in, 2);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_sync_rebinds_disjoint_buffers_and_preserves_null_input() -> Result<(), &'static str>
+    {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        let mut marker = [0u8, 0, 0xff, 0xff];
+        // SAFETY: the initialized stream owns a live exclusively borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("initialized inflate stream is unavailable")?;
+        stream.total_in = z_size::MAX - 2;
+
+        for index in 0..marker.len() {
+            stream.next_in = marker[index..].as_mut_ptr();
+            stream.avail_in = 1;
+            // SAFETY: the supplied byte is readable for this call.
+            let result = unsafe { sync(stream) };
+            assert_eq!(
+                result,
+                if index == 3 {
+                    ReturnCode::Ok
+                } else {
+                    ReturnCode::DataError
+                }
+            );
+            assert_eq!(stream.avail_in, 0);
+            assert_eq!(stream.next_in, marker[index..].as_mut_ptr().wrapping_add(1));
+            assert_eq!(
+                stream.total_in,
+                (z_size::MAX - 2).wrapping_add(index as z_size + 1)
+            );
+
+            if index == 0 {
+                stream.next_in = core::ptr::null_mut();
+                // SAFETY: zero available bytes require no input allocation.
+                assert_eq!(unsafe { sync(stream) }, ReturnCode::BufError);
+                assert!(stream.next_in.is_null());
+                assert_eq!(stream.avail_in, 0);
+                assert_eq!(stream.total_in, z_size::MAX - 1);
+            }
+        }
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_total_in_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        // An empty RFC1950 zlib stream is eight bytes long, and creates no output.
+        let mut input = [0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut output = [0u8; 1];
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized inflate stream was not usable")?;
+        stream.next_in = input.as_mut_ptr();
+        stream.avail_in = 8; // Eight-byte RFC1950 empty stream.
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = 1;
+        stream.total_in = z_size::MAX - 1;
+
+        // SAFETY: the input and output spans remain live and non-overlapping for this call.
+        let status = unsafe { inflate(stream, InflateFlush::Finish) };
+        assert_eq!(status, ReturnCode::StreamEnd);
+        assert_eq!(stream.total_in, 6);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(end(stream).state, core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[test]
+    fn end_leaves_null_abi_state_pointer() -> Result<(), ReturnCode> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: successful initialization created a live, uniquely borrowed inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
+
+        assert!(end(stream).state.is_null());
+        assert!(end(stream).state.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_copy_rejects_inconsistent_owned_window_before_allocating() -> Result<(), &'static str>
+    {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: successful init created one exclusive, live regular inflate state.
+        let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("regular inflate state missing")?;
+        let original_window = core::mem::replace(&mut stream.state.window, Window::empty());
+        let mut destination = MaybeUninit::<InflateStream>::uninit();
+        assert_eq!(copy(&mut destination, stream), ReturnCode::StreamError);
+        stream.state.window = original_window;
+
+        assert!(end(stream).state.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn aligned_inflate_storage_handles_custom_allocator_residues() -> Result<(), &'static str> {
+        for remainder in 0..ALLOCATION_BLOCK_BYTES {
+            let mut ctx = MisalignedAlloc {
+                remainder,
+                modulus: ALLOCATION_BLOCK_BYTES,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let mut source = InflateStream::new_with_abi_stream(
+                z_stream {
+                    zalloc: Some(misaligned_alloc_callback),
+                    zfree: Some(misaligned_free_callback),
+                    opaque: (&raw mut ctx).cast(),
+                    ..z_stream::default()
+                },
+                InflateConfig::default(),
+            )
+            .map_err(|_| "custom allocator failed to initialize native inflater")?;
+            assert_eq!(source.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(
+                source.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
+                0
+            );
+            // Both layouts put State at the exact typed allocation start, and
+            // the ordinary owned window at its sole computed aligned offset.
+            let layout = InflateAllocOffsets::with_window();
+            let window_pos = layout.window_pos.ok_or("regular window offset missing")?;
+            assert_eq!(
+                source.state.as_ptr() as usize,
+                source.state.allocation_start as usize
+            );
+            assert_eq!(source.state.total_allocation_size, layout.total_size);
+            assert_eq!(
+                source.state.window.as_ptr() as usize,
+                source.state.allocation_start as usize + window_pos
+            );
+
+            let mut cloned_raw = MaybeUninit::<InflateStream>::uninit();
+            assert_eq!(copy(&mut cloned_raw, &source), ReturnCode::Ok);
+            // SAFETY: successful copy constructed every field, including an
+            // independently allocated native state. Owning the cloned value
+            // releases it automatically if an invariant check fails.
+            let mut cloned = unsafe { cloned_raw.assume_init() };
+            assert_eq!(cloned.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(
+                cloned.state.window.as_ptr() as usize % ALLOCATION_BLOCK_BYTES,
+                0
+            );
+            assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
+            assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
+            assert_eq!(
+                cloned.state.as_ptr() as usize,
+                cloned.state.allocation_start as usize
+            );
+            assert_eq!(
+                cloned.state.window.as_ptr() as usize,
+                cloned.state.allocation_start as usize + window_pos
+            );
+            assert!(end(&mut cloned).state.is_null());
+            assert!(end(&mut source).state.is_null());
+
+            let mut back_raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut ctx).cast(),
+                ..z_stream::default()
+            };
+            let mut caller_window = vec![0u8; 1usize << MIN_WBITS];
+            let back_window = Window::from_initialized_slice(&mut caller_window);
+            assert_eq!(
+                back_init(
+                    &mut back_raw,
+                    InflateConfig {
+                        window_bits: MIN_WBITS,
+                    },
+                    back_window
+                ),
+                ReturnCode::Ok
+            );
+            // SAFETY: successful back_init created an exclusive inflater state; back_end
+            // detaches the caller-provided history window before releasing that state.
+            let back = (unsafe { InflateStream::from_back_stream_mut(&raw mut back_raw) })
+                .ok_or("callback inflater state missing")?;
+            assert_eq!(back.state.as_ptr() as usize % ALLOCATION_BLOCK_BYTES, 0);
+            assert_eq!(
+                back.state.as_ptr() as usize,
+                back.state.allocation_start as usize
+            );
+            assert_eq!(
+                back.state.total_allocation_size,
+                InflateAllocOffsets::state_only().total_size
+            );
+            back_end(back);
+            assert_eq!(ctx.allocations, 3, "allocations at remainder {remainder}");
+            assert_eq!(ctx.frees, 3, "frees at remainder {remainder}");
+            assert!(ctx.buffers.is_empty(), "outstanding memory at {remainder}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn callback_inflate_sets_and_clears_stream_error_messages() -> Result<(), &'static str> {
+        unsafe extern "C" fn no_more_input(_descriptor: *mut c_void, next: *mut *const u8) -> u32 {
+            // SAFETY: the callback receives a valid output slot for the next input span.
+            unsafe { *next = core::ptr::null() };
+            0
+        }
+
+        unsafe extern "C" fn accept_output(
+            _descriptor: *mut c_void,
+            _buffer: *mut u8,
+            _length: u32,
+        ) -> i32 {
+            0
+        }
+
+        // Match stock zlib's messages and verify that a later successful
+        // inflateBack on the same initialized stream clears the previous error.
+        let bad_type = [0x07u8];
+        let bad_stored_length = [0x01, 1, 0, 0, 0, b'A'];
+        let empty_stored_block = [0x01, 0, 0, 0xff, 0xff];
+        let cases: [(&[u8], ReturnCode, Option<&str>); 3] = [
+            (&bad_type, ReturnCode::DataError, Some("invalid block type")),
+            (
+                &bad_stored_length,
+                ReturnCode::DataError,
+                Some("invalid stored block lengths"),
+            ),
+            (&empty_stored_block, ReturnCode::StreamEnd, None),
+        ];
+
+        let mut window_bytes = vec![0u8; 1usize << MIN_WBITS];
+        let mut raw = z_stream::default();
+        assert_eq!(
+            back_init(
+                &mut raw,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                Window::from_initialized_slice(&mut window_bytes),
+            ),
+            ReturnCode::Ok,
+        );
+
+        for (source, expected_status, expected_message) in cases {
+            raw.next_in = source.as_ptr().cast_mut();
+            raw.avail_in = u32::try_from(source.len()).map_err(|_| "invalid test length")?;
+
+            // SAFETY: back_init initialized this callback-only stream, and
+            // source/window storage remain live throughout the invocation.
+            let back = unsafe { InflateStream::from_back_stream_mut(&raw mut raw) }
+                .ok_or("missing callback decoder")?;
+            // SAFETY: callbacks respect their pointer contracts, and no output
+            // storage is mutated while the decoder owns its window.
+            let status = unsafe {
+                super::back(
+                    back,
+                    no_more_input,
+                    core::ptr::null_mut(),
+                    accept_output,
+                    core::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, expected_status);
+
+            let message = if back.msg.is_null() {
+                None
+            } else {
+                // SAFETY: decoder errors use static, NUL-terminated messages;
+                // the live stream still owns the state during inspection.
+                Some(
+                    unsafe { core::ffi::CStr::from_ptr(back.msg) }
+                        .to_str()
+                        .map_err(|_| "invalid error message encoding")?,
+                )
+            };
+            assert_eq!(message, expected_message);
+        }
+
+        // SAFETY: the same initialized stream is still live and exclusive.
+        let back = unsafe { InflateStream::from_back_stream_mut(&raw mut raw) }
+            .ok_or("callback decoder missing at end")?;
+        back_end(back);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_full_output_callback_is_invoked_once() -> Result<(), &'static str> {
+        struct OutputCalls {
+            count: usize,
+            lengths: Vec<usize>,
+        }
+
+        unsafe extern "C" fn reject_output(
+            descriptor: *mut core::ffi::c_void,
+            _bytes: *mut u8,
+            length: u32,
+        ) -> i32 {
+            // SAFETY: the test passes a live, exclusively borrowed OutputCalls
+            // descriptor which remains valid throughout the back() call.
+            let calls = unsafe { &mut *descriptor.cast::<OutputCalls>() };
+            calls.count += 1;
+            calls.lengths.push(length as usize);
+            1
+        }
+
+        unsafe extern "C" fn no_more_input(
+            _descriptor: *mut core::ffi::c_void,
+            next: *mut *const u8,
+        ) -> u32 {
+            // SAFETY: zlib's input callback contract supplies a writable pointer slot.
+            unsafe { *next = core::ptr::null() };
+            0
+        }
+
+        // A stored block just longer than the callback window forces the
+        // full-window output callback before the stream reaches its final block.
+        let window_size = 1usize << MIN_WBITS;
+        let payload_len = u16::try_from(window_size + 1).map_err(|_| "window too large")?;
+        let mut encoded = vec![1u8]; // final, stored DEFLATE block
+        encoded.extend_from_slice(&payload_len.to_le_bytes());
+        encoded.extend_from_slice(&(!payload_len).to_le_bytes());
+        encoded.extend(core::iter::repeat_n(0x5au8, usize::from(payload_len)));
+
+        let mut storage = vec![0xa5; window_size];
+        let mut raw = z_stream::default();
+        let window = Window::from_initialized_slice(&mut storage);
+        assert_eq!(
+            back_init(
+                &mut raw,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                window,
+            ),
+            ReturnCode::Ok,
+        );
+        raw.next_in = encoded.as_mut_ptr();
+        raw.avail_in = u32::try_from(encoded.len()).map_err(|_| "encoded input too large")?;
+
+        let mut calls = OutputCalls {
+            count: 0,
+            lengths: Vec::new(),
+        };
+        // SAFETY: back_init returned a live callback inflater; encoded and
+        // caller window remain allocated and exclusively borrowed, and the
+        // callbacks obey their input/output buffer lifetime contracts.
+        let back = unsafe { InflateStream::from_back_stream_mut(&raw mut raw) }
+            .ok_or("missing callback decoder")?;
+        // SAFETY: the typed callback stream owns a live initialized state,
+        // the input and output storage remain valid for the entire call,
+        // and the callbacks honor their respective span contracts.
+        let status = unsafe {
+            super::back(
+                back,
+                no_more_input,
+                core::ptr::null_mut(),
+                reject_output,
+                (&raw mut calls).cast(),
+            )
+        };
+        let remaining = back.avail_in;
+        back_end(back);
+
+        assert_eq!(status, ReturnCode::BufError);
+        assert_eq!(
+            calls.count, 1,
+            "the rejected full window must not be delivered again"
+        );
+        assert_eq!(calls.lengths, [window_size]);
+        assert_eq!(remaining, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn inflate_copy_owns_independent_state_and_window_storage() -> Result<(), ReturnCode> {
+        let mut source = InflateStream::new(InflateConfig::default())?;
         let source_state = source.state.as_ptr();
         let source_window = source.state.window.as_ptr();
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        let copied = unsafe { copied.assume_init_mut() };
+        assert_eq!(copy(&mut copied, &source), ReturnCode::Ok);
+        // SAFETY: successful native copy initialized the entire independent
+        // stream. Owning it ensures Drop frees its allocation on any failure.
+        let mut copied = unsafe { copied.assume_init() };
 
         assert_ne!(source_state, copied.state.as_ptr());
         assert_ne!(source_window, copied.state.window.as_ptr());
@@ -3093,12 +4769,102 @@ mod tests {
             copied.state.total_allocation_size
         );
 
-        end(copied);
-        end(source);
+        assert!(end(&mut copied).state.is_null());
+        assert!(end(&mut source).state.is_null());
+        Ok(())
     }
 
     #[test]
-    fn gzip_header_destination_is_shared_safely_across_inflate_copy() {
+    fn extended_gzip_header_resumes_across_every_small_chunk_and_rejects_bad_crc(
+    ) -> Result<(), &'static str> {
+        // Extended gzip prefix including FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT,
+        // with an independently generated CRC16 at the end. The decoder
+        // must finish metadata parsing before attempting the payload.
+        let header = [
+            0x1f, 0x8b, 0x08, 0x1f, 0x44, 0x0a, 0x45, 0x65, 0x00, 0x03, 0x0e, 0x00, 0x54, 0x47,
+            0x0a, 0x00, 0x45, 0x58, 0x54, 0x52, 0x41, 0x20, 0x44, 0x41, 0x54, 0x41, 0x74, 0x65,
+            0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x00, 0x41, 0x20, 0x63, 0x6f, 0x6d, 0x6d, 0x65,
+            0x6e, 0x74, 0x00, 0x3b, 0x92,
+        ];
+        for chunk in [1usize, 2, 3, 5, 7, 13, header.len()] {
+            for corrupt_crc in [false, true] {
+                let mut input = header;
+                if corrupt_crc {
+                    let last = input.len() - 1;
+                    input[last] ^= 1;
+                }
+                let mut extra = [0u8; 14];
+                let mut name = [0u8; 9];
+                let mut comment = [0u8; 10];
+                let mut destination = gz_header {
+                    extra: extra.as_mut_ptr(),
+                    extra_max: 14,
+                    name: name.as_mut_ptr(),
+                    name_max: 9,
+                    comment: comment.as_mut_ptr(),
+                    comm_max: 10,
+                    ..gz_header::default()
+                };
+                let mut raw = z_stream::default();
+                assert_eq!(
+                    init(&mut raw, InflateConfig { window_bits: 47 }),
+                    ReturnCode::Ok
+                );
+                // SAFETY: successful init created an exclusively borrowed
+                // regular inflate state; destination buffers remain live.
+                let stream = unsafe { InflateStream::from_stream_mut(&raw mut raw) }
+                    .ok_or("initialized gzip state is unavailable")?;
+                // SAFETY: the independent nested arrays are live, disjoint,
+                // and writable for exactly the configured capacities.
+                let header_status = unsafe { get_header(stream, Some(&mut destination)) };
+                assert_eq!(header_status, ReturnCode::Ok);
+
+                let mut consumed = 0;
+                let mut scratch = [0u8; 1];
+                let mut status = ReturnCode::Ok;
+                while consumed < input.len() && destination.done == 0 {
+                    let offered = chunk.min(input.len() - consumed);
+                    stream.next_in = input[consumed..].as_ptr().cast_mut();
+                    stream.avail_in = u32::try_from(offered).map_err(|_| "chunk too large")?;
+                    stream.next_out = scratch.as_mut_ptr();
+                    stream.avail_out = 1;
+
+                    // SAFETY: both ABI slices are live and bounded by the
+                    // exact current per-call avail_in/avail_out counts.
+                    status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+                    let taken = offered
+                        - usize::try_from(stream.avail_in)
+                            .map_err(|_| "invalid input remainder")?;
+                    assert!(taken > 0, "gzip header parser stalled at {consumed}");
+                    consumed += taken;
+                    if matches!(status, ReturnCode::DataError) {
+                        break;
+                    }
+                }
+
+                assert_eq!(consumed, input.len());
+                if corrupt_crc {
+                    assert_eq!(status, ReturnCode::DataError);
+                    assert_eq!(destination.done, 0);
+                } else {
+                    assert_eq!(destination.done, 1);
+                    assert_eq!(destination.text, 1);
+                    assert_eq!(destination.time, 1_699_023_428);
+                    assert_eq!(destination.os, 3);
+                    assert_eq!(destination.extra_len, 14);
+                    assert_eq!(destination.hcrc, 1);
+                    assert_eq!(extra, *b"TG\n\0EXTRA DATA");
+                    assert_eq!(name, *b"test.txt\0");
+                    assert_eq!(comment, *b"A comment\0");
+                }
+                assert_eq!(end(stream).state, core::ptr::null_mut());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_header_destination_is_shared_safely_across_inflate_copy() -> Result<(), ReturnCode> {
         // Extended gzip header with FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT set. The payload starts after
         // the header; this test only needs both copied streams to finish parsing the header.
         let input: &[u8] = &[
@@ -3117,42 +4883,40 @@ mod tests {
             os: 0,
             extra: extra.as_mut_ptr(),
             extra_len: 0,
-            extra_max: extra.len() as _,
+            extra_max: u32::try_from(extra.len()).map_err(|_| ReturnCode::StreamError)?,
             name: name.as_mut_ptr(),
-            name_max: name.len() as _,
+            name_max: u32::try_from(name.len()).map_err(|_| ReturnCode::StreamError)?,
             comment: comment.as_mut_ptr(),
-            comm_max: comment.len() as _,
+            comm_max: u32::try_from(comment.len()).map_err(|_| ReturnCode::StreamError)?,
             hcrc: 0,
             done: 0,
         };
 
-        let mut source_stream = z_stream::default();
-        assert_eq!(
-            init(&mut source_stream, InflateConfig { window_bits: 47 }),
-            ReturnCode::Ok
-        );
-        let source = unsafe { InflateStream::from_stream_mut(&mut source_stream) }.unwrap();
-        assert_eq!(
-            unsafe { get_header(source, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        let mut source = InflateStream::new(InflateConfig { window_bits: 47 })?;
+        // SAFETY: the live stream and caller-owned disjoint metadata buffers
+        // remain valid and exclusively writable through both decoder calls.
+        let header_code = unsafe { get_header(&mut source, Some(&mut header)) };
+        assert_eq!(header_code, ReturnCode::Ok);
 
         // Configure I/O before copying, but do not call inflate yet: both states must retain the
         // same caller-owned header destination just as zlib's copied C pointer does.
         let mut source_out = [0u8; 1];
-        source.next_in = input.as_ptr() as *mut _;
-        source.avail_in = input.len() as _;
+        source.next_in = input.as_ptr().cast_mut();
+        source.avail_in = u32::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
         source.next_out = source_out.as_mut_ptr();
-        source.avail_out = source_out.len() as _;
+        source.avail_out = u32::try_from(source_out.len()).map_err(|_| ReturnCode::StreamError)?;
 
         let mut copied = MaybeUninit::<InflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        let copied = unsafe { copied.assume_init_mut() };
+        assert_eq!(copy(&mut copied, &source), ReturnCode::Ok);
+        // SAFETY: the native clone fully initialized an independent state;
+        // owned storage calls Drop even when later assertions or errors fail.
+        let mut copied = unsafe { copied.assume_init() };
         let mut copied_out = [0u8; 1];
         copied.next_out = copied_out.as_mut_ptr();
-        copied.avail_out = copied_out.len() as _;
+        copied.avail_out = u32::try_from(copied_out.len()).map_err(|_| ReturnCode::StreamError)?;
 
-        let source_ret = unsafe { inflate(source, InflateFlush::NoFlush) };
+        // SAFETY: live input, output and header storage are disjoint for this decoder call.
+        let source_ret = unsafe { inflate(&mut source, InflateFlush::NoFlush) };
         assert!(matches!(source_ret, ReturnCode::Ok | ReturnCode::StreamEnd));
         assert_eq!(header.done, 1);
         assert_eq!(header.text, 1);
@@ -3160,15 +4924,17 @@ mod tests {
         assert_eq!(header.os, 3);
         assert_eq!(header.hcrc, 1);
 
-        let copied_ret = unsafe { inflate(copied, InflateFlush::NoFlush) };
+        // SAFETY: copied state retains valid caller buffers for this independent call.
+        let copied_ret = unsafe { inflate(&mut copied, InflateFlush::NoFlush) };
         assert_eq!(copied_ret, source_ret);
         assert_eq!(header.done, 1);
         assert_eq!(extra, *b"TG\n\0EXTRA DATA");
         assert_eq!(&name, b"test.txt\0");
         assert_eq!(&comment, b"A comment\0");
 
-        end(source);
-        end(copied);
+        assert!(end(&mut source).state.is_null());
+        assert!(end(&mut copied).state.is_null());
+        Ok(())
     }
 
     fn inflate_fragmented(
@@ -3176,10 +4942,10 @@ mod tests {
         expected: &[u8],
         input_chunk: usize,
         output_chunk: usize,
-    ) {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, InflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { InflateStream::from_stream_mut(&mut raw) }.unwrap();
+    ) -> Result<(), ReturnCode> {
+        // Typed ownership ensures a decoder error or invalid chunk length
+        // frees the inflate allocation as the helper unwinds its Result.
+        let mut stream = InflateStream::new(InflateConfig::default())?;
 
         let mut output = vec![0u8; expected.len() + output_chunk];
         let mut next_input = 0usize;
@@ -3188,8 +4954,8 @@ mod tests {
         loop {
             if stream.avail_in == 0 && next_input < compressed.len() {
                 let len = input_chunk.min(compressed.len() - next_input);
-                stream.next_in = compressed[next_input..].as_ptr() as *mut u8;
-                stream.avail_in = len as u32;
+                stream.next_in = compressed[next_input..].as_ptr().cast_mut();
+                stream.avail_in = u32::try_from(len).map_err(|_| ReturnCode::StreamError)?;
                 next_input += len;
             }
 
@@ -3200,25 +4966,26 @@ mod tests {
                     "fragmented inflate exhausted its output allocation"
                 );
                 stream.next_out = output[next_output..].as_mut_ptr();
-                stream.avail_out = len as u32;
+                stream.avail_out = u32::try_from(len).map_err(|_| ReturnCode::StreamError)?;
                 next_output += len;
             }
 
-            match unsafe { inflate(stream, InflateFlush::NoFlush) } {
+            // SAFETY: input/output chunks are live and non-overlapping for this decoder call.
+            match unsafe { inflate(&mut stream, InflateFlush::NoFlush) } {
                 ReturnCode::Ok => {}
                 ReturnCode::StreamEnd => break,
-                code => panic!("fragmented inflate returned {code:?}"),
+                code => return Err(code),
             }
         }
 
-        let written = stream.total_out as usize;
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(written, expected.len());
         assert_eq!(&output[..written], expected);
-        end(stream);
+        Ok(())
     }
 
     #[test]
-    fn inflate_resumes_across_fragmented_input_and_output() {
+    fn inflate_resumes_across_fragmented_input_and_output() -> Result<(), ReturnCode> {
         const PATTERN: &[u8] =
             b"the quick brown fox jumps over the lazy dog | 0123456789 | DEFLATE!";
         let input: Vec<u8> = (0..16 * 1024)
@@ -3235,16 +5002,19 @@ mod tests {
 
         for input_chunk in [1, 2, 3, 5, 7, 13] {
             for output_chunk in [1, 3, 7, 31] {
-                inflate_fragmented(&compressed, &input, input_chunk, output_chunk);
+                inflate_fragmented(&compressed, &input, input_chunk, output_chunk)?;
             }
         }
+        Ok(())
     }
 
     #[test]
     fn uninitialized_output_exposes_exactly_the_decompressed_prefix() {
-        let input: Vec<u8> = (0..257)
+        let input: Vec<u8> = (0u16..257)
             .flat_map(|i| {
-                let byte = (i % 251) as u8;
+                // 0..250 is the intended wire-byte domain; taking its low
+                // byte preserves the exact historical test corpus.
+                let byte = (i % 251).to_le_bytes()[0];
                 [b"typed-inflate-output/".as_slice(), &[byte]].concat()
             })
             .collect();
@@ -3295,17 +5065,17 @@ mod tests {
     #[test]
     fn back_init_raw_rejects_null_window() {
         let mut stream = z_stream::default();
-        assert_eq!(
-            unsafe {
-                back_init_raw(
-                    &mut stream,
-                    InflateConfig {
-                        window_bits: MIN_WBITS,
-                    },
-                    core::ptr::null_mut(),
-                )
-            },
-            ReturnCode::StreamError,
-        );
+        // SAFETY: the null window is an intentional invalid argument. The
+        // initializer must reject it before dereferencing the pointer.
+        let status = unsafe {
+            back_init_raw(
+                &mut stream,
+                InflateConfig {
+                    window_bits: MIN_WBITS,
+                },
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ReturnCode::StreamError);
     }
 }

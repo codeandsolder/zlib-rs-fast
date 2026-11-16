@@ -18,8 +18,6 @@ version = "0.6.8"
 edition = "2021"
 license = "Zlib"
 repository = "https://github.com/trifectatechfoundation/zlib-rs"
-homepage = "https://github.com/trifectatechfoundation/zlib-rs"
-readme = "./README.md"
 description = "A memory-safe zlib implementation written in rust"
 publish = true
 

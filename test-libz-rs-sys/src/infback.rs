@@ -4,20 +4,27 @@ use libz_sys as libz_ng_sys;
 
 use crate::assert_eq_rs_ng;
 
+/// C initialization accepts only a representable signed ABI struct size.
+fn stream_struct_size<T>() -> c_int {
+    c_int::try_from(core::mem::size_of::<T>()).unwrap_or(-1)
+}
+
 #[test]
 fn edge_cases() {
     let mut tiny_window = [0u8; 16];
 
     assert_eq!(
         assert_eq_rs_ng! {
-            {
+            // SAFETY: the live tiny window is insufficient and the initializer
+            // rejects invalid window bits before reading the storage.
+            unsafe {
                 let mut stream = MaybeUninit::uninit();
                 inflateBackInit_(
                     stream.as_mut_ptr(),
                     20,
                     tiny_window.as_mut_ptr(),
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as _ ,
+                    stream_struct_size::<z_stream>(),
                 )
             }
         },
@@ -26,14 +33,16 @@ fn edge_cases() {
 
     assert_eq!(
         assert_eq_rs_ng! {
-            {
+            // SAFETY: a null window must be rejected before dereference;
+            // the stream pointer is a live, addressable output location.
+            unsafe {
                 let mut stream = MaybeUninit::uninit();
                 inflateBackInit_(
                     stream.as_mut_ptr(),
                     15,
                     core::ptr::null_mut(),
                     zlibVersion(),
-                    core::mem::size_of::<z_stream>() as _ ,
+                    stream_struct_size::<z_stream>(),
                 )
             }
         },
@@ -44,7 +53,9 @@ fn edge_cases() {
 #[test]
 fn inflate_copy_rejects_back_init_state() {
     for force_non_null_output in [false, true] {
-        let result = assert_eq_rs_ng!({
+        // SAFETY: initialized streams and live output storage are used to
+        // verify rejection of copying an inflateBack-only state.
+        let result = assert_eq_rs_ng!(unsafe {
             let mut source = MaybeUninit::<z_stream>::zeroed();
             let mut copy = MaybeUninit::<z_stream>::zeroed();
             let mut window = vec![0xAA; 1 << 15];
@@ -55,12 +66,12 @@ fn inflate_copy_rejects_back_init_state() {
                 15,
                 window.as_mut_ptr(),
                 zlibVersion(),
-                core::mem::size_of::<z_stream>() as c_int,
+                stream_struct_size::<z_stream>(),
             );
             assert_eq!(init, Z_OK);
 
             if force_non_null_output {
-                (*source.as_mut_ptr()).next_out = &mut output_byte;
+                (*source.as_mut_ptr()).next_out = &raw mut output_byte;
                 (*source.as_mut_ptr()).avail_out = 1;
             }
 
@@ -74,6 +85,56 @@ fn inflate_copy_rejects_back_init_state() {
 
         assert_eq!(result, libz_ng_sys::Z_STREAM_ERROR);
     }
+}
+
+#[test]
+fn invalid_back_history_is_rejected_without_reading_uninitialized_window() {
+    // Minimized by hosted libFuzzer from an inflateBack one-byte callback.
+    // The input runs out before its incomplete DEFLATE stream can terminate.
+    const TRUNCATED: &[u8] = &[0x0a, 0x26, 0x0a, 0x26];
+    for chunk in [1usize, 512] {
+        let (reference, ours) = if chunk == 1 {
+            (
+                run_inflate_back_ng::<1>(TRUNCATED, 15),
+                run_inflate_back_rs::<1>(TRUNCATED, 15),
+            )
+        } else {
+            (
+                run_inflate_back_ng::<512>(TRUNCATED, 15),
+                run_inflate_back_rs::<512>(TRUNCATED, 15),
+            )
+        };
+        // zlib-ng's non-strict decoder can continue through an invalid
+        // distance and eventually report input exhaustion. The Rust decoder
+        // must instead refuse to read history never initialized by output.
+        assert_eq!(reference, Err(libz_ng_sys::Z_BUF_ERROR), "chunk={chunk}");
+        assert_eq!(ours, Err(libz_rs_sys::Z_DATA_ERROR), "chunk={chunk}");
+    }
+}
+
+#[test]
+fn non_strict_reference_can_emit_uninitialized_back_history() {
+    // Minimized by hosted libFuzzer: the reference accepts a distance
+    // reaching before the first output byte and copies the 0xAA sentinel
+    // from its initial window. Rust must not treat it as valid DEFLATE.
+    const INPUT: &[u8] = &[0x22, 0x59, 0x01, 0x60, 0x00, 0x3D];
+
+    let reference = run_inflate_back_ng::<1>(INPUT, 15);
+    let ours = run_inflate_back_rs::<1>(INPUT, 15);
+    assert!(
+        matches!(&reference, Ok(bytes) if !bytes.is_empty() && bytes.iter().all(|&b| b == 0xAA))
+    );
+    assert_eq!(ours, Err(libz_rs_sys::Z_DATA_ERROR));
+
+    // A separate ordinary inflate entrypoint must also refuse this
+    // invalid back-reference before the harness tolerates C's success.
+    let mut output = vec![0; reference.as_ref().map_or(0, Vec::len) + 1];
+    let (_, status) = zlib_rs::decompress_slice(
+        &mut output,
+        INPUT,
+        zlib_rs::InflateConfig { window_bits: -15 },
+    );
+    assert_eq!(status, zlib_rs::ReturnCode::DataError);
 }
 
 #[test]
@@ -116,6 +177,222 @@ fn entry(input: &[u8]) {
     differential_inflate_back::<512>(input);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    status: c_int,
+    message: Option<String>,
+    callback_sizes: Vec<usize>,
+    bytes: Vec<u8>,
+    remaining_input: c_uint,
+}
+
+struct CallbackResult {
+    callback_sizes: Vec<usize>,
+    bytes: Vec<u8>,
+    reject_at: Option<usize>,
+}
+
+unsafe extern "C" fn capture(desc: *mut c_void, buf: *mut c_uchar, count: c_uint) -> c_int {
+    // SAFETY: the live callback descriptor is exclusive to this synchronous
+    // inflateBack invocation and refers to its CallbackResult.
+    let result = unsafe { &mut *desc.cast::<CallbackResult>() };
+    let Ok(count) = usize::try_from(count) else {
+        return 1;
+    };
+    // SAFETY: each callback gives us an initialized prefix of its window.
+    let bytes = unsafe { core::slice::from_raw_parts(buf, count) };
+    result.callback_sizes.push(bytes.len());
+    result.bytes.extend_from_slice(bytes);
+    c_int::from(result.reject_at == Some(result.callback_sizes.len()))
+}
+
+macro_rules! probe {
+    ($library:ident, $input_cb:expr, $output_cb:expr, $encoded:expr, $reject:expr) => {{
+        let encoded: &[u8] = $encoded;
+        let mut stream = MaybeUninit::<$library::z_stream>::zeroed();
+        let mut window = vec![0xa5u8; 32768];
+        let mut input = InputCtx {
+            data: encoded,
+            pos: 0,
+        };
+        let mut output = CallbackResult {
+            callback_sizes: Vec::new(),
+            bytes: Vec::new(),
+            reject_at: $reject,
+        };
+        // SAFETY: live C stream storage, caller-owned 32 KiB window and
+        // matching C ABI version/struct size for the selected library.
+        let init = unsafe {
+            $library::inflateBackInit_(
+                stream.as_mut_ptr(),
+                15,
+                window.as_mut_ptr(),
+                $library::zlibVersion(),
+                stream_struct_size::<$library::z_stream>(),
+            )
+        };
+        assert_eq!(init, $library::Z_OK);
+
+        // SAFETY: both callback descriptors remain valid, the input stays
+        // immutable, and output bytes are copied before the callback returns.
+        let status = unsafe {
+            $library::inflateBack(
+                stream.as_mut_ptr(),
+                $input_cb,
+                (&raw mut input).cast(),
+                $output_cb,
+                (&raw mut output).cast(),
+            )
+        };
+        // SAFETY: successful init created a fully initialized z_stream;
+        // its message storage is stable for the initialized stream lifetime.
+        let raw = unsafe { stream.assume_init_ref() };
+        let message = if raw.msg.is_null() {
+            None
+        } else {
+            // SAFETY: zlib stream errors use NUL-terminated error strings
+            // whose storage remains valid until inflateBackEnd.
+            let text = unsafe { core::ffi::CStr::from_ptr(raw.msg) };
+            Some(text.to_string_lossy().into_owned())
+        };
+        let result = Outcome {
+            status,
+            message,
+            callback_sizes: output.callback_sizes,
+            bytes: output.bytes,
+            remaining_input: raw.avail_in,
+        };
+        // SAFETY: the initialized callback stream is torn down exactly once.
+        let end_status = unsafe { $library::inflateBackEnd(stream.as_mut_ptr()) };
+        assert_eq!(end_status, $library::Z_OK);
+        result
+    }};
+}
+
+#[test]
+fn differential_back_callback_delivery_on_abort_and_truncation() {
+    let plain = vec![0x5au8; 65_539];
+    let mut storage = vec![0u8; zlib_rs::deflate::compress_bound(plain.len())];
+    let (encoded, code) = zlib_rs::deflate::compress_slice(
+        &mut storage,
+        &plain,
+        zlib_rs::deflate::DeflateConfig {
+            level: 0,
+            window_bits: -15,
+            ..zlib_rs::deflate::DeflateConfig::default()
+        },
+    );
+    assert_eq!(code, zlib_rs::ReturnCode::Ok);
+    let encoded: &[u8] = encoded;
+    let truncated = &encoded[..encoded.len() - 1];
+    // Non-final stored "hello" followed by an illegal block type.
+    let malformed = b"\x00\x05\x00\xfa\xffhello\x07".as_slice();
+
+    for (name, source) in [
+        ("complete", encoded),
+        ("truncated", truncated),
+        ("malformed-next-block", malformed),
+    ] {
+        for reject_at in [None, Some(1), Some(2)] {
+            let reference = probe!(libz_ng_sys, pull_cb::<1>, capture, source, reject_at);
+            let ours = probe!(
+                libz_rs_sys,
+                Some(pull_cb::<1>),
+                Some(capture),
+                source,
+                reject_at
+            );
+            assert_eq!(
+                ours, reference,
+                "callback difference: {name}, reject_at={reject_at:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn differential_valid_raw_streams_cover_block_modes_and_window_transitions() {
+    use zlib_rs::deflate::{compress_bound, compress_slice, DeflateConfig, Strategy};
+    use zlib_rs::ReturnCode;
+
+    let mut corpus = vec![
+        Vec::new(),
+        b"x".to_vec(),
+        b"short unique string".to_vec(),
+        vec![b'a'; 65_539],
+    ];
+    // Mix high-entropy bytes, repeated substrings and deliberately shifted
+    // repetition across 32 KiB boundaries. This is real raw DEFLATE input,
+    // unlike the gzip-wrapped fixtures in various().
+    let pattern: Vec<_> = (0..2_057usize)
+        .map(|i| ((i * 73) ^ (i >> 3) ^ (i >> 8)).to_le_bytes()[0])
+        .collect();
+    corpus.push(
+        (0..100_123usize)
+            .map(|i| pattern[(i + (i / 8_192)) % pattern.len()])
+            .collect(),
+    );
+
+    let modes = [
+        (0, Strategy::Default),
+        (1, Strategy::Default),
+        (6, Strategy::Default),
+        (9, Strategy::Default),
+        (6, Strategy::Fixed),
+        (9, Strategy::HuffmanOnly),
+        (6, Strategy::Rle),
+    ];
+
+    for original in &corpus {
+        for (level, strategy) in modes {
+            let config = DeflateConfig {
+                level,
+                strategy,
+                window_bits: -15,
+                ..DeflateConfig::default()
+            };
+            let mut encoded_storage = vec![0u8; compress_bound(original.len())];
+            let (compressed, code) = compress_slice(&mut encoded_storage, original, config);
+            assert_eq!(
+                code,
+                ReturnCode::Ok,
+                "encoding level={level} strategy={strategy:?}"
+            );
+
+            for (chunk, ng, rs) in [
+                (
+                    1,
+                    run_inflate_back_ng::<1>(compressed, 15),
+                    run_inflate_back_rs::<1>(compressed, 15),
+                ),
+                (
+                    15,
+                    run_inflate_back_ng::<15>(compressed, 15),
+                    run_inflate_back_rs::<15>(compressed, 15),
+                ),
+                (
+                    512,
+                    run_inflate_back_ng::<512>(compressed, 15),
+                    run_inflate_back_rs::<512>(compressed, 15),
+                ),
+            ] {
+                assert_eq!(
+                    ng.as_deref(),
+                    Ok(original.as_slice()),
+                    "reference decode len={} level={level} strategy={strategy:?} chunk={chunk}",
+                    original.len()
+                );
+                assert_eq!(
+                    rs.as_deref(),
+                    Ok(original.as_slice()),
+                    "Rust decode len={} level={level} strategy={strategy:?} chunk={chunk}",
+                    original.len()
+                );
+            }
+        }
+    }
+}
+
 fn differential_inflate_back<const CHUNK: usize>(input: &[u8]) {
     // Per the documentation, only window_bits 15 is supported.
     let window_bits = 15;
@@ -137,7 +414,7 @@ fn differential_inflate_back<const CHUNK: usize>(input: &[u8]) {
                 println!("{:?}", &rs_out[i..]);
             }
 
-            assert_eq!(a, b, "failed at position {} of {}", i, ng_out.len());
+            assert_eq!(a, b, "failed at position {i} of {}", ng_out.len());
         }
     }
 
@@ -163,38 +440,55 @@ unsafe extern "C" fn pull_cb<const CHUNK: usize>(
     desc: *mut c_void,
     buf: *mut *const c_uchar,
 ) -> c_uint {
-    let Some(ctx) = desc.cast::<InputCtx>().as_mut() else {
+    // SAFETY: inflateBack synchronously invokes this callback with the live
+    // InputCtx passed as in_desc. A null descriptor is rejected by as_mut.
+    let Some(ctx) = (unsafe { desc.cast::<InputCtx>().as_mut() }) else {
         return 0;
     };
 
     if ctx.pos >= ctx.data.len() {
-        // No more data
-        *buf = core::ptr::null();
+        // No more data. inflateBack passes a valid writable pointer to its
+        // next-input slot, which is live for the duration of this callback.
+        // SAFETY: buf points to that caller-owned pointer slot.
+        unsafe { *buf = core::ptr::null() };
         return 0;
     }
 
     // Feed one byte at a time (stress the state machine a bit)
     let remaining = ctx.data.len() - ctx.pos;
-    let chunk = Ord::min(CHUNK, remaining);
+    // Each callback result is c_uint, even when both the input and the
+    // configured CHUNK are larger than the C ABI's count representation.
+    let max_count = usize::try_from(c_uint::MAX).unwrap_or(usize::MAX);
+    let chunk = CHUNK.min(remaining).min(max_count);
+    let Ok(chunk_count) = c_uint::try_from(chunk) else {
+        return 0;
+    };
 
-    let ptr = ctx.data[ctx.pos..].as_ptr();
-    *buf = ptr;
-
+    // SAFETY: buf points to inflateBack's writable pointer slot. The
+    // returned span remains valid until the next callback, and CHUNK plus
+    // c_uint bounds the advertised length to that borrowed input slice.
+    unsafe { *buf = ctx.data[ctx.pos..].as_ptr() };
     ctx.pos += chunk;
-    chunk as c_uint
+    chunk_count
 }
 
 /// `out` callback: collects decompressed bytes from inflateBack.
 ///
-/// C signature:
-///   int out_func(void *desc, unsigned char *buf, unsigned len);
+/// C signature: `int out_func(void *desc, unsigned char *buf, unsigned len);`
 unsafe extern "C" fn push_cb(desc: *mut c_void, buf: *mut c_uchar, len: c_uint) -> c_int {
-    let Some(ctx) = desc.cast::<OutputCtx>().as_mut() else {
+    // SAFETY: inflateBack invokes this callback synchronously with the live,
+    // uniquely borrowed OutputCtx passed as out_desc. Null is rejected.
+    let Some(ctx) = (unsafe { desc.cast::<OutputCtx>().as_mut() }) else {
         // Signal error; inflateBack will return Z_BUF_ERROR.
         return 1;
     };
 
-    let slice = core::slice::from_raw_parts(buf as *const u8, len as usize);
+    let Ok(len) = usize::try_from(len) else {
+        return 1;
+    };
+    // SAFETY: inflateBack passes an initialized output span for exactly len
+    // bytes. The callback only copies from this span before returning.
+    let slice = unsafe { core::slice::from_raw_parts(buf.cast_const(), len) };
     ctx.buf.extend_from_slice(slice);
 
     // 0 means "ok, continue"
@@ -214,16 +508,18 @@ fn run_inflate_back_ng<const CHUNK: usize>(
     };
     let mut out_ctx = OutputCtx { buf: Vec::new() };
 
-    let in_desc: *mut c_void = &mut in_ctx as *mut _ as *mut c_void;
-    let out_desc: *mut c_void = &mut out_ctx as *mut _ as *mut c_void;
+    let in_desc: *mut c_void = (&raw mut in_ctx).cast::<c_void>();
+    let out_desc: *mut c_void = (&raw mut out_ctx).cast::<c_void>();
 
+    // SAFETY: the stream/window and both callback contexts remain live for
+    // the synchronous reference decoder, and callbacks return borrowed spans.
     unsafe {
         let ret = libz_ng_sys::inflateBackInit_(
             strm.as_mut_ptr(),
             window_bits,
             window.as_mut_ptr(),
             libz_ng_sys::zlibVersion(),
-            core::mem::size_of::<libz_ng_sys::z_stream>() as c_int,
+            stream_struct_size::<libz_ng_sys::z_stream>(),
         );
 
         if ret != libz_ng_sys::Z_OK {
@@ -260,16 +556,18 @@ fn run_inflate_back_rs<const CHUNK: usize>(
     };
     let mut out_ctx = OutputCtx { buf: Vec::new() };
 
-    let in_desc: *mut c_void = &mut in_ctx as *mut _ as *mut c_void;
-    let out_desc: *mut c_void = &mut out_ctx as *mut _ as *mut c_void;
+    let in_desc: *mut c_void = (&raw mut in_ctx).cast::<c_void>();
+    let out_desc: *mut c_void = (&raw mut out_ctx).cast::<c_void>();
 
+    // SAFETY: the stream/window and both callback contexts remain live for
+    // the synchronous Rust decoder; callbacks honor the C input/output ABI.
     unsafe {
         let ret = libz_rs_sys::inflateBackInit_(
             strm.as_mut_ptr(),
             window_bits,
             window.as_mut_ptr(),
             libz_rs_sys::zlibVersion(),
-            core::mem::size_of::<libz_rs_sys::z_stream>() as c_int,
+            stream_struct_size::<libz_rs_sys::z_stream>(),
         );
 
         if ret != libz_rs_sys::Z_OK {
