@@ -6344,7 +6344,7 @@ mod test {
                 "typed allocation has no redundant leading alignment slack"
             );
             assert_eq!(
-                stream.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
+                stream.state.as_ptr().addr() % DEFLATE_ALLOC_ALIGN,
                 0,
                 "State placement must retain its cache-line alignment"
             );
@@ -6385,13 +6385,10 @@ mod test {
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
             let mut source_owner = ScopedDeflateStream::from_initialized(&mut raw)?;
             let source = source_owner.stream()?;
-            assert_eq!(source.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
-            assert_eq!(
-                source.state.window.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
-                0
-            );
-            assert_eq!(source.state.prev.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
-            assert_eq!(source.state.head.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.window.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.prev.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.head.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
             source.state.prev.as_mut_slice()[0] = 0x1234;
             source.state.head.as_mut_slice()[0] = 0x4321;
             source.state.bit_writer.pending.extend(&[11, 22, 33]);
@@ -6402,13 +6399,10 @@ mod test {
             // independent state. Moving it into an owned Rust value ensures
             // Drop releases it even on error or an assertion unwind.
             let mut cloned = unsafe { dest.assume_init() };
-            assert_eq!(cloned.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
-            assert_eq!(
-                cloned.state.window.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
-                0
-            );
-            assert_eq!(cloned.state.prev.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
-            assert_eq!(cloned.state.head.as_ptr() as usize % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.window.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.prev.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.head.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
             assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
             assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
             assert_eq!(cloned.state.prev.as_slice()[0], 0x1234);
