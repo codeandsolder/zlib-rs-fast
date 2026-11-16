@@ -154,6 +154,23 @@ pub struct MatchSearchRequest<'a> {
 }
 
 impl MatchSearchParams {
+    /// Start the bounded hash-chain walk from the lazy-match length and
+    /// reduce its search budget when that previous match was already good.
+    #[inline]
+    fn initial_search_budget(self) -> (usize, u16) {
+        let best_len = if self.prev_length > 0 {
+            usize::from(self.prev_length)
+        } else {
+            STD_MIN_MATCH - 1
+        };
+        let chain_remaining = if best_len >= usize::from(self.good_match) {
+            self.max_chain_length >> 2
+        } else {
+            self.max_chain_length
+        };
+        (best_len, chain_remaining)
+    }
+
     #[inline]
     const fn update_hash(self, hash: u32, value: u32) -> u32 {
         match self.hash_calc_variant {
@@ -353,22 +370,13 @@ fn longest_match_help<const SLOW: bool>(
     let scan = &resources.initialized[params.strstart..];
     let limit_base = params.strstart.saturating_sub(params.max_dist);
 
-    let mut best_len = if params.prev_length > 0 {
-        usize::from(params.prev_length)
-    } else {
-        STD_MIN_MATCH - 1
-    };
+    let (mut best_len, mut chain_remaining) = params.initial_search_budget();
     let mut match_start = params.match_start;
 
     // A previous lazy match can be longer than the input remaining at end of
     // stream. There is then no candidate that can improve it.
     if best_len >= params.lookahead {
         return MatchSearchResult::new(params.lookahead, match_start);
-    }
-
-    let mut chain_remaining = params.max_chain_length;
-    if best_len >= usize::from(params.good_match) {
-        chain_remaining >>= 2;
     }
     if chain_remaining == 0 {
         return break_matching(params, best_len, match_start);
