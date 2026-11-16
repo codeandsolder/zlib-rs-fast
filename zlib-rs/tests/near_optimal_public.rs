@@ -24,7 +24,7 @@ fn near_optimal_public_round_trip_and_buffer_limits() {
     let mut small = vec![0u8; 2];
     let (compressed, code) = compress_slice_near_optimal(&mut small, &original, 3);
     assert_eq!(code, ReturnCode::BufError);
-    assert!(compressed.is_empty());
+    assert_eq!(compressed, []);
 }
 
 #[test]
@@ -35,5 +35,5 @@ fn near_optimal_public_empty_input_round_trip() {
     let mut output = [0u8; 1];
     let (decoded, code) = decompress_slice(&mut output, compressed, InflateConfig::default());
     assert_eq!(code, ReturnCode::Ok);
-    assert!(decoded.is_empty());
+    assert_eq!(decoded, []);
 }
