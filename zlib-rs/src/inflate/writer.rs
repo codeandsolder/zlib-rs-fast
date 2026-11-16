@@ -109,7 +109,11 @@ impl<'a> Writer<'a> {
         self.extend(src);
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "inlining the fast DEFLATE back-reference copy improves RT99 paired PDF decoding by 5.45%"
+    )]
+    #[inline(always)]
     pub fn copy_match(&mut self, offset_from_end: usize, length: usize) {
         assert_ne!(
             offset_from_end, 0,
