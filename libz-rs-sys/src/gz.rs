@@ -1,4 +1,10 @@
-use zlib_rs::c_api::*;
+use zlib_rs::c_api::{
+    z_stream, Bytef, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR, Z_DEFLATED, Z_ERRNO, Z_FINISH,
+    Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_OK, Z_STREAM_END, Z_STREAM_ERROR,
+};
+
+#[cfg(test)]
+use zlib_rs::c_api::{uInt, Z_SYNC_FLUSH};
 
 #[cfg(feature = "export-symbols")]
 use crate::prefix;
