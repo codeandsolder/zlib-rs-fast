@@ -5,7 +5,7 @@ use core::mem::MaybeUninit;
 /// Both initialized and potentially-uninitialized byte slices are valid destinations. Keeping
 /// their types distinct until the caller-visible boundary avoids manufacturing a
 /// `MaybeUninit` view over memory that Rust already knows is initialized.
-pub(crate) trait WritableBytes {
+pub trait WritableBytes {
     fn byte_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
 }
@@ -40,10 +40,7 @@ impl WritableBytes for [MaybeUninit<u8>] {
 ///
 /// Every element of `output[..initialized]` must have been initialized as a valid `u8`.
 #[inline]
-pub(crate) unsafe fn assume_init_prefix(
-    output: &mut [MaybeUninit<u8>],
-    initialized: usize,
-) -> &mut [u8] {
+pub unsafe fn assume_init_prefix(output: &mut [MaybeUninit<u8>], initialized: usize) -> &mut [u8] {
     assert!(
         initialized <= output.len(),
         "initialized prefix exceeds output storage"

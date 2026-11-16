@@ -9,15 +9,16 @@ pub struct Window<'a> {
     initialized: usize,
 }
 
-impl<'a> Window<'a> {
+impl Window<'_> {
     /// Construct an empty logical window over raw writable storage.
     ///
     /// # Safety
     ///
     /// `ptr` must be valid for writes of `2 * (1 << window_bits)` bytes for the returned lifetime
     /// and must not alias another live mutable view. The backing bytes may be uninitialized.
-    pub unsafe fn from_raw_parts(ptr: *mut u8, window_bits: usize) -> Self {
+    pub const unsafe fn from_raw_parts(ptr: *mut u8, window_bits: usize) -> Self {
         let len = (1 << window_bits) * 2;
+        // SAFETY: the constructor contract provides a unique writable span of len bytes.
         let buf = unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len) };
 
         Self {
@@ -27,12 +28,12 @@ impl<'a> Window<'a> {
     }
 
     #[cfg(test)]
-    pub fn as_ptr(&self) -> *const u8 {
+    pub const fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr().cast()
     }
 
     #[cfg(test)]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.buf.len()
     }
 
@@ -65,7 +66,7 @@ impl<'a> Window<'a> {
 
     /// Forget all logical window contents without touching the backing allocation.
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         self.initialized = 0;
     }
 
@@ -91,7 +92,8 @@ impl<'a> Window<'a> {
     ///
     /// `src` must point to `range.len()` readable initialized bytes. The caller-input contract may
     /// permit concurrent mutation, so this operation intentionally copies from the raw pointer
-    /// without manufacturing an immutable source slice.
+    /// without manufacturing an immutable source slice. The source span must not overlap
+    /// the destination range in the window.
     pub unsafe fn copy_and_initialize(&mut self, range: core::ops::Range<usize>, src: *const u8) {
         assert!(range.start <= range.end, "invalid window write range");
         assert!(
@@ -108,6 +110,8 @@ impl<'a> Window<'a> {
             let dst = self.buf.as_mut_slice()[range.clone()]
                 .as_mut_ptr()
                 .cast::<u8>();
+            // SAFETY: this method requires len initialized source bytes. The range assertions
+            // constrain dst to writable storage and the source must not overlap it.
             unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
         }
         self.initialized = self.initialized.max(range.end);
@@ -121,14 +125,17 @@ impl<'a> Window<'a> {
     /// overlap this window, and must remain uniquely owned by the returned window.
     pub(crate) unsafe fn clone_to<'dst>(&self, ptr: *mut u8) -> Window<'dst> {
         let mut cloned = Window {
+            // SAFETY: clone_to requires independent writable backing of exactly this size.
             buf: unsafe {
                 WeakSliceMut::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), self.buf.len())
             },
             initialized: 0,
         };
         if self.initialized != 0 {
+            // SAFETY: self.filled() exposes only initialized bytes; clone_to guarantees
+            // that ptr is distinct, writable, and at least the source window size.
             unsafe {
-                core::ptr::copy_nonoverlapping(self.filled().as_ptr(), ptr, self.initialized)
+                core::ptr::copy_nonoverlapping(self.filled().as_ptr(), ptr, self.initialized);
             };
             cloned.initialized = self.initialized;
         }
@@ -144,16 +151,21 @@ mod tests {
     #[test]
     fn raw_window_tracks_only_the_written_prefix() {
         let mut storage = [MaybeUninit::<u8>::uninit(); 16];
+        // SAFETY: the 16-byte stack allocation provides the unique writable 2*(1<<3) span
+        // for the entire lifetime of this test window.
         let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), 3) };
-        assert!(window.filled().is_empty());
+        assert_eq!(window.filled(), &[]);
 
         let bytes = [1, 2, 3, 4, 5, 6];
+        // SAFETY: bytes is initialized and readable for the full range; the range fits in
+        // the uniquely owned window and preserves its initialized prefix.
         unsafe { window.copy_and_initialize(0..bytes.len(), bytes.as_ptr()) };
         assert_eq!(window.filled(), &bytes);
 
         window.clear();
-        assert!(window.filled().is_empty());
+        assert_eq!(window.filled(), &[]);
         let replacement = [9, 8, 7];
+        // SAFETY: replacement is fully initialized; the cleared window is uniquely writable.
         unsafe { window.copy_and_initialize(0..replacement.len(), replacement.as_ptr()) };
         assert_eq!(window.filled(), &replacement);
     }
@@ -161,8 +173,12 @@ mod tests {
     #[test]
     fn slide_discards_only_the_logical_prefix() {
         let mut storage = [MaybeUninit::<u8>::uninit(); 16];
+        // SAFETY: the 16-byte stack allocation provides the unique writable 2*(1<<3) span
+        // for the entire lifetime of this test window.
         let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), 3) };
         let bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        // SAFETY: bytes is initialized and readable for the full range; the range fits in
+        // the uniquely owned window and preserves its initialized prefix.
         unsafe { window.copy_and_initialize(0..bytes.len(), bytes.as_ptr()) };
 
         window.slide_down(4);
@@ -172,8 +188,12 @@ mod tests {
     #[test]
     fn recent_history_is_checked_and_window_limited() {
         let mut storage = [MaybeUninit::<u8>::uninit(); 16];
+        // SAFETY: the 16-byte stack allocation provides the unique writable 2*(1<<3) span
+        // for the entire lifetime of this test window.
         let mut window = unsafe { Window::from_raw_parts(storage.as_mut_ptr().cast(), 3) };
-        let bytes = core::array::from_fn::<_, 10, _>(|index| index as u8);
+        let bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        // SAFETY: bytes is initialized and readable for the full range; the range fits in
+        // the uniquely owned window and preserves its initialized prefix.
         unsafe { window.copy_and_initialize(0..bytes.len(), bytes.as_ptr()) };
 
         assert_eq!(window.recent_history(6, 4), &[2, 3, 4, 5]);

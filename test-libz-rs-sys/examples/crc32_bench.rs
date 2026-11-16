@@ -1,64 +1,70 @@
-//! a binary just so we can look at the optimized assembly
+//! Direct checksum backend comparison without duplicate file I/O and unchecked CLI paths.
 
-pub fn main() {
-    let mut it = std::env::args();
+use std::error::Error;
 
-    let _ = it.next().unwrap();
-
-    match it.next().unwrap().as_str() {
-        "sse" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(path).unwrap();
-
+fn checksum(mode: &str, input: &[u8]) -> Result<u32, &'static str> {
+    let chunk = match mode {
+        "sse" | "crc32fast" => input.len().max(1),
+        "sse-chunked" | "crc32fast-chunked" => 32,
+        "adler32" => return Ok(zlib_rs::adler32::adler32(42, input)),
+        _ => return Err("expected sse, crc32fast, sse-chunked, crc32fast-chunked or adler32"),
+    };
+    match mode {
+        "sse" | "sse-chunked" => {
             let mut state = zlib_rs::crc32::Crc32Fold::new();
-            state.fold(&input);
-            println!("{:#x}", state.finish());
-        }
-
-        "crc32fast" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(path).unwrap();
-
-            let mut h = crc32fast::Hasher::new_with_initial(0);
-            h.update(&input[..]);
-            println!("{:#x}", h.finalize());
-        }
-
-        "sse-chunked" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(path).unwrap();
-
-            let mut state = zlib_rs::crc32::Crc32Fold::new();
-
-            for c in input.chunks(32) {
-                state.fold(c);
+            for bytes in input.chunks(chunk) {
+                state.fold(bytes);
             }
-            println!("{:#x}", state.finish());
+            Ok(state.finish())
         }
-
-        "crc32fast-chunked" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(path).unwrap();
-
-            let mut h = crc32fast::Hasher::new_with_initial(0);
-
-            for c in input.chunks(32) {
-                h.update(c);
+        "crc32fast" | "crc32fast-chunked" => {
+            let mut state = crc32fast::Hasher::new_with_initial(0);
+            for bytes in input.chunks(chunk) {
+                state.update(bytes);
             }
-            println!("{:#x}", h.finalize());
+            Ok(state.finalize())
         }
+        _ => Err("invalid checksum backend"),
+    }
+}
 
-        "adler32" => {
-            let path = it.next().unwrap();
-            let input = std::fs::read(path).unwrap();
+pub fn main() -> Result<(), Box<dyn Error>> {
+    let mut args = std::env::args().skip(1);
+    let mode = args
+        .next()
+        .ok_or("usage: crc32_bench <sse|crc32fast|sse-chunked|crc32fast-chunked|adler32> <file>")?;
+    let path = args.next().ok_or("missing checksum input file")?;
+    if args.next().is_some() {
+        return Err("unexpected extra arguments".into());
+    }
 
-            let h = zlib_rs::adler32::adler32(42, &input);
-            println!("{h:#x}");
+    let input = std::fs::read(path)?;
+    let value = checksum(&mode, &input)?;
+    println!("{value:#x}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_crc_backends_agree_on_empty_and_chunk_boundary_inputs(
+    ) -> Result<(), &'static str> {
+        for len in [0, 1, 2, 31, 32, 33, 63, 64, 65, 4096] {
+            let bytes = (0u32..len)
+                .map(|index| index.wrapping_mul(37).to_le_bytes()[0])
+                .collect::<Vec<_>>();
+            let reference = checksum("crc32fast", &bytes)?;
+            for mode in ["sse", "sse-chunked", "crc32fast-chunked"] {
+                assert_eq!(checksum(mode, &bytes)?, reference, "{mode} len={len}");
+            }
+            assert_eq!(
+                checksum("adler32", &bytes)?,
+                zlib_rs::adler32::adler32(42, &bytes)
+            );
         }
-
-        other => panic!(
-            "invalid option '{other}', expected one of 'sse', 'crc32fast', \
-                              'sse-chunked', 'crc32fast-chunked' or 'adler32'"
-        ),
+        assert!(checksum("unsupported", b"").is_err());
+        Ok(())
     }
 }

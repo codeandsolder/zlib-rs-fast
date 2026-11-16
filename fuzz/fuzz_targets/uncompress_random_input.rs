@@ -27,12 +27,13 @@ fuzz_target!(|source: &[u8]| {
         )
     };
 
-    let err_ng = ReturnCode::from(err_ng);
-    let err_rs = ReturnCode::from(err_rs);
+    let err_ng = ReturnCode::try_from(err_ng);
+    let err_rs = ReturnCode::try_from(err_rs);
 
+    assert!(err_ng.is_ok() && err_rs.is_ok(), "unknown native C status");
     assert_eq!(err_ng, err_rs);
 
-    if err_ng == ReturnCode::Ok {
+    if err_ng == Ok(ReturnCode::Ok) {
         dest_ng.truncate(dest_len_ng);
         dest_rs.truncate(dest_len_rs as usize);
 

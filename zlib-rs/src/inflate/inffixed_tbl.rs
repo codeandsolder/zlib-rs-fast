@@ -4,7 +4,7 @@ const fn code(op: u8, bits: u8, val: u16) -> Code {
     Code { op, bits, val }
 }
 
-pub(crate) const LENFIX: [Code; 512] = [
+pub const LENFIX: [Code; 512] = [
     code(96, 7, 0),
     code(0, 8, 80),
     code(0, 8, 16),
@@ -519,7 +519,7 @@ pub(crate) const LENFIX: [Code; 512] = [
     code(0, 9, 255),
 ];
 
-pub(crate) const DISTFIX: [Code; 32] = [
+pub const DISTFIX: [Code; 32] = [
     code(16, 5, 1),
     code(23, 5, 257),
     code(19, 5, 17),

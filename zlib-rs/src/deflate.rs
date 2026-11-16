@@ -1,8 +1,9 @@
 use core::{ffi::CStr, marker::PhantomData, mem::MaybeUninit, ops::ControlFlow, ptr::NonNull};
 
 use crate::{
+    abi_cursor::{advance_abi_bytes, SliceBudget},
     adler32::adler32,
-    allocate::Allocator,
+    allocate::{AlignedAllocationBlock, Allocator, ALLOCATION_BLOCK_BYTES},
     c_api::{gz_header, internal_state, z_checksum, z_stream},
     crc32::{crc32, Crc32Fold},
     output_buffer::{assume_init_prefix, WritableBytes},
@@ -29,7 +30,7 @@ mod gpu_match;
 mod hash_calc;
 mod longest_match;
 mod match_compare;
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 mod near_optimal;
 mod pending;
 mod slide_hash;
@@ -50,7 +51,7 @@ pub use batch::{
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 
-pub(crate) type Pos = u16;
+pub type Pos = u16;
 
 // SAFETY: This struct must have the same layout as [`z_stream`], so that casts and transmutations
 // between the two can work without UB.
@@ -98,33 +99,41 @@ const _: () = {
 };
 
 #[derive(Clone, Copy)]
-pub(crate) struct InputCursor {
+pub struct InputCursor {
     next_in: *mut crate::c_api::Bytef,
     pub(crate) avail_in: crate::c_api::uInt,
     pub(crate) total_in: crate::c_api::z_size,
+    // Only bytes consumed during this Compressor invocation can be reread from behind next_in.
+    // A prior invocation's buffer may already have been freed by the caller.
+    initial_capacity: crate::c_api::uInt,
 }
 
 impl InputCursor {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
             next_in: stream.next_in,
             avail_in: stream.avail_in,
             total_in: stream.total_in,
+            initial_capacity: stream.avail_in,
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.next_in = self.next_in;
         stream.avail_in = self.avail_in;
         stream.total_in = self.total_in;
     }
 
-    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Self {
-        Self {
-            next_in: bytes.as_ptr() as *mut u8,
-            avail_in: bytes.len() as crate::c_api::uInt,
+    fn from_slice(bytes: &[u8], total_in: crate::c_api::z_size) -> Option<Self> {
+        // The caller supplies the retained dictionary tail (at most 32 KiB). Keep this
+        // conversion fallible so a future general slice caller cannot silently truncate it.
+        let avail_in = crate::c_api::uInt::try_from(bytes.len()).ok()?;
+        Some(Self {
+            next_in: bytes.as_ptr().cast_mut(),
+            avail_in,
             total_in,
-        }
+            initial_capacity: avail_in,
+        })
     }
 
     /// Copy live caller input into initialized window storage and consume it.
@@ -154,6 +163,11 @@ impl InputCursor {
         copied
     }
 
+    /// Bytes advanced through this cursor since it was bound to the current caller input.
+    const fn consumed_here(&self) -> usize {
+        (self.initial_capacity - self.avail_in) as usize
+    }
+
     /// Copy bytes immediately preceding the current input cursor into the LZ history window.
     ///
     /// # Safety
@@ -165,17 +179,41 @@ impl InputCursor {
         bytes_back: usize,
     ) {
         assert!(destination.len() <= bytes_back);
+        // C callers can replace or free their previous input between deflate calls.
+        // Stored-mode history recovery must never traverse back into that old buffer.
+        assert!(
+            bytes_back <= self.consumed_here(),
+            "stored history must originate from input consumed in this call"
+        );
         let source = self.next_in.wrapping_sub(bytes_back);
         // SAFETY: required by this method's caller; `Window` validates the destination range.
         unsafe { window.copy_and_initialize(destination, source) };
     }
 
     fn consume(&mut self, len: usize) {
-        debug_assert!(len <= self.avail_in as usize);
-        self.next_in = self.next_in.wrapping_add(len);
-        self.avail_in -= len as crate::c_api::uInt;
-        self.total_in = self.total_in.wrapping_add(len as crate::c_api::z_size);
+        advance_abi_bytes(
+            &mut self.next_in,
+            &mut self.avail_in,
+            &mut self.total_in,
+            len,
+        );
     }
+}
+
+/// Native C unsigned long can be wider than the zlib/gzip 32-bit wire
+/// fields. Those fields intentionally encode the low word, modulo 2^32.
+#[inline]
+const fn low_wire_u32(value: core::ffi::c_ulong) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// RFC 1952 extra-field XLEN uses the low 16 bits of the caller's length.
+/// Emit only that many bytes, matching zlib's wire-format contract.
+#[inline]
+const fn gzip_extra_wire_len(length: usize) -> u16 {
+    let bytes = length.to_le_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]])
 }
 
 /// Public zlib checksum field detached from caller input traversal.
@@ -185,35 +223,40 @@ impl InputCursor {
 /// Keeping that ABI-visible value explicit prevents input cursors from silently carrying stream
 /// state unrelated to byte traversal.
 #[derive(Clone, Copy)]
-pub(crate) struct StreamChecksum(crate::c_api::z_checksum);
+pub struct StreamChecksum(crate::c_api::z_checksum);
 
 impl StreamChecksum {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self(stream.adler)
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
         stream.adler = self.0;
     }
 
-    fn value(self) -> crate::c_api::z_checksum {
+    #[cfg(test)]
+    const fn value(self) -> crate::c_api::z_checksum {
         self.0
     }
 
-    fn set(&mut self, value: crate::c_api::z_checksum) {
+    const fn set(&mut self, value: crate::c_api::z_checksum) {
         self.0 = value;
     }
 
-    fn reset_adler(&mut self) {
+    const fn reset_adler(&mut self) {
         self.0 = ADLER32_INITIAL_VALUE as _;
     }
 
+    const fn low_word(self) -> u32 {
+        low_wire_u32(self.0)
+    }
+
     fn update_adler(&mut self, bytes: &[u8]) {
-        self.0 = adler32(self.0 as u32, bytes) as _;
+        self.0 = adler32(self.low_word(), bytes).into();
     }
 
     fn update_crc(&mut self, bytes: &[u8]) {
-        self.0 = crc32(self.0 as u32, bytes) as _;
+        self.0 = crc32(self.low_word(), bytes).into();
     }
 }
 
@@ -240,29 +283,31 @@ impl<'a> GzipHeaderRef<'a> {
         }
     }
 
-    fn header(&self) -> &gz_header {
+    const fn header(&self) -> &gz_header {
         // SAFETY: guaranteed once by `new`. The returned reference is deliberately tied to this
         // short borrow, so callers may still mutate the C header between compression operations.
         unsafe { self.ptr.as_ref() }
     }
 
-    fn flags(&self) -> u8 {
+    const fn flags(self) -> u8 {
         self.header().flags()
     }
 
-    fn time(&self) -> u32 {
-        self.header().time as u32
+    const fn time(self) -> u32 {
+        low_wire_u32(self.header().time)
     }
 
-    fn os(&self) -> u8 {
-        self.header().os as u8
+    const fn os(self) -> u8 {
+        // The RFC 1952 OS field is the low byte of a signed C int,
+        // including a caller-supplied negative value such as -1.
+        self.header().os.to_le_bytes()[0]
     }
 
-    fn hcrc(&self) -> bool {
+    const fn hcrc(self) -> bool {
         self.header().hcrc != 0
     }
 
-    fn extra(&self) -> Option<&[u8]> {
+    const fn extra(&self) -> Option<&[u8]> {
         let header = self.header();
         if header.extra.is_null() {
             return None;
@@ -273,10 +318,11 @@ impl<'a> GzipHeaderRef<'a> {
     }
 
     fn encoded_extra(&self) -> Option<&[u8]> {
-        self.extra().map(|extra| &extra[..extra.len() & 0xffff])
+        self.extra()
+            .map(|extra| &extra[..usize::from(gzip_extra_wire_len(extra.len()))])
     }
 
-    fn name(&self) -> Option<&CStr> {
+    const fn name(&self) -> Option<&CStr> {
         let name = self.header().name;
         if name.is_null() {
             None
@@ -286,7 +332,7 @@ impl<'a> GzipHeaderRef<'a> {
         }
     }
 
-    fn comment(&self) -> Option<&CStr> {
+    const fn comment(&self) -> Option<&CStr> {
         let comment = self.header().comment;
         if comment.is_null() {
             None
@@ -298,42 +344,42 @@ impl<'a> GzipHeaderRef<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct OutputCursor {
-    next_out: *mut crate::c_api::Bytef,
-    pub(crate) avail_out: crate::c_api::uInt,
-    pub(crate) total_out: crate::c_api::z_size,
+pub struct OutputCursor {
+    cursor: *mut crate::c_api::Bytef,
+    pub(crate) remaining: crate::c_api::uInt,
+    pub(crate) total: crate::c_api::z_size,
 }
 
 impl OutputCursor {
-    fn from_stream(stream: &DeflateStream<'_>) -> Self {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
         Self {
-            next_out: stream.next_out,
-            avail_out: stream.avail_out,
-            total_out: stream.total_out,
+            cursor: stream.next_out,
+            remaining: stream.avail_out,
+            total: stream.total_out,
         }
     }
 
-    fn apply(self, stream: &mut DeflateStream<'_>) {
-        stream.next_out = self.next_out;
-        stream.avail_out = self.avail_out;
-        stream.total_out = self.total_out;
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
+        stream.next_out = self.cursor;
+        stream.avail_out = self.remaining;
+        stream.total_out = self.total;
     }
 
     fn write_all(&mut self, bytes: &[u8]) {
         let len = bytes.len();
-        assert!(len <= self.avail_out as usize);
+        assert!(len <= self.remaining as usize);
         if len == 0 {
             return;
         }
 
         // SAFETY: the cursor represents `avail_out` caller-provided writable bytes, and `len` is
         // checked above. Compression state/pending storage must not overlap the caller output.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.next_out, len) };
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.cursor, len) };
         self.advance(len);
     }
 
     fn write_some(&mut self, bytes: &[u8]) -> usize {
-        let len = Ord::min(bytes.len(), self.avail_out as usize);
+        let len = Ord::min(bytes.len(), self.remaining as usize);
         self.write_all(&bytes[..len]);
         len
     }
@@ -342,13 +388,13 @@ impl OutputCursor {
     ///
     /// # Safety
     /// `source` must be readable for `len` bytes and must not overlap the cursor's writable output.
-    unsafe fn copy_from_raw<'a>(&'a mut self, source: *const u8, len: usize) -> &'a [u8] {
-        assert!(len <= self.avail_out as usize);
+    unsafe fn copy_from_raw(&mut self, source: *const u8, len: usize) -> &[u8] {
+        assert!(len <= self.remaining as usize);
         if len == 0 {
             return &[];
         }
 
-        let destination = self.next_out;
+        let destination = self.cursor;
         // SAFETY: guaranteed by the caller contract plus the output bound asserted above.
         unsafe { core::ptr::copy_nonoverlapping(source, destination, len) };
         self.advance(len);
@@ -359,10 +405,46 @@ impl OutputCursor {
     }
 
     fn advance(&mut self, len: usize) {
-        debug_assert!(len <= self.avail_out as usize);
-        self.next_out = self.next_out.wrapping_add(len);
-        self.avail_out -= len as crate::c_api::uInt;
-        self.total_out += len as crate::c_api::z_size;
+        advance_abi_bytes(&mut self.cursor, &mut self.remaining, &mut self.total, len);
+    }
+}
+
+/// One snapshot of the three independent caller-I/O domains.
+///
+/// A driver turn borrows the snapshots while compression state is borrowed
+/// separately. Every turn commits the input, output, and checksum together,
+/// including when it yields for more input, output, or match-search work.
+struct CallCursors {
+    input: InputCursor,
+    output: OutputCursor,
+    checksum: StreamChecksum,
+}
+
+impl CallCursors {
+    const fn from_stream(stream: &DeflateStream<'_>) -> Self {
+        Self {
+            input: InputCursor::from_stream(stream),
+            output: OutputCursor::from_stream(stream),
+            checksum: StreamChecksum::from_stream(stream),
+        }
+    }
+
+    const fn apply(self, stream: &mut DeflateStream<'_>) {
+        self.input.apply(stream);
+        self.output.apply(stream);
+        self.checksum.apply(stream);
+    }
+
+    /// The stream's raw ABI fields are only rebound on entry and commit.
+    #[inline]
+    fn with_state<'state, R>(
+        stream: &mut DeflateStream<'state>,
+        operation: impl FnOnce(&mut State<'state>, &mut Self) -> R,
+    ) -> R {
+        let mut cursors = Self::from_stream(stream);
+        let result = operation(&mut stream.state, &mut cursors);
+        cursors.apply(stream);
+        result
     }
 }
 
@@ -371,19 +453,19 @@ impl OutputCursor {
 /// `DeflateStream` is constrained by the public zlib ABI. Algorithms operate on this
 /// Rust-owned view instead: compression state is borrowed separately from independent input and
 /// output cursors, which are committed back to the ABI shell when the algorithm returns.
-pub(crate) struct Compressor<'a, 'state> {
+pub struct Compressor<'a, 'state> {
     pub(crate) state: &'a mut State<'state>,
-    pub(crate) input: InputCursor,
-    pub(crate) output: OutputCursor,
-    pub(crate) checksum: StreamChecksum,
+    pub(crate) input: &'a mut InputCursor,
+    pub(crate) output: &'a mut OutputCursor,
+    pub(crate) checksum: &'a mut StreamChecksum,
 }
 
 impl<'a, 'state> Compressor<'a, 'state> {
-    fn new(
+    const fn new(
         state: &'a mut State<'state>,
-        input: InputCursor,
-        output: OutputCursor,
-        checksum: StreamChecksum,
+        input: &'a mut InputCursor,
+        output: &'a mut OutputCursor,
+        checksum: &'a mut StreamChecksum,
     ) -> Self {
         Self {
             state,
@@ -393,32 +475,22 @@ impl<'a, 'state> Compressor<'a, 'state> {
         }
     }
 
-    fn into_call_state(self) -> (InputCursor, OutputCursor, StreamChecksum) {
-        (self.input, self.output, self.checksum)
-    }
-
     pub(crate) fn fill_window(&mut self) {
-        fill_window_core(self.state, &mut self.input, &mut self.checksum);
+        fill_window_core(self.state, self.input, self.checksum);
     }
 
     fn drain_pending(&mut self) -> DrainOutcome {
-        drain_pending_output(self.state, &mut self.output)
+        drain_pending_output(self.state, self.output)
     }
 
     pub(crate) fn read_buf_window(&mut self, offset: usize, size: usize) -> usize {
-        read_buf_window_core(
-            self.state,
-            &mut self.input,
-            &mut self.checksum,
-            offset,
-            size,
-        )
+        read_buf_window_core(self.state, self.input, self.checksum, offset, size)
     }
 
     /// Copy initialized history bytes to the caller's output buffer.
     pub(crate) fn copy_window_to_output(&mut self, range: core::ops::Range<usize>) {
         let len = range.len();
-        assert!(len <= self.output.avail_out as usize);
+        assert!(len <= self.output.remaining as usize);
         let src = &self.state.window.filled()[range];
 
         self.output.write_all(src);
@@ -431,14 +503,14 @@ impl<'a, 'state> Compressor<'a, 'state> {
     /// copy has completed.
     pub(crate) fn copy_input_to_output(&mut self, size: usize) -> usize {
         let len = size.min(self.input.avail_in as usize);
-        assert!(len <= self.output.avail_out as usize);
+        assert!(len <= self.output.remaining as usize);
         if len == 0 {
             return 0;
         }
 
         // SAFETY: zlib's direct stored-copy contract requires the caller input/output spans not to
         // overlap. Input/output bounds and cursor accounting are confined to the cursor methods.
-        let copied = unsafe { self.input.copy_to_output(&mut self.output, len) };
+        let copied = unsafe { self.input.copy_to_output(self.output, len) };
         match self.state.wrap {
             2 => self.state.crc_fold.fold(copied),
             1 => self.checksum.update_adler(copied),
@@ -458,8 +530,8 @@ impl<'a, 'state> Compressor<'a, 'state> {
         // region ending at the current input cursor remains within the caller's input allocation.
         unsafe {
             self.input
-                .copy_recent_to_window(&mut self.state.window, destination, bytes_back)
-        };
+                .copy_recent_to_window(&mut self.state.window, destination, bytes_back);
+        }
     }
 }
 
@@ -470,25 +542,22 @@ fn with_compressor<'state, R>(
     // `data_type` is public z_stream metadata, so honor caller overrides at each ABI entry. The
     // encoder owns the working copy in State and publishes any lazy detection result on return.
     stream.state.data_type = stream.data_type;
-    let input = InputCursor::from_stream(stream);
-    let output = OutputCursor::from_stream(stream);
-    let checksum = StreamChecksum::from_stream(stream);
-    let (result, input, output, checksum, data_type) = {
-        let mut compressor = Compressor::new(&mut *stream.state, input, output, checksum);
-        let result = f(&mut compressor);
-        let data_type = compressor.state.data_type;
-        let (input, output, checksum) = compressor.into_call_state();
-        (result, input, output, checksum, data_type)
-    };
-    input.apply(stream);
-    output.apply(stream);
-    checksum.apply(stream);
-    stream.data_type = data_type;
+    let result = CallCursors::with_state(stream, |state, cursors| {
+        let mut compressor = Compressor::new(
+            state,
+            &mut cursors.input,
+            &mut cursors.output,
+            &mut cursors.checksum,
+        );
+        f(&mut compressor)
+    });
+    stream.data_type = stream.state.data_type;
     result
 }
 
-unsafe impl Sync for DeflateStream<'_> {}
-unsafe impl Send for DeflateStream<'_> {}
+// This ABI view contains non-owning caller pointers and mutable state
+// allocations. Thread safety belongs to independently owned compression jobs,
+// not to a blanket Send/Sync assertion on the raw-pointer-backed view.
 
 impl<'a> DeflateStream<'a> {
     /// # Safety
@@ -499,7 +568,7 @@ impl<'a> DeflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_mut`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_mut
-    #[inline(always)]
+    #[inline]
     pub unsafe fn from_stream_mut(strm: *mut z_stream) -> Option<&'a mut Self> {
         {
             // Safety: ptr points to a valid value of type z_stream (if non-null)
@@ -526,7 +595,8 @@ impl<'a> DeflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
-    #[inline(always)]
+    #[must_use]
+    #[inline]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
         {
             // Safety: ptr points to a valid value of type z_stream (if non-null)
@@ -547,9 +617,10 @@ impl<'a> DeflateStream<'a> {
 
     fn as_z_stream_mut(&mut self) -> &mut z_stream {
         // SAFETY: a valid &mut DeflateStream is also a valid &mut z_stream
-        unsafe { &mut *(self as *mut DeflateStream as *mut z_stream) }
+        unsafe { &mut *core::ptr::from_mut(self).cast::<z_stream>() }
     }
 
+    #[must_use]
     pub fn pending(&self) -> (usize, u8) {
         (
             self.state.bit_writer.pending.len(),
@@ -558,29 +629,48 @@ impl<'a> DeflateStream<'a> {
     }
 
     /// Last number of used bits when going to a byte boundary.
+    #[must_use]
     pub fn bits_used(&self) -> u8 {
         self.state.bit_writer.bits_used
     }
 
-    pub fn new(config: DeflateConfig) -> Self {
-        let mut inner = crate::c_api::z_stream::default();
+    /// Construct an owned compressor whose allocation is released on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the initialization status for invalid configuration or
+    /// allocation failure, without constructing a partially initialized state.
+    pub fn new(config: DeflateConfig) -> Result<Self, ReturnCode> {
+        Self::new_with_lit_bufsize(config, None)
+    }
 
-        let ret = crate::deflate::init(&mut inner, config);
-        assert_eq!(ret, ReturnCode::Ok);
+    /// Construct an owned compressor with the validated optional symbol-buffer capacity.
+    fn new_with_lit_bufsize(
+        config: DeflateConfig,
+        lit_bufsize_override: Option<usize>,
+    ) -> Result<Self, ReturnCode> {
+        let mut inner = crate::c_api::z_stream::default();
+        let status = init_with_lit_bufsize(&mut inner, config, lit_bufsize_override);
+        if status != ReturnCode::Ok {
+            return Err(status);
+        }
+
+        // init guarantees callbacks and a live State on success.
+        let (Some(zalloc), Some(zfree)) = (inner.zalloc, inner.zfree) else {
+            return Err(ReturnCode::StreamError);
+        };
+        if inner.state.is_null() {
+            return Err(ReturnCode::StreamError);
+        }
 
         let state = inner.state.cast::<State<'a>>();
         let alloc = Allocator {
-            zalloc: inner
-                .zalloc
-                .expect("initialized deflate stream has an allocator"),
-            zfree: inner
-                .zfree
-                .expect("initialized deflate stream has a deallocator"),
+            zalloc,
+            zfree,
             opaque: inner.opaque,
             _marker: PhantomData,
         };
-
-        Self {
+        Ok(Self {
             next_in: inner.next_in.cast_mut(),
             avail_in: inner.avail_in,
             total_in: inner.total_in,
@@ -588,19 +678,29 @@ impl<'a> DeflateStream<'a> {
             avail_out: inner.avail_out,
             total_out: inner.total_out,
             msg: inner.msg.cast_const(),
-            // SAFETY: successful `init` created a live deflate State allocation owned by this stream.
+            // SAFETY: successful initialization created the exclusively owned State.
             state: unsafe { StatePtr::from_raw(state) },
             alloc,
             data_type: inner.data_type,
             adler: inner.adler,
             reserved: inner.reserved,
+        })
+    }
+}
+
+impl Drop for DeflateStream<'_> {
+    fn drop(&mut self) {
+        // End nulls the State pointer before releasing it, so an explicit
+        // deflateEnd and this owner cleanup cannot free the same state twice.
+        if !self.state.as_ptr().is_null() {
+            let _ = end(self);
         }
     }
 }
 
 /// number of elements in hash table
-pub(crate) const HASH_SIZE: usize = 65536;
-/// log2(HASH_SIZE)
+pub const HASH_SIZE: usize = 65536;
+/// `log2(HASH_SIZE)`
 const HASH_BITS: usize = 16;
 
 /// Maximum value for memLevel in deflateInit2
@@ -650,33 +750,38 @@ pub struct DeflateConfig {
 #[cfg(any(test, feature = "__internal-test"))]
 impl quickcheck::Arbitrary for DeflateConfig {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-        let mem_levels: Vec<_> = (1..=9).collect();
-        let levels: Vec<_> = (0..=9).collect();
+        const LEVELS: [i32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        const MEM_LEVELS: [i32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        const WINDOW_BITS: [i32; 21] = [
+            9, 10, 11, 12, 13, 14, 15, // zlib
+            25, 26, 27, 28, 29, 30, 31, // gzip
+            -15, -14, -13, -12, -11, -10, -9, // raw DEFLATE
+        ];
+        const STRATEGIES: [Strategy; 5] = [
+            Strategy::Default,
+            Strategy::Filtered,
+            Strategy::HuffmanOnly,
+            Strategy::Rle,
+            Strategy::Fixed,
+        ];
 
-        let mut window_bits = Vec::new();
-        window_bits.extend(9..=15); // zlib
-        window_bits.extend(9 + 16..=15 + 16); // gzip
-        window_bits.extend(-15..=-9); // raw
-
+        // These fixed, nonempty choices do not require an allocation, a
+        // potentially absent selection, or a fallback outside their domain.
+        let index = |g: &mut quickcheck::Gen, choices: usize| {
+            usize::from(<u16 as quickcheck::Arbitrary>::arbitrary(g)) % choices
+        };
         Self {
-            level: *g.choose(&levels).unwrap(),
+            level: LEVELS[index(g, LEVELS.len())],
             method: Method::Deflated,
-            window_bits: *g.choose(&window_bits).unwrap(),
-            mem_level: *g.choose(&mem_levels).unwrap(),
-            strategy: *g
-                .choose(&[
-                    Strategy::Default,
-                    Strategy::Filtered,
-                    Strategy::HuffmanOnly,
-                    Strategy::Rle,
-                    Strategy::Fixed,
-                ])
-                .unwrap(),
+            window_bits: WINDOW_BITS[index(g, WINDOW_BITS.len())],
+            mem_level: MEM_LEVELS[index(g, MEM_LEVELS.len())],
+            strategy: STRATEGIES[index(g, STRATEGIES.len())],
         }
     }
 }
 
 impl DeflateConfig {
+    #[must_use]
     pub fn new(level: i32) -> Self {
         Self {
             level,
@@ -685,11 +790,13 @@ impl DeflateConfig {
     }
 
     /// Configure for the best compression (takes longer).
+    #[must_use]
     pub fn best_compression() -> Self {
         Self::new(crate::c_api::Z_BEST_COMPRESSION)
     }
 
     /// Configure for the fastest compression (compresses less well).
+    #[must_use]
     pub fn best_speed() -> Self {
         Self::new(crate::c_api::Z_BEST_SPEED)
     }
@@ -733,17 +840,17 @@ fn init_with_lit_bufsize(
     // and can configure the C allocator
     #[cfg(feature = "rust-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_rust_allocator()
+        stream.configure_default_rust_allocator();
     }
 
     #[cfg(feature = "c-allocator")]
     if stream.zalloc.is_none() || stream.zfree.is_none() {
-        stream.configure_default_c_allocator()
+        stream.configure_default_c_allocator();
     }
 
-    if stream.zalloc.is_none() || stream.zfree.is_none() {
+    let (Some(zalloc), Some(zfree)) = (stream.zalloc, stream.zfree) else {
         return ReturnCode::StreamError;
-    }
+    };
 
     if level == crate::c_api::Z_DEFAULT_COMPRESSION {
         level = 6;
@@ -771,15 +878,16 @@ fn init_with_lit_bufsize(
         return ReturnCode::StreamError;
     }
 
-    let window_bits = if window_bits == 8 {
-        9 /* until 256-byte window bug fixed */
-    } else {
-        window_bits as usize
+    // Configuration validation above guarantees a positive 8..=15 bit
+    // window. Keep the host-address width conversion explicit anyway.
+    let Ok(window_bits) = usize::try_from(window_bits) else {
+        return ReturnCode::StreamError;
     };
+    let window_bits = window_bits.max(9); // zlib's 256-byte window workaround
 
     let alloc = Allocator {
-        zalloc: stream.zalloc.unwrap(),
-        zfree: stream.zfree.unwrap(),
+        zalloc,
+        zfree,
         opaque: stream.opaque,
         _marker: PhantomData,
     };
@@ -792,11 +900,15 @@ fn init_with_lit_bufsize(
     if lit_bufsize == 0 || lit_bufsize > (1 << 16) {
         return ReturnCode::StreamError;
     }
+    // The validated compression level is 0..=9, representable in i8.
+    let Ok(level) = i8::try_from(level) else {
+        return ReturnCode::StreamError;
+    };
     let allocs = DeflateAllocOffsets::new(window_bits, lit_bufsize);
     let Some(state_allocation) = allocs.allocate_state(
         &alloc,
         DeflateStateInit {
-            level: level as i8,
+            level,
             strategy,
             wrap,
         },
@@ -806,6 +918,8 @@ fn init_with_lit_bufsize(
 
     stream.state = state_allocation.as_ptr().cast::<internal_state>();
 
+    // SAFETY: allocation succeeded and initialized stream.state; allocator
+    // callbacks were validated above and still belong to the live stream.
     let Some(stream) = (unsafe { DeflateStream::from_stream_mut(stream) }) else {
         if cfg!(debug_assertions) {
             unreachable!("we should have initialized the stream properly");
@@ -814,6 +928,34 @@ fn init_with_lit_bufsize(
     };
 
     reset(stream)
+}
+
+/// Return the bytes accumulated since the start of the current DEFLATE block.
+///
+/// A nonnegative origin identifies resident bytes in the sliding window.
+/// When a slide moves that origin out of the window, it becomes negative:
+/// its absolute value is the missing prefix length. The accumulated length
+/// still includes that prefix, but no stored-block source range exists.
+///
+/// # Panics
+///
+/// Panics if the block start lies beyond the current position or the combined
+/// distance cannot be represented in the host address-size integer.
+const fn unflushed_block_span(strstart: usize, block_start: isize) -> (Option<usize>, usize) {
+    let origin = block_start.unsigned_abs();
+    if block_start < 0 {
+        assert!(
+            origin <= usize::MAX - strstart,
+            "unflushed block length exceeds host integer range"
+        );
+        (None, strstart + origin)
+    } else {
+        assert!(
+            origin <= strstart,
+            "block start is after the current position"
+        );
+        (Some(origin), strstart - origin)
+    }
 }
 
 pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> ReturnCode {
@@ -827,13 +969,23 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         return ReturnCode::StreamError;
     }
 
-    let level = level as i8;
+    // The public ABI level is signed and validated above; preserve its
+    // representability explicitly before storing it in the compact state.
+    let Ok(level) = i8::try_from(level) else {
+        unreachable!("validated compression level does not fit i8");
+    };
 
     let state = &mut *stream.state;
 
-    if change_requires_block_boundary(state.level, state.strategy, level, strategy)
-        && state.last_flush != -2
-    {
+    let Some(next_config) = level_config(level) else {
+        return ReturnCode::StreamError;
+    };
+    let Some(requires_boundary) =
+        change_requires_block_boundary(state.level, state.strategy, level, strategy)
+    else {
+        return ReturnCode::StreamError;
+    };
+    if requires_boundary && state.last_flush != -2 {
         // Flush the last buffer.
         let err = deflate(stream, DeflateFlush::Block);
         if err == ReturnCode::StreamError {
@@ -843,7 +995,8 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         let state = &mut *stream.state;
 
         if stream.avail_in != 0
-            || ((state.strstart as isize - state.block_start) + state.lookahead as isize) != 0
+            || unflushed_block_span(state.strstart, state.block_start).1 != 0
+            || state.lookahead != 0
         {
             return ReturnCode::BufError;
         }
@@ -861,7 +1014,7 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
             state.matches = 0;
         }
 
-        lm_set_level(state, level);
+        lm_set_level(state, level, next_config);
     }
 
     state.strategy = strategy;
@@ -886,31 +1039,31 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     }
 
     let state = &mut *stream.state;
-    // avoid computing Adler-32 in read_buf
-    state.wrap = 0;
-
-    // if dictionary would fill window, just replace the history
-    if dictionary.len() >= state.w_size {
-        if wrap == 0 {
-            // clear the hash table
-            state.head.as_mut_slice().fill(0);
-
-            state.strstart = 0;
-            state.block_start = 0;
-            state.insert = 0;
-            state.window.clear();
-        } else {
-            /* already empty otherwise */
-        }
-
-        // use the tail
+    let replace_history = dictionary.len() >= state.w_size;
+    if replace_history {
         dictionary = &dictionary[dictionary.len() - state.w_size..];
     }
 
-    // Feed the dictionary through the ordinary window-refill core without impersonating caller
-    // input in the public z_stream. zlib counts retained dictionary bytes in total_in, but next_in
-    // and avail_in remain exactly the caller's values across deflateSetDictionary.
-    let mut dictionary_input = InputCursor::from_slice(dictionary, stream.total_in);
+    // A general input cursor cannot represent more than uInt::MAX bytes in a single call.
+    // This retained dictionary tail is bounded by the window, but validate before mutating
+    // the compressor state so even an invalid future caller gets a clean error.
+    let Some(mut dictionary_input) = InputCursor::from_slice(dictionary, stream.total_in) else {
+        return ReturnCode::StreamError;
+    };
+
+    if replace_history && wrap == 0 {
+        state.head.as_mut_slice().fill(0);
+        state.strstart = 0;
+        state.block_start = 0;
+        state.insert = 0;
+        state.window.clear();
+    }
+
+    // Adler-32 above covered the complete dictionary before retaining only its window tail.
+    // Feed that tail through the ordinary window-refill core without impersonating
+    // caller input in the public z_stream. Retained bytes count in total_in; the caller's
+    // next_in and avail_in remain unchanged across deflateSetDictionary.
+    state.wrap = 0;
     fill_window_core(state, &mut dictionary_input, &mut checksum);
 
     while state.lookahead >= STD_MIN_MATCH {
@@ -923,7 +1076,12 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     }
 
     state.strstart += state.lookahead;
-    state.block_start = state.strstart as _;
+    // The dictionary tail fits in one DEFLATE window. Keep its signed
+    // block-origin conversion checked even if the internal window grows.
+    let Ok(block_start) = isize::try_from(state.strstart) else {
+        return ReturnCode::StreamError;
+    };
+    state.block_start = block_start;
     state.insert = state.lookahead;
     state.lookahead = 0;
     state.prev_length = 0;
@@ -935,32 +1093,32 @@ pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> Retu
     ReturnCode::Ok
 }
 
-pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCode {
-    let mut value64 = value as u64;
-
-    let state = &mut *stream.state;
-
-    if bits < 0
-        || bits > BitWriter::BIT_BUF_SIZE as i32
-        || bits > (core::mem::size_of_val(&value) << 3) as i32
-    {
+pub fn prime(stream: &mut DeflateStream, bits: i32, value: i32) -> ReturnCode {
+    // The public zlib argument is signed, while the bit writer works with
+    // byte-sized widths. Reject out-of-range values before changing state.
+    let Ok(mut bits) = u8::try_from(bits) else {
+        return ReturnCode::BufError;
+    };
+    if bits > BitWriter::BIT_BUF_SIZE || usize::from(bits) > core::mem::size_of_val(&value) * 8 {
         return ReturnCode::BufError;
     }
+    let state = &mut *stream.state;
 
     // `flush_bits()` writes every complete byte from the combined reservoir. Preflight the
     // complete call so a full pending buffer reports zlib's Z_BUF_ERROR instead of reaching the
     // infallible internal append operation. zlib-ng's 64-bit reservoir accepts up to 32 input
     // bits here (bounded by `value`), despite the public compatibility documentation saying 16.
-    let bytes_to_flush = (usize::from(state.bit_writer.bits_valid) + bits as usize) / 8;
+    let bytes_to_flush = (usize::from(state.bit_writer.bits_valid) + usize::from(bits)) / 8;
     if state.bit_writer.pending.remaining() < bytes_to_flush {
         return ReturnCode::BufError;
     }
 
-    let mut put;
+    // Only the requested low bits belong to the DEFLATE stream. Mask once
+    // before the reservoir can inherit high or sign-extended caller bits.
+    let mut value64 = u64::from(value.cast_unsigned()) & ((1u64 << bits) - 1);
 
     loop {
-        put = BitWriter::BIT_BUF_SIZE - state.bit_writer.bits_valid;
-        let put = Ord::min(put as i32, bits);
+        let put = (BitWriter::BIT_BUF_SIZE - state.bit_writer.bits_valid).min(bits);
 
         if state.bit_writer.bits_valid == 0 {
             state.bit_writer.bit_buffer = value64;
@@ -969,7 +1127,7 @@ pub fn prime(stream: &mut DeflateStream, mut bits: i32, value: i32) -> ReturnCod
                 (value64 & ((1 << put) - 1)) << state.bit_writer.bits_valid;
         }
 
-        state.bit_writer.bits_valid += put as u8;
+        state.bit_writer.bits_valid += put;
         state.bit_writer.flush_bits();
         value64 >>= put;
         bits -= put;
@@ -1001,6 +1159,8 @@ pub fn copy<'a>(
         avail_out: source.avail_out,
         total_out: source.total_out,
         msg: source.msg,
+        // SAFETY: clone_state allocated and initialized a separate live
+        // destination State; this wrapper owns it until deflateEnd.
         state: unsafe { StatePtr::from_raw(state_allocation.as_ptr()) },
         alloc: source.alloc,
         data_type: source.data_type,
@@ -1015,6 +1175,12 @@ pub fn copy<'a>(
 ///
 /// - Err when deflate is not done. A common cause is insufficient output space
 /// - Ok otherwise
+///
+/// # Errors
+///
+/// Returns the caller's C stream in the error variant if compression was
+/// interrupted or its state has already been released. In both cases the C
+/// stream remains caller-owned; an initialized allocation is freed exactly once.
 pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mut z_stream> {
     if stream.state.as_ptr().is_null() {
         return Err(stream.as_z_stream_mut());
@@ -1028,7 +1194,15 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
     let stream = stream.as_z_stream_mut();
     let _ = core::mem::replace(&mut stream.state, core::ptr::null_mut());
 
-    unsafe { alloc.deallocate(allocation_start.as_ptr(), total_allocation_size) };
+    // SAFETY: this stream exclusively owns the live State allocation from
+    // init/copy; allocation_start and total_allocation_size came from that
+    // allocation, and stream.state was detached immediately above.
+    unsafe {
+        alloc.deallocate(
+            allocation_start.as_ptr(),
+            total_allocation_size / DEFLATE_ALLOC_ALIGN,
+        );
+    }
 
     match status {
         Status::Busy => Err(stream),
@@ -1037,10 +1211,15 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
 }
 
 pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
+    // A damaged or stale state must fail before reset_keep mutates any
+    // buffered output, checksums, or the live hash history.
+    let Some(config) = level_config(stream.state.level) else {
+        return ReturnCode::StreamError;
+    };
     let ret = reset_keep(stream);
 
     if ret == ReturnCode::Ok {
-        lm_init(&mut *stream.state);
+        lm_init(&mut stream.state, config);
     }
 
     ret
@@ -1068,9 +1247,9 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     stream.adler = match state.wrap {
         2 => {
             state.crc_fold = Crc32Fold::new();
-            CRC32_INITIAL_VALUE as _
+            CRC32_INITIAL_VALUE.into()
         }
-        _ => ADLER32_INITIAL_VALUE as _,
+        _ => ADLER32_INITIAL_VALUE.into(),
     };
 
     state.last_flush = -2;
@@ -1081,15 +1260,17 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
-fn lm_init(state: &mut State) {
+fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
     state.window_size = 2 * state.w_size;
     state.window.clear();
 
     // zlib uses CLEAR_HASH here
     state.head.as_mut_slice().fill(0);
 
-    // Set the default configuration parameters:
-    lm_set_level(state, state.level);
+    // Hashes are a property of the live history representation, not a tunable
+    // search budget. Choose the representation only while the history is empty.
+    lm_set_level(state, state.level, config);
+    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
 
     state.strstart = 0;
     state.block_start = 0;
@@ -1101,8 +1282,7 @@ fn lm_init(state: &mut State) {
     state.ins_h = 0;
 }
 
-fn lm_set_level(state: &mut State, level: i8) {
-    let config = level_config(level);
+const fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConfig) {
     state.medium_next_match = MatchCandidate::EMPTY;
     state.max_insert_length = config.max_lazy;
     state.max_lazy_match = config.max_lazy;
@@ -1110,7 +1290,9 @@ fn lm_set_level(state: &mut State, level: i8) {
     state.nice_match = config.nice_length;
     state.max_chain_length = config.max_chain;
 
-    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
+    // Do not change the hash representation here. deflateParams() may update the
+    // level while a nonempty head/prev table still describes earlier input.
+    // Reinterpreting those buckets with a different hash algorithm breaks searches.
     state.level = level;
 }
 
@@ -1121,21 +1303,28 @@ pub fn tune(
     nice_length: usize,
     max_chain: usize,
 ) -> ReturnCode {
-    stream.state.good_match = good_length as u16;
+    // These are comparison thresholds and maximum chain-search budgets, not bitfields:
+    // - no DEFLATE match length exceeds 258;
+    // - no window search has more than 32,768 distinct candidate positions.
+    // A larger tuning parameter therefore has the same effect as u16::MAX; wrapping
+    // it to zero would instead disable matching or change compression decisions.
+    let bound = |value| u16::try_from(value).unwrap_or(u16::MAX);
+    stream.state.good_match = bound(good_length);
     stream.state.medium_next_match = MatchCandidate::EMPTY;
     // zlib exposes one tuning knob for both historical uses of max_lazy. Keep the
     // public contract while representing the two internal concepts independently.
-    stream.state.max_insert_length = max_lazy as u16;
-    stream.state.max_lazy_match = max_lazy as u16;
-    stream.state.nice_match = nice_length as u16;
-    stream.state.max_chain_length = max_chain as u16;
+    let lazy = bound(max_lazy);
+    stream.state.max_insert_length = lazy;
+    stream.state.max_lazy_match = lazy;
+    stream.state.nice_match = bound(nice_length);
+    stream.state.max_chain_length = bound(max_chain);
 
     ReturnCode::Ok
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Value {
+pub struct Value {
     a: u16,
     b: u16,
 }
@@ -1145,54 +1334,54 @@ impl Value {
         Self { a, b }
     }
 
-    pub(crate) fn freq_mut(&mut self) -> &mut u16 {
+    pub(crate) const fn freq_mut(&mut self) -> &mut u16 {
         &mut self.a
     }
 
-    pub(crate) fn code_mut(&mut self) -> &mut u16 {
+    pub(crate) const fn code_mut(&mut self) -> &mut u16 {
         &mut self.a
     }
 
-    pub(crate) fn dad_mut(&mut self) -> &mut u16 {
+    pub(crate) const fn dad_mut(&mut self) -> &mut u16 {
         &mut self.b
     }
 
-    pub(crate) fn len_mut(&mut self) -> &mut u16 {
+    pub(crate) const fn len_mut(&mut self) -> &mut u16 {
         &mut self.b
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn freq(self) -> u16 {
         self.a
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn code(self) -> u16 {
         self.a
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn dad(self) -> u16 {
         self.b
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) const fn len(self) -> u16 {
         self.b
     }
 }
 
-/// number of length codes, not counting the special END_BLOCK code
-pub(crate) const LENGTH_CODES: usize = 29;
+/// number of length codes, not counting the special `END_BLOCK` code
+pub const LENGTH_CODES: usize = 29;
 
 /// number of literal bytes 0..255
 const LITERALS: usize = 256;
 
-/// number of Literal or Length codes, including the END_BLOCK code
-pub(crate) const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
+/// number of Literal or Length codes, including the `END_BLOCK` code
+pub const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
 
 /// number of distance codes
-pub(crate) const D_CODES: usize = 30;
+pub const D_CODES: usize = 30;
 
 /// number of codes used to transfer the bit lengths
 const BL_CODES: usize = 19;
@@ -1200,13 +1389,14 @@ const BL_CODES: usize = 19;
 /// maximum heap size
 const HEAP_SIZE: usize = 2 * L_CODES + 1;
 
-/// all codes must not exceed MAX_BITS bits
-const MAX_BITS: usize = 15;
+/// RFC1951 code-length bounds are represented in the Huffman tree as u16;
+/// use their losslessly widened usize values for array sizes and indexing.
+const MAX_BITS_WIRE: u16 = 15;
+const MAX_BITS: usize = MAX_BITS_WIRE as usize;
 
-/// Bit length codes must not exceed MAX_BL_BITS bits
-const MAX_BL_BITS: usize = 7;
+const MAX_BL_BITS_WIRE: u16 = 7;
 
-pub(crate) const DIST_CODE_LEN: usize = 512;
+pub const DIST_CODE_LEN: usize = 512;
 
 struct BitWriter<'a> {
     pub(crate) pending: Pending<'a>, // output still pending
@@ -1214,7 +1404,7 @@ struct BitWriter<'a> {
     /// Output buffer. bits are inserted starting at the bottom (least significant bits).
     pub(crate) bit_buffer: u64,
 
-    /// Number of valid bits in bit_buffer. All bits above the last valid bit are always zero.
+    /// Number of valid bits in `bit_buffer`. All bits above the last valid bit are always zero.
     pub(crate) bits_valid: u8,
 
     /// Last number of used bits when going to a byte boundary.
@@ -1228,54 +1418,92 @@ struct BitWriter<'a> {
     bits_sent: usize,
 }
 
+/// A bounded, least-significant-bit-first DEFLATE code or combined match.
+///
+/// The representation maintains the width beside the bits it describes,
+/// instead of narrowing unbounded bit counts at the eventual writer call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedBits {
+    value: u64,
+    len: u8,
+}
+
+impl PackedBits {
+    const fn new(value: u64, len: u8) -> Self {
+        // Only internal Huffman tables and checked extra-bit widths construct
+        // these sequences. Validate their contract in debug builds without
+        // adding per-match branches to release compression.
+        debug_assert!(len <= 64, "packed DEFLATE sequence exceeds reservoir width");
+        debug_assert!(
+            len == 64 || value >> len == 0,
+            "packed DEFLATE sequence contains bits beyond its width"
+        );
+        Self { value, len }
+    }
+
+    const fn code(symbol: Value) -> Self {
+        // Huffman tree nodes reuse a 16-bit field for parent indices and
+        // final lengths. Assert the <=15-bit wire contract *before* taking
+        // the low byte, so an invalid node cannot become a plausible code
+        // length even in a release build. This remains const on Rust 1.99.
+        let length = symbol.len();
+        assert!(length <= 15, "invalid DEFLATE Huffman code length");
+        let [length, _] = length.to_le_bytes();
+        Self::new(symbol.code() as u64, length)
+    }
+
+    const fn append(&mut self, suffix: Self) {
+        debug_assert!(
+            suffix.len <= 64 && self.len <= 64 - suffix.len,
+            "packed DEFLATE sequence exceeds reservoir width"
+        );
+        // Wrapping shift makes appending a zero-width suffix to a full-width
+        // value an ordinary no-op, with no branch in the match hot path.
+        self.value |= suffix.value.wrapping_shl(self.len as u32);
+        self.len += suffix.len;
+    }
+}
+
 #[inline]
-const fn encode_len(ltree: &[Value], lc: u8) -> (u64, usize) {
-    let mut lc = lc as usize;
+const fn encode_len(ltree: &[Value], lc: usize) -> PackedBits {
+    let mut lc = lc;
 
     /* Send the length code, len is the match length - STD_MIN_MATCH */
     let code = self::trees_tbl::LENGTH_CODE[lc] as usize;
     let c = code + LITERALS + 1;
     assert!(c < L_CODES, "bad l_code");
-    // send_code_trace(s, c);
 
-    let lnode = ltree[c];
-    let mut match_bits: u64 = lnode.code() as u64;
-    let mut match_bits_len = lnode.len() as usize;
-    let extra = StaticTreeDesc::EXTRA_LBITS[code] as usize;
+    let mut encoded = PackedBits::code(ltree[c]);
+    let extra = StaticTreeDesc::EXTRA_LBITS[code];
     if extra != 0 {
         lc -= self::trees_tbl::BASE_LENGTH[code] as usize;
-        match_bits |= (lc as u64) << match_bits_len;
-        match_bits_len += extra;
+        encoded.append(PackedBits::new(lc as u64, extra));
     }
 
-    (match_bits, match_bits_len)
+    encoded
 }
 
 #[inline]
-const fn encode_dist(dtree: &[Value], mut dist: u16) -> (u64, usize) {
-    dist -= 1; /* dist is now the match distance - 1 */
+const fn encode_dist(dtree: &[Value], dist: u16) -> PackedBits {
+    assert!(dist != 0, "DEFLATE match distance must be nonzero");
+    let mut dist = dist - 1;
     let code = State::d_code(dist as usize) as usize;
     assert!(code < D_CODES, "bad d_code");
-    // send_code_trace(s, code);
 
-    /* Send the distance code */
-    let dnode = dtree[code];
-    let mut match_bits = dnode.code() as u64;
-    let mut match_bits_len = dnode.len() as usize;
-    let extra = StaticTreeDesc::EXTRA_DBITS[code] as usize;
+    let mut encoded = PackedBits::code(dtree[code]);
+    let extra = StaticTreeDesc::EXTRA_DBITS[code];
     if extra != 0 {
         dist -= self::trees_tbl::BASE_DIST[code];
-        match_bits |= (dist as u64) << match_bits_len;
-        match_bits_len += extra;
+        encoded.append(PackedBits::new(dist as u64, extra));
     }
 
-    (match_bits, match_bits_len)
+    encoded
 }
 
 impl<'a> BitWriter<'a> {
     pub(crate) const BIT_BUF_SIZE: u8 = 64;
 
-    fn from_pending(pending: Pending<'a>) -> Self {
+    const fn from_pending(pending: Pending<'a>) -> Self {
         Self {
             pending,
             bit_buffer: 0,
@@ -1289,7 +1517,7 @@ impl<'a> BitWriter<'a> {
         }
     }
 
-    fn clone_with_pending(&self, pending: Pending<'a>) -> Self {
+    const fn clone_with_pending(&self, pending: Pending<'a>) -> Self {
         Self {
             pending,
             bit_buffer: self.bit_buffer,
@@ -1312,7 +1540,7 @@ impl<'a> BitWriter<'a> {
         self.pending.extend(&src[..keep_bytes as usize]);
 
         self.bits_valid -= removed;
-        self.bit_buffer = self.bit_buffer.checked_shr(removed as u32).unwrap_or(0);
+        self.bit_buffer = self.bit_buffer.checked_shr(u32::from(removed)).unwrap_or(0);
     }
 
     fn emit_align(&mut self) {
@@ -1328,50 +1556,46 @@ impl<'a> BitWriter<'a> {
         self.bit_buffer = 0;
         self.bits_valid = 0;
 
+        #[cfg(feature = "ZLIB_DEBUG")]
         self.sent_bits_align();
     }
 
-    fn send_bits_trace(&self, _value: u64, _len: u8) {
-        trace!(" l {:>2} v {:>4x} ", _len, _value);
+    // These counters do not exist in release builds. Keep their updates
+    // feature-gated rather than exposing release-build no-op methods.
+    #[cfg(feature = "ZLIB_DEBUG")]
+    fn cmpr_bits_add(&mut self, len: usize) {
+        self.compressed_len += len;
     }
 
-    fn cmpr_bits_add(&mut self, _len: usize) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.compressed_len += _len;
-        }
-    }
-
+    #[cfg(feature = "ZLIB_DEBUG")]
     fn cmpr_bits_align(&mut self) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.compressed_len = self.compressed_len.next_multiple_of(8);
-        }
+        self.compressed_len = self.compressed_len.next_multiple_of(8);
     }
 
-    fn sent_bits_add(&mut self, _len: usize) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.bits_sent += _len;
-        }
+    #[cfg(feature = "ZLIB_DEBUG")]
+    fn sent_bits_add(&mut self, len: usize) {
+        self.bits_sent += len;
     }
 
+    #[cfg(feature = "ZLIB_DEBUG")]
     fn sent_bits_align(&mut self) {
-        #[cfg(feature = "ZLIB_DEBUG")]
-        {
-            self.bits_sent = self.bits_sent.next_multiple_of(8);
-        }
+        self.bits_sent = self.bits_sent.next_multiple_of(8);
     }
 
-    #[inline(always)]
+    #[inline]
     fn send_bits(&mut self, val: u64, len: u8) {
         debug_assert!(len <= 64);
         debug_assert!(self.bits_valid <= 64);
+        debug_assert!(
+            len == 64 || val >> len == 0,
+            "bit values must fit their width"
+        );
 
         let total_bits = len + self.bits_valid;
 
-        self.send_bits_trace(val, len);
-        self.sent_bits_add(len as usize);
+        trace!(" l {:>2} v {:>4x} ", len, val);
+        #[cfg(feature = "ZLIB_DEBUG")]
+        self.sent_bits_add(usize::from(len));
 
         if total_bits < Self::BIT_BUF_SIZE {
             self.bit_buffer |= val << self.bits_valid;
@@ -1385,18 +1609,17 @@ impl<'a> BitWriter<'a> {
         if self.bits_valid == Self::BIT_BUF_SIZE {
             self.pending.extend(&self.bit_buffer.to_le_bytes());
             self.bit_buffer = val;
-            self.bits_valid = total_bits - Self::BIT_BUF_SIZE;
         } else {
             self.bit_buffer |= val << self.bits_valid;
             self.pending.extend(&self.bit_buffer.to_le_bytes());
             self.bit_buffer = val >> (Self::BIT_BUF_SIZE - self.bits_valid);
-            self.bits_valid = total_bits - Self::BIT_BUF_SIZE;
         }
+        self.bits_valid = total_bits - Self::BIT_BUF_SIZE;
     }
 
     fn send_code(&mut self, code: usize, tree: &[Value]) {
-        let node = tree[code];
-        self.send_bits(node.code() as u64, node.len() as u8)
+        let bits = PackedBits::code(tree[code]);
+        self.send_bits(bits.value, bits.len);
     }
 
     /// Send one empty static block to give enough lookahead for inflate.
@@ -1408,7 +1631,7 @@ impl<'a> BitWriter<'a> {
     }
 
     pub(crate) fn emit_tree(&mut self, block_type: BlockType, is_last_block: bool) {
-        let header_bits = ((block_type as u64) << 1) | (is_last_block as u64);
+        let header_bits = ((block_type as u64) << 1) | u64::from(is_last_block);
         self.send_bits(header_bits, 3);
         trace!("\n--- Emit Tree: Last: {}\n", is_last_block as u8);
     }
@@ -1453,32 +1676,17 @@ impl<'a> BitWriter<'a> {
         lc: u8,
         dist: u16,
     ) -> usize {
-        let (mut match_bits, mut match_bits_len) = encode_len(ltree, lc);
-
-        let (dist_match_bits, dist_match_bits_len) = encode_dist(dtree, dist);
-
-        match_bits |= dist_match_bits << match_bits_len;
-        match_bits_len += dist_match_bits_len;
-
-        self.send_bits(match_bits, match_bits_len as u8);
-
-        match_bits_len
+        let mut bits = encode_len(ltree, usize::from(lc));
+        bits.append(encode_dist(dtree, dist));
+        self.send_bits(bits.value, bits.len);
+        usize::from(bits.len)
     }
 
-    pub(crate) fn emit_dist_static(&mut self, lc: u8, dist: u16) -> usize {
-        let precomputed_len = trees_tbl::STATIC_LTREE_ENCODINGS[lc as usize];
-        let mut match_bits = precomputed_len.code() as u64;
-        let mut match_bits_len = precomputed_len.len() as usize;
-
-        let dtree = self::trees_tbl::STATIC_DTREE.as_slice();
-        let (dist_match_bits, dist_match_bits_len) = encode_dist(dtree, dist);
-
-        match_bits |= dist_match_bits << match_bits_len;
-        match_bits_len += dist_match_bits_len;
-
-        self.send_bits(match_bits, match_bits_len as u8);
-
-        match_bits_len
+    pub(crate) fn emit_dist_static(&mut self, lc: usize, dist: u16) -> usize {
+        let mut bits = PackedBits::code(trees_tbl::STATIC_LTREE_ENCODINGS[lc]);
+        bits.append(encode_dist(&trees_tbl::STATIC_DTREE, dist));
+        self.send_bits(bits.value, bits.len);
+        usize::from(bits.len)
     }
 
     fn compress_block_help(&mut self, sym_buf: &SymBuf, ltree: &[Value], dtree: &[Value]) {
@@ -1489,77 +1697,39 @@ impl<'a> BitWriter<'a> {
             };
         }
 
-        self.emit_end_block(ltree, false)
+        self.emit_end_block(ltree, false);
     }
 
     fn send_tree(&mut self, tree: &[Value], bl_tree: &[Value], max_code: usize) {
-        /* tree: the tree to be scanned */
-        /* max_code and its largest code of non zero frequency */
-        let mut prevlen: isize = -1; /* last emitted length */
-        let mut curlen; /* length of current code */
-        let mut nextlen = tree[0].len(); /* length of next code */
-        let mut count = 0; /* repeat count of the current code */
-        let mut max_count = 7; /* max repeat count */
-        let mut min_count = 4; /* min repeat count */
-
-        /* tree[max_code+1].Len = -1; */
-        /* guard already set */
-        if nextlen == 0 {
-            max_count = 138;
-            min_count = 3;
-        }
-
-        for n in 0..=max_code {
-            curlen = nextlen;
-            nextlen = tree[n + 1].len();
-            count += 1;
-            if count < max_count && curlen == nextlen {
-                continue;
-            } else if count < min_count {
-                loop {
-                    self.send_code(curlen as usize, bl_tree);
-
-                    count -= 1;
-                    if count == 0 {
-                        break;
-                    }
+        for_each_code_length_run(tree, max_code, |run| match run {
+            CodeLengthRun::Literal { length, count } => {
+                for _ in 0..count {
+                    self.send_code(usize::from(length), bl_tree);
                 }
-            } else if curlen != 0 {
-                if curlen as isize != prevlen {
-                    self.send_code(curlen as usize, bl_tree);
-                    count -= 1;
+            }
+            CodeLengthRun::RepeatPrevious {
+                length,
+                count,
+                emit_initial,
+            } => {
+                if emit_initial {
+                    self.send_code(usize::from(length), bl_tree);
                 }
-                assert!((3..=6).contains(&count), " 3_6?");
                 self.send_code(REP_3_6, bl_tree);
-                self.send_bits(count - 3, 2);
-            } else if count <= 10 {
-                self.send_code(REPZ_3_10, bl_tree);
-                self.send_bits(count - 3, 3);
-            } else {
-                self.send_code(REPZ_11_138, bl_tree);
-                self.send_bits(count - 11, 7);
+                self.send_bits(u64::from(count - 3), 2);
             }
-
-            count = 0;
-            prevlen = curlen as isize;
-
-            if nextlen == 0 {
-                max_count = 138;
-                min_count = 3;
-            } else if curlen == nextlen {
-                max_count = 6;
-                min_count = 3;
-            } else {
-                max_count = 7;
-                min_count = 4;
+            CodeLengthRun::RepeatZero { code, count } => {
+                self.send_code(code, bl_tree);
+                let (base, bits) = if code == REPZ_3_10 { (3, 3) } else { (11, 7) };
+                self.send_bits(u64::from(count - base), bits);
             }
-        }
+        });
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MatchCandidate {
+pub struct MatchCandidate {
     pub(crate) match_start: u16,
     pub(crate) match_length: u16,
     pub(crate) strstart: u16,
@@ -1576,7 +1746,7 @@ impl MatchCandidate {
 }
 
 #[repr(C, align(64))]
-pub(crate) struct State<'a> {
+pub struct State<'a> {
     status: Status,
 
     last_flush: i8, /* value of flush param for previous deflate call */
@@ -1619,7 +1789,7 @@ pub(crate) struct State<'a> {
     /// deflated.
     pub(crate) prev: WeakSliceMut<'a, u16>,
     /// head[H] contains the offset of the last 4-character sequence seen so far in
-    /// the current window that hashes to H (as calculated using the hash_calc_variant).
+    /// the current window that hashes to H (as calculated using the `hash_calc_variant`).
     pub(crate) head: WeakArrayMut<'a, u16, HASH_SIZE>,
 
     /// Length of the best match at previous step. Matches not greater than this
@@ -1649,12 +1819,12 @@ pub(crate) struct State<'a> {
     _cache_line_1: (),
 
     /// Size of match buffer for literals/lengths.  There are 4 reasons for
-    /// limiting lit_bufsize to 64K:
+    /// limiting `lit_bufsize` to 64K:
     ///   - frequencies can be kept in 16 bit counters
     ///   - if compression is not successful for the first block, all input
     ///     data is still in the window so we can still emit a stored block even
     ///     when input comes from standard input.  (This can also be done for
-    ///     all blocks if lit_bufsize is not greater than 32K.)
+    ///     all blocks if `lit_bufsize` is not greater than 32K.)
     ///   - if compression is not successful for a file smaller than 64K, we can
     ///     even emit a stored file instead of a stored block (saving 5 bytes).
     ///     This is applicable only for zip (not gzip or zlib).
@@ -1667,7 +1837,7 @@ pub(crate) struct State<'a> {
     ///   - I can't count above 4
     lit_bufsize: usize,
 
-    /// Actual size of window: 2*w_size, except when the user input buffer is directly used as sliding window.
+    /// Actual size of window: 2*`w_size`, except when the user input buffer is directly used as sliding window.
     pub(crate) window_size: usize,
 
     bit_writer: BitWriter<'a>,
@@ -1699,18 +1869,18 @@ pub(crate) struct State<'a> {
     /// makes compression decisions independent of caller output chunking. It occupies bytes that
     /// were previously explicit alignment padding, so the hand-packed cache-line layout is stable.
     pub(crate) medium_next_match: MatchCandidate,
-    /// Working copy of z_stream::data_type. Kept in compression state so block encoding is
+    /// Working copy of `z_stream::data_type`. Kept in compression state so block encoding is
     /// independent of caller I/O and synchronized once at the outer compression-call boundary.
     pub(crate) data_type: core::ffi::c_int,
-    _padding_0: [u8; 4],
+    padding_0: [u8; 4],
 
     _cache_line_3: (),
 
     crc_fold: crate::crc32::Crc32Fold,
 
-    /// The (unaligned) address of the state allocation that can be passed to zfree.
-    allocation_start: NonNull<u8>,
-    /// Total size of the allocation in bytes.
+    /// Original aligned storage pointer, retained for matching typed deallocation.
+    allocation_start: NonNull<AlignedAllocationBlock>,
+    /// Total size of the aligned storage allocation in bytes.
     total_allocation_size: usize,
 
     l_desc: TreeDesc<HEAP_SIZE>,             /* literal and length tree */
@@ -1734,11 +1904,11 @@ impl TryFrom<i32> for Strategy {
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Strategy::Default),
-            1 => Ok(Strategy::Filtered),
-            2 => Ok(Strategy::HuffmanOnly),
-            3 => Ok(Strategy::Rle),
-            4 => Ok(Strategy::Fixed),
+            0 => Ok(Self::Default),
+            1 => Ok(Self::Filtered),
+            2 => Ok(Self::HuffmanOnly),
+            3 => Ok(Self::Rle),
+            4 => Ok(Self::Fixed),
             _ => Err(()),
         }
     }
@@ -1760,14 +1930,18 @@ impl<'a> State<'a> {
     /// clone-policy decision instead of silently including them in a byte-for-byte state copy.
     fn clone_rebound(
         &self,
-        window: Window<'a>,
-        prev: WeakSliceMut<'a, Pos>,
-        head: WeakArrayMut<'a, Pos, HASH_SIZE>,
-        pending: Pending<'a>,
-        sym_buf: SymBuf<'a>,
-        allocation_start: NonNull<u8>,
+        buffers: DeflateAllocBuffers<'a>,
+        allocation_start: NonNull<AlignedAllocationBlock>,
         total_allocation_size: usize,
     ) -> Self {
+        let DeflateAllocBuffers {
+            state_ptr: _,
+            window,
+            prev,
+            head,
+            pending,
+            sym_buf,
+        } = buffers;
         Self {
             status: self.status,
             last_flush: self.last_flush,
@@ -1808,7 +1982,7 @@ impl<'a> State<'a> {
             gzindex: self.gzindex,
             medium_next_match: self.medium_next_match,
             data_type: self.data_type,
-            _padding_0: self._padding_0,
+            padding_0: self.padding_0,
             _cache_line_3: (),
             crc_fold: self.crc_fold,
             allocation_start,
@@ -1825,27 +1999,42 @@ impl<'a> State<'a> {
     }
 
     // log2(w_size)  (in the range MIN_WBITS..=MAX_WBITS)
-    pub(crate) fn w_bits(&self) -> u32 {
+    pub(crate) const fn w_bits(&self) -> u32 {
         self.w_size.trailing_zeros()
     }
 
-    pub(crate) fn w_mask(&self) -> usize {
+    pub(crate) const fn w_mask(&self) -> usize {
         self.w_size - 1
     }
 
-    pub(crate) fn max_dist(&self) -> usize {
+    pub(crate) const fn max_dist(&self) -> usize {
         self.w_size - MIN_LOOKAHEAD
     }
 
-    #[inline(always)]
-    pub(crate) fn update_hash(&self, h: u32, val: u32) -> u32 {
+    /// Return the representable backward distance to an existing hash-chain position.
+    ///
+    /// Hash position zero may be used by the quick path as an actual history index;
+    /// other match producers separately reject it when treating zero as an empty sentinel.
+    /// Rejection is conservative: absent/out-of-range entries cannot yield invalid
+    /// or unrepresentable backreferences.
+    #[inline]
+    pub(crate) fn recent_hash_distance(&self, head: u16) -> Option<u16> {
+        let distance = self.strstart.checked_sub(usize::from(head))?;
+        if distance == 0 || distance > self.max_dist() {
+            return None;
+        }
+        u16::try_from(distance).ok()
+    }
+
+    #[inline]
+    pub(crate) const fn update_hash(&self, h: u32, val: u32) -> u32 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::update_hash(h, val),
             HashCalcVariant::Roll => RollHashCalc::update_hash(h, val),
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn quick_insert_string(&mut self, string: usize) -> u16 {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::quick_insert_string(self, string),
@@ -1853,7 +2042,7 @@ impl<'a> State<'a> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn insert_string(&mut self, string: usize, count: usize) {
         match self.hash_calc_variant {
             HashCalcVariant::Standard => StandardHashCalc::insert_string(self, string, count),
@@ -1861,7 +2050,7 @@ impl<'a> State<'a> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn tally_lit(&mut self, unmatched: u8) -> bool {
         Self::tally_lit_help(&mut self.sym_buf, &mut self.l_desc, unmatched)
     }
@@ -1894,7 +2083,7 @@ impl<'a> State<'a> {
             // Verify during compilation that every DIST_CODE value is < D_CODES.
             let mut i = 0;
             while i < trees_tbl::DIST_CODE.len() {
-                assert!(trees_tbl::DIST_CODE[i] < D_CODES as u8);
+                assert!((trees_tbl::DIST_CODE[i] as usize) < D_CODES);
                 i += 1;
             }
         };
@@ -1903,7 +2092,7 @@ impl<'a> State<'a> {
         self::trees_tbl::DIST_CODE[index]
     }
 
-    #[inline(always)]
+    #[inline]
     pub(crate) fn tally_dist(&mut self, dist: usize, len: usize) -> bool {
         let max_distance = self.max_dist();
         self.tally_dist_with_limit(dist, len, max_distance)
@@ -1911,22 +2100,37 @@ impl<'a> State<'a> {
 
     /// Tally a match found by a complete-buffer matcher that can safely use the entire configured
     /// DEFLATE history window rather than the streaming matchfinder's lookahead-reserved limit.
-    #[inline(always)]
+    #[inline]
     pub(crate) fn tally_dist_full_window(&mut self, dist: usize, len: usize) -> bool {
         let max_distance = self.w_mask() + 1;
         self.tally_dist_with_limit(dist, len, max_distance)
     }
 
-    #[inline(always)]
-    fn tally_dist_with_limit(&mut self, mut dist: usize, len: usize, max_distance: usize) -> bool {
-        self.sym_buf.push_dist(dist as u16, len as u8);
+    #[inline]
+    fn tally_dist_with_limit(&mut self, dist: usize, len: usize, max_distance: usize) -> bool {
+        // Validate the entire token before writing any of its three bytes
+        // or incrementing Huffman frequencies. A distance is one-based and
+        // must fit both the configured DEFLATE window and the wire encoding.
+        assert!(
+            (1..=max_distance.min(1usize << crate::MAX_WBITS)).contains(&dist),
+            "tally_dist: bad match"
+        );
+        assert!(
+            len <= STD_MAX_MATCH - STD_MIN_MATCH,
+            "tally_dist: bad match length"
+        );
+        let Ok(encoded_dist) = u16::try_from(dist) else {
+            unreachable!("distance was checked against u16::MAX");
+        };
+        let Ok(encoded_len) = u8::try_from(len) else {
+            unreachable!("match length was checked against the 255-byte DEFLATE delta");
+        };
 
+        self.sym_buf.push_dist(encoded_dist, encoded_len);
         self.matches = self.matches.saturating_add(1);
-        dist -= 1;
+        let dist = dist - 1;
 
-        assert!(dist < max_distance, "tally_dist: bad match");
-
-        let index = self::trees_tbl::LENGTH_CODE[len] as usize + LITERALS + 1;
+        let index = usize::from(self::trees_tbl::LENGTH_CODE[len]) + LITERALS + 1;
         *self.l_desc.dyn_tree[index].freq_mut() += 1;
 
         *self.d_desc.dyn_tree[Self::d_code(dist) as usize].freq_mut() += 1;
@@ -1938,7 +2142,7 @@ impl<'a> State<'a> {
     fn detect_data_type(dyn_tree: &[Value]) -> DataType {
         // set bits 0..6, 14..25, and 28..31
         // 0xf3ffc07f = binary 11110011111111111100000001111111
-        const NON_TEXT: u64 = 0xf3ffc07f;
+        const NON_TEXT: u64 = 0xf3ff_c07f;
         let mut mask = NON_TEXT;
 
         /* Check for non-textual bytes. */
@@ -1969,11 +2173,11 @@ impl<'a> State<'a> {
         for (dist, lc) in self.sym_buf.iter() {
             match dist {
                 0 => self.bit_writer.emit_lit(ltree, lc) as usize,
-                _ => self.bit_writer.emit_dist_static(lc, dist),
+                _ => self.bit_writer.emit_dist_static(usize::from(lc), dist),
             };
         }
 
-        self.bit_writer.emit_end_block(ltree, false)
+        self.bit_writer.emit_end_block(ltree, false);
     }
 
     fn compress_block_dynamic_trees(&mut self) {
@@ -1984,23 +2188,25 @@ impl<'a> State<'a> {
         );
     }
 
-    fn header(&self) -> u16 {
-        // preset dictionary flag in zlib header
-        const PRESET_DICT: u16 = 0x20;
+    fn header(&self) -> Result<u16, ReturnCode> {
+        const PRESET_DICT: u32 = 0x20;
+        const Z_DEFLATED: u32 = 8;
 
-        // The deflate compression method (the only one supported in this version)
-        const Z_DEFLATED: u16 = 8;
+        // A zlib CMF encodes an LZ77 window size of 2^(CINFO+8).
+        // Invalid internal state must not silently truncate the window
+        // width into a different, apparently valid wire header.
+        let window_bits = self.w_bits();
+        if !(9..=15).contains(&window_bits) {
+            return Err(ReturnCode::StreamError);
+        }
 
-        let dict = match self.strstart {
-            0 => 0,
-            _ => PRESET_DICT,
-        };
-
-        let h = ((Z_DEFLATED + ((self.w_bits() as u16 - 8) << 4)) << 8)
-            | (self.level_flags() << 6)
+        let dict = if self.strstart == 0 { 0 } else { PRESET_DICT };
+        let h = ((Z_DEFLATED + ((window_bits - 8) << 4)) << 8)
+            | (u32::from(self.level_flags()) << 6)
             | dict;
-
-        h + 31 - (h % 31)
+        // FCHECK ensures the two-byte zlib header is a multiple of 31.
+        let header = h + 31 - (h % 31);
+        u16::try_from(header).map_err(|_| ReturnCode::StreamError)
     }
 
     fn level_flags(&self) -> u16 {
@@ -2016,12 +2222,8 @@ impl<'a> State<'a> {
     }
 
     fn zng_tr_init(&mut self) {
-        self.l_desc.stat_desc = &StaticTreeDesc::L;
-
-        self.d_desc.stat_desc = &StaticTreeDesc::D;
-
-        self.bl_desc.stat_desc = &StaticTreeDesc::BL;
-
+        // Descriptors are associated with their actual alphabets at
+        // construction and retain them across reset/copy operations.
         self.bit_writer.bit_buffer = 0;
         self.bit_writer.bits_valid = 0;
         self.bit_writer.bits_used = 0;
@@ -2038,6 +2240,9 @@ impl<'a> State<'a> {
 
     /// initializes a new block
     fn init_block(&mut self) {
+        // The DEFLATE end-of-block symbol is counted even for empty input.
+        const END_BLOCK: usize = 256;
+
         // Initialize the trees.
         // TODO would a memset also work here?
 
@@ -2052,9 +2257,6 @@ impl<'a> State<'a> {
         for value in &mut self.bl_desc.dyn_tree[..BL_CODES] {
             *value.freq_mut() = 0;
         }
-
-        // end of block literal code
-        const END_BLOCK: usize = 256;
 
         *self.l_desc.dyn_tree[END_BLOCK].freq_mut() = 1;
         self.opt_len = 0;
@@ -2085,7 +2287,7 @@ const fn rank_flush(f: i8) -> i8 {
 }
 
 #[derive(Debug)]
-pub(crate) enum BlockState {
+pub enum BlockState {
     /// block not completed, need more input or more output
     NeedMore = 0,
     /// block flush performed
@@ -2094,10 +2296,26 @@ pub(crate) enum BlockState {
     FinishStarted = 2,
     /// finish done, accept no more input or output
     FinishDone = 3,
+    /// The compressor or scheduler encountered an invalid internal state.
+    InvalidState = 4,
 }
 
 // Maximum stored block length in deflate format (not including header).
-pub(crate) const MAX_STORED: usize = 65535; // so u16::max
+pub const MAX_STORED: usize = 65535; // so u16::max
+
+/// Serialize the length and one's complement shared by pending and direct
+/// stored-block emission. Validate the complete field before either caller
+/// modifies its output: a stored block can hold at most 65,535 bytes.
+#[inline]
+fn stored_block_length_fields(length: usize) -> [u8; 4] {
+    assert!(
+        length <= MAX_STORED,
+        "DEFLATE stored block payload must fit in 16 bits"
+    );
+    let bytes = length.to_le_bytes();
+    let complement = (!length).to_le_bytes();
+    [bytes[0], bytes[1], complement[0], complement[1]]
+}
 
 fn read_buf_window_core(
     state: &mut State<'_>,
@@ -2126,55 +2344,70 @@ fn read_buf_window_core(
     len
 }
 
-pub(crate) enum BlockType {
+pub enum BlockType {
     StoredBlock = 0,
     StaticTrees = 1,
     DynamicTrees = 2,
 }
 
-pub(crate) fn zng_tr_stored_block(
+/// Emit the header for a stored block whose payload will be written separately.
+///
+/// Validates the 16-bit LEN/NLEN field before altering the pending bits.
+/// Both the direct-output and pending-output implementations use this same path.
+#[inline]
+fn emit_stored_block_header(state: &mut State, stored_len: usize, is_last: bool) {
+    let length_fields = stored_block_length_fields(stored_len);
+    state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
+    state.bit_writer.emit_align();
+    #[cfg(feature = "ZLIB_DEBUG")]
+    state.bit_writer.cmpr_bits_align();
+    state.bit_writer.pending.extend(&length_fields);
+    #[cfg(feature = "ZLIB_DEBUG")]
+    state.bit_writer.cmpr_bits_add(32);
+    #[cfg(feature = "ZLIB_DEBUG")]
+    state.bit_writer.sent_bits_add(32);
+}
+
+/// Emit a single DEFLATE stored block using initialized bytes from the window.
+///
+/// # Panics
+///
+/// Panics if the input range is outside the initialized window, the stored payload is
+/// larger than the 16-bit DEFLATE length field, or the pending-output buffer is too small.
+pub fn zng_tr_stored_block(
     state: &mut State,
     window_range: core::ops::Range<usize>,
     is_last: bool,
 ) {
-    // send block type
-    state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
-
-    // align on byte boundary
-    state.bit_writer.emit_align();
-
-    state.bit_writer.cmpr_bits_align();
-
-    let input_block: &[u8] = &state.window.filled()[window_range];
-    let stored_len = input_block.len() as u16;
-
-    state.bit_writer.pending.extend(&stored_len.to_le_bytes());
-    state
-        .bit_writer
-        .pending
-        .extend(&(!stored_len).to_le_bytes());
-
-    state.bit_writer.cmpr_bits_add(32);
-    state.bit_writer.sent_bits_add(32);
+    // Validate both the window range and format width before emitting the header.
+    let stored_len = state.window.filled()[window_range.clone()].len();
+    emit_stored_block_header(state, stored_len, is_last);
     if stored_len > 0 {
-        state.bit_writer.pending.extend(input_block);
-        state.bit_writer.cmpr_bits_add((stored_len << 3) as usize);
-        state.bit_writer.sent_bits_add((stored_len << 3) as usize);
+        state
+            .bit_writer
+            .pending
+            .extend(&state.window.filled()[window_range]);
+        #[cfg(feature = "ZLIB_DEBUG")]
+        {
+            let payload_bits = stored_len << 3;
+            state.bit_writer.cmpr_bits_add(payload_bits);
+            state.bit_writer.sent_bits_add(payload_bits);
+        }
     }
 }
 
 /// The minimum match length mandated by the deflate standard
-pub(crate) const STD_MIN_MATCH: usize = 3;
+pub const STD_MIN_MATCH: usize = 3;
 /// The maximum match length mandated by the deflate standard
-pub(crate) const STD_MAX_MATCH: usize = 258;
+pub const STD_MAX_MATCH: usize = 258;
 
-/// The minimum wanted match length, affects deflate_quick, deflate_fast, deflate_medium and deflate_slow
-pub(crate) const WANT_MIN_MATCH: usize = 4;
+/// The minimum wanted match length, affects `deflate_quick`, `deflate_fast`, `deflate_medium` and `deflate_slow`
+pub const WANT_MIN_MATCH: usize = 4;
 
-pub(crate) const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
+pub const MIN_LOOKAHEAD: usize = STD_MAX_MATCH + STD_MIN_MATCH + 1;
 
 #[inline]
-pub(crate) fn fill_window_core(
+pub fn fill_window_core(
     state: &mut State<'_>,
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
@@ -2182,8 +2415,12 @@ pub(crate) fn fill_window_core(
     fill_window_core_with_hash_maintenance(state, input, checksum, true);
 }
 
+/// # Panics
+///
+/// Panics if the internal ring-buffer cursor invariants are violated:
+/// a nonempty input read must always have room for at least two bytes.
 #[inline]
-pub(crate) fn fill_window_core_with_hash_maintenance(
+pub fn fill_window_core_with_hash_maintenance(
     state: &mut State<'_>,
     input: &mut InputCursor,
     checksum: &mut StreamChecksum,
@@ -2202,15 +2439,19 @@ pub(crate) fn fill_window_core_with_hash_maintenance(
             // Shift only the logically initialized upper-half bytes down.
             state.window.slide_down(wsize);
 
-            if state.match_start >= wsize as u16 {
-                state.match_start -= wsize as u16;
-            } else {
-                state.match_start = 0;
+            // A match before the retained half of the window is no longer
+            // valid. Sliding itself uses a full-width displacement and
+            // saturates the 16-bit position, just like the hash chains.
+            if usize::from(state.match_start) < wsize {
                 state.prev_length = 0;
             }
+            state.match_start = self::slide_hash::slide_position(state.match_start, wsize);
 
             state.strstart -= wsize; /* we now have strstart >= MAX_DIST */
-            state.block_start = state.block_start.wrapping_sub_unsigned(wsize);
+            let Some(slid_origin) = state.block_start.checked_sub_unsigned(wsize) else {
+                unreachable!("window slide exceeds signed block-origin range");
+            };
+            state.block_start = slid_origin;
             state.insert = Ord::min(state.insert, state.strstart);
 
             if maintain_hash_chain {
@@ -2249,9 +2490,11 @@ pub(crate) fn fill_window_core_with_hash_maintenance(
         // Initialize the hash value now that we have some input:
         if maintain_hash_chain && state.lookahead + state.insert >= STD_MIN_MATCH {
             let string = state.strstart - state.insert;
-            if state.max_chain_length > 1024 {
-                let v0 = state.window.filled()[string] as u32;
-                let v1 = state.window.filled()[string + 1] as u32;
+            // The rolling seed must match the hash representation used to index
+            // the live head/prev tables, not the current (possibly tuned) chain budget.
+            if matches!(state.hash_calc_variant, HashCalcVariant::Roll) {
+                let v0 = u32::from(state.window.filled()[string]);
+                let v1 = u32::from(state.window.filled()[string + 1]);
                 state.ins_h = state.update_hash(v0, v1);
             } else if string >= 1 {
                 state.quick_insert_string(string + 2 - STD_MIN_MATCH);
@@ -2280,12 +2523,12 @@ pub(crate) fn fill_window_core_with_hash_maintenance(
     );
 }
 
-pub(crate) struct StaticTreeDesc {
+pub struct StaticTreeDesc {
     /// static tree or NULL
     pub(crate) static_tree: &'static [Value],
     /// extra bits for each code or NULL
     extra_bits: &'static [u8],
-    /// base index for extra_bits
+    /// base index for `extra_bits`
     extra_base: usize,
     /// max number of elements in the tree
     elems: usize,
@@ -2294,14 +2537,6 @@ pub(crate) struct StaticTreeDesc {
 }
 
 impl StaticTreeDesc {
-    const EMPTY: Self = Self {
-        static_tree: &[],
-        extra_bits: &[],
-        extra_base: 0,
-        elems: 0,
-        max_length: 0,
-    };
-
     /// extra bits for each length code
     const EXTRA_LBITS: [u8; LENGTH_CODES] = [
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
@@ -2327,7 +2562,7 @@ impl StaticTreeDesc {
         extra_bits: &Self::EXTRA_LBITS,
         extra_base: LITERALS + 1,
         elems: L_CODES,
-        max_length: MAX_BITS as u16,
+        max_length: MAX_BITS_WIRE,
     };
 
     pub(crate) const D: Self = Self {
@@ -2335,7 +2570,7 @@ impl StaticTreeDesc {
         extra_bits: &Self::EXTRA_DBITS,
         extra_base: 0,
         elems: D_CODES,
-        max_length: MAX_BITS as u16,
+        max_length: MAX_BITS_WIRE,
     };
 
     pub(crate) const BL: Self = Self {
@@ -2343,29 +2578,49 @@ impl StaticTreeDesc {
         extra_bits: &Self::EXTRA_BLBITS,
         extra_base: 0,
         elems: BL_CODES,
-        max_length: MAX_BL_BITS as u16,
+        max_length: MAX_BL_BITS_WIRE,
     };
 }
 
 #[derive(Clone)]
-pub(crate) struct TreeDesc<const N: usize> {
+pub struct TreeDesc<const N: usize> {
     dyn_tree: [Value; N],
     max_code: usize,
     stat_desc: &'static StaticTreeDesc,
 }
 
 impl<const N: usize> TreeDesc<N> {
-    const EMPTY: Self = Self {
-        dyn_tree: [Value::new(0, 0); N],
-        max_code: 0,
-        stat_desc: &StaticTreeDesc::EMPTY,
-    };
+    /// Construct a tree with its fixed alphabet descriptor from the start.
+    /// No transient "empty descriptor" is possible during compression or
+    /// when a stream is cloned or reset.
+    const fn new(stat_desc: &'static StaticTreeDesc) -> Self {
+        assert!(stat_desc.elems >= 2 && stat_desc.elems <= L_CODES && N >= 2 * stat_desc.elems - 1);
+        Self {
+            dyn_tree: [Value::new(0, 0); N],
+            max_code: 0,
+            stat_desc,
+        }
+    }
 }
 
-fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
+fn build_tree<const N: usize>(
+    desc: &mut TreeDesc<N>,
+    optimal_bits: &mut usize,
+    static_bits: &mut usize,
+) {
     let tree = &mut desc.dyn_tree;
     let stree = desc.stat_desc.static_tree;
     let elements = desc.stat_desc.elems;
+    // Each internal Huffman node consumes one more slot than the leaves.
+    // The descriptor must have space for every leaf and combined parent.
+    assert!(
+        (2..=L_CODES).contains(&elements) && N >= 2 * elements - 1,
+        "Huffman tree descriptor does not fit its alphabet"
+    );
+    assert!(
+        (1..=MAX_BITS).contains(&usize::from(desc.stat_desc.max_length)),
+        "Huffman tree descriptor has an invalid code-length bound"
+    );
 
     let mut heap = Heap::new();
     let mut max_code = heap.initialize(&mut tree[..elements]);
@@ -2379,56 +2634,52 @@ fn build_tree<const N: usize>(state: &mut State, desc: &mut TreeDesc<N>) {
     // avoids the C implementation's transient unsigned underflow on empty trees.
     let mut synthetic_opt_len = 0usize;
     let mut synthetic_static_len = 0usize;
-    while heap.heap_len < 2 {
-        heap.heap_len += 1;
-        let node = if max_code < 2 {
-            max_code += 1;
-            max_code
+    while heap.active_len < 2 {
+        let node = if max_code.is_none_or(|code| code < 2) {
+            let next = max_code.map_or(0, |code| code + 1);
+            max_code = Some(next);
+            next
         } else {
             0
         };
 
-        debug_assert!(node >= 0);
-        let node = node as usize;
-
-        heap.heap[heap.heap_len] = node as u32;
+        heap.push_leaf(node);
         *tree[node].freq_mut() = 1;
-        heap.depth[node] = 0;
         synthetic_opt_len += 1;
         if !stree.is_empty() {
-            synthetic_static_len += stree[node].len() as usize;
+            synthetic_static_len += usize::from(stree[node].len());
         }
         /* node is 0 or 1 so it does not have extra bits */
     }
 
-    debug_assert!(max_code >= 0);
-    let max_code = max_code as usize;
+    // A DEFLATE Huffman alphabet always needs at least two symbols,
+    // including synthetic leaves for an initially empty alphabet.
+    let Some(max_code) = max_code else {
+        unreachable!("the two-leaf Huffman tree must have a largest symbol");
+    };
     desc.max_code = max_code;
 
     // The elements heap[heap_len/2+1 .. heap_len] are leaves of the tree,
     // establish sub-heaps of increasing lengths:
-    let mut n = heap.heap_len / 2;
-    while n >= 1 {
-        heap.pqdownheap(tree, n);
-        n -= 1;
-    }
+    heap.heapify(tree);
 
     heap.construct_huffman_tree(tree, elements);
 
     // At this point, the fields freq and dad are set. We can now
     // generate the bit lengths.
-    let bl_count = gen_bitlen(state, &mut heap, desc);
-    state.opt_len -= synthetic_opt_len;
-    state.static_len -= synthetic_static_len;
+    let bl_count = gen_bitlen(&heap, desc, optimal_bits, static_bits);
+    *optimal_bits -= synthetic_opt_len;
+    *static_bits -= synthetic_static_len;
 
     // The field len is now set, we can generate the bit codes
     gen_codes(&mut desc.dyn_tree, max_code, &bl_count);
 }
 
 fn gen_bitlen<const N: usize>(
-    state: &mut State,
-    heap: &mut Heap,
+    heap: &Heap,
     desc: &mut TreeDesc<N>,
+    optimal_bits: &mut usize,
+    static_bits: &mut usize,
 ) -> [u16; MAX_BITS + 1] {
     let tree = &mut desc.dyn_tree;
     let max_code = desc.max_code;
@@ -2441,13 +2692,12 @@ fn gen_bitlen<const N: usize>(
 
     // In a first pass, compute the optimal bit lengths (which may
     // overflow in the case of the bit length tree).
-    *tree[heap.heap[heap.heap_max] as usize].len_mut() = 0; /* root of the heap */
+    *tree[heap.root()].len_mut() = 0; /* root of the completed tree */
 
     // number of elements with bit length too large
     let mut overflow: i32 = 0;
 
-    for &n in &heap.heap[heap.heap_max + 1..HEAP_SIZE] {
-        let n = n as usize;
+    for &n in heap.non_root_nodes() {
         let mut bits = tree[usize::from(tree[n].dad())].len() + 1;
 
         if bits > max_length {
@@ -2464,16 +2714,17 @@ fn gen_bitlen<const N: usize>(
         }
 
         bl_count[usize::from(bits)] += 1;
-        let mut xbits = 0;
-        if n >= base {
-            xbits = extra[n - base] as usize;
-        }
+        let xbits = if n >= base {
+            usize::from(extra[n - base])
+        } else {
+            0
+        };
 
         let f = tree[n].freq() as usize;
-        state.opt_len += f * (bits as usize + xbits);
+        *optimal_bits += f * (bits as usize + xbits);
 
         if !stree.is_empty() {
-            state.static_len += f * (stree[n].len() as usize + xbits);
+            *static_bits += f * (stree[n].len() as usize + xbits);
         }
     }
 
@@ -2483,13 +2734,13 @@ fn gen_bitlen<const N: usize>(
 
     /* Find the first bit length which could increase: */
     loop {
-        let mut bits = max_length as usize - 1;
+        let mut bits = usize::from(max_length) - 1;
         while bl_count[bits] == 0 {
             bits -= 1;
         }
         bl_count[bits] -= 1; /* move one leaf down the tree */
         bl_count[bits + 1] += 2; /* move one overflow item as its brother */
-        bl_count[max_length as usize] -= 1;
+        bl_count[usize::from(max_length)] -= 1;
         /* The brother of the overflow item also moves one step up,
          * but this does not affect bl_count[max_length]
          */
@@ -2509,15 +2760,19 @@ fn gen_bitlen<const N: usize>(
         let mut n = bl_count[bits as usize];
         while n != 0 {
             h -= 1;
-            let m = heap.heap[h] as usize;
+            let m = heap.nodes[h];
             if m > max_code {
                 continue;
             }
 
             if tree[m].len() != bits {
                 // Tracev((stderr, "code %d bits %d->%u\n", m, tree[m].Len, bits));
-                state.opt_len += (bits * tree[m].freq()) as usize;
-                state.opt_len -= (tree[m].len() * tree[m].freq()) as usize;
+                // Cost arithmetic is in the host index domain. Multiplying
+                // two u16 values *before* widening can overflow even though
+                // the final bit cost is a perfectly valid usize.
+                let frequency = usize::from(tree[m].freq());
+                *optimal_bits += usize::from(bits) * frequency;
+                *optimal_bits -= usize::from(tree[m].len()) * frequency;
                 *tree[m].len_mut() = bits;
             }
 
@@ -2528,7 +2783,7 @@ fn gen_bitlen<const N: usize>(
 }
 
 /// Checks that symbol is a printing character (excluding space)
-#[allow(unused)]
+#[cfg(feature = "ZLIB_DEBUG")]
 fn isgraph(c: u8) -> bool {
     (c > 0x20) && (c <= 0x7E)
 }
@@ -2573,11 +2828,11 @@ fn gen_codes(tree: &mut [Value], max_code: usize, bl_count: &[u16]) {
             trace!(
                 "\nn {:>3} {} l {:>2} c {:>4x} ({:x}) ",
                 n,
-                if isgraph(n as u8) {
-                    char::from_u32(n as u32).unwrap()
-                } else {
-                    ' '
-                },
+                u8::try_from(n)
+                    .ok()
+                    .filter(|&symbol| isgraph(symbol))
+                    .map(char::from)
+                    .unwrap_or(' '),
                 len,
                 tree[n].code(),
                 next_code[len as usize] - 1
@@ -2595,51 +2850,86 @@ const REPZ_3_10: usize = 17;
 /// repeat a zero length 11-138 times  (7 bits of repeat count)
 const REPZ_11_138: usize = 18;
 
-fn scan_tree(bl_desc: &mut TreeDesc<{ 2 * BL_CODES + 1 }>, tree: &mut [Value], max_code: usize) {
-    /* tree: the tree to be scanned */
-    /* max_code: and its largest code of non zero frequency */
-    let mut prevlen = -1isize; /* last emitted length */
-    let mut curlen: isize; /* length of current code */
-    let mut nextlen = tree[0].len(); /* length of next code */
-    let mut count = 0; /* repeat count of the current code */
-    let mut max_count = 7; /* max repeat count */
-    let mut min_count = 4; /* min repeat count */
+/// One shared representation of the RFC 1951 code-length RLE decisions.
+///
+/// The frequency pass and bitstream pass must agree on these events. Previously
+/// they independently maintained their own zero/nonzero repeat state, which
+/// allowed the Huffman model to drift from what the encoder actually emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeLengthRun {
+    Literal {
+        length: u16,
+        count: u16,
+    },
+    RepeatPrevious {
+        length: u16,
+        count: u16,
+        emit_initial: bool,
+    },
+    RepeatZero {
+        code: usize,
+        count: u16,
+    },
+}
 
-    if nextlen == 0 {
-        max_count = 138;
-        min_count = 3;
-    }
+/// Visit code-length RLE decisions in wire order. The final sentinel is
+/// virtual: callers no longer need to mutate the tree's guard entry.
+fn for_each_code_length_run(tree: &[Value], max_code: usize, mut visit: impl FnMut(CodeLengthRun)) {
+    assert!(max_code < tree.len(), "code-length tree bound is invalid");
+    let mut previous = None;
+    let mut next_length = tree[0].len();
+    let mut count = 0u16;
+    let (mut max_count, mut min_count) = if next_length == 0 {
+        (138u16, 3u16)
+    } else {
+        (7u16, 4u16)
+    };
 
-    *tree[max_code + 1].len_mut() = 0xffff; /* guard */
-
-    let bl_tree = &mut bl_desc.dyn_tree;
-
-    for n in 0..=max_code {
-        curlen = nextlen as isize;
-        nextlen = tree[n + 1].len();
-        count += 1;
-        if count < max_count && curlen == nextlen as isize {
-            continue;
-        } else if count < min_count {
-            *bl_tree[curlen as usize].freq_mut() += count;
-        } else if curlen != 0 {
-            if curlen != prevlen {
-                *bl_tree[curlen as usize].freq_mut() += 1;
-            }
-            *bl_tree[REP_3_6].freq_mut() += 1;
-        } else if count <= 10 {
-            *bl_tree[REPZ_3_10].freq_mut() += 1;
+    for index in 0..=max_code {
+        let length = next_length;
+        next_length = if index == max_code {
+            u16::MAX
         } else {
-            *bl_tree[REPZ_11_138].freq_mut() += 1;
+            tree[index + 1].len()
+        };
+        count += 1;
+        if count < max_count && length == next_length {
+            continue;
         }
 
-        count = 0;
-        prevlen = curlen;
+        let run = if count < min_count {
+            CodeLengthRun::Literal { length, count }
+        } else if length != 0 {
+            let emit_initial = previous != Some(length);
+            let repeat_count = count - u16::from(emit_initial);
+            assert!(
+                (3..=6).contains(&repeat_count),
+                "nonzero code-length repetition exceeds DEFLATE bounds"
+            );
+            CodeLengthRun::RepeatPrevious {
+                length,
+                count: repeat_count,
+                emit_initial,
+            }
+        } else if count <= 10 {
+            CodeLengthRun::RepeatZero {
+                code: REPZ_3_10,
+                count,
+            }
+        } else {
+            CodeLengthRun::RepeatZero {
+                code: REPZ_11_138,
+                count,
+            }
+        };
+        visit(run);
 
-        if nextlen == 0 {
+        count = 0;
+        previous = Some(length);
+        if next_length == 0 {
             max_count = 138;
             min_count = 3;
-        } else if curlen == nextlen as isize {
+        } else if length == next_length {
             max_count = 6;
             min_count = 3;
         } else {
@@ -2647,6 +2937,28 @@ fn scan_tree(bl_desc: &mut TreeDesc<{ 2 * BL_CODES + 1 }>, tree: &mut [Value], m
             min_count = 4;
         }
     }
+}
+
+fn scan_tree(bl_desc: &mut TreeDesc<{ 2 * BL_CODES + 1 }>, tree: &[Value], max_code: usize) {
+    let bl_tree = &mut bl_desc.dyn_tree;
+    for_each_code_length_run(tree, max_code, |run| match run {
+        CodeLengthRun::Literal { length, count } => {
+            *bl_tree[usize::from(length)].freq_mut() += count;
+        }
+        CodeLengthRun::RepeatPrevious {
+            length,
+            emit_initial,
+            ..
+        } => {
+            if emit_initial {
+                *bl_tree[usize::from(length)].freq_mut() += 1;
+            }
+            *bl_tree[REP_3_6].freq_mut() += 1;
+        }
+        CodeLengthRun::RepeatZero { code, .. } => {
+            *bl_tree[code].freq_mut() += 1;
+        }
+    });
 }
 
 fn send_all_trees(state: &mut State, lcodes: usize, dcodes: usize, blcodes: usize) {
@@ -2667,7 +2979,7 @@ fn send_all_trees(state: &mut State, lcodes: usize, dcodes: usize, blcodes: usiz
     for rank in 0..blcodes {
         trace!("\nbl code {:>2} ", StaticTreeDesc::BL_ORDER[rank]);
         state.bit_writer.send_bits(
-            state.bl_desc.dyn_tree[StaticTreeDesc::BL_ORDER[rank] as usize].len() as u64,
+            u64::from(state.bl_desc.dyn_tree[usize::from(StaticTreeDesc::BL_ORDER[rank])].len()),
             3,
         );
     }
@@ -2687,29 +2999,28 @@ fn send_all_trees(state: &mut State, lcodes: usize, dcodes: usize, blcodes: usiz
 }
 
 /// Construct the Huffman tree for the bit lengths and return the index in
-/// bl_order of the last bit length code to send.
+/// `bl_order` of the last bit length code to send.
 fn build_bl_tree(state: &mut State) -> usize {
     /* Determine the bit length frequencies for literal and distance trees */
 
     scan_tree(
         &mut state.bl_desc,
-        &mut state.l_desc.dyn_tree,
+        &state.l_desc.dyn_tree,
         state.l_desc.max_code,
     );
 
     scan_tree(
         &mut state.bl_desc,
-        &mut state.d_desc.dyn_tree,
+        &state.d_desc.dyn_tree,
         state.d_desc.max_code,
     );
 
-    /* Build the bit length tree: */
-    {
-        let mut tmp = TreeDesc::EMPTY;
-        core::mem::swap(&mut tmp, &mut state.bl_desc);
-        build_tree(state, &mut tmp);
-        core::mem::swap(&mut tmp, &mut state.bl_desc);
-    }
+    /* Build the bit length tree in place. */
+    build_tree(
+        &mut state.bl_desc,
+        &mut state.opt_len,
+        &mut state.static_len,
+    );
 
     /* opt_len now includes the length of the tree representations, except
      * the lengths of the bit lengths codes and the 5+5+4 bits for the counts.
@@ -2763,32 +3074,19 @@ fn zng_tr_flush_block(
             state.data_type = State::detect_data_type(&state.l_desc.dyn_tree) as i32;
         }
 
-        {
-            let mut tmp = TreeDesc::EMPTY;
-            core::mem::swap(&mut tmp, &mut state.l_desc);
+        build_tree(&mut state.l_desc, &mut state.opt_len, &mut state.static_len);
+        trace!(
+            "\nlit data: dyn {}, stat {}",
+            state.opt_len,
+            state.static_len
+        );
 
-            build_tree(state, &mut tmp);
-            core::mem::swap(&mut tmp, &mut state.l_desc);
-
-            trace!(
-                "\nlit data: dyn {}, stat {}",
-                state.opt_len,
-                state.static_len
-            );
-        }
-
-        {
-            let mut tmp = TreeDesc::EMPTY;
-            core::mem::swap(&mut tmp, &mut state.d_desc);
-            build_tree(state, &mut tmp);
-            core::mem::swap(&mut tmp, &mut state.d_desc);
-
-            trace!(
-                "\ndist data: dyn {}, stat {}",
-                state.opt_len,
-                state.static_len
-            );
-        }
+        build_tree(&mut state.d_desc, &mut state.opt_len, &mut state.static_len);
+        trace!(
+            "\ndist data: dyn {}, stat {}",
+            state.opt_len,
+            state.static_len
+        );
 
         // Build the bit length tree for the above two trees, and get the index
         // in bl_order of the last bit length code to send.
@@ -2818,8 +3116,7 @@ fn zng_tr_flush_block(
         static_lenb = stored_len as usize + 5;
     }
 
-    #[allow(clippy::unnecessary_unwrap)]
-    if stored_len as usize + 4 <= opt_lenb && window_offset.is_some() {
+    if let Some(window_offset) = window_offset.filter(|_| stored_len as usize + 4 <= opt_lenb) {
         /* 4: two words for the lengths
          * The test buf != NULL is only necessary if LIT_BUFSIZE > WSIZE.
          * Otherwise we can't have processed more than WSIZE input bytes since
@@ -2827,7 +3124,6 @@ fn zng_tr_flush_block(
          * successful. If LIT_BUFSIZE <= WSIZE, it is never too late to
          * transform a block into a stored block.
          */
-        let window_offset = window_offset.unwrap();
         let range = window_offset..window_offset + stored_len as usize;
         zng_tr_stored_block(state, range, last);
     } else if static_lenb == opt_lenb {
@@ -2859,17 +3155,28 @@ fn zng_tr_flush_block(
 }
 
 fn encode_block_core(state: &mut State<'_>, is_last: bool) {
-    zng_tr_flush_block(
-        state,
-        (state.block_start >= 0).then_some(state.block_start as usize),
-        (state.strstart as isize - state.block_start) as u32,
-        is_last,
-    );
+    let (window_offset, unflushed_len) = unflushed_block_span(state.strstart, state.block_start);
+    // This count describes the current not-yet-encoded token block, not a
+    // lifetime total; token-buffer capacity bounds it well below u32::MAX.
+    let Ok(stored_len) = u32::try_from(unflushed_len) else {
+        unreachable!("unflushed DEFLATE block exceeds u32 length");
+    };
+    zng_tr_flush_block(state, window_offset, stored_len, is_last);
 
-    state.block_start = state.strstart as isize;
+    let Ok(next_origin) = isize::try_from(state.strstart) else {
+        unreachable!("current window position exceeds signed block-origin range");
+    };
+    state.block_start = next_origin;
 }
 
-fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow<ReturnCode> {
+/// Append an optional gzip metadata field incrementally. The caller supplies
+/// only the not-yet-buffered suffix, using state.gzindex after an output pause.
+/// FHCRC's own two bytes must not become part of the header CRC accumulator.
+fn flush_bytes(
+    stream: &mut Compressor<'_, '_>,
+    mut bytes: &[u8],
+    update_header_crc: bool,
+) -> ControlFlow<ReturnCode> {
     let mut state = &mut *stream.state;
 
     // we'll be using the pending buffer as temporary storage
@@ -2880,9 +3187,11 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
 
         state.bit_writer.pending.extend(&bytes[..copy]);
 
-        stream
-            .checksum
-            .update_crc(&state.bit_writer.pending.pending()[beg..]);
+        if update_header_crc {
+            stream
+                .checksum
+                .update_crc(&state.bit_writer.pending.pending()[beg..]);
+        }
 
         state.gzindex += copy;
         let _ = stream.drain_pending();
@@ -2900,9 +3209,11 @@ fn flush_bytes(stream: &mut Compressor<'_, '_>, mut bytes: &[u8]) -> ControlFlow
 
     state.bit_writer.pending.extend(bytes);
 
-    stream
-        .checksum
-        .update_crc(&state.bit_writer.pending.pending()[beg..]);
+    if update_header_crc {
+        stream
+            .checksum
+            .update_crc(&state.bit_writer.pending.pending()[beg..]);
+    }
     state.gzindex = 0;
 
     ControlFlow::Continue(())
@@ -2927,47 +3238,91 @@ pub fn deflate(stream: &mut DeflateStream, flush: DeflateFlush) -> ReturnCode {
     result
 }
 
-fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnCode {
-    let old_flush = stream.state.last_flush;
-    stream.state.last_flush = flush as i8;
+/// Emit the RFC 1950/zlib or RFC 1952/gzip wrapper prefix, including
+/// optional gzip metadata. Incomplete output is not an error: the caller
+/// retains its flush mode and resumes this exact header state.
+/// Resume gzip extra/name/comment fields and the optional FHCRC from
+/// their saved metadata cursor. No payload compression occurs here.
+fn emit_gzip_metadata(stream: &mut Compressor<'_, '_>) -> ControlFlow<ReturnCode> {
+    if stream.state.status == Status::Extra {
+        if let Some(gzhead) = stream.state.gzhead {
+            if let Some(extra) = gzhead.encoded_extra() {
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &extra[stream.state.gzindex..], true)
+                {
+                    return ControlFlow::Break(err);
+                }
+            }
+        }
+        stream.state.status = Status::Name;
+    }
 
-    /* Flush as much pending output as possible */
-    if !stream.state.bit_writer.pending.is_empty() {
-        let _ = stream.drain_pending();
-        if stream.output.avail_out == 0 {
-            /* Since avail_out is 0, deflate will be called again with
-             * more output space, but possibly with both pending and
-             * avail_in equal to zero. There won't be anything to do,
-             * but this is not an error situation so make sure we
-             * return OK instead of BUF_ERROR at next call of deflate:
-             */
-            stream.state.last_flush = -1;
-            return ReturnCode::Ok;
+    if stream.state.status == Status::Name {
+        if let Some(gzhead) = stream.state.gzhead {
+            if let Some(name) = gzhead.name() {
+                if let ControlFlow::Break(err) = flush_bytes(
+                    stream,
+                    &name.to_bytes_with_nul()[stream.state.gzindex..],
+                    true,
+                ) {
+                    return ControlFlow::Break(err);
+                }
+            }
+            stream.state.status = Status::Comment;
+        }
+    }
+
+    if stream.state.status == Status::Comment {
+        if let Some(gzhead) = stream.state.gzhead {
+            if let Some(comment) = gzhead.comment() {
+                if let ControlFlow::Break(err) = flush_bytes(
+                    stream,
+                    &comment.to_bytes_with_nul()[stream.state.gzindex..],
+                    true,
+                ) {
+                    return ControlFlow::Break(err);
+                }
+            }
+            stream.state.status = Status::Hcrc;
+        }
+    }
+
+    if stream.state.status == Status::Hcrc {
+        if let Some(gzhead) = stream.state.gzhead {
+            if gzhead.hcrc() {
+                let word = stream.checksum.low_word().to_le_bytes();
+                let bytes = [word[0], word[1]];
+                if let ControlFlow::Break(err) =
+                    flush_bytes(stream, &bytes[stream.state.gzindex..], false)
+                {
+                    return ControlFlow::Break(err);
+                }
+            }
         }
 
-        /* Make sure there is something to do and avoid duplicate consecutive
-         * flushes. For repeated and useless calls with Z_FINISH, we keep
-         * returning Z_STREAM_END instead of Z_BUF_ERROR.
-         */
-    } else if stream.input.avail_in == 0
-        && rank_flush(flush as i8) <= rank_flush(old_flush)
-        && flush != DeflateFlush::Finish
-    {
-        return ReturnCode::BufError;
+        stream.state.status = Status::Busy;
+
+        // compression must start with an empty pending buffer
+        let _ = stream.drain_pending();
+        if !stream.state.bit_writer.pending.is_empty() {
+            stream.state.last_flush = -1;
+            return ControlFlow::Break(ReturnCode::Ok);
+        }
     }
 
-    /* User must not provide more input after the first FINISH: */
-    if stream.state.status == Status::Finish && stream.input.avail_in != 0 {
-        return ReturnCode::BufError;
-    }
+    ControlFlow::Continue(())
+}
 
+fn emit_wrapper_header(stream: &mut Compressor<'_, '_>) -> ControlFlow<ReturnCode> {
     /* Write the header */
     if stream.state.status == Status::Init && stream.state.wrap == 0 {
         stream.state.status = Status::Busy;
     }
 
     if stream.state.status == Status::Init {
-        let header = stream.state.header();
+        let Ok(header) = stream.state.header() else {
+            return ControlFlow::Break(ReturnCode::StreamError);
+        };
         stream
             .state
             .bit_writer
@@ -2976,7 +3331,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
         /* Save the adler32 of the preset dictionary: */
         if stream.state.strstart != 0 {
-            let adler = stream.checksum.value() as u32;
+            let adler = stream.checksum.low_word();
             stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
         }
 
@@ -2989,7 +3344,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         if !stream.state.bit_writer.pending.is_empty() {
             stream.state.last_flush = -1;
 
-            return ReturnCode::Ok;
+            return ControlFlow::Break(ReturnCode::Ok);
         }
     }
 
@@ -3017,7 +3372,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
                 let _ = stream.drain_pending();
                 if !stream.state.bit_writer.pending.is_empty() {
                     stream.state.last_flush = -1;
-                    return ReturnCode::Ok;
+                    return ControlFlow::Break(ReturnCode::Ok);
                 }
             }
             Some(gzhead) => {
@@ -3034,7 +3389,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
                     .extend(&[extra_flags, gzhead.os()]);
 
                 if let Some(extra) = gzhead.encoded_extra() {
-                    let bytes = (extra.len() as u16).to_le_bytes();
+                    let bytes = gzip_extra_wire_len(extra.len()).to_le_bytes();
                     stream.state.bit_writer.pending.extend(&bytes);
                 }
 
@@ -3050,58 +3405,45 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         }
     }
 
-    if stream.state.status == Status::Extra {
-        if let Some(gzhead) = stream.state.gzhead {
-            if let Some(extra) = gzhead.encoded_extra() {
-                if let ControlFlow::Break(err) = flush_bytes(stream, &extra[stream.state.gzindex..])
-                {
-                    return err;
-                }
-            }
-        }
-        stream.state.status = Status::Name;
-    }
+    emit_gzip_metadata(stream)
+}
 
-    if stream.state.status == Status::Name {
-        if let Some(gzhead) = stream.state.gzhead {
-            if let Some(name) = gzhead.name() {
-                if let ControlFlow::Break(err) = flush_bytes(stream, name.to_bytes_with_nul()) {
-                    return err;
-                }
-            }
-            stream.state.status = Status::Comment;
-        }
-    }
+fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnCode {
+    let old_flush = stream.state.last_flush;
+    stream.state.last_flush = flush as i8;
 
-    if stream.state.status == Status::Comment {
-        if let Some(gzhead) = stream.state.gzhead {
-            if let Some(comment) = gzhead.comment() {
-                if let ControlFlow::Break(err) = flush_bytes(stream, comment.to_bytes_with_nul()) {
-                    return err;
-                }
-            }
-            stream.state.status = Status::Hcrc;
-        }
-    }
-
-    if stream.state.status == Status::Hcrc {
-        if let Some(gzhead) = stream.state.gzhead {
-            if gzhead.hcrc() {
-                let bytes = (stream.checksum.value() as u16).to_le_bytes();
-                if let ControlFlow::Break(err) = flush_bytes(stream, &bytes) {
-                    return err;
-                }
-            }
-        }
-
-        stream.state.status = Status::Busy;
-
-        // compression must start with an empty pending buffer
+    /* Flush as much pending output as possible */
+    if !stream.state.bit_writer.pending.is_empty() {
         let _ = stream.drain_pending();
-        if !stream.state.bit_writer.pending.is_empty() {
+        if stream.output.remaining == 0 {
+            /* Since avail_out is 0, deflate will be called again with
+             * more output space, but possibly with both pending and
+             * avail_in equal to zero. There won't be anything to do,
+             * but this is not an error situation so make sure we
+             * return OK instead of BUF_ERROR at next call of deflate:
+             */
             stream.state.last_flush = -1;
             return ReturnCode::Ok;
         }
+
+        /* Make sure there is something to do and avoid duplicate consecutive
+         * flushes. For repeated and useless calls with Z_FINISH, we keep
+         * returning Z_STREAM_END instead of Z_BUF_ERROR.
+         */
+    } else if stream.input.avail_in == 0
+        && rank_flush(flush as i8) <= rank_flush(old_flush)
+        && flush != DeflateFlush::Finish
+    {
+        return ReturnCode::BufError;
+    }
+
+    /* User must not provide more input after the first FINISH: */
+    if stream.state.status == Status::Finish && stream.input.avail_in != 0 {
+        return ReturnCode::BufError;
+    }
+
+    if let ControlFlow::Break(code) = emit_wrapper_header(stream) {
+        return code;
     }
 
     // Start a new block or continue the current one.
@@ -3119,8 +3461,9 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
         }
 
         match bstate {
+            BlockState::InvalidState => return ReturnCode::StreamError,
             BlockState::NeedMore | BlockState::FinishStarted => {
-                if stream.output.avail_out == 0 {
+                if stream.output.remaining == 0 {
                     state.last_flush = -1; /* avoid BUF_ERROR next call, see above */
                 }
                 return ReturnCode::Ok;
@@ -3165,7 +3508,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 
                 let _ = stream.drain_pending();
 
-                if stream.output.avail_out == 0 {
+                if stream.output.remaining == 0 {
                     stream.state.last_flush = -1; /* avoid BUF_ERROR at next call, see above */
                     return ReturnCode::Ok;
                 }
@@ -3181,19 +3524,19 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
     // write the trailer
     if stream.state.wrap == 2 {
         let crc_fold = core::mem::take(&mut stream.state.crc_fold);
-        stream.checksum.set(crc_fold.finish() as z_checksum);
+        stream.checksum.set(z_checksum::from(crc_fold.finish()));
 
-        let adler = stream.checksum.value() as u32;
+        let adler = stream.checksum.low_word();
         stream.state.bit_writer.pending.extend(&adler.to_le_bytes());
 
-        let total_in = stream.input.total_in as u32;
+        let total_in = low_wire_u32(stream.input.total_in);
         stream
             .state
             .bit_writer
             .pending
             .extend(&total_in.to_le_bytes());
     } else if stream.state.wrap == 1 {
-        let adler = stream.checksum.value() as u32;
+        let adler = stream.checksum.low_word();
         stream.state.bit_writer.pending.extend(&adler.to_be_bytes());
     }
 
@@ -3212,7 +3555,7 @@ fn deflate_core(stream: &mut Compressor<'_, '_>, flush: DeflateFlush) -> ReturnC
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DrainOutcome {
+pub enum DrainOutcome {
     Ready,
     OutputFull,
 }
@@ -3221,10 +3564,7 @@ pub(crate) enum DrainOutcome {
 ///
 /// `OutputFull` deliberately mirrors zlib's streaming boundary: callers return once the supplied
 /// output buffer reaches zero, even when that write happened to consume the final pending byte.
-pub(crate) fn drain_pending_output(
-    state: &mut State<'_>,
-    output: &mut OutputCursor,
-) -> DrainOutcome {
+pub fn drain_pending_output(state: &mut State<'_>, output: &mut OutputCursor) -> DrainOutcome {
     state.bit_writer.flush_bits();
 
     let pending = state.bit_writer.pending.pending();
@@ -3235,7 +3575,7 @@ pub(crate) fn drain_pending_output(
         state.bit_writer.pending.advance(len);
     }
 
-    if output.avail_out == 0 {
+    if output.remaining == 0 {
         DrainOutcome::OutputFull
     } else {
         DrainOutcome::Ready
@@ -3244,7 +3584,7 @@ pub(crate) fn drain_pending_output(
 
 /// Drain all complete bytes currently produced by the complete-buffer near-optimal path while
 /// preserving any sub-byte DEFLATE prefix for the next block.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 fn drain_near_optimal_pending(
     state: &mut State<'_>,
     output: &mut [u8],
@@ -3263,7 +3603,7 @@ fn drain_near_optimal_pending(
     true
 }
 
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 fn emit_planned_near_optimal_block(
     state: &mut State<'_>,
     input: &[u8],
@@ -3271,8 +3611,8 @@ fn emit_planned_near_optimal_block(
     is_last: bool,
     output: &mut [u8],
     produced: &mut usize,
-) -> bool {
-    near_optimal::tally_tokens(state, &block.tokens);
+) -> Result<bool, ReturnCode> {
+    near_optimal::tally_tokens(state, &block.tokens)?;
 
     state.window.clear();
     if block.range.len() <= MAX_STORED {
@@ -3285,7 +3625,7 @@ fn emit_planned_near_optimal_block(
             unsafe {
                 state
                     .window
-                    .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr())
+                    .copy_and_initialize(0..block.range.len(), input[block.range.clone()].as_ptr());
             };
         }
         state.block_start = 0;
@@ -3297,11 +3637,115 @@ fn emit_planned_near_optimal_block(
         // can therefore span more than 65,535 input bytes as long as its token count fits SymBuf.
         // There is no single stored-block fallback for such a span, so deliberately omit window
         // backing and force the existing tree chooser to select static or dynamic Huffman coding.
-        let stored_len = u32::try_from(block.range.len())
-            .expect("near-optimal token capacity bounds input span below u32::MAX");
+        // A planned block normally fits the token-capacity bound. Preserve
+        // the C-ABI error contract if this internal bound is ever changed.
+        let stored_len = u32::try_from(block.range.len()).map_err(|_| ReturnCode::StreamError)?;
         zng_tr_flush_block(state, None, stored_len, is_last);
     }
-    drain_near_optimal_pending(state, output, produced)
+    Ok(drain_near_optimal_pending(state, output, produced))
+}
+
+/// Encode the planned blocks, wrapper and checksum using a live compressor state.
+/// Allocation and unconditional cleanup belong to the owned API wrapper.
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
+fn encode_near_optimal_with_state(
+    state: &mut State<'_>,
+    output: &mut [u8],
+    input: &[u8],
+    optimization_passes: usize,
+) -> Result<Option<usize>, ReturnCode> {
+    // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
+    // reservation, so every distance representable by the configured DEFLATE window is legal.
+    let max_distance = state.w_mask() + 1;
+
+    // Emit the wrapper while strstart still describes the true initial state. Moving this after
+    // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
+    let header = state.header()?;
+    state.bit_writer.pending.extend(&header.to_be_bytes());
+    let mut produced = 0usize;
+    if !drain_near_optimal_pending(state, output, &mut produced) {
+        // In particular, do not build the suffix array when even the header
+        // cannot be written. Caller output exhaustion is already definitive.
+        return Ok(None);
+    }
+
+    let ranges = near_optimal::choose_block_ranges(input, max_distance)?;
+    debug_assert!(ranges
+        .iter()
+        .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
+
+    let mut ok = true;
+    let mut ranges = ranges.into_iter();
+    // Block planning always yields at least an empty-input block. If this
+    // invariant changes, return an error rather than emitting no final block.
+    let Some(first) = ranges.next() else {
+        return Err(ReturnCode::StreamError);
+    };
+    let mut current = near_optimal::parse_planned_block_source(
+        state,
+        input,
+        first,
+        max_distance,
+        optimization_passes,
+        None,
+    )?
+    .into_parts();
+
+    for range in ranges {
+        if !ok {
+            break;
+        }
+        let previous_model = Some(&current.1);
+        let mut next = near_optimal::parse_planned_block_source(
+            state,
+            input,
+            range,
+            max_distance,
+            optimization_passes,
+            previous_model,
+        )?;
+        let (current_block, current_model) = &mut current;
+        match near_optimal::optimize_token_partition(state, current_block, &mut next.block)? {
+            near_optimal::BoundaryOptimization::Merged(merged) => {
+                next.block = merged;
+                let _ =
+                    next.reparse_with_existing_candidates(state, input, optimization_passes, None)?;
+                current = next.into_parts();
+                continue;
+            }
+            near_optimal::BoundaryOptimization::Shifted => {
+                *current_model = near_optimal::model_from_tokens(state, &current_block.tokens)?;
+                let _ = next.reparse_with_existing_candidates(
+                    state,
+                    input,
+                    optimization_passes,
+                    Some(current_model),
+                )?;
+            }
+            near_optimal::BoundaryOptimization::Unchanged => {}
+        }
+        ok = emit_planned_near_optimal_block(
+            state,
+            input,
+            current_block,
+            false,
+            output,
+            &mut produced,
+        )?;
+        current = next.into_parts();
+    }
+
+    if ok {
+        ok =
+            emit_planned_near_optimal_block(state, input, &current.0, true, output, &mut produced)?;
+    }
+
+    if ok {
+        let checksum = adler32(ADLER32_INITIAL_VALUE, input);
+        state.bit_writer.pending.extend(&checksum.to_be_bytes());
+        ok = drain_near_optimal_pending(state, output, &mut produced);
+    }
+    Ok(ok.then_some(produced))
 }
 
 /// Experimental complete-buffer near-optimal compressor with adaptive block splitting.
@@ -3311,135 +3755,44 @@ fn emit_planned_near_optimal_block(
 /// and reuses the production tree builder / stored-static-dynamic block chooser / bit writer.
 /// `optimization_passes` counts minimum-cost path searches per selected block; zero is retained only
 /// as a fixed-Huffman diagnostic baseline.
-#[cfg(any(test, feature = "__internal-api"))]
+#[cfg(any(test, all(feature = "__internal-api", feature = "rust-allocator")))]
 pub fn compress_slice_near_optimal<'a>(
     output: &'a mut [u8],
     input: &[u8],
     optimization_passes: usize,
 ) -> (&'a mut [u8], ReturnCode) {
-    let mut raw = z_stream::default();
-    let init_result = init_with_lit_bufsize(
-        &mut raw,
+    // Every complete zlib stream has a two-byte header, at least two bytes
+    // for a final DEFLATE block, and a four-byte Adler-32 trailer. A smaller
+    // destination cannot succeed, regardless of the input or cost model.
+    const MIN_ZLIB_STREAM_SIZE: usize = ZLIB_WRAPLEN + 2;
+    if output.len() < MIN_ZLIB_STREAM_SIZE {
+        return (&mut output[..0], ReturnCode::BufError);
+    }
+    // Suffix ranks and match positions are stored in u32. An oversized
+    // input must be rejected before building the suffix array, not panic
+    // during conversion after the output and state have been initialized.
+    if let Err(code) = near_optimal::checked_suffix_input_len(input.len()) {
+        return (&mut output[..0], code);
+    }
+
+    let mut stream = match DeflateStream::new_with_lit_bufsize(
         DeflateConfig::new(9),
         Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-    );
-    if init_result != ReturnCode::Ok {
-        return (&mut output[..0], init_result);
-    }
-
-    let produced = {
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }
-            .expect("successful deflate init creates typed state");
-        let state = &mut *stream.state;
-        // Whole-input near-optimal matching is not constrained by zlib's ring-buffer lookahead
-        // reservation, so every distance representable by the configured DEFLATE window is legal.
-        let max_distance = state.w_mask() + 1;
-        let ranges = near_optimal::choose_block_ranges(input, max_distance);
-        debug_assert!(ranges
-            .iter()
-            .all(|range| range.len() <= near_optimal::MAX_COARSE_BLOCK_INPUT));
-
-        // Emit the wrapper while strstart still describes the true initial state. Moving this after
-        // synthetic block bookkeeping would incorrectly set zlib's PRESET_DICT flag.
-        state
-            .bit_writer
-            .pending
-            .extend(&state.header().to_be_bytes());
-        let mut produced = 0usize;
-        let mut ok = drain_near_optimal_pending(state, output, &mut produced);
-
-        let mut ranges = ranges.into_iter();
-        let mut current = ranges.next().map(|range| {
-            near_optimal::parse_planned_block_source(
-                state,
-                input,
-                range,
-                max_distance,
-                optimization_passes,
-                None,
-            )
-            .into_parts()
-        });
-
-        for range in ranges {
-            if !ok {
-                break;
-            }
-            let previous_model = current.as_ref().map(|(_, model)| *model);
-            let mut next = near_optimal::parse_planned_block_source(
-                state,
-                input,
-                range,
-                max_distance,
-                optimization_passes,
-                previous_model,
-            );
-            let (current_block, current_model) = current
-                .as_mut()
-                .expect("the splitter always returns at least one block");
-            match near_optimal::optimize_token_partition(state, current_block, &mut next.block) {
-                near_optimal::BoundaryOptimization::Merged(merged) => {
-                    next.block = merged;
-                    let _ = next.reparse_with_existing_candidates(
-                        state,
-                        input,
-                        optimization_passes,
-                        None,
-                    );
-                    current = Some(next.into_parts());
-                    continue;
-                }
-                near_optimal::BoundaryOptimization::Shifted => {
-                    *current_model = near_optimal::model_from_tokens(state, &current_block.tokens);
-                    let _ = next.reparse_with_existing_candidates(
-                        state,
-                        input,
-                        optimization_passes,
-                        Some(*current_model),
-                    );
-                }
-                near_optimal::BoundaryOptimization::Unchanged => {}
-            }
-            ok = emit_planned_near_optimal_block(
-                state,
-                input,
-                current_block,
-                false,
-                output,
-                &mut produced,
-            );
-            current = Some(next.into_parts());
-        }
-
-        if ok {
-            if let Some((final_block, _)) = current.as_ref() {
-                ok = emit_planned_near_optimal_block(
-                    state,
-                    input,
-                    final_block,
-                    true,
-                    output,
-                    &mut produced,
-                );
-            }
-        }
-
-        if ok {
-            let checksum = adler32(ADLER32_INITIAL_VALUE as u32, input);
-            state.bit_writer.pending.extend(&checksum.to_be_bytes());
-            ok = drain_near_optimal_pending(state, output, &mut produced);
-        }
-        ok.then_some(produced)
+    ) {
+        Ok(stream) => stream,
+        Err(code) => return (&mut output[..0], code),
     };
 
-    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut raw) } {
-        stream.state.status = Status::Finish;
-        let _ = end(stream);
-    }
+    let produced =
+        encode_near_optimal_with_state(&mut stream.state, output, input, optimization_passes);
+    // The typed owner releases state on all paths, including output exhaustion.
+    // Do not manufacture a successful stream status just to permit cleanup.
+    drop(stream);
 
     match produced {
-        Some(len) => (&mut output[..len], ReturnCode::Ok),
-        None => (&mut output[..0], ReturnCode::BufError),
+        Ok(Some(len)) => (&mut output[..len], ReturnCode::Ok),
+        Ok(None) => (&mut output[..0], ReturnCode::BufError),
+        Err(code) => (&mut output[..0], code),
     }
 }
 
@@ -3505,72 +3858,42 @@ fn compress_into<O: WritableBytes + ?Sized>(
     final_flush: DeflateFlush,
 ) -> (usize, ReturnCode) {
     let output_len = output.len();
-    let mut stream = z_stream {
-        next_in: input.as_ptr() as *mut u8,
-        avail_in: 0, // for special logic in the first iteration
-        total_in: 0,
-        next_out: output.byte_ptr(),
-        avail_out: 0, // for special logic on the first iteration
-        total_out: 0,
-        msg: core::ptr::null_mut(),
-        state: core::ptr::null_mut(),
-        zalloc: None,
-        zfree: None,
-        opaque: core::ptr::null_mut(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
+    // This helper owns its compressor. Using the typed constructor ensures
+    // all exit paths release its state instead of requiring raw ABI cleanup.
+    let mut stream = match DeflateStream::new(config) {
+        Ok(stream) => stream,
+        Err(code) => return (0, code),
     };
+    stream.next_in = input.as_ptr().cast_mut();
+    stream.avail_in = 0; // let SliceBudget issue the first chunk
+    stream.next_out = output.byte_ptr();
+    stream.avail_out = 0; // let SliceBudget issue the first chunk
 
-    let err = init(&mut stream, config);
-    if err != ReturnCode::Ok {
-        return (0, err);
-    }
-
-    let max = core::ffi::c_uint::MAX as usize;
-    let mut left = output_len;
-    let mut source_len = input.len();
+    let mut output_budget = SliceBudget::new(output_len);
+    let mut input_budget = SliceBudget::new(input.len());
 
     let return_code = loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, max) as _;
-            left -= stream.avail_out as usize;
-        }
+        output_budget.refill(&mut stream.avail_out);
+        input_budget.refill(&mut stream.avail_in);
 
-        if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(source_len, max) as _;
-            source_len -= stream.avail_in as usize;
-        }
-
-        let flush = if source_len > 0 {
+        let flush = if input_budget.pending() > 0 {
             DeflateFlush::NoFlush
         } else {
             final_flush
         };
-
-        let err = if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {
-            deflate(stream, flush)
-        } else {
-            ReturnCode::StreamError
-        };
+        let err = deflate(&mut stream, flush);
 
         match err {
-            ReturnCode::Ok => continue,
+            ReturnCode::Ok => {}
             ReturnCode::StreamEnd => break ReturnCode::Ok,
             _ => break err,
         }
     };
 
-    let produced = stream.total_out as usize;
-    assert!(
-        produced <= output_len,
-        "deflate reported output beyond caller storage"
-    );
-
-    // may DataError if insufficient output space
-    if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut stream) } {
-        let _ = end(stream);
-    }
+    // The public zlib total_out counter may wrap on 64-bit Windows (32-bit c_ulong).
+    // Recover the exact Rust-slice length from caller output budgets instead.
+    let produced = output_budget.processed(stream.avail_out);
+    drop(stream);
 
     (produced, return_code)
 }
@@ -3578,7 +3901,8 @@ fn compress_into<O: WritableBytes + ?Sized>(
 /// Returns the upper bound on the compressed size for an input of `source_len` bytes.
 ///
 /// When compression has this much space available, it will never fail because of insufficient
-/// output space.
+/// output space. Returns `usize::MAX` if the mathematical bound cannot be represented
+/// as `usize`; no finite output slice can satisfy that bound.
 ///
 /// # Example
 ///
@@ -3594,7 +3918,27 @@ fn compress_into<O: WritableBytes + ?Sized>(
 /// let (compressed, rc) = compress_slice(&mut buf, input, DeflateConfig::default());
 /// # }
 /// ```
+#[must_use]
 pub const fn compress_bound(source_len: usize) -> usize {
+    // div_ceil avoids the overflow in (source_len + 7) / 8; saturating additions
+    // avoid understating bounds that cannot fit in usize.
+    let quick_overhead = source_len.div_ceil(8);
+
+    source_len
+        .saturating_add(if source_len == 0 { 1 } else { 0 })
+        .saturating_add(if source_len < 9 { 1 } else { 0 })
+        .saturating_add(quick_overhead)
+        .saturating_add(DEFLATE_BLOCK_OVERHEAD)
+        .saturating_add(ZLIB_WRAPLEN)
+}
+
+/// zlib-ng-compatible C ABI bound, including its unsigned wrapping semantics.
+///
+/// C callers already observe the original zlib-ng integer behavior at extreme
+/// lengths; the Rust-facing `compress_bound` instead supplies a true saturating
+/// upper bound. This function intentionally stays separate from that safe API.
+#[must_use]
+pub const fn compress_bound_abi(source_len: usize) -> usize {
     compress_bound_help(source_len, ZLIB_WRAPLEN)
 }
 
@@ -3618,42 +3962,66 @@ const fn compress_bound_help(source_len: usize, wrap_len: usize) -> usize {
 /// The same heap array is used to build all trees.
 #[derive(Clone)]
 struct Heap {
-    heap: [u32; 2 * L_CODES + 1],
-
-    /// number of elements in the heap
-    heap_len: usize,
-
-    /// element of the largest frequency
-    heap_max: usize,
-
-    depth: [u8; 2 * L_CODES + 1],
+    // Native indices address the heap and tree arrays, not DEFLATE wire fields.
+    nodes: [usize; HEAP_SIZE],
+    /// Number of active entries in the binary min-heap (indexed from 1).
+    active_len: usize,
+    /// First occupied position in the completed tree's sorted-node suffix.
+    sorted_start: usize,
+    depth: [u8; HEAP_SIZE],
 }
 
 impl Heap {
-    // an empty heap
-    fn new() -> Self {
+    /// A fresh heap; rebuilding a tree resets the active and sorted spans.
+    const fn new() -> Self {
         Self {
-            heap: [0; 2 * L_CODES + 1],
-            heap_len: 0,
-            heap_max: 0,
-            depth: [0; 2 * L_CODES + 1],
+            nodes: [0; HEAP_SIZE],
+            active_len: 0,
+            sorted_start: 0,
+            depth: [0; HEAP_SIZE],
         }
+    }
+
+    /// The sorted suffix contains the root followed by its children.
+    const fn root(&self) -> usize {
+        self.nodes[self.sorted_start]
+    }
+
+    fn non_root_nodes(&self) -> &[usize] {
+        &self.nodes[self.sorted_start + 1..]
+    }
+
+    fn push_leaf(&mut self, code: usize) {
+        assert!(self.active_len + 1 < HEAP_SIZE);
+        self.active_len += 1;
+        self.nodes[self.active_len] = code;
+        self.depth[code] = 0;
+    }
+
+    fn heapify(&mut self, tree: &[Value]) {
+        for index in (1..=self.active_len / 2).rev() {
+            self.pqdownheap(tree, index);
+        }
+    }
+
+    /// Compare the frequency before the tie-breaking depth of two nodes.
+    #[inline]
+    fn priority(&self, tree: &[Value], node: usize) -> u32 {
+        (u32::from(tree[node].freq()) << 8) | u32::from(self.depth[node])
     }
 
     /// Construct the initial heap, with least frequent element in
     /// heap[SMALLEST]. The sons of heap[n] are heap[2*n] and heap[2*n+1]. heap[0] is not used.
-    fn initialize(&mut self, tree: &mut [Value]) -> isize {
-        let mut max_code = -1;
+    fn initialize(&mut self, tree: &mut [Value]) -> Option<usize> {
+        let mut max_code = None;
 
-        self.heap_len = 0;
-        self.heap_max = HEAP_SIZE;
+        self.active_len = 0;
+        self.sorted_start = HEAP_SIZE;
 
         for (n, node) in tree.iter_mut().enumerate() {
             if node.freq() > 0 {
-                self.heap_len += 1;
-                self.heap[self.heap_len] = n as u32;
-                max_code = n as isize;
-                self.depth[n] = 0;
+                self.push_leaf(n);
+                max_code = Some(n);
             } else {
                 *node.len_mut() = 0;
             }
@@ -3669,28 +4037,18 @@ impl Heap {
         /* tree: the tree to restore */
         /* k: node to move down */
 
-        // Given the index $i of a node in the tree, pack the node's frequency and depth
-        // into a single integer. The heap ordering logic uses a primary sort on frequency
-        // and a secondary sort on depth, so packing both into one integer makes it
-        // possible to sort with fewer comparison operations.
-        macro_rules! freq_and_depth {
-            ($i:expr) => {
-                (tree[$i as usize].freq() as u32) << 8 | self.depth[$i as usize] as u32
-            };
-        }
-
-        let v = self.heap[k];
-        let v_val = freq_and_depth!(v);
+        let v = self.nodes[k];
+        let v_val = self.priority(tree, v);
         let mut j = k << 1; /* left son of k */
 
-        while j <= self.heap_len {
+        while j <= self.active_len {
             /* Set j to the smallest of the two sons: */
-            let mut j_val = freq_and_depth!(self.heap[j]);
-            if j < self.heap_len {
-                let j1_val = freq_and_depth!(self.heap[j + 1]);
-                if j1_val <= j_val {
+            let mut j_val = self.priority(tree, self.nodes[j]);
+            if j < self.active_len {
+                let next_val = self.priority(tree, self.nodes[j + 1]);
+                if next_val <= j_val {
                     j += 1;
-                    j_val = j1_val;
+                    j_val = next_val;
                 }
             }
 
@@ -3700,22 +4058,22 @@ impl Heap {
             }
 
             /* Exchange v with the smallest son */
-            self.heap[k] = self.heap[j];
+            self.nodes[k] = self.nodes[j];
             k = j;
 
             /* And continue down the tree, setting j to the left son of k */
             j <<= 1;
         }
 
-        self.heap[k] = v;
+        self.nodes[k] = v;
     }
 
     /// Remove the smallest element from the heap and recreate the heap with
-    /// one less element. Updates heap and heap_len.
-    fn pqremove(&mut self, tree: &[Value]) -> u32 {
-        let top = self.heap[Self::SMALLEST];
-        self.heap[Self::SMALLEST] = self.heap[self.heap_len];
-        self.heap_len -= 1;
+    /// one less element. Updates heap and `heap_len`.
+    fn pqremove(&mut self, tree: &[Value]) -> usize {
+        let top = self.nodes[Self::SMALLEST];
+        self.nodes[Self::SMALLEST] = self.nodes[self.active_len];
+        self.active_len -= 1;
 
         self.pqdownheap(tree, Self::SMALLEST);
 
@@ -3725,34 +4083,44 @@ impl Heap {
     /// Construct the Huffman tree by repeatedly combining the least two frequent nodes.
     fn construct_huffman_tree(&mut self, tree: &mut [Value], mut node: usize) {
         loop {
-            let n = self.pqremove(tree) as usize; /* n = node of least frequency */
-            let m = self.heap[Heap::SMALLEST] as usize; /* m = node of next least frequency */
+            let n = self.pqremove(tree); /* n = node of least frequency */
+            let m = self.nodes[Self::SMALLEST]; /* m = node of next least frequency */
 
-            self.heap_max -= 1;
-            self.heap[self.heap_max] = n as u32; /* keep the nodes sorted by frequency */
-            self.heap_max -= 1;
-            self.heap[self.heap_max] = m as u32;
+            self.sorted_start -= 1;
+            self.nodes[self.sorted_start] = n; /* keep the nodes sorted by frequency */
+            self.sorted_start -= 1;
+            self.nodes[self.sorted_start] = m;
 
             /* Create a new node father of n and m */
-            *tree[node].freq_mut() = tree[n].freq() + tree[m].freq();
-            self.depth[node] = Ord::max(self.depth[n], self.depth[m]) + 1;
+            let combined = u32::from(tree[n].freq()) + u32::from(tree[m].freq());
+            let Ok(frequency) = u16::try_from(combined) else {
+                unreachable!("Huffman parent frequency exceeds the bounded token count");
+            };
+            *tree[node].freq_mut() = frequency;
+            let Some(depth) = self.depth[n].max(self.depth[m]).checked_add(1) else {
+                unreachable!("Huffman tree depth exceeds its packed priority range");
+            };
+            self.depth[node] = depth;
 
-            *tree[n].dad_mut() = node as u16;
-            *tree[m].dad_mut() = node as u16;
+            let Ok(parent) = u16::try_from(node) else {
+                unreachable!("the fixed Huffman alphabet cannot exceed u16 parent indices");
+            };
+            *tree[n].dad_mut() = parent;
+            *tree[m].dad_mut() = parent;
 
             /* and insert the new node in the heap */
-            self.heap[Heap::SMALLEST] = node as u32;
+            self.nodes[Self::SMALLEST] = node;
             node += 1;
 
-            self.pqdownheap(tree, Heap::SMALLEST);
+            self.pqdownheap(tree, Self::SMALLEST);
 
-            if self.heap_len < 2 {
+            if self.active_len < 2 {
                 break;
             }
         }
 
-        self.heap_max -= 1;
-        self.heap[self.heap_max] = self.heap[Heap::SMALLEST];
+        self.sorted_start -= 1;
+        self.nodes[self.sorted_start] = self.nodes[Self::SMALLEST];
     }
 }
 
@@ -3769,14 +4137,14 @@ pub unsafe fn set_header<'a>(
     stream: &mut DeflateStream<'a>,
     head: Option<&'a mut gz_header>,
 ) -> ReturnCode {
-    if stream.state.wrap != 2 {
-        ReturnCode::StreamError
-    } else {
+    if stream.state.wrap == 2 {
         stream.state.gzhead = head.map(|head| {
             // SAFETY: this function's contract establishes all invariants required by the view.
             unsafe { GzipHeaderRef::new(head) }
         });
         ReturnCode::Ok
+    } else {
+        ReturnCode::StreamError
     }
 }
 
@@ -3802,10 +4170,10 @@ const fn deflate_quick_overhead(x: usize) -> usize {
 }
 
 /// For the default windowBits of 15 and memLevel of 8, this function returns
-/// a close to exact, as well as small, upper bound on the compressed size.
-/// They are coded as constants here for a reason--if the #define's are
-/// changed, then this function needs to be changed as well.  The return
-/// value for 15 and 8 only works for those exact settings.
+/// a compact, close-to-exact upper bound on compressed size.
+///
+/// This bound assumes those exact settings. If either value changes,
+/// the corresponding bound constants must be updated.
 ///
 /// For any setting other than those defaults for windowBits and memLevel,
 /// the value returned is a conservative worst case for the maximum expansion
@@ -3816,9 +4184,12 @@ const fn deflate_quick_overhead(x: usize) -> usize {
 /// every combination of windowBits and memLevel.  But even the conservative
 /// upper bound of about 14% expansion does not seem onerous for output buffer
 /// allocation.
+#[must_use]
 pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
     // on windows, c_ulong is only a 32-bit integer
-    let mask = core::ffi::c_ulong::MAX as usize;
+    // A c_ulong can be wider than usize on unusual ABIs. In that case
+    // every usize bit is representable, so the mask is exactly usize::MAX.
+    let mask = usize::try_from(core::ffi::c_ulong::MAX).unwrap_or(usize::MAX);
 
     // conservative upper bound for compressed data
     let comp_len = source_len
@@ -3850,7 +4221,7 @@ pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
             let mut gz_wrap_len = GZIP_WRAPLEN;
 
             if let Some(header) = stream.state.gzhead {
-                if let Some(extra) = header.extra() {
+                if let Some(extra) = header.encoded_extra() {
                     gz_wrap_len += 2 + extra.len();
                 }
                 if let Some(name) = header.name() {
@@ -3893,6 +4264,7 @@ pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
 ///
 /// Raw caller-buffer handling belongs to the C ABI layer; the compression core exposes only a
 /// checked slice over its initialized window storage.
+#[must_use]
 pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] {
     let state = &*stream.state;
     state
@@ -3900,8 +4272,31 @@ pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] 
         .recent_history(state.strstart + state.lookahead, state.w_size)
 }
 
-const DEFLATE_ALLOC_ALIGN: usize = 64;
+const DEFLATE_ALLOC_ALIGN: usize = ALLOCATION_BLOCK_BYTES;
 const LIT_BUFS: usize = 4;
+
+// Every typed view into the shared deflate allocation must fit within the
+// cache-line-aligned base and offsets established by DeflateAllocOffsets.
+const _: () = {
+    assert!(DEFLATE_ALLOC_ALIGN.is_power_of_two());
+    assert!(core::mem::size_of::<AlignedAllocationBlock>() == DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<AlignedAllocationBlock>() == DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<State<'static>>() <= DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<Pos>() <= DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<[Pos; HASH_SIZE]>() <= DEFLATE_ALLOC_ALIGN);
+    assert!(core::mem::align_of::<MaybeUninit<u8>>() <= DEFLATE_ALLOC_ALIGN);
+};
+
+/// All raw region pointers derive from the same aligned allocation base.
+/// This is the sole place where byte offsets become typed deflate regions.
+struct DeflateAllocRegions<'a> {
+    state: *mut State<'a>,
+    window: *mut u8,
+    prev: *mut Pos,
+    head: *mut [Pos; HASH_SIZE],
+    pending: *mut u8,
+    sym_buf: *mut u8,
+}
 
 #[derive(Clone, Copy)]
 struct DeflateStateInit {
@@ -3932,7 +4327,7 @@ struct DeflateAllocOffsets {
 }
 
 impl DeflateAllocOffsets {
-    fn new(window_bits: usize, lit_bufsize: usize) -> Self {
+    const fn new(window_bits: usize, lit_bufsize: usize) -> Self {
         use core::mem::size_of;
 
         let mut curr_size = 0usize;
@@ -3966,10 +4361,9 @@ impl DeflateAllocOffsets {
         let sym_buf_pos = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
         curr_size = sym_buf_pos + sym_buf_size;
 
-        /* Leave enough leading slack to align the allocation base, then round the total allocation
-         * size to the same boundary. Region rebinding is centralized below. */
-        let total_size =
-            (curr_size + (DEFLATE_ALLOC_ALIGN - 1)).next_multiple_of(DEFLATE_ALLOC_ALIGN);
+        // The typed storage allocation is already 64-byte aligned; only trailing
+        // padding to a whole storage unit is necessary.
+        let total_size = curr_size.next_multiple_of(DEFLATE_ALLOC_ALIGN);
 
         Self {
             window_bits,
@@ -3984,16 +4378,12 @@ impl DeflateAllocOffsets {
         }
     }
 
-    /// Allocate raw storage and resolve the 64-byte-aligned interior base used by this layout.
-    fn allocate_storage<'a>(&self, alloc: &Allocator<'a>) -> Option<(NonNull<u8>, NonNull<u8>)> {
-        let allocation_start = alloc.allocate_slice_raw::<u8>(self.total_size)?;
-        let address = allocation_start.as_ptr() as usize;
-        let align_offset = address.next_multiple_of(DEFLATE_ALLOC_ALIGN) - address;
-        // SAFETY: `total_size` reserves `DEFLATE_ALLOC_ALIGN - 1` bytes of leading alignment
-        // headroom, and offsetting a non-null pointer within its allocation cannot produce null.
-        let aligned =
-            unsafe { NonNull::new_unchecked(allocation_start.as_ptr().add(align_offset)) };
-        Some((allocation_start, aligned))
+    /// Allocate cache-line-aligned typed storage through the common allocator.
+    ///
+    /// The allocator handles alignment even when custom C callbacks return
+    /// unaligned memory. No redundant adjustment or headroom is required.
+    fn allocate_storage(&self, alloc: &Allocator<'_>) -> Option<NonNull<AlignedAllocationBlock>> {
+        alloc.allocate_slice_raw::<AlignedAllocationBlock>(self.total_size / DEFLATE_ALLOC_ALIGN)
     }
 
     /// Allocate, initialize, and place one fresh deflate state using this layout.
@@ -4005,9 +4395,10 @@ impl DeflateAllocOffsets {
         alloc: &Allocator<'a>,
         init: DeflateStateInit,
     ) -> Option<NonNull<State<'a>>> {
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
-        // SAFETY: `aligned` is the fresh layout base returned by `allocate_storage` and remains
-        // owned by the state until `end` releases `allocation_start` through the same allocator.
+        let allocation_start = self.allocate_storage(alloc)?;
+        let aligned = allocation_start.cast();
+        // SAFETY: aligned is the fresh 64-byte-aligned typed storage allocation and
+        // remains owned by the state until matching typed deallocation in end().
         let DeflateAllocBuffers {
             state_ptr,
             window,
@@ -4057,20 +4448,44 @@ impl DeflateAllocOffsets {
             gzindex: 0,
             medium_next_match: MatchCandidate::EMPTY,
             data_type: crate::c_api::Z_UNKNOWN,
-            _padding_0: [0; 4],
+            padding_0: [0; 4],
             _cache_line_3: (),
             crc_fold: Crc32Fold::new(),
             allocation_start,
             total_allocation_size: self.total_size,
-            l_desc: TreeDesc::EMPTY,
-            d_desc: TreeDesc::EMPTY,
-            bl_desc: TreeDesc::EMPTY,
+            l_desc: TreeDesc::new(&StaticTreeDesc::L),
+            d_desc: TreeDesc::new(&StaticTreeDesc::D),
+            bl_desc: TreeDesc::new(&StaticTreeDesc::BL),
         };
 
         // SAFETY: `state_ptr` is the aligned State region in this fresh allocation and no State
         // has previously been materialized there.
         unsafe { state_ptr.write(state) };
         NonNull::new(state_ptr)
+    }
+
+    /// Resolve the six nonoverlapping regions of the layout from its aligned allocation base.
+    ///
+    /// # Safety
+    ///
+    /// The aligned pointer must designate the 64-byte-aligned start of a writable
+    /// typed allocation large enough for all six regions, and remain live while used.
+    const unsafe fn regions<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocRegions<'a> {
+        let base = aligned.as_ptr();
+
+        // SAFETY: offsets are within this same allocated region and multiples of
+        // DEFLATE_ALLOC_ALIGN. The base alignment and const assertions establish the
+        // alignment of every typed target.
+        unsafe {
+            DeflateAllocRegions {
+                state: base.add(self.state_pos).cast(),
+                window: base.add(self.window_pos),
+                prev: base.add(self.prev_pos).cast(),
+                head: base.add(self.head_pos).cast(),
+                pending: base.add(self.pending_pos).cast(),
+                sym_buf: base.add(self.sym_buf_pos),
+            }
+        }
     }
 
     /// Resolve this layout inside one raw allocator block and initialize every region whose typed
@@ -4080,34 +4495,38 @@ impl DeflateAllocOffsets {
     ///
     /// `aligned` must be the aligned interior base of a writable allocation described by this
     /// layout, remain alive for `'a`, and not be aliased by another live deflate state.
-    unsafe fn initialize_buffers<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocBuffers<'a> {
-        let base = aligned.as_ptr();
+    const unsafe fn initialize_buffers<'a>(&self, aligned: NonNull<u8>) -> DeflateAllocBuffers<'a> {
+        // SAFETY: the caller supplies the aligned base of an independent allocation described
+        // by this layout; each returned region has the required alignment and valid extent.
+        let DeflateAllocRegions {
+            state: state_ptr,
+            window: window_ptr,
+            prev: prev_ptr,
+            head: head_ptr,
+            pending: pending_ptr,
+            sym_buf: sym_buf_ptr,
+        } = unsafe { self.regions(aligned) };
         let w_size = 1usize << self.window_bits;
 
-        let window_ptr = unsafe { base.add(self.window_pos) };
-        let window = unsafe { Window::from_raw_parts(window_ptr, self.window_bits) };
+        // SAFETY: all regions are disjoint, adequately sized, and backed by this live allocation.
+        // The position tables are initialized before creating their typed views.
+        unsafe {
+            let window = Window::from_raw_parts(window_ptr, self.window_bits);
+            prev_ptr.write_bytes(0, w_size);
+            let prev = WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size);
+            head_ptr.write_bytes(0, 1);
+            let head = WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr);
+            let pending = Pending::from_raw_parts(pending_ptr.cast(), self.lit_bufsize * LIT_BUFS);
+            let sym_buf = SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize * (LIT_BUFS - 1));
 
-        let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
-        unsafe { prev_ptr.write_bytes(0, w_size) };
-        let prev = unsafe { WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size) };
-
-        let head_ptr = unsafe { base.add(self.head_pos).cast::<[Pos; HASH_SIZE]>() };
-        unsafe { head_ptr.write_bytes(0, 1) };
-        let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
-
-        let pending_ptr = unsafe { base.add(self.pending_pos).cast::<MaybeUninit<u8>>() };
-        let pending = unsafe { Pending::from_raw_parts(pending_ptr, self.lit_bufsize * LIT_BUFS) };
-
-        let sym_buf_ptr = unsafe { base.add(self.sym_buf_pos) };
-        let sym_buf = unsafe { SymBuf::from_raw_parts(sym_buf_ptr, self.lit_bufsize) };
-
-        DeflateAllocBuffers {
-            state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
+            DeflateAllocBuffers {
+                state_ptr,
+                window,
+                prev,
+                head,
+                pending,
+                sym_buf,
+            }
         }
     }
 
@@ -4123,37 +4542,39 @@ impl DeflateAllocOffsets {
         aligned: NonNull<u8>,
         source: &State<'_>,
     ) -> DeflateAllocBuffers<'a> {
-        let base = aligned.as_ptr();
+        // SAFETY: caller guarantees a fresh destination allocation disjoint from source.
+        let DeflateAllocRegions {
+            state: state_ptr,
+            window: window_ptr,
+            prev: prev_ptr,
+            head: head_ptr,
+            pending: pending_ptr,
+            sym_buf: sym_buf_ptr,
+        } = unsafe { self.regions(aligned) };
         let w_size = 1usize << self.window_bits;
         debug_assert_eq!(source.w_size, w_size);
         debug_assert_eq!(source.lit_bufsize, self.lit_bufsize);
 
-        let window_ptr = unsafe { base.add(self.window_pos) };
-        let window = unsafe { source.window.clone_to(window_ptr) };
+        // SAFETY: all destination regions are sized and aligned by the shared layout; none
+        // overlap the source buffers. Each typed view is created only after its contents
+        // have been cloned into the new allocation.
+        unsafe {
+            let window = source.window.clone_to(window_ptr);
+            prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len());
+            let prev = WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size);
+            head_ptr.copy_from_nonoverlapping(source.head.as_ptr(), 1);
+            let head = WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr);
+            let pending = source.bit_writer.pending.clone_to(pending_ptr);
+            let sym_buf = source.sym_buf.clone_to(sym_buf_ptr);
 
-        let prev_ptr = unsafe { base.add(self.prev_pos).cast::<Pos>() };
-        unsafe { prev_ptr.copy_from_nonoverlapping(source.prev.as_ptr(), source.prev.len()) };
-        let prev = unsafe { WeakSliceMut::from_raw_parts_mut(prev_ptr, w_size) };
-
-        let head_ptr = unsafe { base.add(self.head_pos).cast::<[Pos; HASH_SIZE]>() };
-        unsafe { head_ptr.copy_from_nonoverlapping(source.head.as_ptr(), 1) };
-        let head = unsafe { WeakArrayMut::<Pos, HASH_SIZE>::from_ptr(head_ptr) };
-
-        let pending = unsafe {
-            source
-                .bit_writer
-                .pending
-                .clone_to(base.add(self.pending_pos))
-        };
-        let sym_buf = unsafe { source.sym_buf.clone_to(base.add(self.sym_buf_pos)) };
-
-        DeflateAllocBuffers {
-            state_ptr: unsafe { base.add(self.state_pos).cast::<State<'a>>() },
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
+            DeflateAllocBuffers {
+                state_ptr,
+                window,
+                prev,
+                head,
+                pending,
+                sym_buf,
+            }
         }
     }
 
@@ -4176,28 +4597,16 @@ impl DeflateAllocOffsets {
         );
         assert_eq!(self.total_size, source.total_allocation_size);
 
-        let (allocation_start, aligned) = self.allocate_storage(alloc)?;
+        let allocation_start = self.allocate_storage(alloc)?;
+        let aligned = allocation_start.cast();
 
         // SAFETY: `aligned` is a fresh layout base and the cloned buffer views below are the only
         // destination views over their respective allocation regions.
-        let DeflateAllocBuffers {
-            state_ptr,
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
-        } = unsafe { self.clone_buffers(aligned, source) };
-
-        let state = source.clone_rebound(
-            window,
-            prev,
-            head,
-            pending,
-            sym_buf,
-            allocation_start,
-            self.total_size,
-        );
+        let buffers = unsafe { self.clone_buffers(aligned, source) };
+        // The storage pointer must be saved before moving the live views into
+        // the destination State. Every view is tied to this same allocation.
+        let state_ptr = buffers.state_ptr;
+        let state = source.clone_rebound(buffers, allocation_start, self.total_size);
 
         // SAFETY: `state_ptr` is the aligned State region in this fresh allocation and no State
         // has previously been materialized there.
@@ -4214,8 +4623,1391 @@ mod test {
     };
 
     use super::*;
+    use crate::allocate::{misaligned_alloc_callback, misaligned_free_callback, MisalignedAlloc};
 
-    use core::{ffi::CStr, sync::atomic::AtomicUsize};
+    use core::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn owned_stream_rejects_invalid_config_and_does_not_double_free_after_end(
+    ) -> Result<(), ReturnCode> {
+        let invalid = DeflateConfig {
+            level: i32::MAX,
+            ..DeflateConfig::default()
+        };
+        assert!(matches!(
+            DeflateStream::new(invalid),
+            Err(ReturnCode::StreamError)
+        ));
+
+        let mut owned = DeflateStream::new(DeflateConfig::default())?;
+        assert!(!owned.state.as_ptr().is_null());
+        assert!(end(&mut owned).is_ok());
+        assert!(owned.state.as_ptr().is_null());
+        // Drop must not release state a second time after explicit deflateEnd.
+        drop(owned);
+        Ok(())
+    }
+
+    #[test]
+    fn whole_slice_invalid_compression_config_preserves_caller_storage() {
+        let invalid = [
+            DeflateConfig {
+                level: i32::MIN,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                level: i32::MAX,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                window_bits: i32::MIN,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                window_bits: i32::MAX,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                mem_level: i32::MIN,
+                ..DeflateConfig::default()
+            },
+            DeflateConfig {
+                mem_level: i32::MAX,
+                ..DeflateConfig::default()
+            },
+        ];
+
+        for config in invalid {
+            let mut initialized = [0xa5u8; 64];
+            let (compressed, status) = compress_slice(&mut initialized, b"input", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(compressed, &[]);
+            assert_eq!(initialized, [0xa5; 64]);
+
+            let mut uninitialized = [MaybeUninit::new(0xa5u8); 64];
+            let (compressed, status) = compress(&mut uninitialized, b"input", config);
+            assert_eq!(status, ReturnCode::StreamError);
+            assert_eq!(compressed, &[]);
+            // SAFETY: every slot started initialized, and rejected initialization
+            // never writes to caller storage or makes existing bytes uninitialized.
+            let untouched = uninitialized.map(|byte| unsafe { byte.assume_init() });
+            assert_eq!(untouched, [0xa5; 64]);
+        }
+    }
+
+    #[test]
+    fn near_optimal_input_length_preflight_prevents_suffix_index_overflow() {
+        assert_eq!(near_optimal::checked_suffix_input_len(0), Ok(0));
+        assert_eq!(near_optimal::checked_suffix_input_len(1), Ok(1));
+        if let Ok(max_rank_len) = usize::try_from(u32::MAX) {
+            assert_eq!(
+                near_optimal::checked_suffix_input_len(max_rank_len),
+                Ok(u32::MAX)
+            );
+            if let Some(too_large) = max_rank_len.checked_add(1) {
+                assert_eq!(
+                    near_optimal::checked_suffix_input_len(too_large),
+                    Err(ReturnCode::StreamError)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_near_optimal_stream_uses_validated_full_symbol_capacity() -> Result<(), ReturnCode> {
+        let default = DeflateStream::new(DeflateConfig::new(9))?;
+        assert!(default.state.lit_bufsize < near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE);
+        drop(default);
+
+        let owned = DeflateStream::new_with_lit_bufsize(
+            DeflateConfig::new(9),
+            Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
+        )?;
+        assert_eq!(
+            owned.state.lit_bufsize,
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE
+        );
+        drop(owned);
+
+        // An invalid custom allocation geometry must return an error without
+        // materializing a partially initialized, owned stream.
+        for invalid in [0, near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE + 1, usize::MAX] {
+            assert!(matches!(
+                DeflateStream::new_with_lit_bufsize(DeflateConfig::new(9), Some(invalid)),
+                Err(ReturnCode::StreamError)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_deflate_configs_cover_only_valid_wrappers_and_parameters(
+    ) -> Result<(), &'static str> {
+        let mut generator = quickcheck::Gen::new(64);
+        let mut windows = [false; 21];
+        let mut strategies = [false; 5];
+        for _ in 0..4096 {
+            let config = <DeflateConfig as quickcheck::Arbitrary>::arbitrary(&mut generator);
+            assert!((0..=9).contains(&config.level));
+            assert!((1..=9).contains(&config.mem_level));
+            assert_eq!(config.method, Method::Deflated);
+            let index = match config.window_bits {
+                9..=15 => usize::try_from(config.window_bits - 9),
+                25..=31 => usize::try_from(config.window_bits - 25 + 7),
+                -15..=-9 => usize::try_from(config.window_bits + 15 + 14),
+                _ => return Err("invalid window bits generated"),
+            };
+            let index = index.map_err(|_| "generated window index does not fit usize")?;
+            windows[index] = true;
+            let strategy = match config.strategy {
+                Strategy::Default => 0,
+                Strategy::Filtered => 1,
+                Strategy::HuffmanOnly => 2,
+                Strategy::Rle => 3,
+                Strategy::Fixed => 4,
+            };
+            strategies[strategy] = true;
+        }
+        assert!(windows.into_iter().all(|observed| observed));
+        assert!(strategies.into_iter().all(|observed| observed));
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_extra_wire_length_uses_low_sixteen_bits_and_exact_prefix() -> Result<(), &'static str> {
+        for (length, expected) in [
+            (0usize, 0u16),
+            (1, 1),
+            (usize::from(u16::MAX), u16::MAX),
+            (usize::from(u16::MAX) + 1, 0),
+            (usize::from(u16::MAX) + 2, 1),
+        ] {
+            assert_eq!(gzip_extra_wire_len(length), expected);
+            let extra = vec![0x5au8; length];
+            let mut header = gz_header {
+                extra: extra.as_ptr().cast_mut(),
+                extra_len: crate::c_api::uInt::try_from(length)
+                    .map_err(|_| "gzip XLEN fixture exceeds C unsigned")?,
+                ..gz_header::default()
+            };
+            // SAFETY: extra is live for the length declared by header;
+            // the metadata pointer is borrowed only for this test scope.
+            let view = unsafe { GzipHeaderRef::new(&mut header) };
+            let emitted = view.encoded_extra();
+            assert_eq!(emitted.map(<[u8]>::len), Some(usize::from(expected)));
+            assert!(emitted.is_some_and(|bytes| bytes.iter().all(|&value| value == 0x5a)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_bound_tracks_encoded_extra_length_not_original_buffer() -> Result<(), &'static str> {
+        let extra = vec![0x5au8; usize::from(u16::MAX) + 2];
+        let mut reference_bound = None;
+        let mut reference_bytes = None;
+
+        for advertised_length in [1usize, extra.len()] {
+            let mut header = gz_header {
+                extra: extra.as_ptr().cast_mut(),
+                extra_len: crate::c_api::uInt::try_from(advertised_length)
+                    .map_err(|_| "extra fixture length exceeds C unsigned")?,
+                ..gz_header::default()
+            };
+            let config = DeflateConfig {
+                window_bits: 16 + crate::MAX_WBITS,
+                ..DeflateConfig::default()
+            };
+            let mut raw = z_stream::default();
+            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            // SAFETY: init created a uniquely owned, live deflate state.
+            let stream = (unsafe { DeflateStream::from_stream_mut(&raw mut raw) })
+                .ok_or("initialized gzip stream lacks a state")?;
+            // SAFETY: the header and extra backing buffer remain live, readable,
+            // and unmodified throughout compression.
+            let header_status = unsafe { set_header(stream, Some(&mut header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
+            let predicted = bound(Some(stream), 0);
+            let mut encoded = [0u8; 128];
+            stream.next_out = encoded.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(encoded.len())
+                .map_err(|_| "output buffer exceeds C unsigned")?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            let written = encoded.len()
+                - usize::try_from(stream.avail_out)
+                    .map_err(|_| "output remaining count exceeds pointer width")?;
+            assert!(written <= predicted);
+            assert_eq!(&encoded[10..13], &[1, 0, 0x5a]);
+            assert!(end(stream).is_ok());
+
+            if let Some(expected) = reference_bound {
+                assert_eq!(predicted, expected);
+                assert_eq!(
+                    &encoded[..written],
+                    reference_bytes.as_deref().ok_or("missing baseline")?
+                );
+            } else {
+                reference_bound = Some(predicted);
+                reference_bytes = Some(encoded[..written].to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_trailer_serializes_modular_c_input_total_without_large_buffers(
+    ) -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        let config = DeflateConfig {
+            window_bits: 16 + crate::MAX_WBITS,
+            ..DeflateConfig::default()
+        };
+        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+        // SAFETY: initialized deflate state is live and borrowed exclusively.
+        let stream = (unsafe { DeflateStream::from_stream_mut(&raw mut raw) })
+            .ok_or("initialized stream missing deflate state")?;
+        // On 64-bit Unix this sets high bits without allocating a 4 GiB input;
+        // on a 32-bit C ABI it still validates the same modulo wire contract.
+        let total = crate::c_api::z_size::MAX - crate::c_api::z_size::from(u32::MAX)
+            + crate::c_api::z_size::from(19u32);
+        stream.total_in = total;
+
+        let mut encoded = [0u8; 128];
+        stream.next_out = encoded.as_mut_ptr();
+        stream.avail_out = crate::c_api::uInt::try_from(encoded.len())
+            .map_err(|_| "output fixture exceeds C unsigned")?;
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let written = encoded.len()
+            - usize::try_from(stream.avail_out)
+                .map_err(|_| "output remaining count exceeds pointer width")?;
+        assert!(written >= 18);
+        assert_eq!(&encoded[written - 8..written - 4], &[0, 0, 0, 0]);
+        assert_eq!(&encoded[written - 4..written], &[19, 0, 0, 0]);
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_header_and_checksum_preserve_low_wire_bits() {
+        let mut header = gz_header {
+            time: crate::c_api::z_checksum::MAX,
+            os: -1,
+            hcrc: 1,
+            ..gz_header::default()
+        };
+        // SAFETY: all header metadata pointers are null; the live C header
+        // outlives the borrowed view in this test.
+        let view = unsafe { GzipHeaderRef::new(&mut header) };
+        assert_eq!(view.time(), u32::MAX);
+        assert_eq!(view.os(), u8::MAX);
+        assert!(view.hcrc());
+        assert_eq!(view.flags() & 2, 2);
+
+        let bytes = b"stream checksum high-bits";
+        for initial in [
+            crate::c_api::z_checksum::from(u32::MAX),
+            crate::c_api::z_checksum::MAX,
+        ] {
+            let mut adler = StreamChecksum(initial);
+            adler.update_adler(bytes);
+            assert_eq!(
+                adler.value(),
+                crate::c_api::z_checksum::from(adler32(u32::MAX, bytes))
+            );
+            let mut crc = StreamChecksum(initial);
+            crc.update_crc(bytes);
+            assert_eq!(
+                crc.value(),
+                crate::c_api::z_checksum::from(crc32(u32::MAX, bytes))
+            );
+        }
+    }
+
+    #[test]
+    fn compress_bound_never_wraps_below_its_input_length() {
+        // No allocation: these are mathematical length queries only.
+        let cases = [
+            0,
+            1,
+            8,
+            9,
+            1_024,
+            usize::MAX / 9,
+            usize::MAX / 2,
+            usize::MAX - 64,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
+        for n in cases {
+            let bound = compress_bound(n);
+            assert!(bound >= n, "bound wrapped for source length {n}");
+        }
+        assert_eq!(compress_bound(usize::MAX), usize::MAX);
+
+        // Existing zlib-sized requests keep exactly their historical bound.
+        for n in [0, 1, 8, 9, 1_024, 65_536, 1_000_000] {
+            assert_eq!(compress_bound(n), compress_bound_abi(n));
+        }
+    }
+
+    #[test]
+    fn huffman_tree_histograms_preserve_codes_and_bit_costs() {
+        fn validate<const N: usize>(descriptor: &'static StaticTreeDesc, seed: u32) {
+            let mut tree = TreeDesc::<N>::new(descriptor);
+            let mut frequencies = [0u16; N];
+            let mut value = seed.wrapping_add(0x9e37_79b9);
+            for (index, frequency) in frequencies[..descriptor.elems].iter_mut().enumerate() {
+                value ^= value << 13;
+                value ^= value >> 17;
+                value ^= value << 5;
+                *frequency = if (seed as usize + index) % 7 == 0 {
+                    0
+                } else {
+                    u16::from(value.to_le_bytes()[0] % 64) + 1
+                };
+                *tree.dyn_tree[index].freq_mut() = *frequency;
+            }
+
+            let mut optimal_bits = 0usize;
+            let mut static_bits = 0usize;
+            build_tree(&mut tree, &mut optimal_bits, &mut static_bits);
+            let maximum = usize::from(descriptor.max_length);
+            let mut kraft = 0usize;
+            let mut expected_optimal = 0usize;
+            let mut expected_static = 0usize;
+            let mut codes = Vec::new();
+            for (index, (&frequency, symbol)) in frequencies[..descriptor.elems]
+                .iter()
+                .zip(&tree.dyn_tree[..descriptor.elems])
+                .enumerate()
+            {
+                let length = usize::from(symbol.len());
+                if length > 0 {
+                    assert!(length <= maximum);
+                    kraft += 1usize << (maximum - length);
+                    codes.push((symbol.code(), length));
+                } else {
+                    assert_eq!(frequency, 0, "a used symbol lacks a Huffman code");
+                }
+                if frequency != 0 {
+                    let extra = descriptor
+                        .extra_bits
+                        .get(index.saturating_sub(descriptor.extra_base))
+                        .filter(|_| index >= descriptor.extra_base)
+                        .copied()
+                        .map_or(0, usize::from);
+                    expected_optimal += usize::from(frequency) * (length + extra);
+                    if !descriptor.static_tree.is_empty() {
+                        expected_static += usize::from(frequency)
+                            * (usize::from(descriptor.static_tree[index].len()) + extra);
+                    }
+                }
+            }
+            assert_eq!(kraft, 1usize << maximum, "incomplete Huffman alphabet");
+            assert_eq!(optimal_bits, expected_optimal);
+            assert_eq!(static_bits, expected_static);
+            for (position, &(left_code, left_length)) in codes.iter().enumerate() {
+                for &(right_code, right_length) in &codes[position + 1..] {
+                    let shared = left_length.min(right_length);
+                    let mask = (1u16 << shared) - 1;
+                    assert_ne!(left_code & mask, right_code & mask, "prefix collision");
+                }
+            }
+        }
+
+        for seed in 0..16 {
+            validate::<HEAP_SIZE>(&StaticTreeDesc::L, seed);
+            validate::<{ 2 * D_CODES + 1 }>(&StaticTreeDesc::D, seed);
+            validate::<{ 2 * BL_CODES + 1 }>(&StaticTreeDesc::BL, seed);
+        }
+    }
+
+    #[test]
+    fn skewed_huffman_tree_respects_length_limit_and_exact_cost() {
+        // Fibonacci frequencies produce a tree much deeper than the seven-bit
+        // wire limit of the 19-symbol code-length alphabet. This exercises
+        // the overflow repair rather than only the ordinary heap path.
+        let mut desc = TreeDesc::<{ 2 * BL_CODES + 1 }>::new(&StaticTreeDesc::BL);
+        let (mut previous, mut current) = (1u16, 1u16);
+        let mut original_frequencies = [0u16; BL_CODES];
+        for (symbol, frequency) in original_frequencies.iter_mut().enumerate() {
+            *frequency = previous;
+            *desc.dyn_tree[symbol].freq_mut() = previous;
+            (previous, current) = (current, previous + current);
+        }
+
+        let (mut optimal_bits, mut static_bits) = (0usize, 0usize);
+        build_tree(&mut desc, &mut optimal_bits, &mut static_bits);
+        assert_eq!(desc.max_code, BL_CODES - 1);
+        assert_eq!(static_bits, 0);
+
+        let mut kraft = 0usize;
+        let mut exact_cost = 0usize;
+        let max_length = usize::from(StaticTreeDesc::BL.max_length);
+        for symbol in 0..BL_CODES {
+            let value = desc.dyn_tree[symbol];
+            let length = usize::from(value.len());
+            assert!((1..=max_length).contains(&length));
+            kraft += 1usize << (max_length - length);
+            // After gen_codes, Value::a holds the codeword, not frequency.
+            // Compute the cost using the independently retained histogram.
+            exact_cost += usize::from(original_frequencies[symbol])
+                * (length + usize::from(StaticTreeDesc::EXTRA_BLBITS[symbol]));
+        }
+        assert_eq!(
+            kraft,
+            1usize << max_length,
+            "Huffman prefix space is incomplete"
+        );
+        assert_eq!(
+            optimal_bits, exact_cost,
+            "overflow correction lost bit cost"
+        );
+        // The assigned bit-reversed codewords must remain prefix-free.
+        for left in 0..BL_CODES {
+            for right in left + 1..BL_CODES {
+                let a = desc.dyn_tree[left];
+                let b = desc.dyn_tree[right];
+                let shared = usize::from(a.len().min(b.len()));
+                let mask = (1u16 << shared) - 1;
+                assert_ne!(
+                    a.code() & mask,
+                    b.code() & mask,
+                    "Huffman codes for {left} and {right} have a prefix collision"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn huffman_heap_initialization_has_explicit_empty_and_sparse_origins(
+    ) -> Result<(), crate::ReturnCode> {
+        for active in [None, Some(0usize), Some(1), Some(D_CODES - 1)] {
+            let mut leaves = [Value::new(0, 0); D_CODES];
+            if let Some(code) = active {
+                *leaves[code].freq_mut() = 1;
+            }
+
+            let mut heap = Heap::new();
+            assert_eq!(heap.initialize(&mut leaves), active);
+            assert_eq!(heap.active_len, usize::from(active.is_some()));
+            if let Some(code) = active {
+                assert_eq!(heap.nodes[Heap::SMALLEST], code);
+            }
+
+            let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+            let mut desc = TreeDesc::<{ 2 * D_CODES + 1 }>::new(&StaticTreeDesc::D);
+            if let Some(code) = active {
+                *desc.dyn_tree[code].freq_mut() = 1;
+            }
+            let state = &mut *stream.state;
+            build_tree(&mut desc, &mut state.opt_len, &mut state.static_len);
+            let expected_max = match active {
+                None | Some(0) => 1,
+                Some(1) => 2,
+                Some(code) => code,
+            };
+            assert_eq!(desc.max_code, expected_max);
+            let used: Vec<usize> = desc.dyn_tree[..D_CODES]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| (v.len() != 0).then_some(i))
+                .collect();
+            assert_eq!(used.len(), 2, "sparse Huffman alphabet {active:?}");
+            if let Some(code) = active {
+                assert!(used.contains(&code));
+            } else {
+                assert_eq!(used, [0, 1]);
+            }
+            for &code in &used {
+                assert_eq!(desc.dyn_tree[code].len(), 1);
+            }
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_match_bits_preserve_every_static_length_and_distance_boundary() {
+        for length in 0..=u8::MAX {
+            let length_bits = encode_len(&trees_tbl::STATIC_LTREE, usize::from(length));
+            let precalculated = trees_tbl::STATIC_LTREE_ENCODINGS[usize::from(length)];
+            assert_eq!(u64::from(precalculated.code()), length_bits.value);
+            assert_eq!(
+                u8::try_from(precalculated.len()).ok(),
+                Some(length_bits.len)
+            );
+
+            // Exhaust every valid distance; no width is narrowed after
+            // concatenation. The complete match always fits the 64-bit writer.
+            for distance in 1..=32768u16 {
+                let distance_bits = encode_dist(&trees_tbl::STATIC_DTREE, distance);
+                let mut combined = length_bits;
+                combined.append(distance_bits);
+                assert!(combined.len <= 64);
+                if combined.len != 64 {
+                    assert_eq!(combined.value >> combined.len, 0);
+                }
+                assert_eq!(
+                    combined.value & ((1u64 << length_bits.len) - 1),
+                    length_bits.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bit_writer_matches_independent_lsb_first_stream_across_reservoir_boundaries(
+    ) -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let writer = &mut stream.state.bit_writer;
+        let mut expected_bits = Vec::new();
+        for len in [0u8, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 1, 64, 8, 0, 7, 63] {
+            let value = if len == 0 { 0 } else { u64::MAX >> (64 - len) };
+            let packed = PackedBits::new(value, len);
+            writer.send_bits(packed.value, packed.len);
+            for bit in 0..len {
+                expected_bits.push(((value >> bit) & 1) != 0);
+            }
+        }
+        writer.emit_align();
+        let mut expected = vec![0u8; expected_bits.len().div_ceil(8)];
+        for (index, bit) in expected_bits.iter().copied().enumerate() {
+            if bit {
+                expected[index / 8] |= 1 << (index % 8);
+            }
+        }
+        assert_eq!(writer.pending.pending(), expected);
+        assert_eq!(writer.bits_valid, 0);
+        assert_eq!(writer.bit_buffer, 0);
+        let last_bits = expected_bits.len() % 8;
+        assert_eq!(
+            usize::from(writer.bits_used),
+            if last_bits == 0 { 8 } else { last_bits }
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "packed DEFLATE sequence contains bits beyond its width")]
+    fn packed_bits_reject_unaccounted_high_bits() {
+        let _ = PackedBits::new(0b100, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid DEFLATE Huffman code length")]
+    fn packed_huffman_length_is_checked_before_narrowing() {
+        // The Huffman node length shares storage with its 16-bit parent index.
+        // A malformed width of 256 must not silently encode as zero bits.
+        let _ = PackedBits::code(Value::new(0, 256));
+    }
+
+    #[test]
+    #[should_panic(expected = "packed DEFLATE sequence exceeds reservoir width")]
+    fn packed_bits_reject_overwide_concatenation() {
+        let mut bits = PackedBits::new(u64::MAX, 64);
+        bits.append(PackedBits::new(1, 1));
+    }
+
+    #[test]
+    fn code_length_runs_cover_literal_repeat_and_zero_boundaries() {
+        use CodeLengthRun::{Literal, RepeatPrevious, RepeatZero};
+
+        let cases: &[(Vec<u16>, Vec<CodeLengthRun>)] = &[
+            (
+                vec![0; 2],
+                vec![Literal {
+                    length: 0,
+                    count: 2,
+                }],
+            ),
+            (
+                vec![0; 3],
+                vec![RepeatZero {
+                    code: REPZ_3_10,
+                    count: 3,
+                }],
+            ),
+            (
+                vec![0; 10],
+                vec![RepeatZero {
+                    code: REPZ_3_10,
+                    count: 10,
+                }],
+            ),
+            (
+                vec![0; 11],
+                vec![RepeatZero {
+                    code: REPZ_11_138,
+                    count: 11,
+                }],
+            ),
+            (
+                vec![0; 138],
+                vec![RepeatZero {
+                    code: REPZ_11_138,
+                    count: 138,
+                }],
+            ),
+            (
+                vec![1; 3],
+                vec![Literal {
+                    length: 1,
+                    count: 3,
+                }],
+            ),
+            (
+                vec![1; 6],
+                vec![RepeatPrevious {
+                    length: 1,
+                    count: 5,
+                    emit_initial: true,
+                }],
+            ),
+            (
+                vec![1; 10],
+                vec![
+                    RepeatPrevious {
+                        length: 1,
+                        count: 6,
+                        emit_initial: true,
+                    },
+                    RepeatPrevious {
+                        length: 1,
+                        count: 3,
+                        emit_initial: false,
+                    },
+                ],
+            ),
+        ];
+        for (lengths, expected) in cases {
+            let tree: Vec<Value> = lengths.iter().map(|&len| Value::new(0, len)).collect();
+            let mut actual = Vec::new();
+            for_each_code_length_run(&tree, lengths.len() - 1, |run| actual.push(run));
+            assert_eq!(&actual, expected, "RLE boundary {lengths:?}");
+        }
+    }
+
+    #[test]
+    fn code_length_runs_roundtrip_randomized() {
+        use CodeLengthRun::{Literal, RepeatPrevious, RepeatZero};
+
+        // Every run expands to the original lengths, even when zeros and
+        // nonzero codes alternate and split across repeat boundaries.
+        for seed in 0..32u32 {
+            let mut state = seed ^ 0x9e37_79b9;
+            let mut lengths = Vec::with_capacity(512);
+            for _ in 0..512 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let raw = state.to_le_bytes()[0];
+                lengths.push(if raw.trailing_zeros() >= 2 {
+                    0
+                } else {
+                    u16::from(raw % 16)
+                });
+            }
+            let tree: Vec<Value> = lengths.iter().map(|&len| Value::new(0, len)).collect();
+            let mut rebuilt = Vec::new();
+            for_each_code_length_run(&tree, lengths.len() - 1, |run| match run {
+                Literal { length, count } => {
+                    rebuilt.extend(core::iter::repeat_n(length, usize::from(count)));
+                }
+                RepeatPrevious {
+                    length,
+                    count,
+                    emit_initial,
+                } => {
+                    if emit_initial {
+                        rebuilt.push(length);
+                    } else {
+                        assert_eq!(rebuilt.last().copied(), Some(length));
+                    }
+                    rebuilt.extend(core::iter::repeat_n(length, usize::from(count)));
+                }
+                RepeatZero { count, .. } => {
+                    rebuilt.extend(core::iter::repeat_n(0, usize::from(count)));
+                }
+            });
+            assert_eq!(rebuilt, lengths, "random RLE case seed {seed}");
+        }
+    }
+
+    #[test]
+    fn unflushed_block_span_tracks_slid_out_prefixes() {
+        let window = 1usize << crate::MAX_WBITS;
+        let slid_origin = -(1isize << crate::MAX_WBITS);
+        assert_eq!(unflushed_block_span(100, 10), (Some(10), 90));
+        assert_eq!(unflushed_block_span(100, 100), (Some(100), 0));
+        assert_eq!(unflushed_block_span(100, -1), (None, 101));
+        assert_eq!(
+            unflushed_block_span(window, slid_origin),
+            (None, window * 2)
+        );
+        assert_eq!(
+            unflushed_block_span(window + 4, slid_origin),
+            (None, window * 2 + 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "block start is after the current position")]
+    fn unflushed_block_span_rejects_future_origin() {
+        let _ = unflushed_block_span(10, 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "unflushed block length exceeds host integer range")]
+    fn unflushed_block_span_rejects_overflow() {
+        let _ = unflushed_block_span(usize::MAX, isize::MIN);
+    }
+
+    #[test]
+    fn compressed_block_survives_multiple_window_slides_before_flush() -> Result<(), &'static str> {
+        // Compressible input produces few tokens but crosses several window
+        // slides before the DEFLATE block is emitted. Its origin must remain
+        // outside the current window and its length must not narrow or wrap.
+        let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
+        for level in [1, 6, 9] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))
+                .map_err(|_| "valid deflate initialization failed")?;
+            let mut output = vec![0u8; compress_bound(source.len()) + 64];
+            stream.next_in = source.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(source.len())
+                .map_err(|_| "test input exceeds ABI length")?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| "test output exceeds ABI length")?;
+
+            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+            assert_eq!(stream.avail_in, 0);
+            assert!(
+                stream.state.block_start < 0,
+                "level {level} did not leave a block spanning a window slide"
+            );
+            let (window_offset, block_len) =
+                unflushed_block_span(stream.state.strstart, stream.state.block_start);
+            assert_eq!(window_offset, None);
+            assert!(block_len > stream.state.w_size);
+            assert!(block_len <= source.len());
+
+            assert_eq!(
+                deflate(&mut stream, DeflateFlush::Finish),
+                ReturnCode::StreamEnd
+            );
+            let written = usize::try_from(stream.total_out)
+                .map_err(|_| "test output count exceeds host usize")?;
+            assert!(end(&mut stream).is_ok());
+            let mut decoded = vec![0u8; source.len()];
+            let (restored, code) = crate::decompress_slice(
+                &mut decoded,
+                &output[..written],
+                crate::InflateConfig::default(),
+            );
+            assert_eq!(code, ReturnCode::Ok, "level {level} did not decode");
+            assert_eq!(restored, source, "level {level} round-trip mismatch");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_valid_window_bits_slide_positions_and_round_trip() -> Result<(), &'static str> {
+        // Cross multiple window slides at every supported zlib window size.
+        // Exercising the encoder and inflater catches stale match positions
+        // that a direct hash-table test cannot observe.
+        let source = b"ABCDxyzXYZ01234abcdefghij".repeat(6_000);
+        for window_bits in 9..=crate::MAX_WBITS {
+            for level in [1, 6, 9] {
+                let config = DeflateConfig {
+                    level,
+                    window_bits,
+                    ..DeflateConfig::default()
+                };
+                let mut stream = DeflateStream::new(config)
+                    .map_err(|_| "valid window configuration failed to initialize")?;
+                let mut output = vec![0u8; compress_bound(source.len()) + 64];
+                stream.next_in = source.as_ptr().cast_mut();
+                stream.avail_in = crate::c_api::uInt::try_from(source.len())
+                    .map_err(|_| "test input exceeds ABI length")?;
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                    .map_err(|_| "test output exceeds ABI length")?;
+
+                assert_eq!(
+                    deflate(&mut stream, DeflateFlush::Finish),
+                    ReturnCode::StreamEnd,
+                    "window bits {window_bits}, level {level}"
+                );
+                assert_eq!(stream.avail_in, 0);
+                let written = usize::try_from(stream.total_out)
+                    .map_err(|_| "test output count exceeds host usize")?;
+                assert!(end(&mut stream).is_ok());
+                let mut decoded = vec![0u8; source.len()];
+                let (restored, status) = crate::decompress_slice(
+                    &mut decoded,
+                    &output[..written],
+                    crate::InflateConfig::default(),
+                );
+                assert_eq!(
+                    status,
+                    ReturnCode::Ok,
+                    "window bits {window_bits}, level {level}"
+                );
+                assert_eq!(
+                    restored, source,
+                    "round trip window bits {window_bits}, level {level}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resetting_a_state_with_invalid_compression_level_preserves_live_cursors(
+    ) -> Result<(), ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let original_level = stream.state.level;
+        let original_total_in = stream.total_in;
+        let original_total_out = stream.total_out;
+        let original_start = stream.state.strstart;
+        for invalid in [i8::MIN, -1, 10, i8::MAX] {
+            stream.state.level = invalid;
+            assert_eq!(reset(&mut stream), ReturnCode::StreamError);
+            assert_eq!(stream.total_in, original_total_in);
+            assert_eq!(stream.total_out, original_total_out);
+            assert_eq!(stream.state.strstart, original_start);
+        }
+        stream.state.level = original_level;
+        assert_eq!(reset(&mut stream), ReturnCode::Ok);
+        let _ = end(&mut stream);
+        Ok(())
+    }
+
+    #[test]
+    fn level_change_flushes_block_with_origin_outside_window() -> Result<(), &'static str> {
+        let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
+        for (initial_level, next_level) in [(1, 6), (6, 9), (9, 1)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))
+                .map_err(|_| "valid deflate initialization failed")?;
+            let mut output = vec![0u8; compress_bound(source.len()) + 256];
+            stream.next_in = source.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(source.len())
+                .map_err(|_| "test input exceeds ABI length")?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| "test output exceeds ABI length")?;
+
+            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+            assert_eq!(stream.avail_in, 0);
+            assert!(stream.state.block_start < 0);
+            assert!(
+                unflushed_block_span(stream.state.strstart, stream.state.block_start).1
+                    > stream.state.w_size
+            );
+
+            assert_eq!(
+                params(&mut stream, next_level, Strategy::Default),
+                ReturnCode::Ok,
+                "level transition {initial_level} -> {next_level} failed"
+            );
+            assert_eq!(i32::from(stream.state.level), next_level);
+            assert!(stream.state.block_start >= 0);
+            assert_eq!(
+                stream.state.block_start.unsigned_abs(),
+                stream.state.strstart
+            );
+            assert_eq!(
+                deflate(&mut stream, DeflateFlush::Finish),
+                ReturnCode::StreamEnd
+            );
+            let written =
+                usize::try_from(stream.total_out).map_err(|_| "test output exceeds host usize")?;
+            assert!(end(&mut stream).is_ok());
+            let mut decoded = vec![0u8; source.len()];
+            let (restored, status) = crate::decompress_slice(
+                &mut decoded,
+                &output[..written],
+                crate::InflateConfig::default(),
+            );
+            assert_eq!(status, ReturnCode::Ok);
+            assert_eq!(restored, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_header_emits_real_length_without_payload_or_rewrite() -> Result<(), crate::ReturnCode>
+    {
+        for len in [0usize, 1, 255, 256, 32_768, MAX_STORED] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(0))?;
+            emit_stored_block_header(&mut stream.state, len, true);
+            let fields = stored_block_length_fields(len);
+            let pending = stream.state.bit_writer.pending.pending();
+            assert_eq!(pending, &[&[1u8][..], &fields[..]].concat());
+            #[cfg(feature = "ZLIB_DEBUG")]
+            {
+                assert_eq!(stream.state.bit_writer.compressed_len, 32);
+                assert_eq!(stream.state.bit_writer.bits_sent, 40);
+            }
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_length_fields_cover_entire_wire_range() {
+        for length in [0usize, 1, 255, 256, 8_192, 32_768, MAX_STORED] {
+            let fields = stored_block_length_fields(length);
+            assert_eq!(&fields[..2], &length.to_le_bytes()[..2]);
+            assert_eq!(&fields[2..], &(!length).to_le_bytes()[..2]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "DEFLATE stored block payload must fit in 16 bits")]
+    fn stored_length_fields_reject_overflow_before_writing() {
+        let _ = stored_block_length_fields(MAX_STORED + 1);
+    }
+
+    #[test]
+    fn stored_streaming_fragmentation_preserves_bytes_across_window_slides(
+    ) -> Result<(), ReturnCode> {
+        let input: Vec<u8> = (0usize..190_001)
+            .map(|index| ((index * 37) ^ (index / 29)).to_le_bytes()[0])
+            .collect();
+
+        for window_bits in [-crate::MAX_WBITS, crate::MAX_WBITS, 16 + crate::MAX_WBITS] {
+            for mem_level in [1, 8] {
+                let config = DeflateConfig {
+                    window_bits,
+                    mem_level,
+                    ..DeflateConfig::new(0)
+                };
+                for chunk_size in [7, 509, 32_768] {
+                    let compressed = compress_with_output_chunks(&input, config, chunk_size)?;
+                    let mut restored = vec![0u8; input.len()];
+                    let (decoded, status) = crate::decompress_slice(
+                        &mut restored,
+                        &compressed,
+                        InflateConfig { window_bits },
+                    );
+                    assert_eq!(
+                        status, ReturnCode::Ok,
+                        "stored roundtrip status for window_bits={window_bits}, mem_level={mem_level}, out_chunk={chunk_size}"
+                    );
+                    assert_eq!(
+                        decoded, input,
+                        "stored roundtrip mismatch for window_bits={window_bits}, mem_level={mem_level}, out_chunk={chunk_size}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_and_compressed_level_transitions_preserve_long_history(
+    ) -> Result<(), SchedulerFixtureError> {
+        let before: Vec<u8> = (0usize..160_000)
+            .map(|index| ((index * 17) ^ (index / 43)).to_le_bytes()[0])
+            .collect();
+        let after = b"level-transition-stored-and-huffman/".repeat(3_000);
+        for (old_level, new_level) in [(0, 6), (6, 0)] {
+            let mut raw = z_stream::default();
+            let config = DeflateConfig {
+                mem_level: 1,
+                ..DeflateConfig::new(old_level)
+            };
+            let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+            let stream = owned.stream()?;
+            let mut output = vec![0u8; compress_bound(before.len() + after.len()) + 1024];
+            stream.next_in = before.as_ptr().cast_mut();
+            stream.avail_in = before
+                .len()
+                .try_into()
+                .map_err(|_| SchedulerFixtureError::Invariant("input too long"))?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output
+                .len()
+                .try_into()
+                .map_err(|_| SchedulerFixtureError::Invariant("output too long"))?;
+
+            while stream.avail_in > 0 {
+                assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+                assert_ne!(stream.avail_out, 0);
+            }
+            assert_eq!(params(stream, new_level, Strategy::Default), ReturnCode::Ok);
+            assert_eq!(i32::from(stream.state.level), new_level);
+
+            stream.next_in = after.as_ptr().cast_mut();
+            stream.avail_in = after
+                .len()
+                .try_into()
+                .map_err(|_| SchedulerFixtureError::Invariant("tail too long"))?;
+            loop {
+                match deflate(stream, DeflateFlush::Finish) {
+                    ReturnCode::Ok => assert_ne!(stream.avail_out, 0),
+                    ReturnCode::StreamEnd => break,
+                    other => return Err(SchedulerFixtureError::Native(other)),
+                }
+            }
+            let written = usize::try_from(stream.total_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("output size exceeds usize"))?;
+            assert_eq!(stream.avail_in, 0);
+            assert!(end(stream).is_ok());
+            drop(owned);
+
+            let mut original = before.clone();
+            original.extend_from_slice(&after);
+            let mut restored = vec![0u8; original.len()];
+            let (decoded, code) = crate::decompress_slice(
+                &mut restored,
+                &output[..written],
+                InflateConfig::default(),
+            );
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(decoded, original, "level {old_level}->{new_level}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_mode_never_reads_a_slid_out_block_start() -> Result<(), crate::ReturnCode> {
+        let mut stream = DeflateStream::new(DeflateConfig::new(0))?;
+        stream.state.block_start = -1;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_compressor(&mut stream, |compressor| {
+                self::algorithm::run(compressor, DeflateFlush::Finish)
+            })
+        }));
+        assert!(
+            result.is_err(),
+            "unavailable stored history must fail before accessing output"
+        );
+        stream.state.block_start = 0;
+        assert!(end(&mut stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn stored_block_large_lengths_preserve_bytes_and_debug_bit_counts(
+    ) -> Result<(), crate::ReturnCode> {
+        for len in [8_191usize, 8_192, 16_384, 32_768, usize::from(u16::MAX)] {
+            let source: Vec<u8> = (0..len)
+                .map(|i| (i * 29 + i / 13).to_le_bytes()[0])
+                .collect();
+            // A maximum-sized stored block needs five bytes of header space beyond 64 KiB.
+            let mut stream = DeflateStream::new(DeflateConfig {
+                mem_level: 9,
+                ..DeflateConfig::new(0)
+            })?;
+            // SAFETY: source is an initialized, non-overlapping buffer and its bytes
+            // remain live while the stream copies the complete window prefix.
+            unsafe {
+                stream
+                    .state
+                    .window
+                    .copy_and_initialize(0..len, source.as_ptr());
+            }
+            zng_tr_stored_block(&mut stream.state, 0..len, true);
+
+            let pending = stream.state.bit_writer.pending.pending();
+            assert_eq!(pending.len(), len + 5);
+            assert_eq!(pending[0], 1);
+            assert_eq!(&pending[1..3], &len.to_le_bytes()[..2]);
+            assert_eq!(&pending[3..5], &(!len).to_le_bytes()[..2]);
+            assert_eq!(&pending[5..], source.as_slice());
+
+            #[cfg(feature = "ZLIB_DEBUG")]
+            {
+                assert_eq!(
+                    stream.state.bit_writer.compressed_len,
+                    32 + len * 8,
+                    "stored {len}-byte payload must count its full width"
+                );
+                assert_eq!(
+                    stream.state.bit_writer.bits_sent,
+                    40 + len * 8,
+                    "stored {len}-byte payload and header must count exactly"
+                );
+            }
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn window_refill_seeds_hash_by_history_representation_not_tuned_chain(
+    ) -> Result<(), &'static str> {
+        let source = b"ABCDABCD0123456789".repeat(32);
+        let rolling_seed = RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]));
+
+        for (level, chain, expected_seed) in [
+            (7, 4_096, 0),
+            (7, 128, 0),
+            (9, 128, rolling_seed),
+            (9, 4_096, rolling_seed),
+        ] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))
+                .map_err(|_| "valid deflate initialization failed")?;
+            assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
+            let mut input = InputCursor::from_slice(&source, stream.total_in)
+                .ok_or("test source length must fit zlib uInt")?;
+            let mut checksum = StreamChecksum::from_stream(&stream);
+            fill_window_core(&mut stream.state, &mut input, &mut checksum);
+            assert_eq!(input.avail_in, 0, "the refill should consume all the input");
+            assert_eq!(
+                stream.state.ins_h, expected_seed,
+                "level {level}, tuned chain {chain}, hash mode {:?}",
+                stream.state.hash_calc_variant
+            );
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn level_changes_preserve_live_hash_table_representation() -> Result<(), crate::ReturnCode> {
+        let dictionary: Vec<u8> = (0..4_096usize)
+            .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
+            .collect();
+
+        for (old_level, new_level, expected_roll) in [(7, 9, false), (9, 7, true), (6, 9, false)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(old_level))?;
+            assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
+            assert!(stream.state.strstart > 0);
+            assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
+            assert_eq!(
+                params(&mut stream, new_level, Strategy::Default),
+                ReturnCode::Ok
+            );
+
+            assert_eq!(
+                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
+                expected_roll,
+                "level change {old_level} to {new_level} reinterpreted existing hash history",
+            );
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tune_wide_parameters_do_not_wrap_to_zero() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::new(9)), ReturnCode::Ok);
+        // SAFETY: init succeeded and its state is live, uniquely borrowed by this test.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("deflate state missing after init")?;
+
+        // All four tunables are upper bounds or comparison thresholds. A positive
+        // value beyond u16 range must not become zero after narrowing.
+        assert_eq!(tune(stream, 65_536, 65_536, 65_536, 65_536), ReturnCode::Ok);
+        assert_eq!(stream.state.good_match, u16::MAX);
+        assert_eq!(stream.state.max_lazy_match, u16::MAX);
+        assert_eq!(stream.state.max_insert_length, u16::MAX);
+        assert_eq!(stream.state.nice_match, u16::MAX);
+        assert_eq!(stream.state.max_chain_length, u16::MAX);
+
+        // A negative C i32 forwarded by the C wrapper becomes a large usize.
+        // It must remain a high threshold rather than wrapping into a short one.
+        assert_eq!(
+            tune(stream, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+            ReturnCode::Ok
+        );
+        assert_eq!(stream.state.max_chain_length, u16::MAX);
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn call_cursors_commit_all_abi_fields_and_rebind_history_per_turn(
+    ) -> Result<(), crate::ReturnCode> {
+        let source = *b"cursorruntime";
+        let mut destination = [0u8; 16];
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in = 8;
+        stream.total_in = crate::c_api::z_size::MAX - 2;
+        stream.next_out = destination.as_mut_ptr();
+        stream.avail_out = 16;
+        stream.total_out = crate::c_api::z_size::MAX - 1;
+        stream.data_type = crate::c_api::Z_TEXT;
+
+        let first = with_compressor(&mut stream, |compressor| {
+            assert_eq!(compressor.state.data_type, crate::c_api::Z_TEXT);
+            assert_eq!(compressor.input.consumed_here(), 0);
+            compressor
+                .input
+                .copy_to_window(&mut compressor.state.window, 0..5);
+            compressor.output.write_all(&source[..3]);
+            compressor.checksum.update_adler(&source[..5]);
+            compressor.state.data_type = crate::c_api::Z_BINARY;
+            compressor.input.consumed_here()
+        });
+        assert_eq!(first, 5);
+        assert_eq!(stream.avail_in, 3);
+        assert_eq!(stream.avail_out, 13);
+        assert_eq!(stream.total_in, 2);
+        assert_eq!(stream.total_out, 1);
+        assert_eq!(stream.next_in, source.as_ptr().wrapping_add(5).cast_mut());
+        assert_eq!(stream.next_out, destination.as_mut_ptr().wrapping_add(3));
+        assert_eq!(&destination[..3], &source[..3]);
+        assert_eq!(&stream.state.window.filled()[..5], &source[..5]);
+        assert_eq!(
+            stream.adler,
+            crate::adler32::adler32(1u32, &source[..5]).into()
+        );
+        assert_eq!(stream.data_type, crate::c_api::Z_BINARY);
+
+        // A second invocation must not reuse the previous call's readable
+        // history allowance or reset the newly committed public counters.
+        let stream_adler = stream.adler;
+        let second = with_compressor(&mut stream, |compressor| {
+            assert_eq!(compressor.input.consumed_here(), 0);
+            assert_eq!(compressor.input.avail_in, 3);
+            assert_eq!(compressor.output.remaining, 13);
+            assert_eq!(compressor.checksum.value(), stream_adler);
+            compressor.input.consume(2);
+            compressor.output.write_all(&source[5..7]);
+            (compressor.input.consumed_here(), compressor.output.total)
+        });
+        assert_eq!(second, (2, 3));
+        assert_eq!(stream.avail_in, 1);
+        assert_eq!(stream.avail_out, 11);
+        assert_eq!(stream.total_in, 4);
+        assert_eq!(stream.total_out, 3);
+        assert_eq!(&destination[..3], &source[..3]);
+        assert_eq!(&destination[3..5], &source[5..7]);
+        assert!(end(&mut stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn input_cursor_history_is_scoped_to_current_call() -> Result<(), &'static str> {
+        let source = b"two separate caller buffers";
+        let mut first = InputCursor::from_slice(&source[..8], crate::c_api::z_size::MAX - 1)
+            .ok_or("the eight-byte input must fit in zlib uInt")?;
+        assert_eq!(first.consumed_here(), 0);
+        first.consume(5);
+        assert_eq!(first.consumed_here(), 5);
+        assert_eq!(first.avail_in, 3);
+        assert_eq!(first.total_in, 3);
+
+        // Changing the caller input buffer resets the readable history budget, even
+        // though total_in carries the wrapped counter from the previous invocation.
+        let next = InputCursor::from_slice(&source[8..], first.total_in)
+            .ok_or("the second input must fit in zlib uInt")?;
+        assert_eq!(next.consumed_here(), 0);
+        assert_eq!(next.total_in, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn deflate_total_out_wraps_like_unsigned_c_counter() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        let mut output = [0u8; 128];
+        // SAFETY: init succeeded and the stream owns a live, exclusively borrowed deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("freshly initialized deflate stream was not usable")?;
+        stream.total_out = crate::c_api::z_size::MAX - 1;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = 128; // Fixed-size output array.
+
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let written = output.len() - stream.avail_out as usize;
+        assert!(written >= 8);
+        assert_eq!(
+            stream.total_out,
+            (crate::c_api::z_size::MAX - 1).wrapping_add(written as crate::c_api::z_size)
+        );
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_match_tokens_do_not_modify_encoder_state() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init created the live uniquely owned Deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("initialized stream has no state")?;
+        {
+            let state = &mut *stream.state;
+            let max_distance = state.w_mask() + 1;
+            let original = (
+                state.matches,
+                state.sym_buf.iter().collect::<Vec<_>>(),
+                state
+                    .l_desc
+                    .dyn_tree
+                    .iter()
+                    .map(|value| value.freq())
+                    .collect::<Vec<_>>(),
+                state
+                    .d_desc
+                    .dyn_tree
+                    .iter()
+                    .map(|value| value.freq())
+                    .collect::<Vec<_>>(),
+            );
+
+            for (distance, len, limit) in [
+                (0, 0, max_distance),
+                (max_distance + 1, 0, max_distance),
+                (usize::from(u16::MAX) + 1, 0, max_distance),
+                (1, usize::from(u8::MAX) + 1, max_distance),
+                (max_distance + 1, 0, max_distance + 1),
+            ] {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.tally_dist_with_limit(distance, len, limit);
+                    }))
+                    .is_err(),
+                    "invalid match {distance}/{len} must be rejected"
+                );
+                assert_eq!(
+                    (
+                        state.matches,
+                        state.sym_buf.iter().collect::<Vec<_>>(),
+                        state
+                            .l_desc
+                            .dyn_tree
+                            .iter()
+                            .map(|value| value.freq())
+                            .collect::<Vec<_>>(),
+                        state
+                            .d_desc
+                            .dyn_tree
+                            .iter()
+                            .map(|value| value.freq())
+                            .collect::<Vec<_>>(),
+                    ),
+                    original,
+                    "failed match must leave tokens and Huffman frequencies intact"
+                );
+            }
+
+            // Full window distance and the 258-byte maximum are both legal.
+            let _ = state.tally_dist_with_limit(
+                max_distance,
+                STD_MAX_MATCH - STD_MIN_MATCH,
+                max_distance,
+            );
+            assert_eq!(state.matches, original.0 + 1);
+            assert_eq!(
+                state
+                    .sym_buf
+                    .iter()
+                    .last()
+                    .map(|(dist, len)| (usize::from(dist), len)),
+                Some((max_distance, u8::MAX))
+            );
+        }
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn detect_data_type_basic() {
@@ -4241,45 +6033,59 @@ mod test {
     }
 
     #[test]
-    fn data_type_override_round_trips_through_state_only_encoder() {
+    fn data_type_override_round_trips_through_state_only_encoder(
+    ) -> Result<(), SchedulerFixtureError> {
+        const CALLER_DATA_TYPE: i32 = 12_345;
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+        let stream = owned.stream()?;
 
         // zlib only auto-detects when this field is Z_UNKNOWN. Preserve arbitrary caller metadata.
-        const CALLER_DATA_TYPE: i32 = 12_345;
         stream.data_type = CALLER_DATA_TYPE;
 
         let input = b"plain text that is compressible plain text that is compressible";
         let mut output = [0u8; 1024];
-        stream.next_in = input.as_ptr() as *mut _;
-        stream.avail_in = input.len() as _;
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
 
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
         assert_eq!(stream.data_type, CALLER_DATA_TYPE);
         assert_eq!(stream.state.data_type, CALLER_DATA_TYPE);
+        let produced = output
+            .len()
+            .checked_sub(usize::try_from(stream.avail_out).map_err(|_| ReturnCode::StreamError)?)
+            .ok_or(ReturnCode::StreamError)?;
         assert!(end(stream).is_ok());
+
+        let mut restored = [0u8; 256];
+        let (decoded, status) =
+            crate::decompress_slice(&mut restored, &output[..produced], InflateConfig::default());
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+        Ok(())
     }
 
     #[test]
-    fn from_stream_mut() {
-        unsafe {
-            assert!(DeflateStream::from_stream_mut(core::ptr::null_mut()).is_none());
+    fn from_stream_mut() -> Result<(), ReturnCode> {
+        // SAFETY: the accessor explicitly checks for null before reading the stream.
+        assert!(unsafe { DeflateStream::from_stream_mut(core::ptr::null_mut()) }.is_none());
 
-            let mut stream = z_stream::default();
-            assert!(DeflateStream::from_stream_mut(&mut stream).is_none());
+        let mut raw = z_stream::default();
+        // SAFETY: default construction leaves state null; the accessor checks
+        // that pointer before attempting to borrow deflate's initialized state.
+        assert!(unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.is_none());
 
-            // state is still NULL
-            assert!(DeflateStream::from_stream_mut(&mut stream).is_none());
-
-            init(&mut stream, DeflateConfig::default());
-            let stream = DeflateStream::from_stream_mut(&mut stream);
-            assert!(stream.is_some());
-
-            assert!(end(stream.unwrap()).is_ok());
-        }
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: initialization succeeded and this test has exclusive
+        // ownership of the live state until the matching end below.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
+        assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[cfg(feature = "c-allocator")]
@@ -4288,15 +6094,19 @@ mod test {
         items: crate::c_api::uInt,
         size: crate::c_api::uInt,
     ) -> crate::c_api::voidpf {
+        // SAFETY: each test passes the address of a live, properly aligned
+        // AtomicUsize as opaque. It outlives every allocator callback made by
+        // its native stream, and atomic increments permit concurrent calls.
         let count = unsafe { &*(opaque as *const AtomicUsize) };
 
-        if count.fetch_add(1, core::sync::atomic::Ordering::Relaxed) != N {
-            // must use the C allocator internally because (de)allocation is based on function
-            // pointer values and because we don't use the rust allocator directly, the allocation
-            // logic will store the pointer to the start at the start of the allocation.
-            unsafe { (crate::allocate::C.zalloc)(opaque, items, size) }
-        } else {
+        if count.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == N {
             core::ptr::null_mut()
+        } else {
+            // The C allocator's deallocation matches its callback address;
+            // the corresponding zfree is installed in the same stream.
+            // SAFETY: the original opaque pointer and C ABI item/count
+            // values are forwarded unchanged to the live native allocator.
+            unsafe { (crate::allocate::C.zalloc)(opaque, items, size) }
         }
     }
 
@@ -4308,7 +6118,7 @@ mod test {
             let mut stream = z_stream {
                 zalloc: Some(fail_nth_allocation::<0>),
                 zfree: Some(crate::allocate::C.zfree),
-                opaque: &atomic as *const _ as *const core::ffi::c_void as *mut _,
+                opaque: (&raw const atomic).cast::<core::ffi::c_void>().cast_mut(),
                 ..z_stream::default()
             };
             assert_eq!(
@@ -4319,21 +6129,24 @@ mod test {
     }
 
     #[test]
-    fn near_optimal_partition_can_merge_beyond_stored_limit() {
-        fn repeated_tokens(mut bytes: usize) -> Vec<near_optimal::ParseToken> {
+    fn near_optimal_partition_can_merge_beyond_stored_limit() -> Result<(), SchedulerFixtureError> {
+        fn repeated_tokens(mut bytes: usize) -> Result<Vec<near_optimal::ParseToken>, ReturnCode> {
             let mut tokens = Vec::new();
+            if bytes == 0 {
+                return Ok(tokens);
+            }
             tokens.push(near_optimal::ParseToken::Literal(b'a'));
             bytes -= 1;
             while bytes >= STD_MAX_MATCH {
                 tokens.push(near_optimal::ParseToken::Match {
-                    length: STD_MAX_MATCH as u16,
+                    length: u16::try_from(STD_MAX_MATCH).map_err(|_| ReturnCode::StreamError)?,
                     distance: 1,
                 });
                 bytes -= STD_MAX_MATCH;
             }
             if bytes >= STD_MIN_MATCH {
                 tokens.push(near_optimal::ParseToken::Match {
-                    length: bytes as u16,
+                    length: u16::try_from(bytes).map_err(|_| ReturnCode::StreamError)?,
                     distance: 1,
                 });
             } else {
@@ -4342,40 +6155,46 @@ mod test {
                     bytes,
                 ));
             }
-            tokens
+            Ok(tokens)
         }
 
+        assert_eq!(repeated_tokens(0)?, Vec::new());
+        assert_eq!(repeated_tokens(1)?.len(), 1);
         let mut raw = z_stream::default();
-        assert_eq!(
-            init_with_lit_bufsize(
-                &mut raw,
-                DeflateConfig::new(9),
-                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-            ),
-            ReturnCode::Ok
-        );
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::with_lit_bufsize(
+            &mut raw,
+            DeflateConfig::new(9),
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE,
+        )?;
+        let stream = owned.stream()?;
         let mut left = near_optimal::PlannedBlock {
             range: 0..60_000,
-            tokens: repeated_tokens(60_000),
+            tokens: repeated_tokens(60_000)?,
         };
         let mut right = near_optimal::PlannedBlock {
             range: 60_000..120_000,
-            tokens: repeated_tokens(60_000),
+            tokens: repeated_tokens(60_000)?,
         };
 
         let outcome =
-            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
-            panic!("expected identical compressible blocks to merge");
+            return Err(SchedulerFixtureError::Invariant(
+                "near-optimal 120,000-byte token partitions failed to merge",
+            ));
         };
         assert_eq!(merged.range, 0..120_000);
         assert!(merged.tokens.len() <= near_optimal::MAX_BLOCK_TOKENS);
+        assert_eq!(left.tokens.as_slice(), &[]);
+        assert_eq!(right.tokens.as_slice(), &[]);
+        // A successful native teardown is itself an ABI invariant.
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn near_optimal_partition_respects_huffman_token_capacity() {
+    fn near_optimal_partition_respects_huffman_token_capacity() -> Result<(), SchedulerFixtureError>
+    {
         fn literal_block(range: core::ops::Range<usize>) -> near_optimal::PlannedBlock {
             near_optimal::PlannedBlock {
                 tokens: vec![near_optimal::ParseToken::Literal(b'a'); range.len()],
@@ -4384,30 +6203,29 @@ mod test {
         }
 
         let mut raw = z_stream::default();
-        assert_eq!(
-            init_with_lit_bufsize(
-                &mut raw,
-                DeflateConfig::new(9),
-                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-            ),
-            ReturnCode::Ok
-        );
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::with_lit_bufsize(
+            &mut raw,
+            DeflateConfig::new(9),
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE,
+        )?;
+        let stream = owned.stream()?;
 
         let half = near_optimal::MAX_BLOCK_TOKENS / 2;
         let mut left = literal_block(0..half);
         let mut right = literal_block(half..near_optimal::MAX_BLOCK_TOKENS);
         let outcome =
-            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         let near_optimal::BoundaryOptimization::Merged(merged) = outcome else {
-            panic!("the exact 65,534-token Huffman capacity should remain mergeable");
+            return Err(SchedulerFixtureError::Invariant(
+                "the exact 65,534-token Huffman capacity should remain mergeable",
+            ));
         };
         assert_eq!(merged.tokens.len(), near_optimal::MAX_BLOCK_TOKENS);
 
         let mut left = literal_block(0..half);
         let mut right = literal_block(half..near_optimal::MAX_BLOCK_TOKENS + 1);
         let outcome =
-            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right);
+            near_optimal::optimize_token_partition(&mut stream.state, &mut left, &mut right)?;
         assert!(!matches!(
             outcome,
             near_optimal::BoundaryOptimization::Merged(_)
@@ -4416,11 +6234,13 @@ mod test {
             left.tokens.len() + right.tokens.len(),
             near_optimal::MAX_BLOCK_TOKENS + 1
         );
+        // A successful native teardown is itself an ABI invariant.
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn near_optimal_emits_exact_huffman_token_capacity() {
+    fn near_optimal_emits_exact_huffman_token_capacity() -> Result<(), SchedulerFixtureError> {
         let input = vec![b'a'; near_optimal::MAX_BLOCK_TOKENS];
         let block = near_optimal::PlannedBlock {
             range: 0..input.len(),
@@ -4428,40 +6248,38 @@ mod test {
         };
         let mut output = vec![0u8; compress_bound(input.len())];
         let mut raw = z_stream::default();
-        assert_eq!(
-            init_with_lit_bufsize(
-                &mut raw,
-                DeflateConfig::new(9),
-                Some(near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE),
-            ),
-            ReturnCode::Ok
-        );
+        let mut owned = ScopedDeflateStream::with_lit_bufsize(
+            &mut raw,
+            DeflateConfig::new(9),
+            near_optimal::NEAR_OPTIMAL_LIT_BUFSIZE,
+        )?;
 
         let produced = {
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+            let stream = owned.stream()?;
             let state = &mut *stream.state;
-            state
-                .bit_writer
-                .pending
-                .extend(&state.header().to_be_bytes());
+            let header = state.header()?;
+            state.bit_writer.pending.extend(&header.to_be_bytes());
             let mut produced = 0usize;
             assert!(drain_near_optimal_pending(
                 state,
                 &mut output,
                 &mut produced
             ));
-            assert!(emit_planned_near_optimal_block(
-                state,
-                &input,
-                &block,
-                true,
-                &mut output,
-                &mut produced,
-            ));
+            assert_eq!(
+                emit_planned_near_optimal_block(
+                    state,
+                    &input,
+                    &block,
+                    true,
+                    &mut output,
+                    &mut produced,
+                ),
+                Ok(true)
+            );
             state
                 .bit_writer
                 .pending
-                .extend(&adler32(ADLER32_INITIAL_VALUE as u32, &input).to_be_bytes());
+                .extend(&adler32(ADLER32_INITIAL_VALUE, &input).to_be_bytes());
             assert!(drain_near_optimal_pending(
                 state,
                 &mut output,
@@ -4470,17 +6288,20 @@ mod test {
             produced
         };
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        assert!(end(stream).is_ok());
+        // Finalize before verifying the emitted zlib stream, checking the
+        // native teardown status rather than only relying on Drop.
+        assert!(end(owned.stream()?).is_ok());
+        drop(owned);
         let mut decoded = vec![0u8; input.len()];
         let (decoded, code) =
             decompress_slice(&mut decoded, &output[..produced], InflateConfig::default());
         assert_eq!(code, ReturnCode::Ok);
         assert_eq!(decoded, input);
+        Ok(())
     }
 
     #[test]
-    fn init_allocation_geometry_matches_config() {
+    fn init_allocation_geometry_matches_config() -> Result<(), ReturnCode> {
         for (window_bits, mem_level) in [(MIN_WBITS, 1), (MAX_WBITS, MAX_MEM_LEVEL)] {
             let mut raw = z_stream::default();
             let config = DeflateConfig {
@@ -4489,12 +6310,22 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+            // SAFETY: a preceding successful init owns a live deflate state; this test
+            // holds the only mutable borrow of its raw stream during this operation.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                .ok_or(ReturnCode::StreamError)?;
 
             let effective_window_bits = if window_bits == 8 { 9 } else { window_bits };
-            let w_size = 1usize << effective_window_bits;
-            let lit_bufsize = 1usize << (mem_level + 6);
-            let layout = DeflateAllocOffsets::new(effective_window_bits as usize, lit_bufsize);
+            let bits =
+                usize::try_from(effective_window_bits).map_err(|_| ReturnCode::StreamError)?;
+            let mem_bits = usize::try_from(mem_level + 6).map_err(|_| ReturnCode::StreamError)?;
+            let w_size = 1usize
+                .checked_shl(u32::try_from(bits).map_err(|_| ReturnCode::StreamError)?)
+                .ok_or(ReturnCode::StreamError)?;
+            let lit_bufsize = 1usize
+                .checked_shl(u32::try_from(mem_bits).map_err(|_| ReturnCode::StreamError)?)
+                .ok_or(ReturnCode::StreamError)?;
+            let layout = DeflateAllocOffsets::new(bits, lit_bufsize);
 
             assert_eq!(stream.state.w_size, w_size);
             assert_eq!(stream.state.window.capacity(), 2 * w_size);
@@ -4506,81 +6337,205 @@ mod test {
             );
             assert!(stream.state.sym_buf.is_empty());
             assert_eq!(stream.state.total_allocation_size, layout.total_size);
+            let logical_end = layout.sym_buf_pos + lit_bufsize * (LIT_BUFS - 1);
             assert_eq!(
-                stream.state.as_ptr() as usize % DEFLATE_ALLOC_ALIGN,
+                layout.total_size,
+                logical_end.next_multiple_of(DEFLATE_ALLOC_ALIGN),
+                "typed allocation has no redundant leading alignment slack"
+            );
+            assert_eq!(
+                stream.state.as_ptr().addr() % DEFLATE_ALLOC_ALIGN,
                 0,
                 "State placement must retain its cache-line alignment"
             );
 
             assert!(end(stream).is_ok());
         }
+        Ok(())
+    }
+
+    /// A valid zalloc callback is not required to return cache-line-aligned
+    /// memory. Cover every possible remainder and both initialization/copy.
+    #[test]
+    fn custom_unaligned_allocator_preserves_state_layout_and_copy(
+    ) -> Result<(), SchedulerFixtureError> {
+        for remainder in 0..DEFLATE_ALLOC_ALIGN {
+            let mut ctx = MisalignedAlloc {
+                remainder,
+                modulus: ALLOCATION_BLOCK_BYTES,
+                allocations: 0,
+                frees: 0,
+                buffers: Vec::new(),
+            };
+            let mut raw = z_stream {
+                zalloc: Some(misaligned_alloc_callback),
+                zfree: Some(misaligned_free_callback),
+                opaque: (&raw mut ctx).cast(),
+                ..z_stream::default()
+            };
+            let config = DeflateConfig {
+                window_bits: if remainder % 2 == 0 {
+                    MIN_WBITS
+                } else {
+                    MAX_WBITS
+                },
+                mem_level: if remainder % 2 == 0 { 1 } else { MAX_MEM_LEVEL },
+                ..DeflateConfig::default()
+            };
+            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            let mut source_owner = ScopedDeflateStream::from_initialized(&mut raw)?;
+            let source = source_owner.stream()?;
+            assert_eq!(source.state.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.window.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.prev.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(source.state.head.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            source.state.prev.as_mut_slice()[0] = 0x1234;
+            source.state.head.as_mut_slice()[0] = 0x4321;
+            source.state.bit_writer.pending.extend(&[11, 22, 33]);
+
+            let mut dest = MaybeUninit::<DeflateStream>::uninit();
+            assert_eq!(copy(&mut dest, source), ReturnCode::Ok);
+            // SAFETY: successful native deflate copy constructed the entire
+            // independent state. Moving it into an owned Rust value ensures
+            // Drop releases it even on error or an assertion unwind.
+            let mut cloned = unsafe { dest.assume_init() };
+            assert_eq!(cloned.state.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.window.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.prev.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_eq!(cloned.state.head.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert_ne!(cloned.state.as_ptr(), source.state.as_ptr());
+            assert_ne!(cloned.state.window.as_ptr(), source.state.window.as_ptr());
+            assert_eq!(cloned.state.prev.as_slice()[0], 0x1234);
+            assert_eq!(cloned.state.head.as_slice()[0], 0x4321);
+            assert_eq!(cloned.state.bit_writer.pending.pending(), &[11, 22, 33]);
+            source.state.prev.as_mut_slice()[0] = 0xabcd;
+            assert_eq!(cloned.state.prev.as_slice()[0], 0x1234);
+            assert!(end(source).is_ok());
+            assert!(end(&mut cloned).is_ok());
+            drop(cloned);
+            drop(source_owner);
+            assert_eq!(
+                ctx.allocations, 2,
+                "allocation count at remainder {remainder}"
+            );
+            assert_eq!(ctx.frees, 2, "free count at remainder {remainder}");
+            assert!(
+                ctx.buffers.is_empty(),
+                "leaked buffers at remainder {remainder}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn set_dictionary_keeps_abi_input_cursor_detached() {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+    fn set_dictionary_keeps_abi_input_cursor_detached() -> Result<(), SchedulerFixtureError> {
+        // Exercise the exact window boundary: only the most recent window
+        // of history can be retained, while the zlib dictionary id covers
+        // all caller bytes (including bytes outside that window).
+        for dictionary_size in [0, 1, 31, 32_767, 32_768, 32_769] {
+            let mut raw = z_stream::default();
+            let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+            let stream = owned.stream()?;
 
-        // A caller may have already populated the next input cursor even though no bytes have been
-        // consumed yet. Dictionary setup must not temporarily publish its own slice through these
-        // ABI fields or disturb the caller's cursor.
-        let caller_input = b"future caller input";
-        stream.next_in = caller_input.as_ptr() as *mut u8;
-        stream.avail_in = caller_input.len() as _;
-        let original_next = stream.next_in;
-        let original_avail = stream.avail_in;
-        let total_before = stream.total_in;
+            let caller_input = b"future caller input";
+            stream.next_in = caller_input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(caller_input.len())
+                .map_err(|_| ReturnCode::StreamError)?;
+            let original_next = stream.next_in;
+            let original_avail = stream.avail_in;
+            let total_before = stream.total_in;
 
-        let retained = stream.state.w_size;
-        let dictionary = vec![0x5a; retained + 1];
-        assert_eq!(set_dictionary(stream, &dictionary), ReturnCode::Ok);
+            let retained = stream.state.w_size.min(dictionary_size);
+            let dictionary = vec![0x5au8; dictionary_size];
+            assert_eq!(set_dictionary(stream, &dictionary), ReturnCode::Ok);
 
-        assert_eq!(stream.next_in, original_next);
-        assert_eq!(stream.avail_in, original_avail);
-        assert_eq!(
-            stream.total_in,
-            total_before + retained as crate::c_api::z_size,
-            "only the logical-window tail is ingested into compression history"
-        );
-        assert_eq!(
-            stream.adler as u32,
-            adler32(ADLER32_INITIAL_VALUE as u32, &dictionary),
-            "zlib wrapper dictionary id still covers the entire supplied dictionary"
-        );
-
-        assert!(end(stream).is_ok());
+            assert_eq!(stream.next_in, original_next);
+            assert_eq!(stream.avail_in, original_avail);
+            let retained =
+                crate::c_api::z_size::try_from(retained).map_err(|_| ReturnCode::StreamError)?;
+            assert_eq!(
+                stream.total_in,
+                total_before
+                    .checked_add(retained)
+                    .ok_or(ReturnCode::StreamError)?,
+                "only the logical-window tail enters history: dictionary length {dictionary_size}"
+            );
+            let adler = u32::try_from(stream.adler).map_err(|_| ReturnCode::StreamError)?;
+            assert_eq!(
+                adler,
+                adler32(ADLER32_INITIAL_VALUE, &dictionary),
+                "zlib dictionary id must cover the whole dictionary: length {dictionary_size}"
+            );
+            assert!(end(stream).is_ok());
+        }
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "c-allocator")]
-    fn copy_invalid_allocator() {
+    fn copy_invalid_allocator() -> Result<(), SchedulerFixtureError> {
         let mut stream = z_stream::default();
 
         let atomic = AtomicUsize::new(0);
-        stream.opaque = &atomic as *const _ as *const core::ffi::c_void as *mut _;
+        stream.opaque = (&raw const atomic).cast::<core::ffi::c_void>().cast_mut();
         stream.zalloc = Some(fail_nth_allocation::<1>);
         stream.zfree = Some(crate::allocate::C.zfree);
 
         // Init consumes the first state allocation; fail the second allocation used by copy.
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
 
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
-            unreachable!()
-        };
+        let mut owned = ScopedDeflateStream::from_initialized(&mut stream)?;
+        let native = owned.stream()?;
+        let mut destination = MaybeUninit::<DeflateStream>::uninit();
 
-        let mut stream_copy = MaybeUninit::<DeflateStream>::zeroed();
-
-        assert_eq!(copy(&mut stream_copy, stream), ReturnCode::MemError);
-
-        assert!(end(stream).is_ok());
+        assert_eq!(copy(&mut destination, native), ReturnCode::MemError);
+        // This is the second allocation attempt: the first initialized the
+        // source, the deliberately failed second must not produce a clone.
+        assert_eq!(atomic.load(core::sync::atomic::Ordering::Relaxed), 2);
+        assert!(end(native).is_ok());
+        Ok(())
     }
 
     mod invalid_deflate_config {
         use super::*;
 
         #[test]
-        fn sanity_check() {
+        fn extreme_signed_parameters_reject_without_allocated_state() {
+            let invalid = [
+                DeflateConfig {
+                    level: i32::MIN,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    level: i32::MAX,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    window_bits: i32::MIN,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    window_bits: i32::MAX,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    mem_level: i32::MIN,
+                    ..DeflateConfig::default()
+                },
+                DeflateConfig {
+                    mem_level: i32::MAX,
+                    ..DeflateConfig::default()
+                },
+            ];
+            for config in invalid {
+                let mut stream = z_stream::default();
+                assert_eq!(init(&mut stream, config), ReturnCode::StreamError);
+                assert!(stream.state.is_null(), "invalid config allocated a state");
+            }
+        }
+
+        #[test]
+        fn sanity_check() -> Result<(), ReturnCode> {
             let mut stream = z_stream::default();
             assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
 
@@ -4588,14 +6543,17 @@ mod test {
             assert!(stream.zfree.is_some());
 
             // this should be the default level
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+            // SAFETY: successful init created a live state with a unique mutable borrow.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+                .ok_or(ReturnCode::StreamError)?;
             assert_eq!(stream.state.level, 6);
 
             assert!(end(stream).is_ok());
+            Ok(())
         }
 
         #[test]
-        fn window_bits_correction() {
+        fn window_bits_correction() -> Result<(), ReturnCode> {
             // window_bits of 8 gets turned into 9 internally
             let mut stream = z_stream::default();
             let config = DeflateConfig {
@@ -4603,10 +6561,47 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+            // SAFETY: successful init created a live state with a unique mutable borrow.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+                .ok_or(ReturnCode::StreamError)?;
             assert_eq!(stream.state.w_bits(), 9);
 
             assert!(end(stream).is_ok());
+            Ok(())
+        }
+
+        #[test]
+        fn zlib_header_rejects_invalid_internal_window_width() -> Result<(), ReturnCode> {
+            for configured_bits in [9, MAX_WBITS] {
+                let mut raw = z_stream::default();
+                assert_eq!(
+                    init(
+                        &mut raw,
+                        DeflateConfig {
+                            window_bits: configured_bits,
+                            ..DeflateConfig::default()
+                        },
+                    ),
+                    ReturnCode::Ok
+                );
+                // SAFETY: successful initialization created the live state;
+                // this test retains its unique mutable stream ownership.
+                let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+                    .ok_or(ReturnCode::StreamError)?;
+                let state = &mut stream.state;
+                let original_size = state.w_size;
+                let header = state.header()?;
+                assert_eq!(header % 31, 0);
+                assert_eq!(i32::from(header >> 12), configured_bits - 8);
+
+                for invalid_size in [0, 1usize << 16] {
+                    state.w_size = invalid_size;
+                    assert_eq!(state.header(), Err(ReturnCode::StreamError));
+                }
+                state.w_size = original_size;
+                assert!(end(stream).is_ok());
+            }
+            Ok(())
         }
 
         #[test]
@@ -4632,75 +6627,89 @@ mod test {
     }
 
     #[test]
-    fn end_leaves_null_abi_state_pointer() {
+    fn end_leaves_null_abi_state_pointer() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         assert!(end(stream).is_ok());
         assert!(stream.as_z_stream_mut().state.is_null());
         assert!(end(stream).is_err());
         assert!(stream.as_z_stream_mut().state.is_null());
+        Ok(())
     }
 
     #[test]
-    fn end_data_error() {
+    fn end_data_error() -> Result<(), ReturnCode> {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // next deflate into too little space
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut u8;
-        stream.avail_in = input.len() as _;
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
         let output = &mut [0, 0, 0];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
 
         // the deflate is fine
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
 
         // but end is not
         assert!(end(stream).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_reset_keep() {
+    fn test_reset_keep() -> Result<(), ReturnCode> {
         let mut stream = z_stream::default();
         assert_eq!(init(&mut stream, DeflateConfig::default()), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut stream) }
+            .ok_or(ReturnCode::StreamError)?;
 
         // next deflate into too little space
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut u8;
-        stream.avail_in = input.len() as _;
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
 
         let output = &mut [0; 1024];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
 
         assert_eq!(reset_keep(stream), ReturnCode::Ok);
 
         let output = &mut [0; 1024];
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn reset_keep_rewinds_partially_drained_pending_output() {
+    fn reset_keep_rewinds_partially_drained_pending_output() -> Result<(), SchedulerFixtureError> {
         let mut raw = z_stream::default();
         let config = DeflateConfig {
             window_bits: 31,
             mem_level: 1,
             ..Default::default()
         };
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-
         // Make the gzip name larger than the small mem_level=1 pending buffer. One deflate call
         // fills that buffer and drains only part of it, leaving `Pending::out` advanced while
         // bytes are still pending.
@@ -4721,16 +6730,21 @@ mod test {
             hcrc: 0,
             done: 0,
         };
-        assert_eq!(
-            unsafe { set_header(stream, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        // Initialize after header/name so both caller-owned buffers outlive
+        // the scoped native state, including on an early failed assertion.
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
+        // SAFETY: the header, name and output allocation are live and disjoint;
+        // the caller retains the header and name until this stream ends.
+        let header_status = unsafe { set_header(stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
 
         let mut output = [0u8; 400];
         stream.next_in = core::ptr::null_mut();
         stream.avail_in = 0;
         stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
         assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
 
         let capacity = stream.state.bit_writer.pending.capacity();
@@ -4746,10 +6760,43 @@ mod test {
         );
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn prime_reports_full_pending_buffer() {
+    fn prime_invalid_width_preserves_existing_bit_reservoir() -> Result<(), &'static str> {
+        let mut raw = z_stream::default();
+        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
+        // SAFETY: init created the live uniquely owned Deflate state.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or("initialized stream has no state")?;
+        assert_eq!(prime(stream, 3, 0b101), ReturnCode::Ok);
+
+        let writer = &stream.state.bit_writer;
+        let original = (
+            writer.bit_buffer,
+            writer.bits_valid,
+            writer.pending.pending().to_vec(),
+        );
+        for invalid_bits in [-1, 33, i32::MAX] {
+            assert_eq!(prime(stream, invalid_bits, -1), ReturnCode::BufError);
+            let writer = &stream.state.bit_writer;
+            assert_eq!(
+                (
+                    writer.bit_buffer,
+                    writer.bits_valid,
+                    writer.pending.pending().to_vec()
+                ),
+                original
+            );
+        }
+        assert_eq!(prime(stream, 0, -1), ReturnCode::Ok);
+        assert!(end(stream).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn prime_reports_full_pending_buffer() -> Result<(), ReturnCode> {
         let mut raw = z_stream::default();
         let config = DeflateConfig {
             window_bits: -15,
@@ -4757,7 +6804,10 @@ mod test {
             ..Default::default()
         };
         assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        // SAFETY: a preceding successful init owns a live deflate state; this test
+        // holds the only mutable borrow of its raw stream during this operation.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
         let calls = stream.state.bit_writer.pending.capacity() / 2;
         for _ in 0..calls {
@@ -4767,6 +6817,7 @@ mod test {
         assert_eq!(prime(stream, 16, 0xa55a), ReturnCode::BufError);
 
         assert!(end(stream).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -4872,84 +6923,296 @@ mod test {
         assert_eq!(EXPECTED, output);
     }
 
+    // Exercise the native zlib streaming contract with separately offered input
+    // chunks, checking counts before crossing the C ABI.
     fn compress_with_input_chunks(
         input: &[u8],
         config: DeflateConfig,
         chunk_size: usize,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, ReturnCode> {
+        if chunk_size == 0 {
+            return Err(ReturnCode::StreamError);
+        }
+        let capacity = compress_bound(input.len())
+            .checked_add(64)
+            .ok_or(ReturnCode::StreamError)?;
+        let avail_out =
+            crate::c_api::uInt::try_from(capacity).map_err(|_| ReturnCode::StreamError)?;
+        let mut output = vec![0u8; capacity];
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-
-        let mut output = vec![0u8; compress_bound(input.len()) + 64];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-
-        for chunk in input.chunks(chunk_size) {
-            stream.next_in = chunk.as_ptr() as *mut u8;
-            stream.avail_in = chunk.len() as _;
-            while stream.avail_in != 0 {
-                assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-                assert_ne!(
-                    stream.avail_out, 0,
-                    "compress_bound-sized output unexpectedly filled"
-                );
-            }
+        let code = init(&mut raw, config);
+        if code != ReturnCode::Ok {
+            return Err(code);
         }
+        // SAFETY: successful init created a live state; the buffers remain
+        // allocated until the matching end() below, including error paths.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
 
-        stream.next_in = core::ptr::null_mut();
-        stream.avail_in = 0;
-        loop {
-            match deflate(stream, DeflateFlush::Finish) {
-                ReturnCode::Ok => assert_ne!(
-                    stream.avail_out, 0,
-                    "compress_bound-sized output unexpectedly filled while finishing"
-                ),
-                ReturnCode::StreamEnd => break,
-                other => panic!("input-chunked deflate failed: {other:?}"),
+        let result = (|| -> Result<usize, ReturnCode> {
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = avail_out;
+            for chunk in input.chunks(chunk_size) {
+                stream.next_in = chunk.as_ptr().cast_mut();
+                stream.avail_in = crate::c_api::uInt::try_from(chunk.len())
+                    .map_err(|_| ReturnCode::StreamError)?;
+                while stream.avail_in != 0 {
+                    let before = (stream.avail_in, stream.avail_out);
+                    let code = deflate(stream, DeflateFlush::NoFlush);
+                    if code != ReturnCode::Ok {
+                        return Err(code);
+                    }
+                    if stream.avail_out == 0 || before == (stream.avail_in, stream.avail_out) {
+                        return Err(ReturnCode::BufError);
+                    }
+                }
             }
+            stream.next_in = core::ptr::null_mut();
+            stream.avail_in = 0;
+            loop {
+                let before = stream.avail_out;
+                match deflate(stream, DeflateFlush::Finish) {
+                    ReturnCode::Ok if stream.avail_out != 0 && before != stream.avail_out => {}
+                    ReturnCode::Ok => return Err(ReturnCode::BufError),
+                    ReturnCode::StreamEnd => break,
+                    code => return Err(code),
+                }
+            }
+            let remaining =
+                usize::try_from(stream.avail_out).map_err(|_| ReturnCode::StreamError)?;
+            output
+                .len()
+                .checked_sub(remaining)
+                .ok_or(ReturnCode::StreamError)
+        })();
+        if end(stream).is_err() {
+            return Err(ReturnCode::StreamError);
         }
-
-        output.truncate(stream.total_out as usize);
-        assert!(end(stream).is_ok());
-        output
+        let written = result?;
+        output.truncate(written);
+        Ok(output)
     }
 
+    // Supply an independent output buffer on each native streaming call and
+    // derive the produced length from the exact current span, not total_out.
     fn compress_with_output_chunks(
         input: &[u8],
         config: DeflateConfig,
         chunk_size: usize,
-    ) -> Vec<u8> {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input.as_ptr() as *mut u8;
-        stream.avail_in = input.len() as _;
-
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = vec![0u8; chunk_size];
-            stream.next_out = chunk.as_mut_ptr();
-            stream.avail_out = chunk.len() as _;
-            let before = stream.total_out;
-            let rc = deflate(stream, DeflateFlush::Finish);
-            let produced = (stream.total_out - before) as usize;
-            output.extend_from_slice(&chunk[..produced]);
-
-            match rc {
-                ReturnCode::Ok => {}
-                ReturnCode::StreamEnd => break,
-                other => panic!("chunked deflate failed: {other:?}"),
-            }
+    ) -> Result<Vec<u8>, ReturnCode> {
+        if chunk_size == 0 {
+            return Err(ReturnCode::StreamError);
         }
-
-        assert_eq!(stream.avail_in, 0);
-        assert!(end(stream).is_ok());
-        output
+        let avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
+        let avail_out =
+            crate::c_api::uInt::try_from(chunk_size).map_err(|_| ReturnCode::StreamError)?;
+        let mut raw = z_stream::default();
+        let code = init(&mut raw, config);
+        if code != ReturnCode::Ok {
+            return Err(code);
+        }
+        // SAFETY: the raw stream owns a valid state after successful init;
+        // source bytes and each writable chunk remain live through deflate().
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }
+            .ok_or(ReturnCode::StreamError)?;
+        let result = (|| -> Result<Vec<u8>, ReturnCode> {
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = avail_in;
+            let mut output = Vec::new();
+            loop {
+                let mut chunk = vec![0u8; chunk_size];
+                stream.next_out = chunk.as_mut_ptr();
+                stream.avail_out = avail_out;
+                let before = stream.avail_in;
+                let code = deflate(stream, DeflateFlush::Finish);
+                let unused =
+                    usize::try_from(stream.avail_out).map_err(|_| ReturnCode::StreamError)?;
+                let count = chunk
+                    .len()
+                    .checked_sub(unused)
+                    .ok_or(ReturnCode::StreamError)?;
+                output.extend_from_slice(&chunk[..count]);
+                match code {
+                    ReturnCode::StreamEnd => break,
+                    ReturnCode::Ok if count != 0 || stream.avail_in != before => {}
+                    ReturnCode::Ok => return Err(ReturnCode::BufError),
+                    code => return Err(code),
+                }
+            }
+            if stream.avail_in != 0 {
+                return Err(ReturnCode::StreamError);
+            }
+            Ok(output)
+        })();
+        if end(stream).is_err() {
+            return Err(ReturnCode::StreamError);
+        }
+        result
     }
 
-    struct RoundRobinCore {
+    /// Test-only error with enough context to distinguish ABI corruption from
+    /// match-search protocol failures.
+    #[derive(Debug)]
+    enum SchedulerFixtureError {
+        Native(ReturnCode),
+        Match(crate::deflate::longest_match::MatchSearchError),
+        Invariant(&'static str),
+    }
+
+    impl From<ReturnCode> for SchedulerFixtureError {
+        fn from(code: ReturnCode) -> Self {
+            Self::Native(code)
+        }
+    }
+
+    impl From<crate::deflate::longest_match::MatchSearchError> for SchedulerFixtureError {
+        fn from(error: crate::deflate::longest_match::MatchSearchError) -> Self {
+            Self::Match(error)
+        }
+    }
+
+    impl core::fmt::Display for SchedulerFixtureError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Native(code) => write!(f, "native deflate returned {code:?}"),
+                Self::Match(error) => write!(f, "match-search failed: {error:?}"),
+                Self::Invariant(message) => f.write_str(message),
+            }
+        }
+    }
+
+    /// Owns the initialized C state while leaving the `z_stream` at its
+    /// original stack address. Every test exit, including error propagation
+    /// and assertion panics, releases it once instead of leaking the state.
+    struct ScopedDeflateStream<'a> {
+        raw: &'a mut z_stream,
+    }
+
+    impl<'a> ScopedDeflateStream<'a> {
+        fn new(
+            raw: &'a mut z_stream,
+            config: DeflateConfig,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let code = init(raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        /// Adopt a stream initialized with a caller-specified C allocator.
+        /// Its original stack address stays fixed while the guard is alive.
+        fn from_initialized(raw: &'a mut z_stream) -> Result<Self, SchedulerFixtureError> {
+            // SAFETY: the caller passed exclusively borrowed stream storage;
+            // the native accessor verifies a live initialized state.
+            if unsafe { DeflateStream::from_stream_mut(raw) }.is_none() {
+                return Err(SchedulerFixtureError::Invariant(
+                    "native state missing after init",
+                ));
+            }
+            Ok(Self { raw })
+        }
+
+        fn with_lit_bufsize(
+            raw: &'a mut z_stream,
+            config: DeflateConfig,
+            lit_bufsize: usize,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let code = init_with_lit_bufsize(raw, config, Some(lit_bufsize));
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        fn stream(&mut self) -> Result<&mut DeflateStream<'_>, SchedulerFixtureError> {
+            // SAFETY: construction succeeded and this guard exclusively holds
+            // the original z_stream until Drop invokes end().
+            unsafe { DeflateStream::from_stream_mut(self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("initialized native stream missing"),
+            )
+        }
+    }
+
+    impl Drop for ScopedDeflateStream<'_> {
+        fn drop(&mut self) {
+            // SAFETY: successful construction installed a live state in raw;
+            // the accessor checks whether a prior call already ended it.
+            if let Some(stream) = unsafe { DeflateStream::from_stream_mut(self.raw) } {
+                let _ = end(stream);
+            }
+        }
+    }
+
+    /// Mirrors `ScopedDeflateStream` for gzip readback. The owning
+    /// stack `z_stream` never moves and native state is released on every exit.
+    struct ScopedInflateStream<'a> {
+        raw: &'a mut z_stream,
+    }
+
+    impl<'a> ScopedInflateStream<'a> {
+        fn new(
+            raw: &'a mut z_stream,
+            config: InflateConfig,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let code = crate::inflate::init(raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
+            Ok(Self { raw })
+        }
+
+        fn stream(&mut self) -> Result<&mut InflateStream<'_>, SchedulerFixtureError> {
+            // SAFETY: successful initialization constructed native inflate
+            // state; the guard retains exclusive access until Drop.
+            unsafe { InflateStream::from_stream_mut(self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("initialized inflate state missing"),
+            )
+        }
+    }
+
+    impl Drop for ScopedInflateStream<'_> {
+        fn drop(&mut self) {
+            // SAFETY: this guard exclusively owns an initialized stream and
+            // the accessor checks if it has already been ended.
+            if let Some(stream) = unsafe { InflateStream::from_stream_mut(self.raw) } {
+                crate::inflate::end(stream);
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_deflate_stream_releases_state_on_normal_and_error_exits(
+    ) -> Result<(), SchedulerFixtureError> {
+        fn abort(raw: &mut z_stream) -> Result<(), SchedulerFixtureError> {
+            let mut owned = ScopedDeflateStream::new(raw, DeflateConfig::default())?;
+            let _stream = owned.stream()?;
+            Err(SchedulerFixtureError::Invariant("intentional early exit"))
+        }
+
+        let mut raw = z_stream::default();
+        {
+            let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+            let stream = owned.stream()?;
+            assert_eq!(stream.total_in, 0);
+        }
+        assert!(raw.state.is_null(), "scope exit must release native state");
+
+        assert!(matches!(
+            abort(&mut raw),
+            Err(SchedulerFixtureError::Invariant(_))
+        ));
+        assert!(
+            raw.state.is_null(),
+            "early return must release native state"
+        );
+        Ok(())
+    }
+
+    struct RoundRobinCore<'input> {
         raw: z_stream,
+        source: &'input [u8],
         output: Vec<u8>,
         driver: algorithm::StandardDriver,
         done: bool,
@@ -4960,22 +7223,50 @@ mod test {
         match_result_turns: usize,
     }
 
-    impl RoundRobinCore {
+    impl Drop for RoundRobinCore<'_> {
+        fn drop(&mut self) {
+            // SAFETY: init in new() created the only state, and end() nulls
+            // its pointer; an early error must still release that state.
+            if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) } {
+                let _ = end(stream);
+            }
+        }
+    }
+
+    impl<'input> RoundRobinCore<'input> {
         const OUTPUT_CHUNK: usize = 17;
 
-        fn new(input: &[u8], config: DeflateConfig, algorithm: algorithm::Algorithm) -> Self {
+        fn new(
+            input: &'input [u8],
+            config: DeflateConfig,
+            algorithm: algorithm::Algorithm,
+        ) -> Result<Self, SchedulerFixtureError> {
+            let avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("input exceeds native C uInt"))?;
             let mut raw = z_stream::default();
-            assert_eq!(init(&mut raw, config), ReturnCode::Ok);
+            let code = init(&mut raw, config);
+            if code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(code));
+            }
 
-            let driver = {
-                let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-                stream.next_in = input.as_ptr() as *mut u8;
-                stream.avail_in = input.len() as _;
-                algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state).unwrap()
+            // SAFETY: a successful init owns the live deflate state; input
+            // remains borrowed for the entire RoundRobinCore lifetime.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.ok_or(
+                SchedulerFixtureError::Invariant("initialized state missing"),
+            )?;
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = avail_in;
+            let Some(driver) = algorithm::StandardDriver::for_algorithm(algorithm, &stream.state)
+            else {
+                let _ = end(stream);
+                return Err(SchedulerFixtureError::Invariant(
+                    "unavailable standard algorithm",
+                ));
             };
 
-            Self {
+            Ok(Self {
                 raw,
+                source: input,
                 output: Vec::new(),
                 driver,
                 done: false,
@@ -4984,34 +7275,40 @@ mod test {
                 pending_match_result: None,
                 match_search_turns: 0,
                 match_result_turns: 0,
-            }
+            })
         }
 
-        /// Perform exactly one production scheduler turn using the same driver as the zlib path.
-        fn step(&mut self) -> Option<crate::deflate::longest_match::MatchSearchWork> {
-            assert!(!self.done);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
+        /// Exactly one scheduler turn, with output bounded by the supplied span.
+        fn step(
+            &mut self,
+        ) -> Result<Option<crate::deflate::longest_match::MatchSearchWork>, SchedulerFixtureError>
+        {
+            if self.done {
+                return Err(SchedulerFixtureError::Invariant(
+                    "resumed finalized segment",
+                ));
+            }
+            // SAFETY: new() initialized the state, and Drop releases it once.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }
+                .ok_or(SchedulerFixtureError::Invariant("scheduler state missing"))?;
 
-            // Match computation and result delivery are distinct scheduler turns. This keeps the
-            // test honest: a batch scheduler may collect work from several paused streams before
-            // executing searches, then resume each producer later with its owned result.
             if let Some(result) = self.pending_match_result.take() {
                 self.driver
-                    .complete_match_search(&mut *stream.state, result);
+                    .complete_match_search(&mut stream.state, result)?;
                 self.match_result_turns += 1;
-                return None;
+                return Ok(None);
             }
 
             let mut chunk = [0u8; Self::OUTPUT_CHUNK];
             stream.next_out = chunk.as_mut_ptr();
-            stream.avail_out = chunk.len() as _;
-            let before = stream.total_out;
+            stream.avail_out = crate::c_api::uInt::try_from(chunk.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("output chunk exceeds C uInt"))?;
 
             let mut input = InputCursor::from_stream(stream);
             let mut output = OutputCursor::from_stream(stream);
             let mut checksum = StreamChecksum::from_stream(stream);
             let outcome = self.driver.step(
-                &mut *stream.state,
+                &mut stream.state,
                 &mut input,
                 &mut output,
                 &mut checksum,
@@ -5021,24 +7318,50 @@ mod test {
             output.apply(stream);
             checksum.apply(stream);
 
-            let produced = (stream.total_out - before) as usize;
+            let produced = usize::try_from(stream.avail_out)
+                .ok()
+                .and_then(|unused| chunk.len().checked_sub(unused))
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "output exceeded current chunk",
+                ));
+            // A scheduler turn must not retain a pointer into this stack chunk.
+            stream.next_out = core::ptr::null_mut();
+            stream.avail_out = 0;
+
+            let produced = produced?;
+            let expected_total = self
+                .output
+                .len()
+                .checked_add(produced)
+                .and_then(|len| crate::c_api::z_size::try_from(len).ok())
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "cumulative output exceeds native counter",
+                ))?;
+            if stream.total_out != expected_total {
+                return Err(SchedulerFixtureError::Invariant(
+                    "native total_out disagrees with chunk cursors",
+                ));
+            }
             if produced != 0 {
                 self.output.extend_from_slice(&chunk[..produced]);
                 self.drain_turns += 1;
             }
 
-            // Do not leave a raw cursor into the stack-local chunk between scheduler turns.
-            stream.next_out = core::ptr::null_mut();
-            stream.avail_out = 0;
-
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
                 algorithm::StandardTurnOutcome::MatchSearch(work) => {
                     self.match_search_turns += 1;
-                    return Some(work);
+                    return Ok(Some(work));
                 }
-                algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
-                    panic!("Final mode with all input supplied unexpectedly requested more input")
+                algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error.into()),
+                algorithm::StandardTurnOutcome::InvalidSegmentMode
+                | algorithm::StandardTurnOutcome::NeedMoreCallerInput
+                | algorithm::StandardTurnOutcome::SegmentDone(
+                    algorithm::EndBlockKind::FlushBoundary,
+                ) => {
+                    return Err(SchedulerFixtureError::Invariant(
+                        "invalid final-segment scheduler outcome",
+                    ));
                 }
                 algorithm::StandardTurnOutcome::NeedMoreOutput { .. } => {
                     self.output_full_count += 1;
@@ -5046,91 +7369,144 @@ mod test {
                 algorithm::StandardTurnOutcome::SegmentDone(algorithm::EndBlockKind::Final) => {
                     self.done = true;
                 }
-                algorithm::StandardTurnOutcome::SegmentDone(
-                    algorithm::EndBlockKind::FlushBoundary,
-                ) => panic!("final batch job ended as a non-final flush boundary"),
             }
-            None
+            Ok(None)
         }
 
         fn match_request(
             &self,
             work: crate::deflate::longest_match::MatchSearchWork,
-        ) -> crate::deflate::longest_match::MatchSearchRequest<'_> {
-            let stream = unsafe { DeflateStream::from_stream_ref(&self.raw) }.unwrap();
-            work.request(&*stream.state)
+        ) -> Result<crate::deflate::longest_match::MatchSearchRequest<'_>, SchedulerFixtureError>
+        {
+            // SAFETY: the state is live for every request until it is ended.
+            let stream = unsafe { DeflateStream::from_stream_ref(&raw const self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("scheduler request state missing"),
+            )?;
+            work.request(&stream.state).map_err(Into::into)
         }
 
-        fn into_output(mut self) -> Vec<u8> {
-            assert!(self.done);
-            let stream = unsafe { DeflateStream::from_stream_mut(&mut self.raw) }.unwrap();
-            assert_eq!(stream.avail_in, 0);
-            assert_eq!(stream.total_out as usize, self.output.len());
-            assert!(end(stream).is_ok());
-            self.output
+        fn into_output(mut self) -> Result<Vec<u8>, SchedulerFixtureError> {
+            if !self.done {
+                return Err(SchedulerFixtureError::Invariant("scheduler did not finish"));
+            }
+            // SAFETY: new() initialized this state; this is the unique final borrow.
+            let stream = unsafe { DeflateStream::from_stream_mut(&raw mut self.raw) }.ok_or(
+                SchedulerFixtureError::Invariant("finalized stream state missing"),
+            )?;
+            let expected_input =
+                crate::c_api::z_size::try_from(self.source.len()).map_err(|_| {
+                    SchedulerFixtureError::Invariant("input length exceeds native total")
+                })?;
+            let expected_output =
+                crate::c_api::z_size::try_from(self.output.len()).map_err(|_| {
+                    SchedulerFixtureError::Invariant("output length exceeds native total")
+                })?;
+            if stream.avail_in != 0
+                || stream.total_in != expected_input
+                || stream.total_out != expected_output
+            {
+                return Err(SchedulerFixtureError::Invariant(
+                    "final native input/output counters mismatch",
+                ));
+            }
+            if end(stream).is_err() {
+                return Err(SchedulerFixtureError::Invariant(
+                    "native deflate cleanup failed",
+                ));
+            }
+            Ok(core::mem::take(&mut self.output))
         }
     }
 
-    fn direct_algorithm_output(input: &[u8], config: DeflateConfig) -> Vec<u8> {
+    fn direct_algorithm_output(
+        input: &[u8],
+        config: DeflateConfig,
+    ) -> Result<Vec<u8>, SchedulerFixtureError> {
+        let input_avail = crate::c_api::uInt::try_from(input.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("direct input exceeds C uInt"))?;
+        let capacity =
+            compress_bound(input.len())
+                .checked_add(64)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "direct output capacity overflow",
+                ))?;
+        let output_avail = crate::c_api::uInt::try_from(capacity)
+            .map_err(|_| SchedulerFixtureError::Invariant("direct output exceeds C uInt"))?;
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let mut output = vec![0u8; compress_bound(input.len()) + 64];
+        let code = init(&mut raw, config);
+        if code != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(code));
+        }
+        let mut output = vec![0u8; capacity];
+        // SAFETY: init created the uniquely held state; all I/O buffers
+        // remain live throughout the native driver and the matching end.
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.ok_or(
+            SchedulerFixtureError::Invariant("direct encoder state missing"),
+        )?;
+        let result = (|| -> Result<usize, SchedulerFixtureError> {
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = input_avail;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output_avail;
 
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input.as_ptr() as *mut u8;
-        stream.avail_in = input.len() as _;
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-
-        assert!(matches!(
-            with_compressor(stream, |compressor| {
-                algorithm::run(compressor, DeflateFlush::Finish)
-            }),
-            BlockState::FinishDone
-        ));
-        let len = stream.total_out as usize;
-        assert_eq!(stream.avail_in, 0);
-        assert!(end(stream).is_ok());
+            if !matches!(
+                with_compressor(stream, |compressor| algorithm::run(
+                    compressor,
+                    DeflateFlush::Finish
+                )),
+                BlockState::FinishDone
+            ) {
+                return Err(SchedulerFixtureError::Invariant(
+                    "direct encoder did not finish",
+                ));
+            }
+            if stream.avail_in != 0 {
+                return Err(SchedulerFixtureError::Invariant(
+                    "direct encoder left unconsumed input",
+                ));
+            }
+            let unused = usize::try_from(stream.avail_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("native output remainder invalid"))?;
+            output
+                .len()
+                .checked_sub(unused)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "direct output counter exceeds buffer",
+                ))
+        })();
+        if end(stream).is_err() {
+            return Err(SchedulerFixtureError::Invariant(
+                "direct native teardown failed",
+            ));
+        }
+        let len = result?;
         output.truncate(len);
-        output
+        Ok(output)
     }
 
-    fn framed_standard_driver_output(input: &[u8], config: DeflateConfig) -> Vec<u8> {
-        let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-        let mut output = vec![0u8; compress_bound(input.len()) + 64];
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+    /// Drive the bounded standard-token phase; leave outer zlib framing to the caller.
+    fn run_framed_standard_segment(
+        stream: &mut DeflateStream<'_>,
+        input: &[u8],
+        input_avail: crate::c_api::uInt,
+    ) -> Result<(), SchedulerFixtureError> {
+        let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy)
+            .ok_or(SchedulerFixtureError::Invariant(
+                "no algorithm for configured level",
+            ))?;
+        let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &stream.state).ok_or(
+            SchedulerFixtureError::Invariant("standard driver unavailable"),
+        )?;
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in = input_avail;
 
-        // Use the real zlib framing/status path with no caller input attached. `reset_keep()`
-        // initializes last_flush to zlib's -2 sentinel, so this emits any zlib/gzip header without
-        // entering the compression algorithm.
-        stream.next_in = core::ptr::null_mut();
-        stream.avail_in = 0;
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-        assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-        assert!(stream.state.bit_writer.pending.is_empty());
-
-        let algorithm = algorithm::Algorithm::for_stream(stream.state.level, stream.state.strategy);
-        let mut driver = algorithm::StandardDriver::for_algorithm(algorithm, &*stream.state)
-            .expect("proof only covers the five standard token-producing algorithms");
-
-        stream.next_in = input.as_ptr() as *mut u8;
-        stream.avail_in = input.len().try_into().expect("proof input fits zlib uInt");
-
-        let mut turns = 0usize;
-        loop {
-            turns += 1;
-            assert!(
-                turns < 100_000,
-                "framed StandardDriver failed to make progress"
-            );
-
+        let mut complete = false;
+        for _ in 0..100_000 {
             let mut input_cursor = InputCursor::from_stream(stream);
             let mut output_cursor = OutputCursor::from_stream(stream);
             let mut checksum = StreamChecksum::from_stream(stream);
             let outcome = driver.step(
-                &mut *stream.state,
+                &mut stream.state,
                 &mut input_cursor,
                 &mut output_cursor,
                 &mut checksum,
@@ -5143,7 +7519,7 @@ mod test {
             match outcome {
                 algorithm::StandardTurnOutcome::Progress => {}
                 algorithm::StandardTurnOutcome::MatchSearch(work) => {
-                    let request = work.request(&*stream.state);
+                    let request = work.request(&stream.state)?;
                     let mut results = [crate::deflate::longest_match::MatchSearchResult {
                         length: 0,
                         start: 0,
@@ -5152,46 +7528,148 @@ mod test {
                         core::slice::from_ref(&request),
                         &mut results,
                     );
-                    driver.complete_match_search(&mut *stream.state, results[0]);
+                    driver.complete_match_search(&mut stream.state, results[0])?;
                 }
-                algorithm::StandardTurnOutcome::NeedMoreCallerInput => {
-                    panic!("final proof supplied the complete caller input")
-                }
-                algorithm::StandardTurnOutcome::NeedMoreOutput { .. } => {
-                    panic!("compress_bound-sized proof output unexpectedly filled")
+                algorithm::StandardTurnOutcome::MatchSearchError(error) => return Err(error.into()),
+                algorithm::StandardTurnOutcome::InvalidSegmentMode
+                | algorithm::StandardTurnOutcome::NeedMoreCallerInput
+                | algorithm::StandardTurnOutcome::NeedMoreOutput { .. }
+                | algorithm::StandardTurnOutcome::SegmentDone(
+                    algorithm::EndBlockKind::FlushBoundary,
+                ) => {
+                    return Err(SchedulerFixtureError::Invariant(
+                        "invalid bounded final-segment outcome",
+                    ));
                 }
                 algorithm::StandardTurnOutcome::SegmentDone(algorithm::EndBlockKind::Final) => {
+                    complete = true;
                     break;
                 }
-                algorithm::StandardTurnOutcome::SegmentDone(
-                    algorithm::EndBlockKind::FlushBoundary,
-                ) => panic!("final proof ended at a non-final boundary"),
             }
         }
+        if !complete {
+            return Err(SchedulerFixtureError::Invariant(
+                "framed driver exceeded progress bound",
+            ));
+        }
+        if stream.avail_in != 0 || !stream.state.bit_writer.pending.is_empty() {
+            return Err(SchedulerFixtureError::Invariant(
+                "framed driver left input or pending output",
+            ));
+        }
 
-        assert_eq!(stream.avail_in, 0);
-        assert!(stream.state.bit_writer.pending.is_empty());
+        Ok(())
+    }
 
-        // The StandardDriver already encoded the final DEFLATE block. Mark only that fact in the
-        // outer zlib status machine, then let the real deflate path emit the wrapper trailer.
-        stream.state.status = Status::Finish;
-        stream.next_in = core::ptr::null_mut();
-        stream.avail_in = 0;
-        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+    fn framed_standard_driver_output(
+        input: &[u8],
+        config: DeflateConfig,
+    ) -> Result<Vec<u8>, SchedulerFixtureError> {
+        let input_avail = crate::c_api::uInt::try_from(input.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("framed input exceeds C uInt"))?;
+        let capacity =
+            compress_bound(input.len())
+                .checked_add(64)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "framed output capacity overflow",
+                ))?;
+        let output_avail = crate::c_api::uInt::try_from(capacity)
+            .map_err(|_| SchedulerFixtureError::Invariant("framed output exceeds C uInt"))?;
+        let mut raw = z_stream::default();
+        let init_code = init(&mut raw, config);
+        if init_code != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(init_code));
+        }
+        let mut output = vec![0u8; capacity];
 
-        let len = stream.total_out as usize;
-        assert!(end(stream).is_ok());
+        // SAFETY: init successfully owns a live native deflate state; the
+        // caller input and output buffers outlive all calls before end().
+        let stream = unsafe { DeflateStream::from_stream_mut(&raw mut raw) }.ok_or(
+            SchedulerFixtureError::Invariant("initialized framed stream missing"),
+        )?;
+        let result = (|| -> Result<usize, SchedulerFixtureError> {
+            // The ordinary zlib framing path emits the header first, without
+            // letting the token producer see any caller input.
+            stream.next_in = core::ptr::null_mut();
+            stream.avail_in = 0;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output_avail;
+            let header_code = deflate(stream, DeflateFlush::NoFlush);
+            if header_code != ReturnCode::Ok {
+                return Err(SchedulerFixtureError::Native(header_code));
+            }
+            if !stream.state.bit_writer.pending.is_empty() {
+                return Err(SchedulerFixtureError::Invariant(
+                    "framed header left pending output",
+                ));
+            }
+
+            run_framed_standard_segment(stream, input, input_avail)?;
+
+            // Only the outer wrapper remains to be emitted.
+            stream.state.status = Status::Finish;
+            stream.next_in = core::ptr::null_mut();
+            stream.avail_in = 0;
+            let trailer_code = deflate(stream, DeflateFlush::Finish);
+            if trailer_code != ReturnCode::StreamEnd {
+                return Err(SchedulerFixtureError::Native(trailer_code));
+            }
+            let unused = usize::try_from(stream.avail_out).map_err(|_| {
+                SchedulerFixtureError::Invariant("framed output cursor exceeds host width")
+            })?;
+            let produced =
+                output
+                    .len()
+                    .checked_sub(unused)
+                    .ok_or(SchedulerFixtureError::Invariant(
+                        "framed output exceeds capacity",
+                    ))?;
+            let total_output = crate::c_api::z_size::try_from(produced).map_err(|_| {
+                SchedulerFixtureError::Invariant("framed output exceeds native total")
+            })?;
+            let total_input = crate::c_api::z_size::try_from(input.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("framed input exceeds native total")
+            })?;
+            if stream.total_out != total_output || stream.total_in != total_input {
+                return Err(SchedulerFixtureError::Invariant(
+                    "framed aggregate stream totals mismatch",
+                ));
+            }
+            Ok(produced)
+        })();
+        if end(stream).is_err() {
+            return Err(SchedulerFixtureError::Invariant(
+                "framed native teardown failed",
+            ));
+        }
+        let len = result?;
         output.truncate(len);
-        output
+        Ok(output)
     }
 
     #[test]
-    fn standard_driver_middle_preserves_full_stream_framing() {
+    fn framed_standard_driver_rejects_invalid_config() {
+        let invalid = DeflateConfig {
+            level: i32::MAX,
+            ..DeflateConfig::default()
+        };
+        assert!(matches!(
+            framed_standard_driver_output(b"fixture", invalid),
+            Err(SchedulerFixtureError::Native(ReturnCode::StreamError))
+        ));
+    }
+
+    #[test]
+    fn standard_driver_middle_preserves_full_stream_framing() -> Result<(), SchedulerFixtureError> {
         let mut input = Vec::with_capacity(120_000);
         for i in 0..3_000usize {
             input.extend_from_slice(b"framed-standard-driver/");
-            input.extend_from_slice(&(i as u32).rotate_left(9).to_le_bytes());
-            input.extend(core::iter::repeat_n(((i * 29) % 251) as u8, 3 + i % 31));
+            let row = u32::try_from(i)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture row exceeds u32"))?;
+            let marker = u8::try_from((i * 29) % 251)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture byte exceeds u8"))?;
+            input.extend_from_slice(&row.rotate_left(9).to_le_bytes());
+            input.extend(core::iter::repeat_n(marker, 3 + i % 31));
         }
 
         let algorithms = [
@@ -5216,48 +7694,27 @@ mod test {
                 let (reference, rc) = compress_slice(&mut reference_buf, &input, config);
                 assert_eq!(rc, ReturnCode::Ok);
 
-                let scheduled = framed_standard_driver_output(&input, config);
+                let scheduled = framed_standard_driver_output(&input, config)?;
                 assert_eq!(
                     scheduled, reference,
                     "framed StandardDriver changed output for level {level}, strategy {strategy:?}, window_bits {window_bits}"
                 );
+                let mut restored = vec![0u8; input.len()];
+                let (decoded, code) = crate::decompress_slice(
+                    &mut restored,
+                    &scheduled,
+                    InflateConfig { window_bits },
+                );
+                assert_eq!(code, ReturnCode::Ok);
+                assert_eq!(decoded, input);
             }
         }
+        Ok(())
     }
 
-    #[test]
-    fn standard_core_events_can_be_round_robin_scheduled_across_streams() {
-        let mut input = Vec::with_capacity(160_000);
-        for i in 0..4_000usize {
-            input.extend_from_slice(b"round-robin-standard-core/");
-            input.extend_from_slice(&(i as u32).rotate_left(7).to_le_bytes());
-            input.extend(core::iter::repeat_n(((i * 17) % 251) as u8, 5 + i % 37));
-        }
-
-        let cases = [
-            (algorithm::Algorithm::Fast, 2, Strategy::Default),
-            (algorithm::Algorithm::Medium, 3, Strategy::Default),
-            (algorithm::Algorithm::Medium, 6, Strategy::Default),
-            (algorithm::Algorithm::Slow, 7, Strategy::Default),
-            (algorithm::Algorithm::Slow, 9, Strategy::Default),
-            (algorithm::Algorithm::Huffman, 6, Strategy::HuffmanOnly),
-            (algorithm::Algorithm::Rle, 6, Strategy::Rle),
-        ];
-
-        let mut jobs = Vec::new();
-        let mut references = Vec::new();
-        for (algorithm, level, strategy) in cases {
-            let config = || DeflateConfig {
-                level,
-                method: Method::Deflated,
-                window_bits: crate::MAX_WBITS,
-                mem_level: 1,
-                strategy,
-            };
-            references.push(direct_algorithm_output(&input, config()));
-            jobs.push(RoundRobinCore::new(&input, config(), algorithm));
-        }
-
+    fn schedule_round_robin_core(
+        jobs: &mut [RoundRobinCore<'_>],
+    ) -> Result<(usize, usize), SchedulerFixtureError> {
         let mut scheduler_turns = 0usize;
         let mut match_batch_count = 0usize;
         let mut max_match_batch = 0usize;
@@ -5265,7 +7722,7 @@ mod test {
             let mut match_work = Vec::new();
             for (index, job) in jobs.iter_mut().enumerate() {
                 if !job.done {
-                    if let Some(work) = job.step() {
+                    if let Some(work) = job.step()? {
                         match_work.push((index, work));
                     }
                     scheduler_turns += 1;
@@ -5276,7 +7733,7 @@ mod test {
                 let requests = match_work
                     .iter()
                     .map(|(index, work)| jobs[*index].match_request(*work))
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut results = vec![
                     crate::deflate::longest_match::MatchSearchResult {
                         length: 0,
@@ -5299,6 +7756,48 @@ mod test {
                 "round-robin scheduler failed to make progress"
             );
         }
+        Ok((match_batch_count, max_match_batch))
+    }
+
+    #[test]
+    fn standard_core_events_can_be_round_robin_scheduled_across_streams(
+    ) -> Result<(), SchedulerFixtureError> {
+        let mut input = Vec::with_capacity(160_000);
+        for i in 0..4_000usize {
+            input.extend_from_slice(b"round-robin-standard-core/");
+            let row = u32::try_from(i)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture row exceeds u32"))?;
+            let marker = u8::try_from((i * 17) % 251)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture byte exceeds u8"))?;
+            input.extend_from_slice(&row.rotate_left(7).to_le_bytes());
+            input.extend(core::iter::repeat_n(marker, 5 + i % 37));
+        }
+
+        let cases = [
+            (algorithm::Algorithm::Fast, 2, Strategy::Default),
+            (algorithm::Algorithm::Medium, 3, Strategy::Default),
+            (algorithm::Algorithm::Medium, 6, Strategy::Default),
+            (algorithm::Algorithm::Slow, 7, Strategy::Default),
+            (algorithm::Algorithm::Slow, 9, Strategy::Default),
+            (algorithm::Algorithm::Huffman, 6, Strategy::HuffmanOnly),
+            (algorithm::Algorithm::Rle, 6, Strategy::Rle),
+        ];
+
+        let mut jobs = Vec::new();
+        let mut references = Vec::new();
+        for (algorithm, level, strategy) in cases {
+            let config = || DeflateConfig {
+                level,
+                method: Method::Deflated,
+                window_bits: crate::MAX_WBITS,
+                mem_level: 1,
+                strategy,
+            };
+            references.push(direct_algorithm_output(&input, config())?);
+            jobs.push(RoundRobinCore::new(&input, config(), algorithm)?);
+        }
+
+        let (match_batch_count, max_match_batch) = schedule_round_robin_core(&mut jobs)?;
 
         assert!(
             match_batch_count > 0,
@@ -5343,12 +7842,14 @@ mod test {
                 job.match_search_turns, job.match_result_turns,
                 "every yielded match search must resume on a later scheduler turn"
             );
-            assert_eq!(job.into_output(), reference);
+            assert_eq!(job.into_output()?, reference);
         }
+        Ok(())
     }
 
     #[test]
-    fn tuned_medium_long_chain_still_yields_detached_match_search() {
+    fn tuned_medium_long_chain_still_yields_detached_match_search(
+    ) -> Result<(), SchedulerFixtureError> {
         let input_bytes = b"tuned-medium-detached-search/".repeat(2_000);
         let config = DeflateConfig {
             level: 6,
@@ -5358,23 +7859,25 @@ mod test {
             strategy: Strategy::Default,
         };
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
         assert_eq!(tune(stream, 8, 16, 128, 129), ReturnCode::Ok);
-        stream.next_in = input_bytes.as_ptr() as *mut u8;
-        stream.avail_in = input_bytes.len() as _;
+        stream.next_in = input_bytes.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(input_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test input exceeds C uInt"))?;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &*stream.state)
-                .unwrap();
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Medium, &stream.state)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "standard core unavailable",
+                ))?;
 
         let search = loop {
-            match core.next_event(&mut *stream.state) {
+            match core.next_event(&mut stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        &mut *stream.state,
+                        &mut stream.state,
                         &mut input,
                         &mut checksum,
                         demand,
@@ -5388,22 +7891,28 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error.into()),
                 algorithm::CoreEvent::TokenBlockReady(_) => {
-                    panic!("tuned Medium filled a token block before yielding match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "tuned Medium filled a token block before yielding work",
+                    ));
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
-                    panic!("test input exhausted before tuned Medium yielded match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "tuned Medium exhausted input before yielding work",
+                    ));
                 }
             }
         };
 
-        let result = search.request(&*stream.state).execute();
-        core.complete_match_search(&mut *stream.state, result);
-        let _ = end(stream);
+        let result = search.request(&stream.state)?.execute();
+        core.complete_match_search(&mut stream.state, result)?;
+        Ok(())
     }
 
     #[test]
-    fn standard_core_rejects_production_before_match_search_completes() {
+    fn standard_core_rejects_production_before_match_search_completes(
+    ) -> Result<(), SchedulerFixtureError> {
         let input_bytes = b"detached-match-search/".repeat(2_000);
         let config = DeflateConfig {
             level: 7,
@@ -5413,22 +7922,24 @@ mod test {
             strategy: Strategy::Default,
         };
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input_bytes.as_ptr() as *mut u8;
-        stream.avail_in = input_bytes.len() as _;
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
+        stream.next_in = input_bytes.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(input_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test input exceeds C uInt"))?;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Slow, &*stream.state)
-                .unwrap();
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Slow, &stream.state)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "standard core unavailable",
+                ))?;
 
         let search = loop {
-            match core.next_event(&mut *stream.state) {
+            match core.next_event(&mut stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        &mut *stream.state,
+                        &mut stream.state,
                         &mut input,
                         &mut checksum,
                         demand,
@@ -5442,42 +7953,52 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => break work,
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error.into()),
                 algorithm::CoreEvent::TokenBlockReady(_) => {
-                    panic!("Slow filled a token block before yielding match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "Slow emitted a token block before yielding work",
+                    ));
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
-                    panic!("test input exhausted before yielding match-search work")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "Slow exhausted input before yielding work",
+                    ));
                 }
             }
         };
 
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = core.next_event(&mut *stream.state);
+            let _ = core.next_event(&mut stream.state);
         }));
         assert!(
             rejected.is_err(),
             "production advanced with an outstanding match search"
         );
 
-        let result = search.request(&*stream.state).execute();
-        core.complete_match_search(&mut *stream.state, result);
+        let result = search.request(&stream.state)?.execute();
+        core.complete_match_search(&mut stream.state, result)?;
         assert!(matches!(
-            core.next_event(&mut *stream.state),
+            core.next_event(&mut stream.state),
             algorithm::CoreEvent::MatchSearch(_)
                 | algorithm::CoreEvent::TokenBlockReady(_)
                 | algorithm::CoreEvent::NeedInput(_)
                 | algorithm::CoreEvent::EndOfInput(_)
         ));
 
-        let _ = end(stream);
+        Ok(())
     }
 
     #[test]
-    fn standard_core_rejects_production_before_pending_output_is_drained() {
+    fn standard_core_rejects_production_before_pending_output_is_drained(
+    ) -> Result<(), SchedulerFixtureError> {
         let mut input_bytes = Vec::with_capacity(40_000);
         for i in 0..2_000usize {
             input_bytes.extend_from_slice(b"must-drain-before-producing/");
-            input_bytes.extend_from_slice(&(i as u32).to_le_bytes());
+            input_bytes.extend_from_slice(
+                &u32::try_from(i)
+                    .map_err(|_| SchedulerFixtureError::Invariant("fixture row too large"))?
+                    .to_le_bytes(),
+            );
         }
 
         let config = DeflateConfig {
@@ -5488,22 +8009,24 @@ mod test {
             strategy: Strategy::Default,
         };
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, config), ReturnCode::Ok);
-
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
-        stream.next_in = input_bytes.as_ptr() as *mut u8;
-        stream.avail_in = input_bytes.len() as _;
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
+        stream.next_in = input_bytes.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(input_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test input exceeds C uInt"))?;
         let mut core =
-            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &*stream.state)
-                .unwrap();
+            algorithm::StandardCore::for_algorithm(algorithm::Algorithm::Fast, &stream.state)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "standard core unavailable",
+                ))?;
 
         let pending = loop {
-            match core.next_event(&mut *stream.state) {
+            match core.next_event(&mut stream.state) {
                 algorithm::CoreEvent::NeedInput(demand) => {
                     let mut input = InputCursor::from_stream(stream);
                     let mut checksum = StreamChecksum::from_stream(stream);
                     let outcome = core.satisfy_input(
-                        &mut *stream.state,
+                        &mut stream.state,
                         &mut input,
                         &mut checksum,
                         demand,
@@ -5517,20 +8040,23 @@ mod test {
                     ));
                 }
                 algorithm::CoreEvent::MatchSearch(work) => {
-                    let result = work.request(&*stream.state).execute();
-                    core.complete_match_search(&mut *stream.state, result);
+                    let result = work.request(&stream.state)?.execute();
+                    core.complete_match_search(&mut stream.state, result)?;
                 }
+                algorithm::CoreEvent::MatchSearchError(error) => return Err(error.into()),
                 algorithm::CoreEvent::TokenBlockReady(work) => {
-                    break core.encode_token_block(&mut *stream.state, work);
+                    break core.encode_token_block(&mut stream.state, work);
                 }
                 algorithm::CoreEvent::EndOfInput(_) => {
-                    panic!("test input exhausted before producing a token block")
+                    return Err(SchedulerFixtureError::Invariant(
+                        "Fast exhausted input before producing a token block",
+                    ));
                 }
             }
         };
 
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = core.next_event(&mut *stream.state);
+            let _ = core.next_event(&mut stream.state);
         }));
         assert!(
             rejected.is_err(),
@@ -5539,25 +8065,62 @@ mod test {
 
         let mut output_bytes = vec![0u8; compress_bound(input_bytes.len()) + 64];
         stream.next_out = output_bytes.as_mut_ptr();
-        stream.avail_out = output_bytes.len() as _;
+        stream.avail_out = crate::c_api::uInt::try_from(output_bytes.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("test output exceeds C uInt"))?;
         let mut output = OutputCursor::from_stream(stream);
         assert!(matches!(
-            core.drain_output(&mut *stream.state, &mut output, pending),
+            core.drain_output(&mut stream.state, &mut output, pending),
             algorithm::PendingOutputOutcome::Ready
         ));
         output.apply(stream);
 
         // This test bypasses the outer zlib status machine; only ensure the allocation is released.
-        let _ = end(stream);
+        Ok(())
     }
 
     #[test]
-    fn fast_deflate_is_input_chunking_independent() {
+    fn chunked_deflate_drivers_check_native_buffer_budgets() -> Result<(), ReturnCode> {
+        let config = DeflateConfig::default();
+        assert_eq!(
+            compress_with_input_chunks(b"bytes", config, 0),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(
+            compress_with_output_chunks(b"bytes", config, 0),
+            Err(ReturnCode::StreamError)
+        );
+        if let Some(overwide) = usize::try_from(crate::c_api::uInt::MAX)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(1))
+        {
+            assert_eq!(
+                compress_with_output_chunks(b"bytes", config, overwide),
+                Err(ReturnCode::StreamError)
+            );
+        }
+
+        for length in [0, 1, 17, 257] {
+            let input = vec![b'q'; length];
+            let expected = compress_with_input_chunks(&input, config, 1)?;
+            for chunk in [1, 2, 7, 31] {
+                assert_eq!(
+                    compress_with_output_chunks(&input, config, chunk)?,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fast_deflate_is_input_chunking_independent() -> Result<(), ReturnCode> {
         let mut input = Vec::with_capacity(100_000);
         for i in 0..3_000usize {
             input.extend_from_slice(b"logical-window-tail/");
-            input.extend(core::iter::repeat_n((i % 251) as u8, 1 + i % 19));
-            input.extend_from_slice(&(i as u32).to_le_bytes());
+            let marker = u8::try_from(i % 251).map_err(|_| ReturnCode::StreamError)?;
+            let row = u32::try_from(i).map_err(|_| ReturnCode::StreamError)?;
+            input.extend(core::iter::repeat_n(marker, 1 + i % 19));
+            input.extend_from_slice(&row.to_le_bytes());
         }
 
         let config = DeflateConfig {
@@ -5574,22 +8137,25 @@ mod test {
 
         for chunk_size in [1, 2, 3, 4, 7, 31, 257] {
             assert_eq!(
-                compress_with_input_chunks(&input, config, chunk_size),
+                compress_with_input_chunks(&input, config, chunk_size)?,
                 reference,
                 "fast output changed with {chunk_size}-byte input chunks"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn token_producers_are_output_chunking_independent_across_block_boundaries() {
+    fn token_producers_are_output_chunking_independent_across_block_boundaries(
+    ) -> Result<(), ReturnCode> {
         let mut input = Vec::with_capacity(160_000);
         for i in 0..4_000usize {
             input.extend_from_slice(b"portable-simd::token-block/");
             for _ in 0..(8 + i % 23) {
-                input.push((i % 251) as u8);
+                input.push(u8::try_from(i % 251).map_err(|_| ReturnCode::StreamError)?);
             }
-            input.extend_from_slice(&(i as u32).to_le_bytes());
+            let row = u32::try_from(i).map_err(|_| ReturnCode::StreamError)?;
+            input.extend_from_slice(&row.to_le_bytes());
         }
 
         let configurations = [
@@ -5614,17 +8180,18 @@ mod test {
             let reference = reference.to_vec();
 
             for chunk_size in [1, 7, 23, 257] {
-                let chunked = compress_with_output_chunks(&input, config, chunk_size);
+                let chunked = compress_with_output_chunks(&input, config, chunk_size)?;
                 assert_eq!(
                     chunked, reference,
                     "output changed with {chunk_size}-byte output chunks for level {level}, strategy {strategy:?}"
                 );
             }
         }
+        Ok(())
     }
 
     fn fuzz_based_test(input: &[u8], config: DeflateConfig, expected: &[u8]) {
-        let mut output_rs = [0; 1 << 17];
+        let mut output_rs = vec![0; 1 << 17];
         let (output_rs, err) = compress_slice(&mut output_rs, input, config);
         assert_eq!(err, ReturnCode::Ok);
 
@@ -5634,7 +8201,7 @@ mod test {
     #[test]
     fn simple_rle() {
         fuzz_based_test(
-            "\0\0\0\0\u{6}".as_bytes(),
+            b"\0\0\0\0\x06",
             DeflateConfig {
                 level: -1,
                 method: Method::Deflated,
@@ -5643,7 +8210,7 @@ mod test {
                 strategy: Strategy::Rle,
             },
             &[56, 17, 99, 0, 2, 54, 0, 0, 11, 0, 7],
-        )
+        );
     }
 
     #[test]
@@ -5733,11 +8300,11 @@ mod test {
                 0x0, 0x8e, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x6a,
                 0xf5, 0x63, 0x60, 0x60, 0x3, 0x0, 0xee, 0x8a, 0x88, 0x67,
             ],
-        )
+        );
     }
 
     #[test]
-    fn reset_preserves_custom_gzip_header() {
+    fn reset_preserves_custom_gzip_header() -> Result<(), SchedulerFixtureError> {
         let name = b"survives-reset\0";
         let mut header = gz_header {
             text: 1,
@@ -5747,7 +8314,7 @@ mod test {
             extra: core::ptr::null_mut(),
             extra_len: 0,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
             comment: core::ptr::null_mut(),
             comm_max: 0,
@@ -5759,33 +8326,56 @@ mod test {
             window_bits: 31,
             ..Default::default()
         };
-        let mut stream = z_stream::default();
-        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-        let stream = unsafe { DeflateStream::from_stream_mut(&mut stream) }.unwrap();
-        assert_eq!(
-            unsafe { set_header(stream, Some(&mut header)) },
-            ReturnCode::Ok
-        );
-
-        assert_eq!(reset(stream), ReturnCode::Ok);
-        assert!(stream.state.gzhead.is_some());
-
         let input = b"gzip after reset";
         let mut output = [0u8; 128];
-        stream.next_in = input.as_ptr() as *mut _;
-        stream.avail_in = input.len() as _;
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        let mut raw = z_stream::default();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let produced = {
+            let stream = owned.stream()?;
+            // SAFETY: the caller-owned header and name remain live and unmodified
+            // through final deflate and the matching native stream teardown.
+            let header_status = unsafe { set_header(stream, Some(&mut header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
+            assert_eq!(reset(stream), ReturnCode::Ok);
+            assert!(stream.state.gzhead.is_some());
 
-        // zlib and zlib-ng retain the caller's custom header across both reset variants.
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip input exceeds C uInt"))?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output exceeds C uInt"))?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let remaining = usize::try_from(stream.avail_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output cursor too large"))?;
+            output
+                .len()
+                .checked_sub(remaining)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "gzip output count exceeded buffer",
+                ))?
+        };
+        // Release native ownership while caller header and backing arrays remain live.
+        drop(owned);
+
+        // zlib and zlib-ng retain the caller's custom header across reset.
         assert_eq!(
             &output[..10],
             &[31, 139, 8, 0b1011, 0x78, 0x56, 0x34, 0x12, 0, 3]
         );
         assert_eq!(&output[10..10 + name.len()], name);
 
-        assert!(end(stream).is_ok());
+        // Check the full emitted payload and gzip trailer as well as header bytes.
+        let mut restored = [0u8; 128];
+        let (decoded, code) = crate::decompress_slice(
+            &mut restored,
+            &output[..produced],
+            InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+        Ok(())
     }
 
     #[test]
@@ -5807,7 +8397,7 @@ mod test {
                 31, 139, 8, 0, 0, 0, 0, 0, 2, os, 243, 72, 205, 201, 201, 87, 8, 207, 47, 202, 73,
                 81, 4, 0, 163, 28, 41, 28, 12, 0, 0, 0,
             ],
-        )
+        );
     }
 
     #[test]
@@ -5828,11 +8418,126 @@ mod test {
                 31, 139, 8, 0, 0, 0, 0, 0, 4, gz_header::OS_CODE, 1, 18, 0, 237, 255, 27, 27, 27, 27, 27, 27, 27,
                 27, 27, 27, 27, 27, 27, 27, 27, 27, 9, 0, 60, 101, 156, 55, 18, 0, 0, 0,
             ],
-        )
+        );
+    }
+
+    fn encode_custom_gzip_header(output_chunk: usize) -> Result<Vec<u8>, &'static str> {
+        // All three metadata fields exceed the mem-level-1 pending buffer.
+        // Every state must therefore handle an interrupted header flush.
+        let extra = vec![0x5au8; 701];
+        let mut name = vec![b'n'; 709];
+        name.push(0);
+        // Make the gzip header length 511 modulo 512, so FHCRC itself
+        // must also resume across an exhausted pending buffer.
+        let mut comment = vec![b'c'; 1_135];
+        comment.push(0);
+        let mut header = gz_header {
+            text: 1,
+            time: 0x1020_3040,
+            os: 3,
+            extra: extra.as_ptr().cast_mut(),
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| "extra header fixture exceeds C length")?,
+            name: name.as_mut_ptr(),
+            comment: comment.as_mut_ptr(),
+            hcrc: 1,
+            ..gz_header::default()
+        };
+
+        let config = DeflateConfig {
+            window_bits: 16 + crate::MAX_WBITS,
+            mem_level: 1,
+            ..DeflateConfig::default()
+        };
+        let mut stream =
+            DeflateStream::new(config).map_err(|_| "valid gzip compressor configuration failed")?;
+        // SAFETY: header and all three backing buffers remain live and
+        // unmodified until deflateEnd, including every resumed call.
+        let header_status = unsafe { set_header(&mut stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
+        let source = b"chunked gzip header then actual deflate payload".repeat(8);
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(source.len())
+            .map_err(|_| "source fixture exceeds C length")?;
+
+        let limit = bound(Some(&stream), source.len());
+        let mut encoded = vec![0u8; limit];
+        let mut written = 0usize;
+        let mut finished = false;
+        let mut paused_header_crc = false;
+        for _ in 0..limit.saturating_add(8) {
+            let count = output_chunk.min(encoded.len() - written);
+            if count == 0 {
+                break;
+            }
+            stream.next_out = encoded[written..].as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(count)
+                .map_err(|_| "output fixture exceeds C length")?;
+            let status = deflate(&mut stream, DeflateFlush::Finish);
+            paused_header_crc |= stream.state.status == Status::Hcrc && stream.state.gzindex != 0;
+            let remaining = usize::try_from(stream.avail_out)
+                .map_err(|_| "output cursor exceeds host pointer width")?;
+            written += count - remaining;
+            if status == ReturnCode::StreamEnd {
+                finished = true;
+                break;
+            }
+            assert_eq!(
+                status,
+                ReturnCode::Ok,
+                "gzip streaming failed at chunk {output_chunk}"
+            );
+        }
+        assert!(
+        finished,
+        "gzip chunk {output_chunk} stuck: produced {written}/{limit}, status={:?}, gzindex={}, pending={}, avail_in={}, last_flush={}",
+        stream.state.status,
+        stream.state.gzindex,
+        stream.state.bit_writer.pending.pending().len(),
+        stream.avail_in,
+        stream.state.last_flush
+    );
+        assert_eq!(stream.avail_in, 0);
+        if output_chunk == 1 {
+            assert!(
+                paused_header_crc,
+                "the one-byte output fixture must interrupt FHCRC"
+            );
+        }
+        assert!(end(&mut stream).is_ok());
+        encoded.truncate(written);
+        assert!(encoded.starts_with(&[31, 139, 8, 0x1f]));
+        Ok(encoded)
     }
 
     #[test]
-    fn gzip_header_pending_flush() {
+    fn gzip_custom_header_is_identical_across_tiny_output_chunks() -> Result<(), &'static str> {
+        let baseline = encode_custom_gzip_header(16_384)?;
+        let source = b"chunked gzip header then actual deflate payload".repeat(8);
+        let mut restored = vec![0u8; source.len()];
+        let (decoded, status) = crate::decompress_slice(
+            &mut restored,
+            &baseline,
+            crate::InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, source);
+        let hcrc_at = 10 + 2 + 701 + 710 + 1_136;
+        let expected_crc = crc32(0, &baseline[..hcrc_at]).to_le_bytes();
+        assert_eq!(
+            &baseline[hcrc_at..hcrc_at + 2],
+            &expected_crc[..2],
+            "FHCRC must cover the header without including its own bytes"
+        );
+        for output_chunk in [1usize, 2, 3, 7, 31, 127, 511] {
+            let actual = encode_custom_gzip_header(output_chunk)?;
+            assert_eq!(actual, baseline, "gzip output chunk size {output_chunk}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_header_pending_flush() -> Result<(), SchedulerFixtureError> {
         let extra = "aaaaaaaaaaaaaaaaaaaa\0";
         let name = "bbbbbbbbbbbbbbbbbbbb\0";
         let comment = "cccccccccccccccccccc\0";
@@ -5842,12 +8547,13 @@ mod test {
             time: 0,
             xflags: 0,
             os: 0,
-            extra: extra.as_ptr() as *mut _,
-            extra_len: extra.len() as _,
+            extra: extra.as_ptr().cast_mut(),
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip extra exceeds native count"))?,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
@@ -5858,57 +8564,85 @@ mod test {
             mem_level: 1,
             ..Default::default()
         };
-
-        let mut stream = z_stream::default();
-        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
-            unreachable!()
-        };
-
-        unsafe { set_header(stream, Some(&mut header)) };
-
         let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut _;
-        stream.avail_in = input.len() as _;
-
         let mut output = [0u8; 1024];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = 100;
+        let mut raw = z_stream::default();
+        let mut owned = ScopedDeflateStream::new(&mut raw, config)?;
+        let stream = owned.stream()?;
+        // SAFETY: the header and all backing string bytes remain alive until
+        // the scoped native stream is finalized at the end of this test.
+        let header_status = unsafe { set_header(stream, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
 
+        stream.next_in = input.as_ptr().cast_mut();
+        stream.avail_in = crate::c_api::uInt::try_from(input.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("gzip input exceeds C uInt"))?;
+        stream.next_out = output.as_mut_ptr();
+        let first_capacity = 100usize;
+        stream.avail_out = crate::c_api::uInt::try_from(first_capacity)
+            .map_err(|_| SchedulerFixtureError::Invariant("first chunk exceeds native count"))?;
         assert_eq!(stream.state.bit_writer.pending.capacity(), 512);
 
-        // only 12 bytes remain, so to write the name the pending buffer must be flushed.
-        // but there is insufficient output space to flush (only 100 bytes)
+        // Only 12 pending bytes remain; the header cannot continue until
+        // the first output chunk drains enough of this pending content.
         stream.state.bit_writer.pending.extend(&[0; 500]);
-
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::Ok);
 
-        // now try that again but with sufficient output space
-        stream.avail_out = output.len() as _;
+        let first_remaining = usize::try_from(stream.avail_out)
+            .map_err(|_| SchedulerFixtureError::Invariant("first output cursor too large"))?;
+        let first_written =
+            first_capacity
+                .checked_sub(first_remaining)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "first output count exceeded capacity",
+                ))?;
+
+        // Reset both cursor and count to the *remaining slice*. Merely
+        // restoring avail_out=output.len() while keeping an advanced next_out
+        // would advertise writable memory beyond the 1024-byte array.
+        let remaining = &mut output[first_written..];
+        stream.next_out = remaining.as_mut_ptr();
+        stream.avail_out = crate::c_api::uInt::try_from(remaining.len())
+            .map_err(|_| SchedulerFixtureError::Invariant("second chunk exceeds native count"))?;
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        assert_eq!(stream.avail_in, 0);
 
-        let n = stream.total_out as usize;
-
+        let second_remaining = usize::try_from(stream.avail_out)
+            .map_err(|_| SchedulerFixtureError::Invariant("second output cursor too large"))?;
+        let second_written = remaining.len().checked_sub(second_remaining).ok_or(
+            SchedulerFixtureError::Invariant("second output count exceeded capacity"),
+        )?;
+        let written =
+            first_written
+                .checked_add(second_written)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "total gzip output overflow",
+                ))?;
+        assert_eq!(
+            stream.total_out,
+            crate::c_api::z_size::try_from(written)
+                .map_err(|_| SchedulerFixtureError::Invariant("native total output too large"))?
+        );
+        assert_eq!(written, 500 + 99);
         assert!(end(stream).is_ok());
-
-        let output_rs = &mut output[..n];
-
-        assert_eq!(output_rs.len(), 500 + 99);
+        Ok(())
     }
 
     #[test]
-    fn deflate_copy_owns_independent_state_and_buffer_storage() {
+    fn deflate_copy_owns_independent_state_and_buffer_storage() -> Result<(), SchedulerFixtureError>
+    {
         let mut raw = z_stream::default();
-        assert_eq!(init(&mut raw, DeflateConfig::default()), ReturnCode::Ok);
-        let source = unsafe { DeflateStream::from_stream_mut(&mut raw) }.unwrap();
+        let mut owned = ScopedDeflateStream::new(&mut raw, DeflateConfig::default())?;
+        let source = owned.stream()?;
 
         let initial_window_byte = 0x11u8;
+        // SAFETY: the live window owns a mutable slot at index zero and the
+        // caller-provided byte remains readable throughout the copy.
         unsafe {
             source
                 .state
                 .window
-                .copy_and_initialize(0..1, &initial_window_byte)
+                .copy_and_initialize(0..1, &raw const initial_window_byte);
         };
         source.state.prev.as_mut_slice()[0] = 0x1234;
         source.state.head.as_mut_slice()[0] = 0x2345;
@@ -5920,9 +8654,15 @@ mod test {
         let source_prev = source.state.prev.as_ptr();
         let source_head = source.state.head.as_ptr();
 
-        let mut copied = MaybeUninit::<DeflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        let copied = unsafe { copied.assume_init_mut() };
+        let mut clone_storage = MaybeUninit::<DeflateStream>::uninit();
+        let status = copy(&mut clone_storage, source);
+        if status != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(status));
+        }
+        // SAFETY: copy returned Ok and initialized the entire destination
+        // DeflateStream. Moving it into an owned local enables Drop cleanup
+        // on any subsequent failure, unlike a borrowed MaybeUninit slot.
+        let mut copied = unsafe { clone_storage.assume_init() };
 
         assert_ne!(source_state, copied.state.as_ptr());
         assert_ne!(source_window, copied.state.window.as_ptr());
@@ -5951,11 +8691,44 @@ mod test {
         }
 
         assert!(end(source).is_ok());
-        assert!(end(copied).is_ok());
+        assert!(end(&mut copied).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn gzip_header_is_shared_safely_across_deflate_copy() {
+    fn gzip_header_is_shared_safely_across_deflate_copy() -> Result<(), SchedulerFixtureError> {
+        fn finish(
+            stream: &mut DeflateStream<'_>,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<usize, SchedulerFixtureError> {
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip-copy input exceeds C uInt"))?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(output.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip-copy output exceeds C uInt"))?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let unused = usize::try_from(stream.avail_out).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip-copy cursor exceeds host width")
+            })?;
+            let written =
+                output
+                    .len()
+                    .checked_sub(unused)
+                    .ok_or(SchedulerFixtureError::Invariant(
+                        "gzip-copy wrote past output",
+                    ))?;
+            assert_eq!(
+                stream.total_out,
+                crate::c_api::z_size::try_from(written).map_err(|_| {
+                    SchedulerFixtureError::Invariant("gzip-copy count exceeds C size")
+                })?
+            );
+            Ok(written)
+        }
+
         let extra = b"copy-extra\0";
         let name = b"copy-name\0";
         let comment = b"copy-comment\0";
@@ -5964,12 +8737,13 @@ mod test {
             time: 0x1234_5678,
             xflags: 0,
             os: 3,
-            extra: extra.as_ptr() as *mut _,
-            extra_len: extra.len() as _,
+            extra: extra.as_ptr().cast_mut(),
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("copy gzip extra exceeds C uInt"))?,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
@@ -5980,64 +8754,89 @@ mod test {
             ..Default::default()
         };
         let mut source_stream = z_stream::default();
-        assert_eq!(init(&mut source_stream, config), ReturnCode::Ok);
-        let source = unsafe { DeflateStream::from_stream_mut(&mut source_stream) }.unwrap();
-        assert_eq!(
-            unsafe { set_header(source, Some(&mut header)) },
-            ReturnCode::Ok
-        );
+        let mut owned = ScopedDeflateStream::new(&mut source_stream, config)?;
+        let source = owned.stream()?;
+        // SAFETY: the shared header and its caller-owned strings remain
+        // valid until both source and destination streams are ended.
+        let header_status = unsafe { set_header(source, Some(&mut header)) };
+        assert_eq!(header_status, ReturnCode::Ok);
 
         // Copy before either stream starts emitting the caller-owned header. zlib semantics require
         // both compressors to retain the same header pointer.
-        let mut copied = MaybeUninit::<DeflateStream>::uninit();
-        assert_eq!(copy(&mut copied, source), ReturnCode::Ok);
-        let copied = unsafe { copied.assume_init_mut() };
+        let mut clone_storage = MaybeUninit::<DeflateStream>::uninit();
+        let status = copy(&mut clone_storage, source);
+        if status != ReturnCode::Ok {
+            return Err(SchedulerFixtureError::Native(status));
+        }
+        // SAFETY: a successful copy initialized every field and allocated
+        // an independent native state. Ownership makes cleanup automatic.
+        let mut copied = unsafe { clone_storage.assume_init() };
 
         let input = b"same payload through both copied streams";
         let mut source_output = [0u8; 256];
-        source.next_in = input.as_ptr() as *mut _;
-        source.avail_in = input.len() as _;
-        source.next_out = source_output.as_mut_ptr();
-        source.avail_out = source_output.len() as _;
-
         let mut copied_output = [0u8; 256];
-        copied.next_in = input.as_ptr() as *mut _;
-        copied.avail_in = input.len() as _;
-        copied.next_out = copied_output.as_mut_ptr();
-        copied.avail_out = copied_output.len() as _;
-
-        assert_eq!(deflate(source, DeflateFlush::Finish), ReturnCode::StreamEnd);
-        assert_eq!(deflate(copied, DeflateFlush::Finish), ReturnCode::StreamEnd);
-
-        let source_len = source.total_out as usize;
-        let copied_len = copied.total_out as usize;
+        let source_len = finish(source, input, &mut source_output)?;
+        let copied_len = finish(&mut copied, input, &mut copied_output)?;
         assert_eq!(source_len, copied_len);
         assert_eq!(&source_output[..source_len], &copied_output[..copied_len]);
 
+        let mut plaintext = [0u8; 256];
+        let (decoded, decode_status) = crate::decompress_slice(
+            &mut plaintext,
+            &source_output[..source_len],
+            InflateConfig { window_bits: 31 },
+        );
+        assert_eq!(decode_status, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+
         assert!(end(source).is_ok());
-        assert!(end(copied).is_ok());
+        assert!(end(&mut copied).is_ok());
+        Ok(())
+    }
+
+    /// Parse a native gzip FNAME/FCOMMENT destination without assuming that
+    /// the native decoder wrote a NUL before the end of its allocation.
+    fn bounded_gzip_string(bytes: &[u8]) -> Result<&str, SchedulerFixtureError> {
+        let terminator =
+            bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or(SchedulerFixtureError::Invariant(
+                    "gzip metadata string lacks terminator",
+                ))?;
+        core::str::from_utf8(&bytes[..terminator])
+            .map_err(|_| SchedulerFixtureError::Invariant("gzip metadata string invalid UTF-8"))
     }
 
     #[test]
-    fn gzip_with_header() {
-        // this test is here mostly so we get some MIRI action on the gzip header. A test that
-        // compares behavior with zlib-ng is in the libz-rs-sys test suite
+    fn bounded_gzip_metadata_rejects_unterminated_and_invalid_utf8(
+    ) -> Result<(), SchedulerFixtureError> {
+        assert_eq!(bounded_gzip_string(b"ok\0\xff")?, "ok");
+        assert!(bounded_gzip_string(b"not terminated").is_err());
+        assert!(bounded_gzip_string(b"\xff\0").is_err());
+        Ok(())
+    }
 
-        let extra = "some extra stuff\0";
+    fn encode_gzip_with_header(
+        extra: &[u8],
+        input: &[u8],
+    ) -> Result<([u8; 256], usize), SchedulerFixtureError> {
+        // Keep gzipHeader readback in addition to the zlib-ng differential
+        // suite: it exercises Miri-relevant native input/output lifetimes.
         let name = "nomen est omen\0";
         let comment = "such comment\0";
-
         let mut header = gz_header {
             text: 0,
             time: 0,
             xflags: 0,
             os: 0,
-            extra: extra.as_ptr() as *mut _,
-            extra_len: extra.len() as _,
+            extra: extra.as_ptr().cast_mut(),
+            extra_len: crate::c_api::uInt::try_from(extra.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip extra too large"))?,
             extra_max: 0,
-            name: name.as_ptr() as *mut _,
+            name: name.as_ptr().cast_mut(),
             name_max: 0,
-            comment: comment.as_ptr() as *mut _,
+            comment: comment.as_ptr().cast_mut(),
             comm_max: 0,
             hcrc: 1,
             done: 0,
@@ -6047,110 +8846,142 @@ mod test {
             window_bits: 31,
             ..Default::default()
         };
+        let mut compressed = [0u8; 256];
+        let mut raw_deflate = z_stream::default();
+        let mut encoder = ScopedDeflateStream::new(&mut raw_deflate, config)?;
+        let encoded_len = {
+            let stream = encoder.stream()?;
+            // SAFETY: header and its three caller-owned backing strings remain
+            // valid throughout compression and native state teardown.
+            let header_status = unsafe { set_header(stream, Some(&mut header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(input.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip plaintext too large"))?;
+            stream.next_out = compressed.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(compressed.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output capacity too large"))?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let remaining = usize::try_from(stream.avail_out)
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip output cursor too large"))?;
+            let written =
+                compressed
+                    .len()
+                    .checked_sub(remaining)
+                    .ok_or(SchedulerFixtureError::Invariant(
+                        "gzip output crossed buffer boundary",
+                    ))?;
+            assert_eq!(
+                stream.total_out,
+                crate::c_api::z_size::try_from(written)
+                    .map_err(|_| SchedulerFixtureError::Invariant("gzip output count too large"))?
+            );
+            written
+        };
+        drop(encoder);
+        Ok((compressed, encoded_len))
+    }
 
-        let mut stream = z_stream::default();
-        assert_eq!(init(&mut stream, config), ReturnCode::Ok);
-
-        let Some(stream) = (unsafe { DeflateStream::from_stream_mut(&mut stream) }) else {
-            unreachable!()
+    fn gzip_header_roundtrip(
+        extra: &[u8],
+        expected_compressed_len: usize,
+    ) -> Result<(), SchedulerFixtureError> {
+        let name = "nomen est omen\0";
+        let comment = "such comment\0";
+        let input = b"Hello World\n";
+        let (compressed, encoded_len) = encode_gzip_with_header(extra, input)?;
+        assert_eq!(encoded_len, expected_compressed_len);
+        let gzip_bytes = &compressed[..encoded_len];
+        let mut plaintext = [0u8; 12];
+        // Nonzero sentinels prove the decoder wrote the actual NUL
+        // terminators rather than relying on zero-initialized spare space.
+        let mut extra_buf = [0xa5u8; 64];
+        let mut name_buf = [0xa5u8; 64];
+        let mut comment_buf = [0xa5u8; 64];
+        let mut decoded_header = gz_header {
+            extra: extra_buf.as_mut_ptr(),
+            extra_max: crate::c_api::uInt::try_from(extra_buf.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip extra destination too large")
+            })?,
+            name: name_buf.as_mut_ptr(),
+            name_max: crate::c_api::uInt::try_from(name_buf.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip name destination too large"))?,
+            comment: comment_buf.as_mut_ptr(),
+            comm_max: crate::c_api::uInt::try_from(comment_buf.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip comment destination too large")
+            })?,
+            ..gz_header::default()
         };
 
-        unsafe { set_header(stream, Some(&mut header)) };
-
-        let input = b"Hello World\n";
-        stream.next_in = input.as_ptr() as *mut _;
-        stream.avail_in = input.len() as _;
-
-        let mut output = [0u8; 256];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out = output.len() as _;
-
-        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
-
-        let n = stream.total_out as usize;
-
-        assert!(end(stream).is_ok());
-
-        let output_rs = &mut output[..n];
-
-        assert_eq!(output_rs.len(), 81);
-
+        let mut raw_inflate = z_stream::default();
+        let mut decoder =
+            ScopedInflateStream::new(&mut raw_inflate, InflateConfig { window_bits: 31 })?;
         {
-            let mut stream = z_stream::default();
+            let stream = decoder.stream()?;
+            stream.next_in = gzip_bytes.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(gzip_bytes.len())
+                .map_err(|_| SchedulerFixtureError::Invariant("gzip frame too large"))?;
+            stream.next_out = plaintext.as_mut_ptr();
+            stream.avail_out = crate::c_api::uInt::try_from(plaintext.len()).map_err(|_| {
+                SchedulerFixtureError::Invariant("gzip plaintext capacity too large")
+            })?;
 
-            let config = InflateConfig {
-                window_bits: config.window_bits,
-            };
-
-            assert_eq!(crate::inflate::init(&mut stream, config), ReturnCode::Ok);
-
-            let Some(stream) = (unsafe { InflateStream::from_stream_mut(&mut stream) }) else {
-                unreachable!();
-            };
-
-            stream.next_in = output_rs.as_mut_ptr() as _;
-            stream.avail_in = output_rs.len() as _;
-
-            let mut output = [0u8; 12];
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out = output.len() as _;
-
-            let mut extra_buf = [0u8; 64];
-            let mut name_buf = [0u8; 64];
-            let mut comment_buf = [0u8; 64];
-
-            let mut header = gz_header {
-                text: 0,
-                time: 0,
-                xflags: 0,
-                os: 0,
-                extra: extra_buf.as_mut_ptr(),
-                extra_len: 0,
-                extra_max: extra_buf.len() as _,
-                name: name_buf.as_mut_ptr(),
-                name_max: name_buf.len() as _,
-                comment: comment_buf.as_mut_ptr(),
-                comm_max: comment_buf.len() as _,
-                hcrc: 0,
-                done: 0,
-            };
-
+            // SAFETY: the gzip header and all nested output arrays are live,
+            // disjoint from compressed input, and writable for the capacities
+            // advertised to the native decoder until its state is ended.
+            let header_status =
+                unsafe { crate::inflate::get_header(stream, Some(&mut decoded_header)) };
+            assert_eq!(header_status, ReturnCode::Ok);
+            // SAFETY: input and output are valid disjoint caller-owned slices,
+            // advertised with checked native sizes throughout this call.
+            let status = unsafe { crate::inflate::inflate(stream, InflateFlush::Finish) };
+            assert_eq!(status, ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
             assert_eq!(
-                unsafe { crate::inflate::get_header(stream, Some(&mut header)) },
-                ReturnCode::Ok
-            );
-
-            assert_eq!(
-                unsafe { crate::inflate::inflate(stream, InflateFlush::Finish) },
-                ReturnCode::StreamEnd
-            );
-
-            crate::inflate::end(stream);
-
-            assert!(!header.comment.is_null());
-            assert_eq!(
-                unsafe { CStr::from_ptr(header.comment.cast()) }
-                    .to_str()
-                    .unwrap(),
-                comment.trim_end_matches('\0')
-            );
-
-            assert!(!header.name.is_null());
-            assert_eq!(
-                unsafe { CStr::from_ptr(header.name.cast()) }
-                    .to_str()
-                    .unwrap(),
-                name.trim_end_matches('\0')
-            );
-
-            assert!(!header.extra.is_null());
-            assert_eq!(
-                unsafe { CStr::from_ptr(header.extra.cast()) }
-                    .to_str()
-                    .unwrap(),
-                extra.trim_end_matches('\0')
+                stream.total_out,
+                crate::c_api::z_size::try_from(input.len()).map_err(|_| {
+                    SchedulerFixtureError::Invariant("decoded byte count too large")
+                })?
             );
         }
+        drop(decoder);
+        assert_eq!(&plaintext, input);
+        assert_eq!(decoded_header.done, 1);
+
+        // RFC 1952 extra data is arbitrary bytes, *not* a C string.
+        // Use its explicit wire length and preserve embedded zeros and invalid UTF-8.
+        let extra_size = usize::try_from(decoded_header.extra_len)
+            .map_err(|_| SchedulerFixtureError::Invariant("gzip extra count exceeds host width"))?;
+        assert_eq!(extra_size, extra.len());
+        assert_eq!(
+            extra_buf.get(..extra_size),
+            Some(extra),
+            "decoded gzip extra differs from raw binary metadata"
+        );
+        assert_eq!(extra_buf.get(extra_size), Some(&0xa5));
+
+        // FNAME/FCOMMENT are C strings, but only read within their actual
+        // destination allocations; never use unbounded CStr::from_ptr.
+        let name_text = bounded_gzip_string(&name_buf)?;
+        let comment_text = bounded_gzip_string(&comment_buf)?;
+        assert_eq!(name_text, name.trim_end_matches('\0'));
+        assert_eq!(comment_text, comment.trim_end_matches('\0'));
+        assert_eq!(name_buf.get(name_text.len() + 1), Some(&0xa5));
+        assert_eq!(comment_buf.get(comment_text.len() + 1), Some(&0xa5));
+        Ok(())
+    }
+    #[test]
+    fn gzip_with_header() -> Result<(), SchedulerFixtureError> {
+        gzip_header_roundtrip(b"some extra stuff\0", 81)
+    }
+
+    #[test]
+    fn gzip_header_supports_binary_extra_with_embedded_nul_and_non_utf8(
+    ) -> Result<(), SchedulerFixtureError> {
+        // A gzip FEXTRA field is length-prefixed binary data. No NUL
+        // terminator or UTF-8 interpretation is required by the decoder.
+        gzip_header_roundtrip(b"\0\xff\x80\xaa", 68)
     }
 
     #[test]
@@ -6173,7 +9004,7 @@ mod test {
                 window_bits: config.window_bits,
             };
 
-            let mut uncompr = [0; 1 << 17];
+            let mut uncompr = vec![0; 1 << 17];
             let (uncompr, err) = decompress_slice(&mut uncompr, output, config);
 
             if err == ReturnCode::Ok {
@@ -6183,7 +9014,7 @@ mod test {
             err
         }
 
-        let mut output = [0; 1 << 17];
+        let mut output = vec![0; 1 << 17];
 
         // this is too little space
         assert_eq!(
@@ -6228,7 +9059,7 @@ mod test {
                 31, 139, 8, 0, 0, 0, 0, 0, 0, gz_header::OS_CODE, 242, 72, 205, 201, 201, 87, 8, 207, 47, 202, 73,
                 81, 228, 2, 0, 0, 0, 255, 255,
             ],
-        )
+        );
     }
 
     #[test]
@@ -6271,7 +9102,7 @@ mod test {
     // splits the input into two, deflates them seperately and then joins the deflated byte streams
     // into something that can be correctly inflated again. This is the basic idea behind pigz, and
     // allows for parallel compression.
-    fn split_deflate() {
+    fn split_deflate() -> Result<(), Box<dyn std::error::Error>> {
         let input = "Hello World!\n";
 
         let (input1, input2) = input.split_at(6);
@@ -6310,12 +9141,22 @@ mod test {
         };
 
         // cuts off the length and crc
-        let (suffix, end) = output2.split_at(output2.len() - 8);
-        let (crc2, len2) = end.split_at(4);
-        let crc2 = u32::from_le_bytes(crc2.try_into().unwrap());
+        let trailer_offset = output2
+            .len()
+            .checked_sub(8)
+            .ok_or("second gzip fragment is missing its eight-byte trailer")?;
+        let (suffix, end) = output2
+            .split_at_checked(trailer_offset)
+            .ok_or("invalid gzip trailer boundary")?;
+        let (crc2, len2) = end
+            .split_at_checked(4)
+            .ok_or("gzip trailer is missing its ISIZE field")?;
+        let crc2 = u32::from_le_bytes(crc2.try_into()?);
 
-        // cuts off the gzip header (10 bytes) from the front
-        let suffix = &suffix[10..];
+        // Exclude the ten-byte gzip header from the second fragment.
+        let suffix = suffix
+            .get(10..)
+            .ok_or("second gzip fragment is missing its header")?;
 
         let mut result: Vec<u8> = Vec::new();
         result.extend(prefix.iter());
@@ -6323,12 +9164,12 @@ mod test {
 
         // it would be more proper to use `stream.total_in` here, but the slice helpers hide the
         // stream so we're cheating a bit here
-        let len1 = input1.len() as u32;
-        let len2 = u32::from_le_bytes(len2.try_into().unwrap());
-        assert_eq!(len2 as usize, input2.len());
+        let len1 = u32::try_from(input1.len())?;
+        let len2 = u32::from_le_bytes(len2.try_into()?);
+        assert_eq!(usize::try_from(len2)?, input2.len());
 
         let crc1 = crate::crc32::crc32(0, input1.as_bytes());
-        let crc = crate::crc32::crc32_combine(crc1, crc2, len2 as u64);
+        let crc = crate::crc32::crc32_combine(crc1, crc2, u64::from(len2));
 
         // combined crc of the parts should be the crc of the whole
         let crc_cheating = crate::crc32::crc32(0, input.as_bytes());
@@ -6336,13 +9177,18 @@ mod test {
 
         // write the trailer
         result.extend(crc.to_le_bytes());
-        result.extend((len1 + len2).to_le_bytes());
+        result.extend(
+            len1.checked_add(len2)
+                .ok_or("combined gzip ISIZE exceeded 32 bits")?
+                .to_le_bytes(),
+        );
 
         let mut output = vec![0; 128];
         let (output, err) = crate::inflate::decompress_slice(&mut output, &result, inflate_config);
         assert_eq!(err, ReturnCode::Ok);
 
         assert_eq!(output, input.as_bytes());
+        Ok(())
     }
 
     #[test]

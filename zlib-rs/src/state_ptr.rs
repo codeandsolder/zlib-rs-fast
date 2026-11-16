@@ -7,18 +7,20 @@ use core::ops::{Deref, DerefMut};
 /// long-lived Rust `&mut` reference. Rust references are materialized only for the duration of a
 /// borrow through `Deref`/`DerefMut`.
 #[repr(transparent)]
-pub(crate) struct StatePtr<T>(*mut T);
+pub struct StatePtr<T>(*mut T);
 
 impl<T> StatePtr<T> {
     /// # Safety
     ///
-    /// If `ptr` is non-null, it must point to a valid `T` whenever this handle is dereferenced.
-    pub(crate) unsafe fn from_raw(ptr: *mut T) -> Self {
+    /// A non-null pointer must point to a live, correctly aligned T whenever the handle
+    /// is dereferenced. The caller must also uphold shared/exclusive reference aliasing
+    /// rules for each Deref/DerefMut access. Null may be stored but not dereferenced.
+    pub(crate) const unsafe fn from_raw(ptr: *mut T) -> Self {
         Self(ptr)
     }
 
     #[inline]
-    pub(crate) fn as_ptr(&self) -> *mut T {
+    pub(crate) const fn as_ptr(&self) -> *mut T {
         self.0
     }
 }
@@ -29,7 +31,7 @@ impl<T> Deref for StatePtr<T> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         // SAFETY: construction requires every non-null pointer to be valid while dereferenced.
-        unsafe { self.0.as_ref().expect("zlib stream state is null") }
+        unsafe { self.0.as_ref() }.unwrap_or_else(|| unreachable!("zlib stream state is null"))
     }
 }
 
@@ -38,7 +40,7 @@ impl<T> DerefMut for StatePtr<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: mutable access requires `&mut self`, so safe callers cannot materialize two
         // mutable references through the same handle at once.
-        unsafe { self.0.as_mut().expect("zlib stream state is null") }
+        unsafe { self.0.as_mut() }.unwrap_or_else(|| unreachable!("zlib stream state is null"))
     }
 }
 
@@ -53,6 +55,7 @@ mod tests {
 
     #[test]
     fn null_is_a_valid_abi_state() {
+        // SAFETY: null is a representable zlib ABI state and is never dereferenced here.
         let state = unsafe { StatePtr::<u8>::from_raw(core::ptr::null_mut()) };
         assert!(state.as_ptr().is_null());
     }
