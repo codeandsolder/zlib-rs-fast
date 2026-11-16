@@ -7718,44 +7718,9 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn standard_core_events_can_be_round_robin_scheduled_across_streams(
-    ) -> Result<(), SchedulerFixtureError> {
-        let mut input = Vec::with_capacity(160_000);
-        for i in 0..4_000usize {
-            input.extend_from_slice(b"round-robin-standard-core/");
-            let row = u32::try_from(i)
-                .map_err(|_| SchedulerFixtureError::Invariant("fixture row exceeds u32"))?;
-            let marker = u8::try_from((i * 17) % 251)
-                .map_err(|_| SchedulerFixtureError::Invariant("fixture byte exceeds u8"))?;
-            input.extend_from_slice(&row.rotate_left(7).to_le_bytes());
-            input.extend(core::iter::repeat_n(marker, 5 + i % 37));
-        }
-
-        let cases = [
-            (algorithm::Algorithm::Fast, 2, Strategy::Default),
-            (algorithm::Algorithm::Medium, 3, Strategy::Default),
-            (algorithm::Algorithm::Medium, 6, Strategy::Default),
-            (algorithm::Algorithm::Slow, 7, Strategy::Default),
-            (algorithm::Algorithm::Slow, 9, Strategy::Default),
-            (algorithm::Algorithm::Huffman, 6, Strategy::HuffmanOnly),
-            (algorithm::Algorithm::Rle, 6, Strategy::Rle),
-        ];
-
-        let mut jobs = Vec::new();
-        let mut references = Vec::new();
-        for (algorithm, level, strategy) in cases {
-            let config = || DeflateConfig {
-                level,
-                method: Method::Deflated,
-                window_bits: crate::MAX_WBITS,
-                mem_level: 1,
-                strategy,
-            };
-            references.push(direct_algorithm_output(&input, config())?);
-            jobs.push(RoundRobinCore::new(&input, config(), algorithm)?);
-        }
-
+    fn schedule_round_robin_core(
+        jobs: &mut [RoundRobinCore<'_>],
+    ) -> Result<(usize, usize), SchedulerFixtureError> {
         let mut scheduler_turns = 0usize;
         let mut match_batch_count = 0usize;
         let mut max_match_batch = 0usize;
@@ -7797,6 +7762,48 @@ mod test {
                 "round-robin scheduler failed to make progress"
             );
         }
+        Ok((match_batch_count, max_match_batch))
+    }
+
+    #[test]
+    fn standard_core_events_can_be_round_robin_scheduled_across_streams(
+    ) -> Result<(), SchedulerFixtureError> {
+        let mut input = Vec::with_capacity(160_000);
+        for i in 0..4_000usize {
+            input.extend_from_slice(b"round-robin-standard-core/");
+            let row = u32::try_from(i)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture row exceeds u32"))?;
+            let marker = u8::try_from((i * 17) % 251)
+                .map_err(|_| SchedulerFixtureError::Invariant("fixture byte exceeds u8"))?;
+            input.extend_from_slice(&row.rotate_left(7).to_le_bytes());
+            input.extend(core::iter::repeat_n(marker, 5 + i % 37));
+        }
+
+        let cases = [
+            (algorithm::Algorithm::Fast, 2, Strategy::Default),
+            (algorithm::Algorithm::Medium, 3, Strategy::Default),
+            (algorithm::Algorithm::Medium, 6, Strategy::Default),
+            (algorithm::Algorithm::Slow, 7, Strategy::Default),
+            (algorithm::Algorithm::Slow, 9, Strategy::Default),
+            (algorithm::Algorithm::Huffman, 6, Strategy::HuffmanOnly),
+            (algorithm::Algorithm::Rle, 6, Strategy::Rle),
+        ];
+
+        let mut jobs = Vec::new();
+        let mut references = Vec::new();
+        for (algorithm, level, strategy) in cases {
+            let config = || DeflateConfig {
+                level,
+                method: Method::Deflated,
+                window_bits: crate::MAX_WBITS,
+                mem_level: 1,
+                strategy,
+            };
+            references.push(direct_algorithm_output(&input, config())?);
+            jobs.push(RoundRobinCore::new(&input, config(), algorithm)?);
+        }
+
+        let (match_batch_count, max_match_batch) = schedule_round_robin_core(&mut jobs)?;
 
         assert!(
             match_batch_count > 0,
@@ -8816,10 +8823,10 @@ mod test {
         Ok(())
     }
 
-    fn gzip_header_roundtrip(
+    fn encode_gzip_with_header(
         extra: &[u8],
-        expected_compressed_len: usize,
-    ) -> Result<(), SchedulerFixtureError> {
+        input: &[u8],
+    ) -> Result<([u8; 256], usize), SchedulerFixtureError> {
         // Keep gzipHeader readback in addition to the zlib-ng differential
         // suite: it exercises Miri-relevant native input/output lifetimes.
         let name = "nomen est omen\0";
@@ -8845,7 +8852,6 @@ mod test {
             window_bits: 31,
             ..Default::default()
         };
-        let input = b"Hello World\n";
         let mut compressed = [0u8; 256];
         let mut raw_deflate = z_stream::default();
         let mut encoder = ScopedDeflateStream::new(&mut raw_deflate, config)?;
@@ -8880,8 +8886,18 @@ mod test {
             written
         };
         drop(encoder);
-        assert_eq!(encoded_len, expected_compressed_len);
+        Ok((compressed, encoded_len))
+    }
 
+    fn gzip_header_roundtrip(
+        extra: &[u8],
+        expected_compressed_len: usize,
+    ) -> Result<(), SchedulerFixtureError> {
+        let name = "nomen est omen\0";
+        let comment = "such comment\0";
+        let input = b"Hello World\n";
+        let (compressed, encoded_len) = encode_gzip_with_header(extra, input)?;
+        assert_eq!(encoded_len, expected_compressed_len);
         let gzip_bytes = &compressed[..encoded_len];
         let mut plaintext = [0u8; 12];
         // Nonzero sentinels prove the decoder wrote the actual NUL
@@ -8905,12 +8921,8 @@ mod test {
         };
 
         let mut raw_inflate = z_stream::default();
-        let mut decoder = ScopedInflateStream::new(
-            &mut raw_inflate,
-            InflateConfig {
-                window_bits: config.window_bits,
-            },
-        )?;
+        let mut decoder =
+            ScopedInflateStream::new(&mut raw_inflate, InflateConfig { window_bits: 31 })?;
         {
             let stream = decoder.stream()?;
             stream.next_in = gzip_bytes.as_ptr().cast_mut();

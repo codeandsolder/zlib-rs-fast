@@ -1482,26 +1482,98 @@ impl State<'_> {
         outcome.flow
     }
 
-    fn len_and_friends_inner<'input>(
+    /// Decode an entire length symbol before committing its resumable state.
+    fn decode_slow_length_code(
         &mut self,
-        mut bit_reader: BitReader<'input>,
-        output: &mut InflateOutput<'_>,
-    ) -> LenDecodeOutcome<'input> {
-        let mut mode = self.mode;
-
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
         let len_table = match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
             Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
+        self.back = 0;
+        let decoded = decode_huffman_code::<true>(bit_reader, len_table, self.len_table.bits)
+            .map_err(|code| DispatchExit {
+                mode: Mode::Len,
+                code,
+            })?;
+        match accept_length_code(decoded, &mut self.back, &mut self.length, &mut self.extra) {
+            Ok(next) => Ok(next),
+            Err(msg) => {
+                self.error_message = Some(msg);
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: ReturnCode::DataError,
+                })
+            }
+        }
+    }
 
+    fn decode_slow_distance_code(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
         let dist_table = match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX[..],
             Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
+        match decode_distance_code(bit_reader, dist_table, self.dist_table.bits) {
+            Ok(decoded) => Ok(accept_distance_code(
+                decoded,
+                &mut self.back,
+                &mut self.offset,
+                &mut self.extra,
+            )),
+            Err(DistanceDecodeError::Input(code)) => Err(DispatchExit {
+                mode: Mode::Dist,
+                code,
+            }),
+            Err(DistanceDecodeError::InvalidCode) => {
+                self.error_message = Some("invalid distance code\0");
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: ReturnCode::DataError,
+                })
+            }
+        }
+    }
+
+    fn decode_slow_distance_extension(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+    ) -> Result<Mode, DispatchExit> {
+        match decode_distance_extension(
+            bit_reader,
+            self.extra,
+            &mut self.offset,
+            &mut self.back,
+            self.dmax,
+        ) {
+            Ok(next) => Ok(next),
+            Err(DistanceExtensionError::Input(code)) => Err(DispatchExit {
+                mode: Mode::DistExt,
+                code,
+            }),
+            Err(DistanceExtensionError::TooFarBack) => {
+                self.error_message = Some("invalid distance code too far back\0");
+                Err(DispatchExit {
+                    mode: Mode::Bad,
+                    code: ReturnCode::DataError,
+                })
+            }
+        }
+    }
+
+    fn len_and_friends_inner<'input>(
+        &mut self,
+        mut bit_reader: BitReader<'input>,
+        output: &mut InflateOutput<'_>,
+    ) -> LenDecodeOutcome<'input> {
+        let mut mode = self.mode;
 
         loop {
             mode = 'top: {
@@ -1518,37 +1590,14 @@ impl State<'_> {
                             return LenDecodeOutcome::continue_with(self.mode, bit_reader);
                         }
 
-                        self.back = 0;
-
-                        // Decode a complete table entry before changing the
-                        // length/extra state. A short input returns in Len.
-                        let decoded = match decode_huffman_code::<true>(
-                            &mut bit_reader,
-                            len_table,
-                            self.len_table.bits,
-                        ) {
-                            Ok(decoded) => decoded,
-                            Err(code) => {
-                                return LenDecodeOutcome::break_with(Mode::Len, bit_reader, code);
-                            }
-                        };
-
-                        match accept_length_code(
-                            decoded,
-                            &mut self.back,
-                            &mut self.length,
-                            &mut self.extra,
-                        ) {
+                        match self.decode_slow_length_code(&mut bit_reader) {
                             Ok(Mode::Type) => {
                                 return LenDecodeOutcome::continue_with(Mode::Type, bit_reader);
                             }
                             Ok(next) => break 'top next,
-                            Err(msg) => {
-                                self.error_message = Some(msg);
+                            Err(exit) => {
                                 return LenDecodeOutcome::break_with(
-                                    Mode::Bad,
-                                    bit_reader,
-                                    ReturnCode::DataError,
+                                    exit.mode, bit_reader, exit.code,
                                 );
                             }
                         }
@@ -1584,51 +1633,16 @@ impl State<'_> {
                             return LenDecodeOutcome::break_with(Mode::LenExt, bit_reader, code);
                         }
                     },
-                    Mode::Dist => {
-                        match decode_distance_code(
-                            &mut bit_reader,
-                            dist_table,
-                            self.dist_table.bits,
-                        ) {
-                            Ok(decoded) => {
-                                break 'top accept_distance_code(
-                                    decoded,
-                                    &mut self.back,
-                                    &mut self.offset,
-                                    &mut self.extra,
-                                )
-                            }
-                            Err(DistanceDecodeError::Input(code)) => {
-                                return LenDecodeOutcome::break_with(Mode::Dist, bit_reader, code);
-                            }
-                            Err(DistanceDecodeError::InvalidCode) => {
-                                self.error_message = Some("invalid distance code\0");
-                                return LenDecodeOutcome::break_with(
-                                    Mode::Bad,
-                                    bit_reader,
-                                    ReturnCode::DataError,
-                                );
-                            }
-                        }
-                    }
-                    Mode::DistExt => match decode_distance_extension(
-                        &mut bit_reader,
-                        self.extra,
-                        &mut self.offset,
-                        &mut self.back,
-                        self.dmax,
-                    ) {
+                    Mode::Dist => match self.decode_slow_distance_code(&mut bit_reader) {
                         Ok(next) => break 'top next,
-                        Err(DistanceExtensionError::Input(code)) => {
-                            return LenDecodeOutcome::break_with(Mode::DistExt, bit_reader, code);
+                        Err(exit) => {
+                            return LenDecodeOutcome::break_with(exit.mode, bit_reader, exit.code);
                         }
-                        Err(DistanceExtensionError::TooFarBack) => {
-                            self.error_message = Some("invalid distance code too far back\0");
-                            return LenDecodeOutcome::break_with(
-                                Mode::Bad,
-                                bit_reader,
-                                ReturnCode::DataError,
-                            );
+                    },
+                    Mode::DistExt => match self.decode_slow_distance_extension(&mut bit_reader) {
+                        Ok(next) => break 'top next,
+                        Err(exit) => {
+                            return LenDecodeOutcome::break_with(exit.mode, bit_reader, exit.code);
                         }
                     },
                     Mode::Match => match copy_pending_match(
@@ -2192,6 +2206,84 @@ impl State<'_> {
         }
     }
 
+    /// Block framing can either enter the next state or pause at a flush
+    /// boundary; in the latter case the caller publishes the exact pending mode.
+    fn dispatch_block_mode(
+        &mut self,
+        bit_reader: &mut BitReader<'_>,
+        output: &mut InflateOutput<'_>,
+        flush: InflateFlush,
+        mode: Mode,
+    ) -> Result<ControlFlow<(Mode, ReturnCode), Mode>, DispatchExit> {
+        match mode {
+            Mode::Type => match flush {
+                InflateFlush::Block | InflateFlush::Trees => {
+                    Ok(ControlFlow::Break((Mode::Type, ReturnCode::Ok)))
+                }
+                InflateFlush::NoFlush | InflateFlush::SyncFlush | InflateFlush::Finish => {
+                    Ok(ControlFlow::Continue(Mode::TypeDo))
+                }
+            },
+            Mode::TypeDo => {
+                let next = self.decode_block_type(bit_reader)?;
+                if flush == InflateFlush::Trees && matches!(next, Mode::Len_) {
+                    Ok(ControlFlow::Break((next, ReturnCode::Ok)))
+                } else {
+                    Ok(ControlFlow::Continue(next))
+                }
+            }
+            Mode::Stored => {
+                let next = self.decode_stored_header(bit_reader)?;
+                if flush == InflateFlush::Trees {
+                    Ok(ControlFlow::Break((next, ReturnCode::Ok)))
+                } else {
+                    Ok(ControlFlow::Continue(next))
+                }
+            }
+            Mode::CopyBlock => Ok(self.copy_stored_payload(bit_reader, output).map_or(
+                ControlFlow::Break((Mode::CopyBlock, ReturnCode::Ok)),
+                ControlFlow::Continue,
+            )),
+            Mode::Check => self
+                .decode_data_checksum(bit_reader, output)
+                .map(ControlFlow::Continue),
+            _ => unreachable!("only block framing states enter dispatch_block_mode"),
+        }
+    }
+
+    /// Both literal and back-reference emission may pause when caller output
+    /// fills; an incomplete emission retains its precise mode and cursor.
+    fn emit_pending_payload(
+        &mut self,
+        output: &mut InflateOutput<'_>,
+        mode: Mode,
+    ) -> Result<Option<Mode>, DispatchExit> {
+        let written = match mode {
+            Mode::Lit => emit_literal(output, self.length),
+            Mode::Match => copy_pending_match(
+                &self.window,
+                self.flags.contains(Flags::SANE),
+                self.offset,
+                &mut self.length,
+                output,
+            ),
+            _ => unreachable!("only pending payload states enter emit_pending_payload"),
+        };
+        match written {
+            Ok(true) => Ok(Some(Mode::Len)),
+            Ok(false) => {
+                if matches!(mode, Mode::Lit) {
+                    traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
+                }
+                Ok(None)
+            }
+            Err(msg) => Err(DispatchExit {
+                mode: Mode::Bad,
+                code: self.bad(msg),
+            }),
+        }
+    }
+
     fn dispatch_inner(
         &mut self,
         bit_reader: &mut BitReader<'_>,
@@ -2217,40 +2309,14 @@ impl State<'_> {
                             break 'label ReturnCode::Ok;
                         }
                     },
-                    Mode::Type => {
-                        use InflateFlush::*;
-
-                        match flush {
-                            Block | Trees => break 'label ReturnCode::Ok,
-                            NoFlush | SyncFlush | Finish => {
-                                // NOTE: this is slightly different to what zlib-rs does!
-                                break 'blk Mode::TypeDo;
+                    Mode::Type | Mode::TypeDo | Mode::Stored | Mode::CopyBlock | Mode::Check => {
+                        match self.dispatch_block_mode(bit_reader, output, flush, mode)? {
+                            ControlFlow::Continue(next) => break 'blk next,
+                            ControlFlow::Break((paused, code)) => {
+                                mode = paused;
+                                break 'label code;
                             }
                         }
-                    }
-                    Mode::TypeDo => {
-                        let next = self.decode_block_type(bit_reader)?;
-                        if flush == InflateFlush::Trees && matches!(next, Mode::Len_) {
-                            mode = next;
-                            break 'label ReturnCode::Ok;
-                        }
-                        break 'blk next;
-                    }
-                    Mode::Stored => {
-                        let next = self.decode_stored_header(bit_reader)?;
-                        if flush == InflateFlush::Trees {
-                            // This return is at the stored-block header boundary.
-                            mode = next;
-                            break 'label ReturnCode::Ok;
-                        }
-                        break 'blk next;
-                    }
-                    Mode::CopyBlock => match self.copy_stored_payload(bit_reader, output) {
-                        Some(next) => break 'blk next,
-                        None => break 'label ReturnCode::Ok,
-                    },
-                    Mode::Check => {
-                        break 'blk self.decode_data_checksum(bit_reader, output)?;
                     }
                     Mode::Len_ => {
                         break 'blk Mode::Len;
@@ -2277,78 +2343,12 @@ impl State<'_> {
                             code,
                         })?;
                     }
-                    Mode::Lit => match emit_literal(output, self.length) {
-                        Ok(true) => break 'blk Mode::Len,
-                        Ok(false) => {
-                            traceln!("Ok: writer is full ({} bytes)", output.writer.capacity());
-                            break 'label ReturnCode::Ok;
-                        }
-                        Err(msg) => {
-                            mode = Mode::Bad;
-                            break 'label self.bad(msg);
-                        }
+                    Mode::Lit | Mode::Match => match self.emit_pending_payload(output, mode)? {
+                        Some(next) => break 'blk next,
+                        None => break 'label ReturnCode::Ok,
                     },
-                    Mode::Dist => {
-                        let decoded = {
-                            let table = self.dist_table_ref();
-                            decode_distance_code(bit_reader, table, self.dist_table.bits)
-                        };
-                        match decoded {
-                            Ok(decoded) => {
-                                break 'blk accept_distance_code(
-                                    decoded,
-                                    &mut self.back,
-                                    &mut self.offset,
-                                    &mut self.extra,
-                                )
-                            }
-                            Err(DistanceDecodeError::Input(code)) => {
-                                return Err(DispatchExit {
-                                    mode: Mode::Dist,
-                                    code,
-                                });
-                            }
-                            Err(DistanceDecodeError::InvalidCode) => {
-                                mode = Mode::Bad;
-                                break 'label self.bad("invalid distance code\0");
-                            }
-                        }
-                    }
-                    Mode::DistExt => {
-                        match decode_distance_extension(
-                            bit_reader,
-                            self.extra,
-                            &mut self.offset,
-                            &mut self.back,
-                            self.dmax,
-                        ) {
-                            Ok(next) => break 'blk next,
-                            Err(DistanceExtensionError::Input(code)) => {
-                                return Err(DispatchExit {
-                                    mode: Mode::DistExt,
-                                    code,
-                                });
-                            }
-                            Err(DistanceExtensionError::TooFarBack) => {
-                                mode = Mode::Bad;
-                                break 'label self.bad("invalid distance code too far back\0");
-                            }
-                        }
-                    }
-                    Mode::Match => match copy_pending_match(
-                        &self.window,
-                        self.flags.contains(Flags::SANE),
-                        self.offset,
-                        &mut self.length,
-                        output,
-                    ) {
-                        Ok(true) => break 'blk Mode::Len,
-                        Ok(false) => break 'label ReturnCode::Ok,
-                        Err(msg) => {
-                            mode = Mode::Bad;
-                            break 'label self.bad(msg);
-                        }
-                    },
+                    Mode::Dist => break 'blk self.decode_slow_distance_code(bit_reader)?,
+                    Mode::DistExt => break 'blk self.decode_slow_distance_extension(bit_reader)?,
                     Mode::Table => break 'blk self.decode_dynamic_table_header(bit_reader)?,
                     Mode::LenLens => {
                         break 'blk self.decode_code_length_alphabet(bit_reader)?;
@@ -2549,6 +2549,56 @@ impl FastDecodeOutput for writer::BackWriter<'_> {
     }
 }
 
+/// Decode a complete distance code and copy its match before leaving the fast path.
+#[inline]
+fn decode_fast_distance<O: FastDecodeOutput>(
+    state: &State,
+    bit_reader: &mut BitReader<'_>,
+    output: &mut O,
+    dcode: &[Code],
+    dmask: u16,
+    len: u16,
+) -> Result<(), &'static str> {
+    let mut here = dcode[BitBuffer::lookup_index(bit_reader.hold(), dmask)];
+
+    // The preceding fast literal/length read guarantees eight input bytes
+    // for a refill, even when the distance needs its maximum extra bits.
+    if bit_reader.bits_in_buffer() < MAX_BITS + MAX_DIST_EXTRA_BITS {
+        debug_assert!(bit_reader.bytes_remaining() >= 8);
+        bit_reader.refill();
+    }
+
+    loop {
+        bit_reader.drop_bits(here.bits);
+        let op = here.op;
+        if op & 16 != 0 {
+            let op = op & MAX_BITS;
+            let dist = here.val + bit_reader.bits_u16(usize::from(op));
+            if INFLATE_STRICT && usize::from(dist) > state.dmax {
+                return Err("invalid distance too far back\0");
+            }
+            bit_reader.drop_bits(op);
+            output.copy_back_reference(state, usize::from(dist), usize::from(len))?;
+            return Ok(());
+        }
+        if op & 64 != 0 {
+            return Err("invalid distance code\0");
+        }
+        // A second-level distance code is followed without advancing the
+        // bit reader twice: the next loop iteration drops the entry width.
+        here = dcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
+    }
+}
+
+/// The code-width checks are shared by both fast decoder lookup tables.
+#[inline]
+fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
+    Some((
+        BitBuffer::huffman_mask(state.len_table.bits)?,
+        BitBuffer::huffman_mask(state.dist_table.bits)?,
+    ))
+}
+
 /// Fast literal/length/distance decoder.
 ///
 /// Callers enter only when at least `INFLATE_FAST_MIN_HAVE` bytes and
@@ -2568,10 +2618,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
 
     // Validate table widths once per decoder invocation; retain bounded
     // u16 masks for the entire hot loop, avoiding per-symbol validation.
-    let (Some(lmask), Some(dmask)) = (
-        BitBuffer::huffman_mask(state.len_table.bits),
-        BitBuffer::huffman_mask(state.dist_table.bits),
-    ) else {
+    let Some((lmask, dmask)) = fast_huffman_masks(state) else {
         state.mode = Mode::Bad;
         state.error_message = Some("invalid Huffman decode table width\0");
         return;
@@ -2662,55 +2709,11 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 let len = here.val + bit_reader.bits_u16(usize::from(op));
                 bit_reader.drop_bits(op);
 
-                here = dcode[BitBuffer::lookup_index(bit_reader.hold(), dmask)];
-
-                // we have two fast-path loads: 10+10 + 15+5 = 40,
-                // but we may need to refill here in the worst case
-                if bit_reader.bits_in_buffer() < MAX_BITS + MAX_DIST_EXTRA_BITS {
-                    debug_assert!(bit_reader.bytes_remaining() >= 8);
-                    // Safety: On the first iteration of the `dolen` loop, we can rely on the
-                    // invariant documented for the previous `refill` call above: after that
-                    // operation, `bit_reader.bytes_remining >= 8`, which satisfies the safety
-                    // requirement for this call. For subsequent iterations, this invariant
-                    // remains true because nothing else within the `dolen` loop consumes data
-                    // from the slice.
-                    bit_reader.refill();
-                }
-
-                'dodist: loop {
-                    bit_reader.drop_bits(here.bits);
-                    let op = here.op;
-
-                    if op & 16 != 0 {
-                        let op = op & MAX_BITS;
-                        let dist = here.val + bit_reader.bits_u16(usize::from(op));
-
-                        if INFLATE_STRICT && dist as usize > state.dmax {
-                            bad = Some("invalid distance too far back\0");
-                            state.mode = Mode::Bad;
-                            break 'outer;
-                        }
-
-                        bit_reader.drop_bits(op);
-
-                        if let Err(msg) =
-                            output.copy_back_reference(state, usize::from(dist), usize::from(len))
-                        {
-                            bad = Some(msg);
-                            state.mode = Mode::Bad;
-                            break 'outer;
-                        }
-                    } else if (op & 64) == 0 {
-                        // 2nd level distance code
-                        here = dcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
-                        continue 'dodist;
-                    } else {
-                        bad = Some("invalid distance code\0");
-                        state.mode = Mode::Bad;
-                        break 'outer;
-                    }
-
-                    break 'dodist;
+                if let Err(msg) = decode_fast_distance(state, bit_reader, output, dcode, dmask, len)
+                {
+                    bad = Some(msg);
+                    state.mode = Mode::Bad;
+                    break 'outer;
                 }
             } else if (op & 64) == 0 {
                 // 2nd level length code
