@@ -389,20 +389,7 @@ fn longest_match_help<const SLOW: bool>(
 
     let early_exit = !SLOW && params.level < EARLY_EXIT_TRIGGER_LEVEL;
 
-    // The first eight scan bytes remain the same for the entire search.
-    // The tail probe changes only when a candidate improves best_len.
-    // Cache scan-side words instead of loading them once per hash link.
-    let max_scan_len = params.lookahead.min(STD_MAX_MATCH);
-    let scan_first = if max_scan_len >= 8 {
-        load_u64_le(scan, 0)
-    } else {
-        0
-    };
-    let mut scan_tail = if best_len >= 8 && best_len < max_scan_len {
-        load_u64_le(scan, best_len + 1 - 8)
-    } else {
-        0
-    };
+    let mut scan_words = ScanProbeWords::new(scan, params.lookahead.min(STD_MAX_MATCH), best_len);
 
     while let Some(candidate_pos) = cursor.candidate_start() {
         let candidate_start = usize::from(candidate_pos);
@@ -418,7 +405,13 @@ fn longest_match_help<const SLOW: bool>(
         let candidate = &resources.initialized[candidate_start..candidate_start + max_len];
         let scan = &scan[..max_len];
 
-        let len = match probe_candidate_cached(scan, candidate, best_len, scan_first, scan_tail) {
+        let len = match probe_candidate_cached(
+            scan,
+            candidate,
+            best_len,
+            scan_words.first,
+            scan_words.tail,
+        ) {
             CandidateProbe::Reject => {
                 let Some(next) = next_in_chain(
                     cursor,
@@ -446,9 +439,7 @@ fn longest_match_help<const SLOW: bool>(
             }
 
             best_len = len;
-            if best_len >= 8 && best_len < max_scan_len {
-                scan_tail = load_u64_le(scan, best_len + 1 - 8);
-            }
+            scan_words.update_tail(scan, best_len);
             if best_len >= usize::from(params.nice_match) {
                 return MatchSearchResult::new(best_len, match_start);
             }
@@ -579,6 +570,43 @@ fn next_in_chain(
         .then_some(SearchCursor { hash_pos, ..cursor })
 }
 
+/// Scan-side words shared by all hash-chain candidates. The second word
+/// depends on the best match length and is refreshed only on improvement.
+struct ScanProbeWords {
+    first: u64,
+    tail: u64,
+    max_len: usize,
+}
+
+impl ScanProbeWords {
+    #[inline]
+    fn new(scan: &[u8], max_len: usize, best_len: usize) -> Self {
+        debug_assert!(max_len <= scan.len());
+        let first = if max_len >= 8 {
+            load_u64_le(scan, 0)
+        } else {
+            0
+        };
+        let tail = if best_len >= 8 && best_len < max_len {
+            load_u64_le(scan, best_len + 1 - 8)
+        } else {
+            0
+        };
+        Self {
+            first,
+            tail,
+            max_len,
+        }
+    }
+
+    #[inline]
+    fn update_tail(&mut self, scan: &[u8], best_len: usize) {
+        if best_len >= 8 && best_len < self.max_len {
+            self.tail = load_u64_le(scan, best_len + 1 - 8);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CandidateProbe {
     Reject,
@@ -589,7 +617,7 @@ enum CandidateProbe {
 }
 
 /// Test-facing uncached entrypoint. Production reuses the invariant scan
-/// words across all candidates and updates the tail only as best_len grows.
+/// words across all candidates and updates the tail only as `best_len` grows.
 #[cfg(test)]
 fn probe_candidate(scan: &[u8], candidate: &[u8], best_len: usize) -> CandidateProbe {
     let first = if scan.len() >= 8 {
