@@ -2005,6 +2005,46 @@ mod coverage {
 }
 
 #[cfg(test)]
+fn assert_zero_chunk_rejected(encode: impl FnOnce(&mut &[u8], &mut Vec<u8>) -> i32) {
+    // A zero-sized buffer must fail immediately rather than looping forever.
+    let mut input: &[u8] = b"any input";
+    let mut output = Vec::new();
+    assert_eq!(encode(&mut input, &mut output), libz_rs_sys::Z_STREAM_ERROR);
+    assert_eq!(output, Vec::<u8>::new());
+}
+
+#[cfg(test)]
+fn read_chunked_input<R: std::io::Read, const CHUNK: usize>(
+    source: &mut R,
+    input: &mut [u8; CHUNK],
+) -> Result<u32, i32> {
+    let n = source.read(input).map_err(|_| libz_rs_sys::Z_ERRNO)?;
+    u32::try_from(n).map_err(|_| libz_rs_sys::Z_STREAM_ERROR)
+}
+
+#[cfg(test)]
+fn write_chunked_output<W: std::io::Write, const CHUNK: usize>(
+    dest: &mut W,
+    output: &mut [u8; CHUNK],
+    mut encode: impl FnMut(&mut [u8; CHUNK]) -> (i32, u32),
+) -> Result<i32, i32> {
+    loop {
+        let (code, available) = encode(output);
+        assert_ne!(code, libz_rs_sys::Z_STREAM_ERROR);
+        // Never interpret an invalid native cursor as a slice index.
+        let have = usize::try_from(available)
+            .ok()
+            .and_then(|remaining| CHUNK.checked_sub(remaining))
+            .ok_or(libz_rs_sys::Z_STREAM_ERROR)?;
+        dest.write_all(&output[..have])
+            .map_err(|_| libz_rs_sys::Z_ERRNO)?;
+        if available != 0 {
+            return Ok(code);
+        }
+    }
+}
+
+#[cfg(test)]
 fn chunked_deflate_output<const CHUNK: usize>(
     level: i32,
     encode: fn(&mut std::io::Cursor<Vec<u8>>, &mut Vec<u8>, i32) -> i32,
@@ -2023,7 +2063,7 @@ fn chunked_deflate_output<const CHUNK: usize>(
 
 #[test]
 fn deflate_chunked_input_all_levels() {
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::mem::MaybeUninit;
 
     assert_eq_rs_ng!({
@@ -2065,22 +2105,12 @@ fn deflate_chunked_input_all_levels() {
             let strm = unsafe { strm.assume_init_mut() };
 
             loop {
-                strm.avail_in = match source.read(&mut in_buf) {
-                    Ok(0) => 0,
-                    Ok(n) => {
-                        let Ok(count) = u32::try_from(n) else {
-                            // A read may never exceed the validated CHUNK
-                            // buffer size, but reject a violated contract.
-                            // SAFETY: The initialized stream must be finalized before returning on a short-read contract error.
-                            unsafe { deflateEnd(strm) };
-                            return Z_STREAM_ERROR;
-                        };
-                        count
-                    }
-                    Err(_) => {
-                        // SAFETY: The initialized stream must be finalized when the input reader returns an I/O error.
+                strm.avail_in = match read_chunked_input(source, &mut in_buf) {
+                    Ok(n) => n,
+                    Err(code) => {
+                        // SAFETY: The native stream was initialized before reading input.
                         unsafe { deflateEnd(strm) };
-                        return Z_ERRNO;
+                        return code;
                     }
                 };
                 strm.next_in = in_buf.as_mut_ptr();
@@ -2091,34 +2121,21 @@ fn deflate_chunked_input_all_levels() {
                     Z_NO_FLUSH
                 };
 
-                loop {
+                ret = match write_chunked_output(dest, &mut out_buf, |output| {
                     strm.avail_out = chunk_len;
-                    strm.next_out = out_buf.as_mut_ptr();
-
-                    // SAFETY: Input/output arrays are initialized, writable as required, and live through the C deflate call.
-                    ret = unsafe { deflate(strm, flush) };
-                    assert_ne!(ret, Z_STREAM_ERROR);
-
-                    // Never interpret a corrupt/wrapped ABI cursor as an
-                    // index into the caller-owned output buffer.
-                    let Some(have) = usize::try_from(strm.avail_out)
-                        .ok()
-                        .and_then(|remaining| CHUNK.checked_sub(remaining))
-                    else {
-                        // SAFETY: The initialized stream is finalized before rejecting an out-of-range output cursor.
+                    strm.next_out = output.as_mut_ptr();
+                    // SAFETY: Input and output arrays are initialized, disjoint,
+                    // and live through this synchronous native deflate call.
+                    let code = unsafe { deflate(strm, flush) };
+                    (code, strm.avail_out)
+                }) {
+                    Ok(code) => code,
+                    Err(code) => {
+                        // SAFETY: The initialized stream is ended exactly once on failure.
                         unsafe { deflateEnd(strm) };
-                        return Z_STREAM_ERROR;
-                    };
-                    if dest.write_all(&out_buf[..have]).is_err() {
-                        // SAFETY: The initialized stream is finalized after any destination writer error.
-                        unsafe { deflateEnd(strm) };
-                        return Z_ERRNO;
+                        return code;
                     }
-
-                    if strm.avail_out != 0 {
-                        break;
-                    }
-                }
+                };
 
                 if flush == Z_FINISH {
                     break;
@@ -2133,30 +2150,21 @@ fn deflate_chunked_input_all_levels() {
             Z_OK
         }
 
-        // A zero-sized callback buffer must fail immediately, not spin
-        // indefinitely in the inner output loop.
-        let mut empty_input: &[u8] = b"any input";
-        let mut empty_output = Vec::new();
-        assert_eq!(
-            def::<_, _, 0>(&mut empty_input, &mut empty_output, 6),
-            Z_STREAM_ERROR
-        );
-        assert_eq!(empty_output, Vec::<u8>::new());
+        assert_zero_chunk_rejected(|input, output| def::<_, _, 0>(input, output, 6));
 
         let mut outputs = Vec::new();
-
         for level in -1..=9 {
             outputs.push((
                 level,
                 4,
-                chunked_deflate_output::<4>(level, def::<std::io::Cursor<Vec<u8>>, Vec<u8>, 4>),
+                chunked_deflate_output::<4>(level, def::<Cursor<Vec<u8>>, Vec<u8>, 4>),
             ));
             outputs.push((
                 level,
                 1 << 10,
                 chunked_deflate_output::<{ 1 << 10 }>(
                     level,
-                    def::<std::io::Cursor<Vec<u8>>, Vec<u8>, { 1 << 10 }>,
+                    def::<Cursor<Vec<u8>>, Vec<u8>, { 1 << 10 }>,
                 ),
             ));
             outputs.push((
@@ -2164,7 +2172,7 @@ fn deflate_chunked_input_all_levels() {
                 1 << 12,
                 chunked_deflate_output::<{ 1 << 12 }>(
                     level,
-                    def::<std::io::Cursor<Vec<u8>>, Vec<u8>, { 1 << 12 }>,
+                    def::<Cursor<Vec<u8>>, Vec<u8>, { 1 << 12 }>,
                 ),
             ));
             outputs.push((
@@ -2172,7 +2180,7 @@ fn deflate_chunked_input_all_levels() {
                 1 << 14,
                 chunked_deflate_output::<{ 1 << 14 }>(
                     level,
-                    def::<std::io::Cursor<Vec<u8>>, Vec<u8>, { 1 << 14 }>,
+                    def::<Cursor<Vec<u8>>, Vec<u8>, { 1 << 14 }>,
                 ),
             ));
         }

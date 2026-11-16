@@ -440,13 +440,17 @@ unsafe extern "C" fn pull_cb<const CHUNK: usize>(
     desc: *mut c_void,
     buf: *mut *const c_uchar,
 ) -> c_uint {
-    let Some(ctx) = desc.cast::<InputCtx>().as_mut() else {
+    // SAFETY: inflateBack synchronously invokes this callback with the live
+    // InputCtx passed as in_desc. A null descriptor is rejected by as_mut.
+    let Some(ctx) = (unsafe { desc.cast::<InputCtx>().as_mut() }) else {
         return 0;
     };
 
     if ctx.pos >= ctx.data.len() {
-        // No more data
-        *buf = core::ptr::null();
+        // No more data. inflateBack passes a valid writable pointer to its
+        // next-input slot, which is live for the duration of this callback.
+        // SAFETY: buf points to that caller-owned pointer slot.
+        unsafe { *buf = core::ptr::null() };
         return 0;
     }
 
@@ -460,7 +464,10 @@ unsafe extern "C" fn pull_cb<const CHUNK: usize>(
         return 0;
     };
 
-    *buf = ctx.data[ctx.pos..].as_ptr();
+    // SAFETY: buf points to inflateBack's writable pointer slot. The
+    // returned span remains valid until the next callback, and CHUNK plus
+    // c_uint bounds the advertised length to that borrowed input slice.
+    unsafe { *buf = ctx.data[ctx.pos..].as_ptr() };
     ctx.pos += chunk;
     chunk_count
 }
@@ -469,7 +476,9 @@ unsafe extern "C" fn pull_cb<const CHUNK: usize>(
 ///
 /// C signature: `int out_func(void *desc, unsigned char *buf, unsigned len);`
 unsafe extern "C" fn push_cb(desc: *mut c_void, buf: *mut c_uchar, len: c_uint) -> c_int {
-    let Some(ctx) = desc.cast::<OutputCtx>().as_mut() else {
+    // SAFETY: inflateBack invokes this callback synchronously with the live,
+    // uniquely borrowed OutputCtx passed as out_desc. Null is rejected.
+    let Some(ctx) = (unsafe { desc.cast::<OutputCtx>().as_mut() }) else {
         // Signal error; inflateBack will return Z_BUF_ERROR.
         return 1;
     };
