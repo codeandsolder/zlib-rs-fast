@@ -42,7 +42,11 @@ macro_rules! checksum_body {
             u32::try_from($lanes - lane)
                 .unwrap_or_else(|_| unreachable!("SIMD lane index exceeds u32"))
         }));
-        for block in $data.chunks(NMAX as usize) {
+        // NMAX (5552) is not divisible by all SIMD widths. Use the
+        // largest whole-vector block within NMAX, avoiding per-block
+        // scalar tails and preserving aligned vector boundaries.
+        let block_bytes = (NMAX as usize / $lanes) * $lanes;
+        for block in $data.chunks(block_bytes) {
             let (vectors, tail) = block.as_chunks::<$lanes>();
             let vector_bytes = vectors.len() * $lanes;
             let mut byte_lanes = Simd::<u32, $lanes>::splat(0);
@@ -101,6 +105,7 @@ macro_rules! checksum_body {
 // platforms whose native SIMD width is known at compile time.
 #[cfg(any(
     test,
+    all(target_arch = "x86_64", not(feature = "std")),
     target_arch = "aarch64",
     all(target_arch = "arm", target_feature = "neon"),
     all(target_arch = "wasm32", target_feature = "simd128")
