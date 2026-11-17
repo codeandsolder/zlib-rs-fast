@@ -351,6 +351,194 @@ impl ParseStep {
     }
 }
 
+// A bounded tile lets us process each large suffix-rank frontier consecutively.
+// Its staging buffer preserves the position-major CSR order visible to parsers.
+const DIRECT_SCAN_MAX: usize = 8;
+const FRONTIER_TILE_POSITIONS: usize = 512;
+const _: () = assert!(FRONTIER_TILE_POSITIONS * D_CODES <= u16::MAX as usize);
+
+#[derive(Clone, Copy)]
+struct StagedCandidate {
+    local_position: u16,
+    candidate: MatchCandidate,
+}
+
+struct FrontierTileScratch {
+    counts: [u16; FRONTIER_TILE_POSITIONS],
+    starts: [u16; FRONTIER_TILE_POSITIONS],
+    ranks: [usize; FRONTIER_TILE_POSITIONS],
+    available: [u16; FRONTIER_TILE_POSITIONS],
+    staged: Vec<StagedCandidate>,
+}
+
+impl FrontierTileScratch {
+    fn new() -> Self {
+        Self {
+            counts: [0; FRONTIER_TILE_POSITIONS],
+            starts: [0; FRONTIER_TILE_POSITIONS],
+            ranks: [0; FRONTIER_TILE_POSITIONS],
+            available: [0; FRONTIER_TILE_POSITIONS],
+            staged: Vec::with_capacity(FRONTIER_TILE_POSITIONS * D_CODES),
+        }
+    }
+
+    fn prepare(&mut self, suffixes: &SuffixRanks, input_len: usize, tile_start: usize, len: usize) {
+        self.counts[..len].fill(0);
+        self.staged.clear();
+        for (local, (rank, available)) in self.ranks[..len]
+            .iter_mut()
+            .zip(self.available[..len].iter_mut())
+            .enumerate()
+        {
+            let position = tile_start + local;
+            *rank = suffixes.rank_of(position);
+            *available = u16::try_from(STD_MAX_MATCH.min(input_len - position))
+                .unwrap_or_else(|_| unreachable!("DEFLATE maximum match length fits in u16"));
+        }
+    }
+
+    fn scatter(&mut self, len: usize, entries: &mut Vec<MatchCandidate>, offsets: &mut Vec<usize>) {
+        let mut next = 0u16;
+        for (start, &count) in self.starts[..len].iter_mut().zip(&self.counts[..len]) {
+            *start = next;
+            next += count;
+        }
+        debug_assert_eq!(usize::from(next), self.staged.len());
+
+        let output_start = entries.len();
+        entries.resize(output_start + self.staged.len(), MatchCandidate::NONE);
+        let mut cursors = self.starts;
+        for staged in &self.staged {
+            let local = usize::from(staged.local_position);
+            let index = output_start + usize::from(cursors[local]);
+            entries[index] = staged.candidate;
+            cursors[local] += 1;
+        }
+        let mut next_offset = output_start;
+        for &count in &self.counts[..len] {
+            next_offset += usize::from(count);
+            offsets.push(next_offset);
+        }
+        debug_assert_eq!(next_offset, entries.len());
+    }
+}
+
+#[inline]
+fn stage_candidate(
+    local_position: usize,
+    candidate: MatchCandidate,
+    counts: &mut [u16; FRONTIER_TILE_POSITIONS],
+    staged: &mut Vec<StagedCandidate>,
+) {
+    counts[local_position] += 1;
+    staged.push(StagedCandidate {
+        local_position: u16::try_from(local_position)
+            .unwrap_or_else(|_| unreachable!("tile-local index fits in u16")),
+        candidate,
+    });
+}
+
+#[inline]
+fn direct_bucket_match(
+    input: &[u8],
+    position: usize,
+    available: usize,
+    min_distance: usize,
+    max_distance: usize,
+) -> MatchCandidate {
+    let mut best = MatchCandidate::NONE;
+    for distance in min_distance..=max_distance.min(position) {
+        let candidate_position = position - distance;
+        let length = match_compare::common_prefix_len(
+            &input[position..position + available],
+            &input[candidate_position..candidate_position + available],
+        );
+        best.consider(length, distance);
+    }
+    best
+}
+
+fn scan_direct_buckets(
+    input: &[u8],
+    ranges: &[(usize, usize)],
+    tile_start: usize,
+    tile_len: usize,
+    scratch: &mut FrontierTileScratch,
+) {
+    for (local, &available) in scratch.available[..tile_len].iter().enumerate() {
+        let available = usize::from(available);
+        if available < STD_MIN_MATCH {
+            continue;
+        }
+        let position = tile_start + local;
+        for &(min_distance, max_distance) in ranges {
+            if min_distance == 0 {
+                continue;
+            }
+            let best = direct_bucket_match(input, position, available, min_distance, max_distance);
+            if best.length != 0 {
+                stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
+            }
+        }
+    }
+}
+
+fn scan_rank_buckets(
+    input: &[u8],
+    suffixes: &SuffixRanks,
+    ranges: &[(usize, usize); D_CODES],
+    active: &mut [Option<RankSet>; D_CODES],
+    codes: core::ops::Range<usize>,
+    tile: core::ops::Range<usize>,
+    scratch: &mut FrontierTileScratch,
+) {
+    for code in codes {
+        let (min_distance, max_distance) = ranges[code];
+        if min_distance == 0 {
+            continue;
+        }
+        let Some(active) = &mut active[code] else {
+            unreachable!("only RankSet-backed classes enter the tiled traversal");
+        };
+        for (local, &available) in scratch.available[..tile.len()].iter().enumerate() {
+            let available = usize::from(available);
+            if available < STD_MIN_MATCH {
+                continue;
+            }
+            let position = tile.start + local;
+            let Some(add) = position.checked_sub(min_distance) else {
+                continue;
+            };
+            active.insert(suffixes.rank_of(add));
+            if let Some(remove) = position.checked_sub(max_distance + 1) {
+                active.remove(suffixes.rank_of(remove));
+            }
+
+            let mut best = MatchCandidate::NONE;
+            let (predecessor, successor) = active.neighbors(scratch.ranks[local]);
+            let mut consider_rank = |rank: usize| {
+                let candidate_position = suffixes.position_at(rank);
+                let distance = position - candidate_position;
+                debug_assert!((min_distance..=max_distance).contains(&distance));
+                let length = match_compare::common_prefix_len(
+                    &input[position..position + available],
+                    &input[candidate_position..candidate_position + available],
+                );
+                best.consider(length, distance);
+            };
+            if let Some(rank) = predecessor {
+                consider_rank(rank);
+            }
+            if let Some(rank) = successor {
+                consider_rank(rank);
+            }
+            if best.length != 0 {
+                stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
+            }
+        }
+    }
+}
+
 /// Build the exact useful-match frontier for a complete input.
 ///
 /// Suffix-array ranks make this exact without walking every equal-prefix predecessor. For each DEFLATE
@@ -362,78 +550,68 @@ pub fn build_match_candidates(
     input: &[u8],
     max_distance: usize,
 ) -> Result<MatchCandidates, ReturnCode> {
-    const DIRECT_SCAN_MAX: usize = 8;
     // Reject invalid history as an API error, not a process-wide panic.
     if max_distance > 1usize << crate::MAX_WBITS {
         return Err(ReturnCode::StreamError);
     }
-    // Candidate offsets remain usize because there may be D_CODES entries per byte.
     let suffixes = SuffixRanks::new(input)?;
     let ranges = distance_code_ranges(max_distance);
+    let first_rank_code = ranges
+        .iter()
+        .position(|&(min_distance, max_distance)| {
+            min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX
+        })
+        .unwrap_or(D_CODES);
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
         (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
             .then(|| RankSet::new(input.len()))
     });
+    let last_rank_code = active
+        .iter()
+        .rposition(Option::is_some)
+        .map_or(first_rank_code, |code| code + 1);
+
     let mut offsets = Vec::with_capacity(input.len() + 1);
     let mut entries = Vec::new();
+    let mut scratch = FrontierTileScratch::new();
     offsets.push(0);
 
-    for position in 0..input.len() {
-        let rank = suffixes.rank_of(position);
-        let available = STD_MAX_MATCH.min(input.len() - position);
+    for tile_start in (0..input.len()).step_by(FRONTIER_TILE_POSITIONS) {
+        let tile_len = tile_start
+            .saturating_add(FRONTIER_TILE_POSITIONS)
+            .min(input.len())
+            - tile_start;
+        scratch.prepare(&suffixes, input.len(), tile_start, tile_len);
 
-        for (code, &(min_distance, max_distance)) in ranges.iter().enumerate() {
-            if min_distance == 0 {
-                continue;
-            }
-
-            let mut best = MatchCandidate::NONE;
-            // Both suffix-rank probes and direct scans use exactly the same
-            // comparison, distance-bucket tie-breaking and token conversion.
-            let mut consider_position = |candidate_position: usize| {
-                debug_assert!(candidate_position < position);
-                let distance = position - candidate_position;
-                debug_assert!((min_distance..=max_distance).contains(&distance));
-                let length = match_compare::common_prefix_len(
-                    &input[position..position + available],
-                    &input[candidate_position..candidate_position + available],
-                );
-                best.consider(length, distance);
-            };
-
-            if let Some(active) = &mut active[code] {
-                if available < STD_MIN_MATCH {
-                    continue;
-                }
-                let Some(add) = position.checked_sub(min_distance) else {
-                    continue;
-                };
-                active.insert(suffixes.rank_of(add));
-                if let Some(remove) = position.checked_sub(max_distance + 1) {
-                    active.remove(suffixes.rank_of(remove));
-                }
-
-                let (predecessor, successor) = active.neighbors(rank);
-                if let Some(candidate_rank) = predecessor {
-                    consider_position(suffixes.position_at(candidate_rank));
-                }
-                if let Some(candidate_rank) = successor {
-                    consider_position(suffixes.position_at(candidate_rank));
-                }
-            } else if available >= STD_MIN_MATCH {
-                for distance in min_distance..=max_distance.min(position) {
-                    consider_position(position - distance);
-                }
-            }
-
-            if best.length != 0 {
-                entries.push(best);
-            }
-        }
-        offsets.push(entries.len());
+        // Short classes are position-major. Wide classes are class-major
+        // for locality. A truncated final short class must be emitted last.
+        scan_direct_buckets(
+            input,
+            &ranges[..first_rank_code],
+            tile_start,
+            tile_len,
+            &mut scratch,
+        );
+        scan_rank_buckets(
+            input,
+            &suffixes,
+            &ranges,
+            &mut active,
+            first_rank_code..last_rank_code,
+            tile_start..tile_start + tile_len,
+            &mut scratch,
+        );
+        scan_direct_buckets(
+            input,
+            &ranges[last_rank_code..],
+            tile_start,
+            tile_len,
+            &mut scratch,
+        );
+        scratch.scatter(tile_len, &mut entries, &mut offsets);
     }
-
+    debug_assert_eq!(offsets.last().copied(), Some(entries.len()));
     Ok(MatchCandidates { offsets, entries })
 }
 
@@ -1383,6 +1561,85 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
 mod tests {
     use super::*;
 
+    fn build_match_candidates_position_major(
+        input: &[u8],
+        max_distance: usize,
+    ) -> Result<MatchCandidates, ReturnCode> {
+        const DIRECT_SCAN_MAX: usize = 8;
+        // Reject invalid history as an API error, not a process-wide panic.
+        if max_distance > 1usize << crate::MAX_WBITS {
+            return Err(ReturnCode::StreamError);
+        }
+        // Candidate offsets remain usize because there may be D_CODES entries per byte.
+        let suffixes = SuffixRanks::new(input)?;
+        let ranges = distance_code_ranges(max_distance);
+        let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
+            let (min_distance, max_distance) = ranges[code];
+            (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
+                .then(|| RankSet::new(input.len()))
+        });
+        let mut offsets = Vec::with_capacity(input.len() + 1);
+        let mut entries = Vec::new();
+        offsets.push(0);
+
+        for position in 0..input.len() {
+            let rank = suffixes.rank_of(position);
+            let available = STD_MAX_MATCH.min(input.len() - position);
+
+            for (code, &(min_distance, max_distance)) in ranges.iter().enumerate() {
+                if min_distance == 0 {
+                    continue;
+                }
+
+                let mut best = MatchCandidate::NONE;
+                // Both suffix-rank probes and direct scans use exactly the same
+                // comparison, distance-bucket tie-breaking and token conversion.
+                let mut consider_position = |candidate_position: usize| {
+                    debug_assert!(candidate_position < position);
+                    let distance = position - candidate_position;
+                    debug_assert!((min_distance..=max_distance).contains(&distance));
+                    let length = match_compare::common_prefix_len(
+                        &input[position..position + available],
+                        &input[candidate_position..candidate_position + available],
+                    );
+                    best.consider(length, distance);
+                };
+
+                if let Some(active) = &mut active[code] {
+                    if available < STD_MIN_MATCH {
+                        continue;
+                    }
+                    let Some(add) = position.checked_sub(min_distance) else {
+                        continue;
+                    };
+                    active.insert(suffixes.rank_of(add));
+                    if let Some(remove) = position.checked_sub(max_distance + 1) {
+                        active.remove(suffixes.rank_of(remove));
+                    }
+
+                    let (predecessor, successor) = active.neighbors(rank);
+                    if let Some(candidate_rank) = predecessor {
+                        consider_position(suffixes.position_at(candidate_rank));
+                    }
+                    if let Some(candidate_rank) = successor {
+                        consider_position(suffixes.position_at(candidate_rank));
+                    }
+                } else if available >= STD_MIN_MATCH {
+                    for distance in min_distance..=max_distance.min(position) {
+                        consider_position(position - distance);
+                    }
+                }
+
+                if best.length != 0 {
+                    entries.push(best);
+                }
+            }
+            offsets.push(entries.len());
+        }
+
+        Ok(MatchCandidates { offsets, entries })
+    }
+
     #[test]
     fn rank_set_queries_match_reference_across_hierarchy_shapes() {
         use std::collections::BTreeSet;
@@ -1842,6 +2099,36 @@ mod tests {
                             "len={len} alphabet={alphabet} distance={max_distance} position={position}"
                         );
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_frontier_matches_exact_records_across_tile_boundaries() -> Result<(), ReturnCode> {
+        // Exercise truncated direct-scan buckets and the tile edges that
+        // shorter generated-input tests cannot reach. Compare full candidates
+        // (including the selected distance), not just code/length.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for len in [
+            127usize, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025,
+        ] {
+            for alphabet in [2u8, 31, 251] {
+                let mut input = vec![0u8; len];
+                for byte in &mut input {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    *byte = state.to_le_bytes()[4] % alphabet;
+                }
+                for max_distance in [1usize, 7, 31, 50, 64, 257] {
+                    let table = build_match_candidates(&input, max_distance)?;
+                    let reference = build_match_candidates_position_major(&input, max_distance)?;
+                    assert_eq!(
+                        table, reference,
+                        "len={len} alphabet={alphabet} max_distance={max_distance}"
+                    );
                 }
             }
         }
