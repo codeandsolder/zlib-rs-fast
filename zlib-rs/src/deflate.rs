@@ -2,7 +2,6 @@ use core::{ffi::CStr, marker::PhantomData, mem::MaybeUninit, ops::ControlFlow, p
 
 use crate::{
     abi_cursor::{advance_abi_bytes, SliceBudget},
-    adler32::adler32,
     allocate::{AlignedAllocationBlock, Allocator, ALLOCATION_BLOCK_BYTES},
     c_api::{gz_header, internal_state, z_checksum, z_stream},
     crc32::{crc32, Crc32Fold},
@@ -256,7 +255,7 @@ impl StreamChecksum {
     }
 
     fn update_adler(&mut self, bytes: &[u8]) {
-        self.0 = adler32(self.low_word(), bytes).into();
+        self.0 = crate::adler32::adler32_for_deflate(self.low_word(), bytes).into();
     }
 
     fn update_crc(&mut self, bytes: &[u8]) {
@@ -3757,7 +3756,10 @@ fn encode_near_optimal_with_state(
     }
 
     if ok {
-        let checksum = adler32(ADLER32_INITIAL_VALUE, input);
+        // Use the same portable checksum path as streaming deflate.
+        // Full-buffer AVX2 is faster in isolation, but slows this parser's
+        // combined runtime on representative compressed inputs.
+        let checksum = crate::adler32::adler32_for_deflate(ADLER32_INITIAL_VALUE, input);
         state.bit_writer.pending.extend(&checksum.to_be_bytes());
         ok = drain_near_optimal_pending(state, output, &mut produced);
     }
@@ -4942,7 +4944,7 @@ mod test {
             adler.update_adler(bytes);
             assert_eq!(
                 adler.value(),
-                crate::c_api::z_checksum::from(adler32(u32::MAX, bytes))
+                crate::c_api::z_checksum::from(crate::adler32::adler32(u32::MAX, bytes))
             );
             let mut crc = StreamChecksum(initial);
             crc.update_crc(bytes);
@@ -6310,7 +6312,7 @@ mod test {
             state
                 .bit_writer
                 .pending
-                .extend(&adler32(ADLER32_INITIAL_VALUE, &input).to_be_bytes());
+                .extend(&crate::adler32::adler32(ADLER32_INITIAL_VALUE, &input).to_be_bytes());
             assert!(drain_near_optimal_pending(
                 state,
                 &mut output,
@@ -6494,7 +6496,7 @@ mod test {
             let adler = u32::try_from(stream.adler).map_err(|_| ReturnCode::StreamError)?;
             assert_eq!(
                 adler,
-                adler32(ADLER32_INITIAL_VALUE, &dictionary),
+                crate::adler32::adler32(ADLER32_INITIAL_VALUE, &dictionary),
                 "zlib dictionary id must cover the whole dictionary: length {dictionary_size}"
             );
             assert!(end(stream).is_ok());
