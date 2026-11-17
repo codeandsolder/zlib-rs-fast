@@ -493,41 +493,39 @@ impl RankSet {
         }
     }
 
+    /// Return both neighbors from one local bitset lookup. Strictly exclude
+    /// the query rank, then consult the hierarchy only for a missing side.
     #[inline]
     fn neighbors(&self, rank: usize) -> (Option<usize>, Option<usize>) {
-        (self.predecessor(rank), self.successor(rank))
-    }
+        let word_index = rank / 64;
+        let bit_index = rank % 64;
+        let word = self.levels[0][word_index];
 
-    #[inline]
-    fn predecessor(&self, rank: usize) -> Option<usize> {
-        if rank == 0 {
-            return None;
-        }
-        let word_index = (rank - 1) / 64;
-        let bits = (rank - 1) % 64 + 1;
-        let word = self.levels[0][word_index] & low_bits(bits);
-        if word != 0 {
-            return Some(word_index * 64 + highest_bit(word));
-        }
-        let previous_word = self.previous_set_bit(1, word_index)?;
-        let word = self.levels[0][previous_word];
-        debug_assert_ne!(word, 0);
-        Some(previous_word * 64 + highest_bit(word))
-    }
+        let previous = word & low_bits(bit_index);
+        let predecessor = if previous != 0 {
+            Some(word_index * 64 + highest_bit(previous))
+        } else {
+            let previous_word = self.previous_set_bit(1, word_index);
+            previous_word.map(|index| {
+                let bits = self.levels[0][index];
+                debug_assert_ne!(bits, 0);
+                index * 64 + highest_bit(bits)
+            })
+        };
 
-    #[inline]
-    fn successor(&self, rank: usize) -> Option<usize> {
-        let start = rank.checked_add(1)?;
-        let word_index = start / 64;
-        let &raw_word = self.levels[0].get(word_index)?;
-        let word = raw_word & !low_bits(start % 64);
-        if word != 0 {
-            return Some(word_index * 64 + word.trailing_zeros() as usize);
-        }
-        let next_word = self.next_set_bit(1, word_index + 1)?;
-        let word = self.levels[0][next_word];
-        debug_assert_ne!(word, 0);
-        Some(next_word * 64 + word.trailing_zeros() as usize)
+        let following = word & !low_bits(bit_index + 1);
+        let successor = if following != 0 {
+            Some(word_index * 64 + following.trailing_zeros() as usize)
+        } else {
+            let next_word = self.next_set_bit(1, word_index + 1);
+            next_word.map(|index| {
+                let bits = self.levels[0][index];
+                debug_assert_ne!(bits, 0);
+                index * 64 + bits.trailing_zeros() as usize
+            })
+        };
+
+        (predecessor, successor)
     }
 
     #[inline]
