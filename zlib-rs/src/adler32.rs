@@ -3,29 +3,28 @@
 mod simd;
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
-mod avx2;
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-mod avx512;
+mod weighted;
 
-// Measured on AVX2 hardware across 32 source alignments: below 1 KiB,
-// portable SIMD avoids feature-check and scalar alignment-prefix overhead.
+// Keep small updates on the existing portable fallback. The large-buffer
+// architecture-width SIMD path has a per-block reduction setup cost.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 const AVX2_MIN_INPUT: usize = 1024;
 
 #[must_use]
 pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
-    // AVX2 wins consistently at this size, but carries overhead on short
-    // and misaligned incremental updates. Keep those on portable SIMD.
+    // Use architecture-width portable SIMD for large updates and retain
+    // the existing short-input kernel for incremental updates.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if data.len() >= AVX2_MIN_INPUT {
-        // x86-64 with AVX-512BW/F uses the 64-byte SAD/dot kernel.
-        // Retain the proven AVX2 implementation for other x86-64 CPUs.
+        // Both paths use the same portable SIMD algorithm, specialized to
+        // the native register width under an OS-checked CPU feature guard.
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
             // SAFETY: CPU and OS feature detection establish AVX-512F+BW.
-            return unsafe { avx512::checksum(start_checksum, data) };
+            return unsafe { weighted::checksum_avx512(start_checksum, data) };
         }
         if std::is_x86_feature_detected!("avx2") {
-            return avx2::adler32_avx2(start_checksum, data);
+            // SAFETY: runtime detection establishes AVX2 for CPU and OS.
+            return unsafe { weighted::checksum_avx2(start_checksum, data) };
         }
     }
 
@@ -144,7 +143,7 @@ mod test {
 
     #[test]
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    fn restored_avx2_matches_portable_at_lengths_offsets_and_seeds() {
+    fn deferred_dot_avx2_matches_portable_at_lengths_offsets_and_seeds() {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
@@ -197,7 +196,8 @@ mod test {
                 let slice = &data[offset..offset + len];
                 for start in [0, 1, 42, u32::MAX, 0xffff_0001, 0x1234_abcd] {
                     let expected = simd::adler32(start, slice);
-                    let actual = avx2::adler32_avx2(start, slice);
+                    // SAFETY: the test checked AVX2 support before entering its loops.
+                    let actual = unsafe { weighted::checksum_avx2(start, slice) };
                     assert_eq!(
                         actual, expected,
                         "offset={offset} len={len} seed={start:#x}"
@@ -222,7 +222,8 @@ mod test {
             let all_ff = vec![u8::MAX; len];
             for start in [0, 1, 42, u32::MAX] {
                 assert_eq!(
-                    avx2::adler32_avx2(start, &all_ff),
+                    // SAFETY: the test checked AVX2 support before entering its loops.
+                    unsafe { weighted::checksum_avx2(start, &all_ff) },
                     naive_adler32(start, &all_ff),
                     "all-ff len={len} seed={start:#x}"
                 );
@@ -287,7 +288,7 @@ mod test {
                 for initial in [0, 1, 42, u32::MAX, 0xffff_0001, 0x1234_abcd] {
                     let expected = simd::adler32(initial, slice);
                     // SAFETY: runtime detection checked both required features.
-                    let actual = unsafe { avx512::checksum(initial, slice) };
+                    let actual = unsafe { weighted::checksum_avx512(initial, slice) };
                     assert_eq!(
                         actual, expected,
                         "AVX-512 offset={offset} len={len} initial={initial:#x}"
@@ -321,7 +322,11 @@ mod test {
             for initial in [0, 1, 42, u32::MAX, 0xffff_0001] {
                 let expected = naive_adler32(initial, &data);
                 // SAFETY: runtime detection checked both required features.
-                assert_eq!(unsafe { avx512::checksum(initial, &data) }, expected);
+                assert_eq!(
+                    // SAFETY: the test checked AVX-512F and AVX-512BW support.
+                    unsafe { weighted::checksum_avx512(initial, &data) },
+                    expected
+                );
                 assert_eq!(adler32(initial, &data), expected);
             }
         }
