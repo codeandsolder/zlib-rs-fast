@@ -2,8 +2,31 @@
 
 mod simd;
 
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+mod avx2;
+
+// Measured on AVX2 hardware across 32 source alignments: below 1 KiB,
+// portable SIMD avoids feature-check and scalar alignment-prefix overhead.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+const AVX2_MIN_INPUT: usize = 1024;
+
 #[must_use]
 pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
+    // AVX2 wins consistently at this size, but carries overhead on short
+    // and misaligned incremental updates. Keep those on portable SIMD.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if data.len() >= AVX2_MIN_INPUT && std::is_x86_feature_detected!("avx2") {
+        return avx2::adler32_avx2(start_checksum, data);
+    }
+
+    simd::adler32(start_checksum, data)
+}
+
+// The compressing parser benefits from preserving its portable-SIMD checksum
+// path rather than taking the otherwise faster AVX2 checksum dispatch.
+// Keep the choice local to the encoder, where the whole codec was measured.
+#[inline]
+pub(crate) fn adler32_for_deflate(start_checksum: u32, data: &[u8]) -> u32 {
     simd::adler32(start_checksum, data)
 }
 
@@ -104,6 +127,94 @@ mod test {
                     adler32(start, &data),
                     naive_adler32(start, &data),
                     "len={len}, start={start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    fn restored_avx2_matches_portable_at_lengths_offsets_and_seeds() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut data = vec![0u8; 4 * 1024 * 1024 + 64];
+        for byte in &mut data {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = state.to_le_bytes()[4];
+        }
+        let lengths = [
+            0,
+            1,
+            2,
+            3,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            351,
+            352,
+            353,
+            1023,
+            1024,
+            1025,
+            NMAX as usize - 1,
+            NMAX as usize,
+            NMAX as usize + 1,
+            2 * NMAX as usize,
+            2 * NMAX as usize + 1,
+            32 * 1024,
+            64 * 1024,
+            256 * 1024,
+            4 * 1024 * 1024,
+        ];
+        for offset in 0..32 {
+            for &len in &lengths {
+                let slice = &data[offset..offset + len];
+                for start in [0, 1, 42, u32::MAX, 0xffff_0001, 0x1234_abcd] {
+                    let expected = simd::adler32(start, slice);
+                    let actual = avx2::adler32_avx2(start, slice);
+                    assert_eq!(
+                        actual, expected,
+                        "offset={offset} len={len} seed={start:#x}"
+                    );
+                    assert_eq!(
+                        adler32(start, slice),
+                        expected,
+                        "dispatch offset={offset} len={len} seed={start:#x}"
+                    );
+                }
+            }
+        }
+        for len in [
+            127,
+            128,
+            129,
+            NMAX as usize,
+            NMAX as usize + 1,
+            2 * NMAX as usize,
+            4 * 1024 * 1024,
+        ] {
+            let all_ff = vec![u8::MAX; len];
+            for start in [0, 1, 42, u32::MAX] {
+                assert_eq!(
+                    avx2::adler32_avx2(start, &all_ff),
+                    naive_adler32(start, &all_ff),
+                    "all-ff len={len} seed={start:#x}"
                 );
             }
         }
