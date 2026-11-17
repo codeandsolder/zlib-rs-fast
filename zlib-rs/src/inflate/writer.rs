@@ -6,6 +6,11 @@ use crate::weak_slice::WeakSliceMut;
 
 use super::window::BackWindow;
 
+// A short overlapping match is cheaper to advance byte-by-byte than to
+// seed and repeatedly double an initialized prefix. Longer matches use
+// disjoint block copies instead of doing one load/store per output byte.
+const SCALAR_OVERLAP_COPY_LIMIT: usize = 32;
+
 pub struct Writer<'a> {
     buf: WeakSliceMut<'a, MaybeUninit<u8>>,
     filled: usize,
@@ -129,25 +134,29 @@ impl<'a> Writer<'a> {
 
         // DEFLATE matches may overlap their output. `copy_within` has memmove semantics,
         // which is not enough for a match longer than its distance: newly written bytes
-        // become the source for later bytes. Seed at most one distance, then repeatedly
-        // double the initialized prefix. This expresses that recurrence directly without
-        // architecture dispatch or copying past the logical end of the match.
+        // become the source for later bytes. Short overlaps copy forward;
+        // longer matches seed one distance and then double the initialized
+        // prefix using disjoint copies, without architecture-specific dispatch.
         if length > offset_from_end {
             if offset_from_end == 1 {
                 // A distance-one match repeats a single initialized byte.
                 // Filling the span avoids up to eight overlapping memmoves.
                 let repeated = buf[start];
                 buf[current..end].fill(repeated);
+            } else if length <= SCALAR_OVERLAP_COPY_LIMIT {
+                // Short overlaps are a forward recurrence: each source byte is
+                // initialized history or was written by an earlier iteration.
+                for i in 0..length {
+                    buf[current + i] = buf[start + i];
+                }
             } else {
-                // The initial source precedes the destination. Explicit
-                // disjoint borrows permit memcpy rather than memmove.
+                // Seed one distance from disjoint history, then repeatedly
+                // double the initialized output prefix with disjoint copies.
                 let (previous, output) = buf.split_at_mut(current);
                 output[..offset_from_end].copy_from_slice(&previous[start..current]);
                 let mut initialized = offset_from_end;
                 while initialized < length {
                     let copy_len = initialized.min(length - initialized);
-                    // Each prefix-doubling step reads exclusively from the
-                    // already written prefix and writes beyond its end.
                     let (prefix, tail) = buf.split_at_mut(current + initialized);
                     tail[..copy_len].copy_from_slice(&prefix[current..current + copy_len]);
                     initialized += copy_len;
