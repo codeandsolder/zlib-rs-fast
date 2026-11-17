@@ -2,23 +2,58 @@
 
 mod simd;
 
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-mod avx2;
+// Compile SIMD-width variants where supported, and in tests.
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        any(feature = "std", target_feature = "avx2", target_feature = "avx512bw")
+    ),
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "neon"),
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+mod weighted;
 
-// Measured on AVX2 hardware across 32 source alignments: below 1 KiB,
-// portable SIMD avoids feature-check and scalar alignment-prefix overhead.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-const AVX2_MIN_INPUT: usize = 1024;
+// Below 1 KiB, the existing short-update SIMD kernel is preferable.
+const WIDE_SIMD_MIN_INPUT: usize = 1024;
 
 #[must_use]
 pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
-    // AVX2 wins consistently at this size, but carries overhead on short
-    // and misaligned incremental updates. Keep those on portable SIMD.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if data.len() >= AVX2_MIN_INPUT && std::is_x86_feature_detected!("avx2") {
-        return avx2::adler32_avx2(start_checksum, data);
+    if data.len() >= WIDE_SIMD_MIN_INPUT {
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        {
+            // 64 u16 lanes under AVX-512BW, 32 under AVX2.
+            if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+            {
+                // SAFETY: runtime CPU and OS checks establish both features.
+                return unsafe { weighted::checksum_avx512(start_checksum, data) };
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: runtime CPU and OS feature detection establishes AVX2.
+                return unsafe { weighted::checksum_avx2(start_checksum, data) };
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "std")))]
+        {
+            // Freestanding builds cannot perform runtime feature detection.
+            // When the target itself requires AVX2 or AVX-512BW, use its
+            // statically enabled native width.
+            #[cfg(target_feature = "avx512bw")]
+            return weighted::checksum::<64>(start_checksum, data);
+            #[cfg(all(not(target_feature = "avx512bw"), target_feature = "avx2"))]
+            return weighted::checksum::<32>(start_checksum, data);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon"),
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
+        {
+            // 8 u16 lanes match a native 128-bit NEON or Wasm SIMD register.
+            return weighted::checksum::<8>(start_checksum, data);
+        }
     }
-
     simd::adler32(start_checksum, data)
 }
 
@@ -133,11 +168,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    fn restored_avx2_matches_portable_at_lengths_offsets_and_seeds() {
-        if !std::is_x86_feature_detected!("avx2") {
-            return;
-        }
+    fn architecture_widths_match_portable_across_lengths_alignments_and_seeds() {
         let mut state = 0x243f_6a88_85a3_08d3u64;
         let mut data = vec![0u8; 4 * 1024 * 1024 + 64];
         for byte in &mut data {
@@ -146,6 +177,7 @@ mod test {
                 .wrapping_add(1_442_695_040_888_963_407);
             *byte = state.to_le_bytes()[4];
         }
+
         let lengths = [
             0,
             1,
@@ -163,15 +195,24 @@ mod test {
             127,
             128,
             129,
+            175,
+            176,
+            177,
             255,
             256,
             257,
             351,
             352,
             353,
+            703,
+            704,
+            705,
             1023,
             1024,
             1025,
+            1407,
+            1408,
+            1409,
             NMAX as usize - 1,
             NMAX as usize,
             NMAX as usize + 1,
@@ -184,38 +225,66 @@ mod test {
         ];
         for offset in 0..32 {
             for &len in &lengths {
+                if len > 256 * 1024 && offset != 0 && offset != 31 {
+                    continue;
+                }
                 let slice = &data[offset..offset + len];
-                for start in [0, 1, 42, u32::MAX, 0xffff_0001, 0x1234_abcd] {
-                    let expected = simd::adler32(start, slice);
-                    let actual = avx2::adler32_avx2(start, slice);
+                for initial in [0, 1, 42, u32::MAX, 0xffff_0001, 0x1234_abcd] {
+                    let expected = simd::adler32(initial, slice);
                     assert_eq!(
-                        actual, expected,
-                        "offset={offset} len={len} seed={start:#x}"
+                        weighted::checksum::<8>(initial, slice),
+                        expected,
+                        "8 lanes offset={offset} len={len} initial={initial:#x}"
                     );
                     assert_eq!(
-                        adler32(start, slice),
+                        weighted::checksum::<16>(initial, slice),
                         expected,
-                        "dispatch offset={offset} len={len} seed={start:#x}"
+                        "16 lanes offset={offset} len={len} initial={initial:#x}"
+                    );
+                    assert_eq!(
+                        weighted::checksum::<32>(initial, slice),
+                        expected,
+                        "32 lanes offset={offset} len={len} initial={initial:#x}"
+                    );
+                    assert_eq!(
+                        weighted::checksum::<64>(initial, slice),
+                        expected,
+                        "64 lanes offset={offset} len={len} initial={initial:#x}"
+                    );
+                    assert_eq!(
+                        adler32(initial, slice),
+                        expected,
+                        "dispatch offset={offset} len={len} initial={initial:#x}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn architecture_widths_preserve_worst_case_nmax_sums() {
         for len in [
             127,
             128,
             129,
+            NMAX as usize - 1,
             NMAX as usize,
             NMAX as usize + 1,
             2 * NMAX as usize,
             4 * 1024 * 1024,
         ] {
             let all_ff = vec![u8::MAX; len];
-            for start in [0, 1, 42, u32::MAX] {
-                assert_eq!(
-                    avx2::adler32_avx2(start, &all_ff),
-                    naive_adler32(start, &all_ff),
-                    "all-ff len={len} seed={start:#x}"
-                );
+            for initial in [0, 1, 42, u32::MAX] {
+                let expected = naive_adler32(initial, &all_ff);
+                for actual in [
+                    weighted::checksum::<8>(initial, &all_ff),
+                    weighted::checksum::<16>(initial, &all_ff),
+                    weighted::checksum::<32>(initial, &all_ff),
+                    weighted::checksum::<64>(initial, &all_ff),
+                    adler32(initial, &all_ff),
+                ] {
+                    assert_eq!(actual, expected, "all-0xff len={len} initial={initial:#x}");
+                }
             }
         }
     }
