@@ -4,6 +4,8 @@ mod simd;
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 mod avx2;
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+mod avx512;
 
 // Measured on AVX2 hardware across 32 source alignments: below 1 KiB,
 // portable SIMD avoids feature-check and scalar alignment-prefix overhead.
@@ -15,8 +17,16 @@ pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
     // AVX2 wins consistently at this size, but carries overhead on short
     // and misaligned incremental updates. Keep those on portable SIMD.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if data.len() >= AVX2_MIN_INPUT && std::is_x86_feature_detected!("avx2") {
-        return avx2::adler32_avx2(start_checksum, data);
+    if data.len() >= AVX2_MIN_INPUT {
+        // x86-64 with AVX-512BW/F uses the 64-byte SAD/dot kernel.
+        // Retain the proven AVX2 implementation for other x86-64 CPUs.
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
+            // SAFETY: CPU and OS feature detection establish AVX-512F+BW.
+            return unsafe { avx512::checksum(start_checksum, data) };
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            return avx2::adler32_avx2(start_checksum, data);
+        }
     }
 
     simd::adler32(start_checksum, data)
@@ -216,6 +226,103 @@ mod test {
                     naive_adler32(start, &all_ff),
                     "all-ff len={len} seed={start:#x}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    fn avx512_matches_portable_at_offsets_and_seeds() {
+        if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+            return;
+        }
+
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut data = vec![0u8; 4 * 1024 * 1024 + 64];
+        for byte in &mut data {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = state.to_le_bytes()[4];
+        }
+        for offset in 0..32 {
+            for len in [
+                0,
+                1,
+                2,
+                3,
+                15,
+                16,
+                31,
+                32,
+                33,
+                63,
+                64,
+                65,
+                127,
+                128,
+                129,
+                255,
+                256,
+                257,
+                511,
+                512,
+                1023,
+                1024,
+                1025,
+                5503,
+                5504,
+                5505,
+                NMAX as usize,
+                NMAX as usize + 1,
+                2 * NMAX as usize,
+                64 * 1024,
+                256 * 1024,
+                4 * 1024 * 1024,
+            ] {
+                if len > 256 * 1024 && offset != 0 && offset != 31 {
+                    continue;
+                }
+                let slice = &data[offset..offset + len];
+                for initial in [0, 1, 42, u32::MAX, 0xffff_0001, 0x1234_abcd] {
+                    let expected = simd::adler32(initial, slice);
+                    // SAFETY: runtime detection checked both required features.
+                    let actual = unsafe { avx512::checksum(initial, slice) };
+                    assert_eq!(
+                        actual, expected,
+                        "AVX-512 offset={offset} len={len} initial={initial:#x}"
+                    );
+                    assert_eq!(adler32(initial, slice), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    fn avx512_preserves_worst_case_nmax_sums() {
+        if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+            return;
+        }
+        for len in [
+            127,
+            128,
+            129,
+            5503,
+            5504,
+            5505,
+            NMAX as usize - 1,
+            NMAX as usize,
+            NMAX as usize + 1,
+            2 * NMAX as usize,
+            4 * 1024 * 1024,
+        ] {
+            let data = vec![u8::MAX; len];
+            for initial in [0, 1, 42, u32::MAX, 0xffff_0001] {
+                let expected = naive_adler32(initial, &data);
+                // SAFETY: runtime detection checked both required features.
+                assert_eq!(unsafe { avx512::checksum(initial, &data) }, expected);
+                assert_eq!(adler32(initial, &data), expected);
             }
         }
     }
