@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: ["**"]
 
+# Keep the newest security scan for each PR without piling up old commits.
+# Main-branch pushes and individual pull requests stay independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions: {}
 
 jobs:
