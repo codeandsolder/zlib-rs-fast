@@ -184,8 +184,8 @@ impl<'a> Writer<'a> {
     /// # Safety
     /// Both source and destination N-byte spans must lie in the allocation,
     /// source bytes must be initialized, and the spans must not overlap.
-    #[inline(always)]
-    unsafe fn copy_disjoint_chunk<const N: usize>(
+    #[inline]
+    const unsafe fn copy_disjoint_chunk<const N: usize>(
         ptr: *mut MaybeUninit<u8>,
         src: usize,
         dst: usize,
@@ -194,6 +194,8 @@ impl<'a> Writer<'a> {
         // disjointness are provided by the caller. Byte arrays have no
         // alignment requirement; LLVM can generate an unaligned vector move.
         let value = unsafe { ptr.add(src).cast::<[u8; N]>().read_unaligned() };
+        // SAFETY: the caller guaranteed this is writable and disjoint
+        // from the initialized source; N bytes are within the allocation.
         unsafe { ptr.add(dst).cast::<[u8; N]>().write_unaligned(value) };
     }
 
@@ -203,7 +205,7 @@ impl<'a> Writer<'a> {
     /// # Safety
     /// The full length must be at least N, the entire source span is
     /// initialized before dst, and the destination span has length bytes.
-    #[inline(always)]
+    #[inline]
     unsafe fn copy_disjoint_chunks<const N: usize>(
         ptr: *mut MaybeUninit<u8>,
         src: usize,
@@ -226,7 +228,7 @@ impl<'a> Writer<'a> {
 
     /// Fast ordinary-inflate copy for a non-overlapping DEFLATE reference.
     /// The callback writer uses the original, exact match copy instead.
-    #[inline(always)]
+    #[inline]
     pub(super) fn copy_match_fast(&mut self, distance: usize, length: usize) {
         assert_ne!(distance, 0, "DEFLATE match distance must be positive");
         assert!(distance <= self.filled, "match distance in bounds");
@@ -250,6 +252,9 @@ impl<'a> Writer<'a> {
         // caller-owned bytes after the reported output are untouched.
         // The width is known at compile time so LLVM may choose native
         // vector moves without handwritten architecture intrinsics.
+        // SAFETY: distance >= length, so the complete source is in the
+        // initialized prefix before current. Each chosen chunk stays
+        // entirely inside the source and logical destination spans.
         unsafe {
             if length >= MATCH_COPY_WIDTH {
                 Self::copy_disjoint_chunks::<MATCH_COPY_WIDTH>(ptr, start, current, length);
@@ -581,7 +586,7 @@ mod test {
     fn fast_copy_match_preserves_logical_bytes_and_allocation_canaries() {
         // Include a genuinely uninitialized output tail, unaligned lengths,
         // every RFC 1951 match length, and both vector and boundary paths.
-        let prefix: [u8; 64] = core::array::from_fn(|i| i as u8 + 1);
+        let prefix: [u8; 64] = core::array::from_fn(|i| u8::try_from(i + 1).unwrap_or(0));
         for distance in 1..=prefix.len() {
             for length in 0..=258 {
                 for slack in [
@@ -626,7 +631,11 @@ mod test {
                     for (i, slot) in storage[prefix.len() + length..capacity].iter().enumerate() {
                         // SAFETY: slack canaries were initialized above.
                         assert_eq!(
-                            unsafe { slot.assume_init() },
+                            {
+                                // SAFETY: slack canaries were
+                                // initialized before the tested copy.
+                                unsafe { slot.assume_init() }
+                            },
                             0x5a,
                             "unexpected write after logical output at {i}, distance {distance}, length {length}, slack {slack}"
                         );
@@ -635,7 +644,11 @@ mod test {
                         // SAFETY: the allocation canaries were initialized above
                         // and the copy routine must not write beyond capacity.
                         assert_eq!(
-                            unsafe { slot.assume_init() },
+                            {
+                                // SAFETY: allocation guard canaries were
+                                // initialized before the tested copy.
+                                unsafe { slot.assume_init() }
+                            },
                             0xa5,
                             "out-of-bounds write at {i}, distance {distance}, length {length}, slack {slack}"
                         );
@@ -647,7 +660,7 @@ mod test {
 
     #[test]
     fn callback_writer_preserves_unused_previous_window_history() {
-        let mut storage = core::array::from_fn::<u8, 128, _>(|i| i as u8);
+        let mut storage = core::array::from_fn::<u8, 128, _>(|i| u8::try_from(i).unwrap_or(0));
         {
             let mut window = super::super::window::BackWindow::from_initialized_slice(&mut storage);
             window.mark_full_history();
