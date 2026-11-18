@@ -10,6 +10,14 @@ use super::window::BackWindow;
 // seed and repeatedly double an initialized prefix. Longer matches use
 // disjoint block copies instead of doing one load/store per output byte.
 const SCALAR_OVERLAP_COPY_LIMIT: usize = 32;
+// A fixed-size byte-array copy lets LLVM choose efficient native vector
+// loads and stores without handwritten SIMD intrinsics.
+#[cfg(target_arch = "x86_64")]
+const MATCH_COPY_WIDTH: usize = 32;
+#[cfg(target_arch = "aarch64")]
+const MATCH_COPY_WIDTH: usize = 16;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const MATCH_COPY_WIDTH: usize = 8;
 
 pub struct Writer<'a> {
     buf: WeakSliceMut<'a, MaybeUninit<u8>>,
@@ -169,6 +177,108 @@ impl<'a> Writer<'a> {
         }
         // Commit the initialized extent only after every copy succeeds.
         self.filled = end;
+    }
+
+    /// Copy one fixed-size initialized chunk between disjoint buffers.
+    ///
+    /// # Safety
+    /// Both source and destination N-byte spans must lie in the allocation,
+    /// source bytes must be initialized, and the spans must not overlap.
+    #[inline]
+    const unsafe fn copy_disjoint_chunk<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        src: usize,
+        dst: usize,
+    ) {
+        // SAFETY: source and destination validity, initialization, and
+        // disjointness are provided by the caller. Byte arrays have no
+        // alignment requirement; LLVM can generate an unaligned vector move.
+        let value = unsafe { ptr.add(src).cast::<[u8; N]>().read_unaligned() };
+        // SAFETY: the caller guaranteed this is writable and disjoint
+        // from the initialized source; N bytes are within the allocation.
+        unsafe { ptr.add(dst).cast::<[u8; N]>().write_unaligned(value) };
+    }
+
+    /// Copy a disjoint DEFLATE match in exact N-byte chunks, using a final
+    /// overlapping *destination* chunk anchored at the logical end.
+    ///
+    /// # Safety
+    /// The full length must be at least N, the entire source span is
+    /// initialized before dst, and the destination span has length bytes.
+    #[inline]
+    unsafe fn copy_disjoint_chunks<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        src: usize,
+        dst: usize,
+        length: usize,
+    ) {
+        debug_assert!(length >= N);
+        let mut offset = 0;
+        while offset + N < length {
+            // SAFETY: offset + N < length; both ranges fit entirely within
+            // the disjoint initialized source and writable destination.
+            unsafe { Self::copy_disjoint_chunk::<N>(ptr, src + offset, dst + offset) };
+            offset += N;
+        }
+        // SAFETY: length >= N, so this last chunk lies exactly within the
+        // logical source/output spans even when it overlaps an earlier
+        // destination chunk. It cannot affect bytes after the reported end.
+        unsafe { Self::copy_disjoint_chunk::<N>(ptr, src + length - N, dst + length - N) };
+    }
+
+    /// Fast ordinary-inflate copy for a non-overlapping DEFLATE reference.
+    /// The callback writer uses the original, exact match copy instead.
+    // The large fast-path dispatch needs to be inlined at its one-shot
+    // decoder call site. A plain inline hint loses 10–15% end-to-end
+    // decode throughput on the tested Zen2/Zen5 PDFs.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured fast-inflater throughput requires inlining this dispatch"
+    )]
+    #[inline(always)]
+    pub(super) fn copy_match_fast(&mut self, distance: usize, length: usize) {
+        assert_ne!(distance, 0, "DEFLATE match distance must be positive");
+        assert!(distance <= self.filled, "match distance in bounds");
+        assert!(length <= self.remaining(), "match fits output buffer");
+
+        if length == 0 {
+            return;
+        }
+        if length > distance {
+            self.copy_match(distance, length);
+            return;
+        }
+
+        let start = self.filled - distance;
+        let current = self.filled;
+        let ptr = self.buf.as_mut_ptr();
+
+        // The full source span lies in the initialized prefix and ends
+        // before current. Every store is strictly within the logical
+        // destination [current, current+length); C ABI output canaries and
+        // caller-owned bytes after the reported output are untouched.
+        // The width is known at compile time so LLVM may choose native
+        // vector moves without handwritten architecture intrinsics.
+        // SAFETY: distance >= length, so the complete source is in the
+        // initialized prefix before current. Each chosen chunk stays
+        // entirely inside the source and logical destination spans.
+        unsafe {
+            if length >= MATCH_COPY_WIDTH {
+                Self::copy_disjoint_chunks::<MATCH_COPY_WIDTH>(ptr, start, current, length);
+            } else if length >= 16 {
+                Self::copy_disjoint_chunks::<16>(ptr, start, current, length);
+            } else if length >= 8 {
+                Self::copy_disjoint_chunks::<8>(ptr, start, current, length);
+            } else if length >= 4 {
+                Self::copy_disjoint_chunks::<4>(ptr, start, current, length);
+            } else if length >= 2 {
+                Self::copy_disjoint_chunks::<2>(ptr, start, current, length);
+            } else {
+                Self::copy_disjoint_chunks::<1>(ptr, start, current, length);
+            }
+        }
+
+        self.filled = current + length;
     }
 
     /// Copy initialized bytes from another position in this same backing allocation.
@@ -476,6 +586,98 @@ mod test {
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "exhaustive copy-length and slack matrix")]
+    fn fast_copy_match_preserves_logical_bytes_and_allocation_canaries() {
+        // Include a genuinely uninitialized output tail, unaligned lengths,
+        // every RFC 1951 match length, and both vector and boundary paths.
+        let prefix: [u8; 64] = core::array::from_fn(|i| u8::try_from(i + 1).unwrap_or(0));
+        for distance in 1..=prefix.len() {
+            for length in 0..=258 {
+                for slack in [
+                    0,
+                    1,
+                    7,
+                    MATCH_COPY_WIDTH - 1,
+                    MATCH_COPY_WIDTH,
+                    MATCH_COPY_WIDTH + 1,
+                ] {
+                    let capacity = prefix.len() + length + slack;
+                    let mut storage = vec![MaybeUninit::<u8>::uninit(); capacity + 32];
+                    for (slot, byte) in storage.iter_mut().zip(prefix) {
+                        slot.write(byte);
+                    }
+                    for slot in &mut storage[capacity..] {
+                        slot.write(0xa5);
+                    }
+                    for slot in &mut storage[prefix.len() + length..capacity] {
+                        slot.write(0x5a);
+                    }
+
+                    let mut expected = prefix.to_vec();
+                    for _ in 0..length {
+                        let source = expected.len() - distance;
+                        expected.push(expected[source]);
+                    }
+
+                    {
+                        let mut writer = Writer {
+                            buf: WeakSliceMut::from_mut_slice(&mut storage[..capacity]),
+                            filled: prefix.len(),
+                        };
+                        writer.copy_match_fast(distance, length);
+                        assert_eq!(writer.len(), expected.len());
+                        assert_eq!(
+                            writer.filled(),
+                            expected,
+                            "distance {distance}, length {length}, slack {slack}"
+                        );
+                    }
+                    for (i, slot) in storage[prefix.len() + length..capacity].iter().enumerate() {
+                        // SAFETY: slack canaries were initialized above.
+                        assert_eq!(
+                            {
+                                // SAFETY: slack canaries were
+                                // initialized before the tested copy.
+                                unsafe { slot.assume_init() }
+                            },
+                            0x5a,
+                            "unexpected write after logical output at {i}, distance {distance}, length {length}, slack {slack}"
+                        );
+                    }
+                    for (i, slot) in storage[capacity..].iter().enumerate() {
+                        // SAFETY: the allocation canaries were initialized above
+                        // and the copy routine must not write beyond capacity.
+                        assert_eq!(
+                            {
+                                // SAFETY: allocation guard canaries were
+                                // initialized before the tested copy.
+                                unsafe { slot.assume_init() }
+                            },
+                            0xa5,
+                            "out-of-bounds write at {i}, distance {distance}, length {length}, slack {slack}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn callback_writer_preserves_unused_previous_window_history() {
+        let mut storage = core::array::from_fn::<u8, 128, _>(|i| u8::try_from(i).unwrap_or(0));
+        {
+            let mut window = super::super::window::BackWindow::from_initialized_slice(&mut storage);
+            window.mark_full_history();
+            let mut writer = BackWriter::new(&mut window, 0);
+            assert_eq!(writer.copy_match(true, 64, 1), Ok(()));
+        }
+        // A padded 32-byte store here would destroy previous-window bytes
+        // that subsequent inflateBack callbacks might need.
+        assert_eq!(storage[0], 64);
+        assert_eq!(&storage[1..64], &(1u8..64).collect::<Vec<_>>());
     }
 
     #[test]
