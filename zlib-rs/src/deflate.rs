@@ -5775,14 +5775,19 @@ mod test {
         let source = b"ABCDABCD0123456789".repeat(32);
         let rolling_seed = RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]));
 
-        for (level, chain, expected_seed) in [
-            (7, 4_096, 0),
-            (7, 128, 0),
-            (9, 128, rolling_seed),
-            (9, 4_096, rolling_seed),
+        for (level, chain, use_rolling_history, expected_seed) in [
+            (7, 4_096, false, 0),
+            (7, 128, false, 0),
+            (9, 128, false, 0),
+            (9, 4_096, false, 0),
+            (9, 4_096, true, rolling_seed),
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(level))
                 .map_err(|_| "valid deflate initialization failed")?;
+            if use_rolling_history {
+                // Only switch hash representations while the history is empty.
+                stream.state.hash_calc_variant = HashCalcVariant::Roll;
+            }
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             let mut input = InputCursor::from_slice(&source, stream.total_in)
                 .ok_or("test source length must fit zlib uInt")?;
@@ -5805,8 +5810,15 @@ mod test {
             .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
             .collect();
 
-        for (old_level, new_level, expected_roll) in [(7, 9, false), (9, 7, true), (6, 9, false)] {
+        for (old_level, new_level, use_rolling_history) in
+            [(7, 9, false), (9, 7, false), (6, 9, false), (9, 7, true)]
+        {
             let mut stream = DeflateStream::new(DeflateConfig::new(old_level))?;
+            if use_rolling_history {
+                // Build the dictionary in rolling-hash mode to verify a
+                // subsequent level change preserves its live index.
+                stream.state.hash_calc_variant = HashCalcVariant::Roll;
+            }
             assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
             assert!(stream.state.strstart > 0);
             assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
@@ -5817,7 +5829,7 @@ mod test {
 
             assert_eq!(
                 matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
-                expected_roll,
+                use_rolling_history,
                 "level change {old_level} to {new_level} reinterpreted existing hash history",
             );
             assert!(end(&mut stream).is_ok());

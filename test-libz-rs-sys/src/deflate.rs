@@ -2866,10 +2866,11 @@ fn gzip_with_header() {
 
 mod fuzz_based_tests {
     use super::{FIREWORKS, LCET10, PAPER_100K};
-    use crate::helpers::compress_slice_ng;
+    use crate::helpers::{compress_slice_ng, uncompress_slice_ng};
     use libz_rs_sys::gz_header;
     use zlib_rs::{
         deflate::{compress_slice, DeflateConfig, Method, Strategy},
+        inflate::{decompress_slice, InflateConfig},
         ReturnCode,
     };
 
@@ -2878,12 +2879,39 @@ mod fuzz_based_tests {
         let (output_rs, err) = compress_slice(&mut output_rs, input, config);
         assert_eq!(err, ReturnCode::Ok);
 
+        let inflate_config = InflateConfig {
+            window_bits: match config.window_bits {
+                8 => 9,
+                width => width,
+            },
+        };
+        let mut decoded_rs = vec![0; input.len()];
+        let (decoded, err) = decompress_slice(&mut decoded_rs, output_rs, inflate_config);
+        assert_eq!(err, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+
         if !cfg!(miri) {
             let mut output_ng = vec![0; 1 << 19];
             let (output_ng, err) = compress_slice_ng(&mut output_ng, input, config);
             assert_eq!(err, Ok(ReturnCode::Ok));
 
-            assert_eq!(output_rs, output_ng);
+            // The level-9 match finder now deliberately chooses a different
+            // valid DEFLATE representation. Other levels remain byte-exact.
+            if config.level != 9 {
+                assert_eq!(output_rs, output_ng);
+            }
+
+            for compressed in [&*output_rs, &*output_ng] {
+                let (decoded, err) = decompress_slice(&mut decoded_rs, compressed, inflate_config);
+                assert_eq!(err, ReturnCode::Ok);
+                assert_eq!(decoded, input);
+
+                let mut decoded_ng = vec![0; input.len()];
+                let (decoded, err) =
+                    uncompress_slice_ng(&mut decoded_ng, compressed, inflate_config);
+                assert_eq!(err, Ok(ReturnCode::Ok));
+                assert_eq!(decoded, input);
+            }
         }
 
         if !expected.is_empty() {

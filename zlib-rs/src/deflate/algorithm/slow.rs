@@ -217,18 +217,24 @@ mod tests {
 
     #[test]
     fn specialized_search_requires_rolling_hash_history() -> Result<(), crate::ReturnCode> {
-        for (level, chain, expected_specialized) in [
-            (7, 4_096, false), // tune a Standard-hash stream above the usual chain limit
+        for (level, chain, use_rolling_history) in [
+            (7, 4_096, false), // tuning a Standard-hash stream cannot change its index
             (7, 128, false),
-            (9, 4_096, true),
+            (9, 4_096, false), // level 9 now initializes the four-byte index
             (9, 128, false),
+            (9, 4_096, true), // separately exercise a live rolling-hash history
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(level))?;
+            if use_rolling_history {
+                // History is still empty: selecting its representation here
+                // is safe. Once populated, tuning must not reinterpret it.
+                stream.state.hash_calc_variant = HashCalcVariant::Roll;
+            }
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             assert_eq!(
                 SlowProducer::new(&stream.state, MatchSourceKind::HashChain).use_longest_match_slow,
-                expected_specialized,
-                "level {level}, tuned chain {chain}",
+                use_rolling_history && chain > 1024,
+                "level {level}, tuned chain {chain}, rolling history {use_rolling_history}",
             );
             assert!(end(&mut stream).is_ok());
         }

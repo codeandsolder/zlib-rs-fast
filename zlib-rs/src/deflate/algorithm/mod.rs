@@ -913,7 +913,10 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(8, 16, 128, 128, Algorithm::Medium),
     LevelConfig::new(8, 32, 128, 256, Algorithm::Slow),
     LevelConfig::new(32, 128, 258, 1024, Algorithm::Slow),
-    LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
+    // The selective four-byte hash needs a shorter candidate walk than
+    // rolling hashing. Keep 128 links at level 9: deep walks are expensive
+    // and bring diminishing compression-ratio improvements.
+    LevelConfig::new(32, 258, 258, 128, Algorithm::Slow),
 ];
 
 /// Resolve a compressor's signed level without permitting invalid table indices.

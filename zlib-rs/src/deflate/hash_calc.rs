@@ -23,8 +23,10 @@ pub enum HashCalcVariant {
 }
 
 impl HashCalcVariant {
-    /// Use rolling hash for `deflate_slow` algorithm with level 9. It allows us to
-    /// properly lookup different hash chains to speed up `longest_match` search.
+    /// Choose the hash representation when the history is empty. Deep
+    /// searches can use a rolling three-byte index; the default level-9
+    /// profile uses the more selective four-byte index with fewer links.
+    /// Tuning an existing stream never reinterprets its populated history.
     pub const fn for_max_chain_length(max_chain_length: u16) -> Self {
         if max_chain_length > 1024 {
             Self::Roll
@@ -182,6 +184,21 @@ mod tests {
         ] {
             assert_eq!(hash_chain_position(position), expected);
         }
+    }
+
+    #[test]
+    fn level9_defaults_to_the_bounded_four_byte_hash() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{end, DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(9))?;
+        assert!(matches!(
+            stream.state.hash_calc_variant,
+            HashCalcVariant::Standard
+        ));
+        assert_eq!(stream.state.max_chain_length, 128);
+        assert_eq!(stream.state.level, 9);
+        assert!(end(&mut stream).is_ok());
+        Ok(())
     }
 
     #[test]
