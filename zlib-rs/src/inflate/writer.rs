@@ -179,18 +179,63 @@ impl<'a> Writer<'a> {
         self.filled = end;
     }
 
-    /// Fast ordinary-inflate match copy when the output allocation has
-    /// spare capacity. Callback-driven inflateBack cannot use this method:
-    /// its unused output tail can still contain *live previous history*.
+    /// Copy one fixed-size initialized chunk between disjoint buffers.
+    ///
+    /// # Safety
+    /// Both source and destination N-byte spans must lie in the allocation,
+    /// source bytes must be initialized, and the spans must not overlap.
+    #[inline(always)]
+    unsafe fn copy_disjoint_chunk<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        src: usize,
+        dst: usize,
+    ) {
+        // SAFETY: source and destination validity, initialization, and
+        // disjointness are provided by the caller. Byte arrays have no
+        // alignment requirement; LLVM can generate an unaligned vector move.
+        let value = unsafe { ptr.add(src).cast::<[u8; N]>().read_unaligned() };
+        unsafe { ptr.add(dst).cast::<[u8; N]>().write_unaligned(value) };
+    }
+
+    /// Copy a disjoint DEFLATE match in exact N-byte chunks, using a final
+    /// overlapping *destination* chunk anchored at the logical end.
+    ///
+    /// # Safety
+    /// The full length must be at least N, the entire source span is
+    /// initialized before dst, and the destination span has length bytes.
+    #[inline(always)]
+    unsafe fn copy_disjoint_chunks<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        src: usize,
+        dst: usize,
+        length: usize,
+    ) {
+        debug_assert!(length >= N);
+        let mut offset = 0;
+        while offset + N < length {
+            // SAFETY: offset + N < length; both ranges fit entirely within
+            // the disjoint initialized source and writable destination.
+            unsafe { Self::copy_disjoint_chunk::<N>(ptr, src + offset, dst + offset) };
+            offset += N;
+        }
+        // SAFETY: length >= N, so this last chunk lies exactly within the
+        // logical source/output spans even when it overlaps an earlier
+        // destination chunk. It cannot affect bytes after the reported end.
+        unsafe { Self::copy_disjoint_chunk::<N>(ptr, src + length - N, dst + length - N) };
+    }
+
+    /// Fast ordinary-inflate copy for a non-overlapping DEFLATE reference.
+    /// The callback writer uses the original, exact match copy instead.
     #[inline(always)]
     pub(super) fn copy_match_fast(&mut self, distance: usize, length: usize) {
         assert_ne!(distance, 0, "DEFLATE match distance must be positive");
         assert!(distance <= self.filled, "match distance in bounds");
         assert!(length <= self.remaining(), "match fits output buffer");
 
-        // The source is disjoint from the logical destination. Only use
-        // padded copies if the destination has an extra vector of capacity.
-        if length > distance || self.remaining() - length < MATCH_COPY_WIDTH {
+        if length == 0 {
+            return;
+        }
+        if length > distance {
             self.copy_match(distance, length);
             return;
         }
@@ -198,28 +243,29 @@ impl<'a> Writer<'a> {
         let start = self.filled - distance;
         let current = self.filled;
         let ptr = self.buf.as_mut_ptr();
-        let mut copied = 0;
-        while copied < length {
-            // SAFETY: distance >= length and copied < length, so every
-            // *logical* source byte precedes current and is initialized.
-            // The fixed-width load and store may extend at most N-1 bytes
-            // beyond the logical match. The spare-capacity check guarantees
-            // both spans stay within the allocation. Padded source bytes
-            // have MaybeUninit representation, and the load completes
-            // before the store, even when those padded spans overlap.
-            unsafe {
-                let chunk = ptr
-                    .add(start + copied)
-                    .cast::<[MaybeUninit<u8>; MATCH_COPY_WIDTH]>()
-                    .read_unaligned();
-                ptr.add(current + copied)
-                    .cast::<[MaybeUninit<u8>; MATCH_COPY_WIDTH]>()
-                    .write_unaligned(chunk);
+
+        // The full source span lies in the initialized prefix and ends
+        // before current. Every store is strictly within the logical
+        // destination [current, current+length); C ABI output canaries and
+        // caller-owned bytes after the reported output are untouched.
+        // The width is known at compile time so LLVM may choose native
+        // vector moves without handwritten architecture intrinsics.
+        unsafe {
+            if length >= MATCH_COPY_WIDTH {
+                Self::copy_disjoint_chunks::<MATCH_COPY_WIDTH>(ptr, start, current, length);
+            } else if length >= 16 {
+                Self::copy_disjoint_chunks::<16>(ptr, start, current, length);
+            } else if length >= 8 {
+                Self::copy_disjoint_chunks::<8>(ptr, start, current, length);
+            } else if length >= 4 {
+                Self::copy_disjoint_chunks::<4>(ptr, start, current, length);
+            } else if length >= 2 {
+                Self::copy_disjoint_chunks::<2>(ptr, start, current, length);
+            } else {
+                Self::copy_disjoint_chunks::<1>(ptr, start, current, length);
             }
-            copied += MATCH_COPY_WIDTH;
         }
-        // Only the actually decoded bytes become part of the initialized
-        // output prefix. No callback or cross-window history is present.
+
         self.filled = current + length;
     }
 
@@ -554,6 +600,9 @@ mod test {
                     for slot in &mut storage[capacity..] {
                         slot.write(0xa5);
                     }
+                    for slot in &mut storage[prefix.len() + length..capacity] {
+                        slot.write(0x5a);
+                    }
 
                     let mut expected = prefix.to_vec();
                     for _ in 0..length {
@@ -572,6 +621,14 @@ mod test {
                             writer.filled(),
                             expected,
                             "distance {distance}, length {length}, slack {slack}"
+                        );
+                    }
+                    for (i, slot) in storage[prefix.len() + length..capacity].iter().enumerate() {
+                        // SAFETY: slack canaries were initialized above.
+                        assert_eq!(
+                            unsafe { slot.assume_init() },
+                            0x5a,
+                            "unexpected write after logical output at {i}, distance {distance}, length {length}, slack {slack}"
                         );
                     }
                     for (i, slot) in storage[capacity..].iter().enumerate() {
