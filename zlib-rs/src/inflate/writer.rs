@@ -10,6 +10,14 @@ use super::window::BackWindow;
 // seed and repeatedly double an initialized prefix. Longer matches use
 // disjoint block copies instead of doing one load/store per output byte.
 const SCALAR_OVERLAP_COPY_LIMIT: usize = 32;
+// A fixed-size byte-array copy lets LLVM choose efficient native vector
+// loads and stores without handwritten SIMD intrinsics.
+#[cfg(target_arch = "x86_64")]
+const MATCH_COPY_WIDTH: usize = 32;
+#[cfg(target_arch = "aarch64")]
+const MATCH_COPY_WIDTH: usize = 16;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const MATCH_COPY_WIDTH: usize = 8;
 
 pub struct Writer<'a> {
     buf: WeakSliceMut<'a, MaybeUninit<u8>>,
@@ -169,6 +177,50 @@ impl<'a> Writer<'a> {
         }
         // Commit the initialized extent only after every copy succeeds.
         self.filled = end;
+    }
+
+    /// Fast ordinary-inflate match copy when the output allocation has
+    /// spare capacity. Callback-driven inflateBack cannot use this method:
+    /// its unused output tail can still contain *live previous history*.
+    #[inline(always)]
+    pub(super) fn copy_match_fast(&mut self, distance: usize, length: usize) {
+        assert_ne!(distance, 0, "DEFLATE match distance must be positive");
+        assert!(distance <= self.filled, "match distance in bounds");
+        assert!(length <= self.remaining(), "match fits output buffer");
+
+        // The source is disjoint from the logical destination. Only use
+        // padded copies if the destination has an extra vector of capacity.
+        if length > distance || self.remaining() - length < MATCH_COPY_WIDTH {
+            self.copy_match(distance, length);
+            return;
+        }
+
+        let start = self.filled - distance;
+        let current = self.filled;
+        let ptr = self.buf.as_mut_ptr();
+        let mut copied = 0;
+        while copied < length {
+            // SAFETY: distance >= length and copied < length, so every
+            // *logical* source byte precedes current and is initialized.
+            // The fixed-width load and store may extend at most N-1 bytes
+            // beyond the logical match. The spare-capacity check guarantees
+            // both spans stay within the allocation. Padded source bytes
+            // have MaybeUninit representation, and the load completes
+            // before the store, even when those padded spans overlap.
+            unsafe {
+                let chunk = ptr
+                    .add(start + copied)
+                    .cast::<[MaybeUninit<u8>; MATCH_COPY_WIDTH]>()
+                    .read_unaligned();
+                ptr.add(current + copied)
+                    .cast::<[MaybeUninit<u8>; MATCH_COPY_WIDTH]>()
+                    .write_unaligned(chunk);
+            }
+            copied += MATCH_COPY_WIDTH;
+        }
+        // Only the actually decoded bytes become part of the initialized
+        // output prefix. No callback or cross-window history is present.
+        self.filled = current + length;
     }
 
     /// Copy initialized bytes from another position in this same backing allocation.
@@ -476,6 +528,79 @@ mod test {
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "exhaustive copy-length and slack matrix")]
+    fn fast_copy_match_preserves_logical_bytes_and_allocation_canaries() {
+        // Include a genuinely uninitialized output tail, unaligned lengths,
+        // every RFC 1951 match length, and both vector and boundary paths.
+        let prefix: [u8; 64] = core::array::from_fn(|i| i as u8 + 1);
+        for distance in 1..=prefix.len() {
+            for length in 0..=258 {
+                for slack in [
+                    0,
+                    1,
+                    7,
+                    MATCH_COPY_WIDTH - 1,
+                    MATCH_COPY_WIDTH,
+                    MATCH_COPY_WIDTH + 1,
+                ] {
+                    let capacity = prefix.len() + length + slack;
+                    let mut storage = vec![MaybeUninit::<u8>::uninit(); capacity + 32];
+                    for (slot, byte) in storage.iter_mut().zip(prefix) {
+                        slot.write(byte);
+                    }
+                    for slot in &mut storage[capacity..] {
+                        slot.write(0xa5);
+                    }
+
+                    let mut expected = prefix.to_vec();
+                    for _ in 0..length {
+                        let source = expected.len() - distance;
+                        expected.push(expected[source]);
+                    }
+
+                    {
+                        let mut writer = Writer {
+                            buf: WeakSliceMut::from_mut_slice(&mut storage[..capacity]),
+                            filled: prefix.len(),
+                        };
+                        writer.copy_match_fast(distance, length);
+                        assert_eq!(writer.len(), expected.len());
+                        assert_eq!(
+                            writer.filled(),
+                            expected,
+                            "distance {distance}, length {length}, slack {slack}"
+                        );
+                    }
+                    for (i, slot) in storage[capacity..].iter().enumerate() {
+                        // SAFETY: the allocation canaries were initialized above
+                        // and the copy routine must not write beyond capacity.
+                        assert_eq!(
+                            unsafe { slot.assume_init() },
+                            0xa5,
+                            "out-of-bounds write at {i}, distance {distance}, length {length}, slack {slack}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn callback_writer_preserves_unused_previous_window_history() {
+        let mut storage = core::array::from_fn::<u8, 128, _>(|i| i as u8);
+        {
+            let mut window = super::super::window::BackWindow::from_initialized_slice(&mut storage);
+            window.mark_full_history();
+            let mut writer = BackWriter::new(&mut window, 0);
+            assert_eq!(writer.copy_match(true, 64, 1), Ok(()));
+        }
+        // A padded 32-byte store here would destroy previous-window bytes
+        // that subsequent inflateBack callbacks might need.
+        assert_eq!(storage[0], 64);
+        assert_eq!(&storage[1..64], &(1u8..64).collect::<Vec<_>>());
     }
 
     #[test]

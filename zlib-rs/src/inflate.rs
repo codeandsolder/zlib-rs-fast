@@ -1106,7 +1106,7 @@ impl InflateOutput<'_> {
     }
     #[inline]
     fn copy_match(&mut self, offset_from_end: usize, length: usize) {
-        self.writer.copy_match(offset_from_end, length);
+        self.writer.copy_match_fast(offset_from_end, length);
     }
 }
 
