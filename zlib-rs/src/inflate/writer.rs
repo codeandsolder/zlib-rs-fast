@@ -228,7 +228,14 @@ impl<'a> Writer<'a> {
 
     /// Fast ordinary-inflate copy for a non-overlapping DEFLATE reference.
     /// The callback writer uses the original, exact match copy instead.
-    #[inline]
+    // The large fast-path dispatch needs to be inlined at its one-shot
+    // decoder call site. A plain inline hint loses 10–15% end-to-end
+    // decode throughput on the tested Zen2/Zen5 PDFs.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured fast-inflater throughput requires inlining this dispatch"
+    )]
+    #[inline(always)]
     pub(super) fn copy_match_fast(&mut self, distance: usize, length: usize) {
         assert_ne!(distance, 0, "DEFLATE match distance must be positive");
         assert!(distance <= self.filled, "match distance in bounds");
