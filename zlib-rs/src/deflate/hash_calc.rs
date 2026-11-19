@@ -195,7 +195,7 @@ mod tests {
             stream.state.hash_calc_variant,
             HashCalcVariant::Standard
         ));
-        assert_eq!(stream.state.max_chain_length, 128);
+        assert_eq!(stream.state.max_chain_length, 76);
         assert_eq!(stream.state.level, 9);
         assert!(end(&mut stream).is_ok());
         Ok(())
