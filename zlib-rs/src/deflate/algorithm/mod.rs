@@ -914,9 +914,10 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(8, 32, 128, 256, Algorithm::Slow),
     LevelConfig::new(32, 128, 258, 1024, Algorithm::Slow),
     // A 76-link four-byte chain retains long-match quality while
-    // avoiding the high cost of deeper searches at level 9. The budget
-    // deliberately trades a small amount of encoded size for speed.
-    LevelConfig::new(32, 258, 258, 76, Algorithm::Slow),
+    // avoiding the high cost of deeper searches at level 9. A shorter
+    // good-match threshold also limits repeated searches once a useful
+    // lazy match was found. Both trade a little ratio for throughput.
+    LevelConfig::new(18, 258, 258, 76, Algorithm::Slow),
 ];
 
 /// Resolve a compressor's signed level without permitting invalid table indices.
