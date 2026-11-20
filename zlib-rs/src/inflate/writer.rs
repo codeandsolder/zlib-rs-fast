@@ -257,7 +257,7 @@ impl<'a> Writer<'a> {
             unsafe {
                 ptr.add(current + written)
                     .cast::<[u8; 32]>()
-                    .write_unaligned(chunk)
+                    .write_unaligned(chunk);
             };
             written += chunk.len();
         }
@@ -275,7 +275,7 @@ impl<'a> Writer<'a> {
     /// Replicate one initialized short period without reading new output.
     ///
     /// # Safety
-    /// Distance is positive and less than MAX_REPLICATED_PERIOD, the
+    /// Distance is positive and less than `MAX_REPLICATED_PERIOD`, the
     /// preceding distance bytes are initialized, and length bytes fit
     /// in the output capacity. The caller commits the final extent.
     #[cold]
