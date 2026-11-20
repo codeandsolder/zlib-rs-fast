@@ -242,7 +242,11 @@ fn execute_standard(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
 ) -> MatchSearchResult {
-    longest_match_help::<false>(resources, params)
+    if params.lookahead >= STD_MAX_MATCH {
+        longest_match_help::<false, true>(resources, params)
+    } else {
+        longest_match_help::<false, false>(resources, params)
+    }
 }
 
 #[inline(never)]
@@ -250,7 +254,11 @@ fn execute_slow(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
 ) -> MatchSearchResult {
-    longest_match_help::<true>(resources, params)
+    if params.lookahead >= STD_MAX_MATCH {
+        longest_match_help::<true, true>(resources, params)
+    } else {
+        longest_match_help::<true, false>(resources, params)
+    }
 }
 
 /// Backend contract for executing an ordered batch of independent immutable match searches.
@@ -366,7 +374,11 @@ pub fn execute_match_search_batch(
     execute_match_search_batch_with_backend(&ScalarMatchSearchBackend, requests, results);
 }
 
-fn longest_match_help<const SLOW: bool>(
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the shared chain walk and its full/short lookahead specializations together"
+)]
+fn longest_match_help<const SLOW: bool, const FULL: bool>(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
 ) -> MatchSearchResult {
@@ -400,7 +412,15 @@ fn longest_match_help<const SLOW: bool>(
 
     let early_exit = !SLOW && params.level < EARLY_EXIT_TRIGGER_LEVEL;
 
-    let mut scan_words = ScanProbeWords::new(scan, params.lookahead.min(STD_MAX_MATCH), best_len);
+    // Full lookahead is overwhelmingly common in the producer. Select its
+    // fixed-size comparison domain once, not for each hash-chain candidate.
+    let max_len = if FULL {
+        STD_MAX_MATCH
+    } else {
+        params.lookahead.min(STD_MAX_MATCH)
+    };
+    let scan = &scan[..max_len];
+    let mut scan_words = ScanProbeWords::new(scan, max_len, best_len);
 
     while let Some(candidate_pos) = cursor.candidate_start() {
         let candidate_start = usize::from(candidate_pos);
@@ -408,14 +428,11 @@ fn longest_match_help<const SLOW: bool>(
             break;
         }
 
-        let max_len = params.lookahead.min(STD_MAX_MATCH);
         if best_len >= max_len {
             break;
         }
 
         let candidate = &resources.initialized[candidate_start..candidate_start + max_len];
-        let scan = &scan[..max_len];
-
         let len = match probe_candidate_cached(
             scan,
             candidate,
