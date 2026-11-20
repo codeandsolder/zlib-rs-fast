@@ -16,6 +16,7 @@ use wgpu::{
 };
 
 const HASH_SIZE: usize = 1 << 16;
+const NO_PREDECESSOR: u32 = u32::MAX;
 const WORKGROUP_SIZE: u32 = 128;
 const MAX_MATCH: u32 = 258;
 const DEFAULT_MAX_DIST: u32 = 32_768 - (258 + 3 + 1);
@@ -29,10 +30,9 @@ struct Params {
 }
 
 @group(0) @binding(0) var<storage, read> input_words: array<u32>;
-@group(0) @binding(1) var<storage, read> bucket_offsets: array<u32>;
-@group(0) @binding(2) var<storage, read> bucket_positions: array<u32>;
-@group(0) @binding(3) var<storage, read_write> results: array<vec2<u32>>;
-@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> predecessors: array<u32>;
+@group(0) @binding(2) var<storage, read_write> results: array<vec2<u32>>;
+@group(0) @binding(3) var<uniform> params: Params;
 
 fn load_byte(index: u32) -> u32 {
     let word = input_words[index >> 2u];
@@ -49,28 +49,6 @@ fn load_u32(index: u32) -> u32 {
     return low | (input_words[word_index + 1u] << (32u - shift));
 }
 
-fn hash_at(position: u32) -> u32 {
-    let value = load_byte(position)
-        | (load_byte(position + 1u) << 8u)
-        | (load_byte(position + 2u) << 16u);
-    return (value * 2654435761u) >> 16u;
-}
-
-fn lower_bound(begin: u32, end: u32, value: u32) -> u32 {
-    var low = begin;
-    var high = end;
-    loop {
-        if low >= high { break; }
-        let middle = low + ((high - low) >> 1u);
-        if bucket_positions[middle] < value {
-            low = middle + 1u;
-        } else {
-            high = middle;
-        }
-    }
-    return low;
-}
-
 @compute @workgroup_size(128)
 fn search(@builtin(global_invocation_id) gid: vec3<u32>) {
     let position = gid.x;
@@ -80,33 +58,29 @@ fn search(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let hash = hash_at(position);
-    let bucket_begin = bucket_offsets[hash];
-    let bucket_end = bucket_offsets[hash + 1u];
-
     var minimum_start = 0u;
     if position >= params.max_dist {
         // zlib's matcher uses cur_match > strstart - max_dist, not >=.
         minimum_start = position - params.max_dist + 1u;
     }
 
-    let first = lower_bound(bucket_begin, bucket_end, minimum_start);
-    var cursor = lower_bound(first, bucket_end, position);
+    var cursor = predecessors[position];
     let max_len = min(params.max_match, params.input_len - position);
 
     var best_len = 0u;
     var best_start = 0u;
     var visited = 0u;
 
-    // Buckets are sorted by input position. Search newest candidates first so a finite budget
-    // spends work on the closest history, and tie-break deterministically toward the newest match.
+    // The predecessor index walks the same hash bucket newest to oldest.
+    // Once one entry is outside the history bound, all later entries are too.
     loop {
-        if cursor <= first || visited >= params.search_budget { break; }
-        cursor -= 1u;
+        if best_len == max_len || cursor == 0xffffffffu || cursor < minimum_start || visited >= params.search_budget {
+            break;
+        }
+        let candidate = cursor;
+        cursor = predecessors[candidate];
         visited += 1u;
-        let candidate = bucket_positions[cursor];
 
-        if best_len == max_len { break; }
         if best_len >= 3u && load_byte(position + best_len) != load_byte(candidate + best_len) {
             continue;
         }
@@ -195,11 +169,6 @@ impl GpuMatchTable {
     }
 }
 
-struct HashIndex {
-    offsets: Vec<u32>,
-    positions: Vec<u32>,
-}
-
 struct ReusableBuffer {
     buffer: Buffer,
     capacity: u64,
@@ -257,8 +226,7 @@ impl ReusableBuffer {
 
 struct GpuWorkspace {
     input: ReusableBuffer,
-    offsets: ReusableBuffer,
-    positions: ReusableBuffer,
+    predecessors: ReusableBuffer,
     results: ReusableBuffer,
     params: ReusableBuffer,
     download: ReusableBuffer,
@@ -272,14 +240,9 @@ impl GpuWorkspace {
                 "match input workspace",
                 BufferUsages::STORAGE | BufferUsages::COPY_DST,
             ),
-            offsets: ReusableBuffer::new(
+            predecessors: ReusableBuffer::new(
                 device,
-                "match bucket-offset workspace",
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            ),
-            positions: ReusableBuffer::new(
-                device,
-                "match bucket-position workspace",
+                "match predecessor workspace",
                 BufferUsages::STORAGE | BufferUsages::COPY_DST,
             ),
             results: ReusableBuffer::new(
@@ -305,11 +268,10 @@ struct PreparedGpuInput {
     input_index: usize,
     input_len: u32,
     input_words: Vec<u32>,
-    index: HashIndex,
+    predecessors: Vec<u32>,
     params: [u32; 4],
     input_offset: u64,
-    offsets_offset: u64,
-    positions_offset: u64,
+    predecessors_offset: u64,
     result_offset: u64,
     params_offset: u64,
     download_offset: u64,
@@ -320,16 +282,8 @@ impl PreparedGpuInput {
         (self.input_words.len() * size_of::<u32>()) as u64
     }
 
-    fn offsets_size(&self) -> u64 {
-        (self.index.offsets.len() * size_of::<u32>()) as u64
-    }
-
-    fn positions_data_size(&self) -> u64 {
-        (self.index.positions.len() * size_of::<u32>()) as u64
-    }
-
-    fn positions_binding_size(&self) -> u64 {
-        self.positions_data_size().max(size_of::<u32>() as u64)
+    fn predecessors_size(&self) -> u64 {
+        size_of_val(self.predecessors.as_slice()) as u64
     }
 
     fn result_size(&self) -> u64 {
@@ -356,7 +310,7 @@ fn allocate_aligned(cursor: &mut u64, size: u64, alignment: u64) -> Result<u64, 
 /// Persistent Vulkan whole-input match-search engine.
 ///
 /// Device selection, shader compilation, and compute-pipeline creation happen once in [`Self::new`].
-/// Individual searches build a compact CPU CSR index, upload one input, dispatch the already-compiled
+/// Individual searches build a direct predecessor index, upload one input, dispatch the already-compiled
 /// kernel, and read back one `(length, absolute_start)` entry per input byte.
 pub struct GpuMatchSearcher {
     device: Device,
@@ -463,8 +417,7 @@ impl GpuMatchSearcher {
         let max_uniform_binding_size = u64::from(limits.max_uniform_buffer_binding_size);
 
         let mut input_cursor = 0u64;
-        let mut offsets_cursor = 0u64;
-        let mut positions_cursor = 0u64;
+        let mut predecessors_cursor = 0u64;
         let mut result_cursor = 0u64;
         let mut params_cursor = 0u64;
         let mut download_cursor = 0u64;
@@ -481,17 +434,16 @@ impl GpuMatchSearcher {
                 continue;
             }
 
-            let index = build_hash_index(input)?;
+            let predecessors = build_predecessors(input)?;
             let input_words = pack_words(input);
             let mut item = PreparedGpuInput {
                 input_index,
                 input_len,
                 input_words,
-                index,
+                predecessors,
                 params: [input_len, max_dist, MAX_MATCH, search_budget],
                 input_offset: 0,
-                offsets_offset: 0,
-                positions_offset: 0,
+                predecessors_offset: 0,
                 result_offset: 0,
                 params_offset: 0,
                 download_offset: 0,
@@ -499,8 +451,7 @@ impl GpuMatchSearcher {
 
             for (name, size) in [
                 ("input", item.input_size()),
-                ("bucket offsets", item.offsets_size()),
-                ("bucket positions", item.positions_binding_size()),
+                ("predecessors", item.predecessors_size()),
                 ("results", item.result_size()),
             ] {
                 if size > max_storage_binding_size {
@@ -518,11 +469,9 @@ impl GpuMatchSearcher {
 
             item.input_offset =
                 allocate_aligned(&mut input_cursor, item.input_size(), storage_alignment)?;
-            item.offsets_offset =
-                allocate_aligned(&mut offsets_cursor, item.offsets_size(), storage_alignment)?;
-            item.positions_offset = allocate_aligned(
-                &mut positions_cursor,
-                item.positions_binding_size(),
+            item.predecessors_offset = allocate_aligned(
+                &mut predecessors_cursor,
+                item.predecessors_size(),
                 storage_alignment,
             )?;
             item.result_offset =
@@ -553,12 +502,11 @@ impl GpuMatchSearcher {
         workspace
             .input
             .ensure_capacity(&self.device, input_cursor, max_buffer_size)?;
-        workspace
-            .offsets
-            .ensure_capacity(&self.device, offsets_cursor, max_buffer_size)?;
-        workspace
-            .positions
-            .ensure_capacity(&self.device, positions_cursor, max_buffer_size)?;
+        workspace.predecessors.ensure_capacity(
+            &self.device,
+            predecessors_cursor,
+            max_buffer_size,
+        )?;
         workspace
             .results
             .ensure_capacity(&self.device, result_cursor, max_buffer_size)?;
@@ -576,17 +524,10 @@ impl GpuMatchSearcher {
                 cast_slice(&item.input_words),
             );
             self.queue.write_buffer(
-                &workspace.offsets.buffer,
-                item.offsets_offset,
-                cast_slice(&item.index.offsets),
+                &workspace.predecessors.buffer,
+                item.predecessors_offset,
+                cast_slice(&item.predecessors),
             );
-            if !item.index.positions.is_empty() {
-                self.queue.write_buffer(
-                    &workspace.positions.buffer,
-                    item.positions_offset,
-                    cast_slice(&item.index.positions),
-                );
-            }
             self.queue.write_buffer(
                 &workspace.params.buffer,
                 item.params_offset,
@@ -617,21 +558,13 @@ impl GpuMatchSearcher {
                     BindGroupEntry {
                         binding: 1,
                         resource: BindingResource::Buffer(BufferBinding {
-                            buffer: &workspace.offsets.buffer,
-                            offset: item.offsets_offset,
-                            size: NonZeroU64::new(item.offsets_size()),
+                            buffer: &workspace.predecessors.buffer,
+                            offset: item.predecessors_offset,
+                            size: NonZeroU64::new(item.predecessors_size()),
                         }),
                     },
                     BindGroupEntry {
                         binding: 2,
-                        resource: BindingResource::Buffer(BufferBinding {
-                            buffer: &workspace.positions.buffer,
-                            offset: item.positions_offset,
-                            size: NonZeroU64::new(item.positions_binding_size()),
-                        }),
-                    },
-                    BindGroupEntry {
-                        binding: 3,
                         resource: BindingResource::Buffer(BufferBinding {
                             buffer: &workspace.results.buffer,
                             offset: item.result_offset,
@@ -639,7 +572,7 @@ impl GpuMatchSearcher {
                         }),
                     },
                     BindGroupEntry {
-                        binding: 4,
+                        binding: 3,
                         resource: BindingResource::Buffer(BufferBinding {
                             buffer: &workspace.params.buffer,
                             offset: item.params_offset,
@@ -760,47 +693,28 @@ fn pack_words(input: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-fn build_hash_index(input: &[u8]) -> Result<HashIndex, GpuMatchError> {
+/// Store the immediately preceding position in the same three-byte hash bucket.
+/// A descending chain enumerates exactly the old CSR bucket prefix in reverse.
+fn build_predecessors(input: &[u8]) -> Result<Vec<u32>, GpuMatchError> {
     let valid_positions = input.len().saturating_sub(2);
-    let _ = u32::try_from(valid_positions)
+    let positions = u32::try_from(valid_positions)
         .map_err(|_| GpuMatchError("GPU hash index exceeds u32::MAX positions".into()))?;
-    let mut counts = vec![0u32; HASH_SIZE];
-    for position in 0..valid_positions {
-        counts[hash3(input, position) as usize] += 1;
+    let mut heads = vec![NO_PREDECESSOR; HASH_SIZE];
+    // Nonempty short inputs still need a nonzero-sized storage binding.
+    let mut predecessors = Vec::with_capacity(valid_positions.max(1));
+    for (position, bytes) in (0..positions).zip(input.windows(3)) {
+        let hash = hash3(bytes);
+        predecessors.push(core::mem::replace(&mut heads[hash], position));
     }
-
-    let mut offsets = vec![0u32; HASH_SIZE + 1];
-    for (index, count) in counts.into_iter().enumerate() {
-        offsets[index + 1] = offsets[index]
-            .checked_add(count)
-            .ok_or_else(|| GpuMatchError("GPU hash index offset overflow".into()))?;
+    if predecessors.is_empty() {
+        predecessors.push(NO_PREDECESSOR);
     }
-
-    let mut cursors = offsets[..HASH_SIZE].to_vec();
-    let mut positions = vec![0u32; valid_positions];
-    for position in 0..valid_positions {
-        let hash = hash3(input, position) as usize;
-        let cursor = &mut cursors[hash];
-        positions[*cursor as usize] = position as u32;
-        *cursor += 1;
-    }
-    debug_assert!(positions_by_bucket_are_sorted(&offsets, &positions));
-    Ok(HashIndex { offsets, positions })
+    Ok(predecessors)
 }
 
-fn positions_by_bucket_are_sorted(offsets: &[u32], positions: &[u32]) -> bool {
-    offsets.windows(2).all(|bounds| {
-        positions[bounds[0] as usize..bounds[1] as usize]
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-    })
-}
-
-fn hash3(input: &[u8], position: usize) -> u32 {
-    let value = u32::from(input[position])
-        | (u32::from(input[position + 1]) << 8)
-        | (u32::from(input[position + 2]) << 16);
-    value.wrapping_mul(2_654_435_761) >> 16
+fn hash3(bytes: &[u8]) -> usize {
+    let value = u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16);
+    (value.wrapping_mul(2_654_435_761) >> 16) as usize
 }
 
 #[cfg(test)]
@@ -808,13 +722,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn csr_buckets_preserve_input_order() {
-        let input = b"abcabcabc/abcabcabc/xyzxyzxyz";
-        let index = build_hash_index(input).unwrap();
-        assert!(positions_by_bucket_are_sorted(
-            &index.offsets,
-            &index.positions
-        ));
-        assert_eq!(index.positions.len(), input.len() - 2);
+    fn predecessors_match_reverse_bucket_prefixes() -> Result<(), GpuMatchError> {
+        let mut random = 0x618d_0e32u32;
+        let input = (0..2048)
+            .map(|i| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                if i % 7 > 2 {
+                    b"abc"[i % 3]
+                } else {
+                    random.to_le_bytes()[0]
+                }
+            })
+            .collect::<Vec<_>>();
+        let predecessors = build_predecessors(&input)?;
+        let mut found_collision = false;
+        for position in 0..input.len() - 2 {
+            let bytes = &input[position..position + 3];
+            let hash = hash3(bytes);
+            let expected = (0..position)
+                .rev()
+                .filter(|&candidate| hash3(&input[candidate..candidate + 3]) == hash)
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            let mut next = predecessors[position];
+            while next != NO_PREDECESSOR {
+                let candidate = next as usize;
+                assert!(candidate < position);
+                found_collision |= &input[candidate..candidate + 3] != bytes;
+                actual.push(candidate);
+                next = predecessors[candidate];
+            }
+            assert_eq!(actual, expected);
+            // Also preserve finite-budget and limited-history traversal.
+            for (minimum, budget) in [(0, 1), (position / 2, 7), (position.saturating_sub(32), 64)]
+            {
+                assert_eq!(
+                    actual
+                        .iter()
+                        .copied()
+                        .take_while(|&candidate| candidate >= minimum)
+                        .take(budget)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .copied()
+                        .filter(|&candidate| candidate >= minimum)
+                        .take(budget)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        assert!(found_collision);
+        Ok(())
+    }
+
+    #[test]
+    fn short_inputs_have_a_valid_storage_binding() -> Result<(), GpuMatchError> {
+        for input in [b"".as_slice(), b"a", b"ab", b"abc"] {
+            assert_eq!(build_predecessors(input)?, [NO_PREDECESSOR]);
+        }
+        Ok(())
     }
 }
