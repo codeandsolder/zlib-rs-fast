@@ -189,6 +189,14 @@ impl GpuMatchTable {
             .map(|&entry| decode_match(position, entry))
     }
 
+    /// Return the wire-domain length and backward distance directly.
+    /// A zero word means no match (both components are zero).
+    #[inline]
+    pub(super) fn length_distance(&self, position: usize) -> Option<(u16, u16)> {
+        let [a, b, c, d] = self.entries.get(position)?.to_le_bytes();
+        Some((u16::from_le_bytes([a, b]), u16::from_le_bytes([c, d])))
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
