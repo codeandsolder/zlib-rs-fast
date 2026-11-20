@@ -547,6 +547,7 @@ impl StandardDriver {
         })
     }
 
+    #[cfg(any(feature = "gpu", test))]
     pub(super) fn step(
         &mut self,
         state: &mut State<'_>,
