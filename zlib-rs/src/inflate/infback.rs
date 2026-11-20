@@ -284,7 +284,6 @@ fn decode_back_len(
 
     let len_table = match state.len_table.codes {
         Codes::Fixed => &crate::inflate::inffixed_tbl::LENFIX[..],
-        Codes::CodeLengths => &state.codes_codes,
         Codes::Len => &state.len_codes,
         Codes::Dist => &state.dist_codes,
     };
