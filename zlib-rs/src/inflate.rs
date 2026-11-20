@@ -1711,7 +1711,8 @@ impl State<'_> {
             header.set_done(-1);
         }
 
-        if (self.wrap & 1) == 0 || ((bit_reader.bits(8) << 8) + (bit_reader.hold() >> 8)) % 31 != 0
+        if (self.wrap & 1) == 0
+            || !((bit_reader.bits(8) << 8) + (bit_reader.hold() >> 8)).is_multiple_of(31)
         {
             return Err(self.invalid_header("incorrect header check\0"));
         }

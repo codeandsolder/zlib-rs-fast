@@ -219,14 +219,15 @@ fn run_case(case: Case, full: bool) -> Result<(), std::num::TryFromIntError> {
         )
     };
 
-    let mut run = || {
-        let (written, code) = compress_slice(&mut output, &input, config);
-        assert_eq!(code, ReturnCode::Ok);
-        assert_eq!(written.len(), reference_len);
-        written.len()
+    let stats = {
+        let mut run = || {
+            let (written, code) = compress_slice(&mut output, &input, config);
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(written.len(), reference_len);
+            written.len()
+        };
+        measure(&mut run, full)?
     };
-    let stats = measure(&mut run, full)?;
-    drop(run);
     black_box(&output);
 
     let mib_per_s = approximately_f64(case.bytes) / MIB / stats.median.as_secs_f64();
@@ -298,7 +299,7 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
             while out.len() < len {
                 let sensor = row % 37;
                 let value = (row.wrapping_mul(2_654_435_761) >> 11) % 100_000;
-                let status = if row % 11 == 0 { "warn" } else { "ok" };
+                let status = if row.is_multiple_of(11) { "warn" } else { "ok" };
                 let line = format!(
                     "{{\"row\":{row},\"sensor\":{sensor},\"value\":{value},\"status\":\"{status}\"}}\n"
                 );
@@ -346,8 +347,11 @@ fn self_test() -> Result<(), std::num::TryFromIntError> {
         iterations_for(Duration::from_secs(1), target, MAX_SAMPLE_ITERS)?,
         1
     );
-    assert_eq!(approximately_f64(0), 0.0);
-    assert_eq!(approximately_f64(1_048_576), 1_048_576.0);
+    assert_eq!(approximately_f64(0).to_bits(), 0.0f64.to_bits());
+    assert_eq!(
+        approximately_f64(1_048_576).to_bits(),
+        1_048_576.0f64.to_bits()
+    );
     for corpus in [Corpus::Repetitive, Corpus::Structured, Corpus::PseudoRandom] {
         for seed in [0, 1, 0x1234_5678_9abc_def0, u64::MAX] {
             let short = make_input(corpus, 31, seed);

@@ -17,7 +17,7 @@ const fn reg(input: [u32; 4]) -> __m128i {
 
 /// # Safety
 ///
-/// The methods of this struct should only be used on x86_64 systems that support the `pclmulqdq`
+/// The methods of this struct should only be used on `x86_64` systems that support the `pclmulqdq`
 /// instruction, and SSE2 and SSE4.1 instruction sets.
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_arch = "x86_64")]

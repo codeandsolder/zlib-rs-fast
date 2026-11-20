@@ -287,31 +287,33 @@ fn bench_independent(
     outputs: &mut [Vec<u8>],
 ) -> Result<Stats, Box<dyn std::error::Error>> {
     let mut written_lengths = Vec::with_capacity(inputs.len());
-    let mut validate = || {
-        let mut sink = 0usize;
-        for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
-            let (written, code) = compress_slice(output, input, config);
-            assert_eq!(code, ReturnCode::Ok);
-            written_lengths.push(written.len());
-            sink ^= written.len();
-        }
-        sink
-    };
-    black_box(validate());
-    drop(validate);
+    {
+        let mut validate = || {
+            let mut sink = 0usize;
+            for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
+                let (written, code) = compress_slice(output, input, config);
+                assert_eq!(code, ReturnCode::Ok);
+                written_lengths.push(written.len());
+                sink ^= written.len();
+            }
+            sink
+        };
+        black_box(validate());
+    }
     assert_outputs(Mode::Independent, outputs, reference, &written_lengths);
 
-    let mut run = || {
-        let mut sink = 0usize;
-        for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
-            let (written, code) = compress_slice(output, input, config);
-            assert_eq!(code, ReturnCode::Ok);
-            sink ^= written.len();
-        }
-        sink
+    let stats = {
+        let mut run = || {
+            let mut sink = 0usize;
+            for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
+                let (written, code) = compress_slice(output, input, config);
+                assert_eq!(code, ReturnCode::Ok);
+                sink ^= written.len();
+            }
+            sink
+        };
+        measure(&mut run, full)?
     };
-    let stats = measure(&mut run, full)?;
-    drop(run);
     black_box(&outputs);
     Ok(stats)
 }
@@ -333,69 +335,69 @@ fn bench_batched(
         None
     };
 
-    let mut jobs = inputs
-        .iter()
-        .zip(outputs.iter_mut())
-        .map(|(input, output)| BatchCompressJob::new(input, output))
-        .collect::<Vec<_>>();
     let mut written_lengths = Vec::with_capacity(inputs.len());
-    let mut run = || {
-        let results = match mode {
-            Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
-            Mode::Threads(workers) => compress_slices_batch_with_backend(
-                &mut jobs,
-                config,
-                BatchMatchSearchBackend::ScopedThreads { workers },
-            ),
-            #[cfg(feature = "parallel")]
-            Mode::ParallelStreams(_) => parallel_compressor
-                .as_ref()
-                .expect("parallel mode initialized its compressor")
-                .compress(&mut jobs, config),
-            Mode::Independent => unreachable!(),
+    {
+        let mut jobs = inputs
+            .iter()
+            .zip(outputs.iter_mut())
+            .map(|(input, output)| BatchCompressJob::new(input, output))
+            .collect::<Vec<_>>();
+        let mut run = || {
+            let results = match mode {
+                Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
+                Mode::Threads(workers) => compress_slices_batch_with_backend(
+                    &mut jobs,
+                    config,
+                    BatchMatchSearchBackend::ScopedThreads { workers },
+                ),
+                #[cfg(feature = "parallel")]
+                Mode::ParallelStreams(_) => parallel_compressor
+                    .as_ref()
+                    .expect("parallel mode initialized its compressor")
+                    .compress(&mut jobs, config),
+                Mode::Independent => unreachable!(),
+            };
+            results.into_iter().fold(0usize, |sink, result| {
+                assert_eq!(result.code, ReturnCode::Ok);
+                written_lengths.push(result.written);
+                sink ^ result.written
+            })
         };
-        results.into_iter().fold(0usize, |sink, result| {
-            assert_eq!(result.code, ReturnCode::Ok);
-            written_lengths.push(result.written);
-            sink ^ result.written
-        })
-    };
-    black_box(run());
-    drop(run);
-    drop(jobs);
+        black_box(run());
+    }
     assert_outputs(mode, outputs, reference, &written_lengths);
 
     // Rebind jobs after validation so the timed closure owns the same pre-built caller job
     // descriptors for every iteration. Only allocations performed inside the batch API are
     // charged to the batch modes.
-    let mut jobs = inputs
-        .iter()
-        .zip(outputs.iter_mut())
-        .map(|(input, output)| BatchCompressJob::new(input, output))
-        .collect::<Vec<_>>();
-    let mut run = || {
-        let results = match mode {
-            Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
-            Mode::Threads(workers) => compress_slices_batch_with_backend(
-                &mut jobs,
-                config,
-                BatchMatchSearchBackend::ScopedThreads { workers },
-            ),
-            #[cfg(feature = "parallel")]
-            Mode::ParallelStreams(_) => parallel_compressor
-                .as_ref()
-                .expect("parallel mode initialized its compressor")
-                .compress(&mut jobs, config),
-            Mode::Independent => unreachable!(),
+    let stats = {
+        let mut jobs = inputs
+            .iter()
+            .zip(outputs.iter_mut())
+            .map(|(input, output)| BatchCompressJob::new(input, output))
+            .collect::<Vec<_>>();
+        let mut run = || {
+            let results = match mode {
+                Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
+                Mode::Threads(workers) => compress_slices_batch_with_backend(
+                    &mut jobs,
+                    config,
+                    BatchMatchSearchBackend::ScopedThreads { workers },
+                ),
+                #[cfg(feature = "parallel")]
+                Mode::ParallelStreams(_) => parallel_compressor
+                    .as_ref()
+                    .expect("parallel mode initialized its compressor")
+                    .compress(&mut jobs, config),
+                Mode::Independent => unreachable!(),
+            };
+            results.into_iter().fold(0usize, |sink, result| {
+                assert_eq!(result.code, ReturnCode::Ok);
+                sink ^ result.written
+            })
         };
-        results.into_iter().fold(0usize, |sink, result| {
-            assert_eq!(result.code, ReturnCode::Ok);
-            sink ^ result.written
-        })
+        measure(&mut run, full)?
     };
-    let stats = measure(&mut run, full)?;
-    drop(run);
-    drop(jobs);
     black_box(&outputs);
     Ok(stats)
 }
@@ -485,7 +487,7 @@ fn make_input(corpus: Corpus, len: usize, seed: u64) -> Vec<u8> {
             while out.len() < len {
                 let sensor = row % 37;
                 let value = (row.wrapping_mul(2_654_435_761) >> 11) % 100_000;
-                let status = if row % 11 == 0 { "warn" } else { "ok" };
+                let status = if row.is_multiple_of(11) { "warn" } else { "ok" };
                 let line = format!(
                     "{{\"stream\":{seed},\"row\":{row},\"sensor\":{sensor},\"value\":{value},\"status\":\"{status}\"}}\n"
                 );
@@ -525,7 +527,10 @@ fn self_test() -> Result<(), std::num::TryFromIntError> {
         iterations_for(Duration::from_millis(30), target, MAX_SAMPLE_ITERS)?,
         3
     );
-    assert_eq!(approximately_f64(1_048_576), 1_048_576.0);
+    assert_eq!(
+        approximately_f64(1_048_576).to_bits(),
+        1_048_576.0f64.to_bits()
+    );
     for corpus in [Corpus::Repetitive, Corpus::Structured, Corpus::PseudoRandom] {
         for seed in [0, 1, u64::MAX] {
             let short = make_input(corpus, 17, seed);

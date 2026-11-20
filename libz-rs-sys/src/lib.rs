@@ -331,7 +331,8 @@ pub extern "C" fn crc32_combine_gen(len2: z_off_t) -> c_ulong {
 }
 
 /// Give the same result as [`crc32_combine`], using `op` in place of `len2`.
-/// `op` is is generated from `len2` by [`crc32_combine_gen`].
+///
+/// `op` is generated from `len2` by [`crc32_combine_gen`].
 /// This will be faster than [`crc32_combine`] if the generated `op` is used more than once.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine_op))]
 #[must_use]

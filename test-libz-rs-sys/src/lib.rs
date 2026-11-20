@@ -2087,6 +2087,7 @@ fn chunked_deflate_output<const CHUNK: usize>(
 
 /// Cross-decode every chunked stream and retain bit-exact checks for
 /// levels whose matching configuration is unchanged.
+#[cfg(test)]
 fn assert_chunked_streams_decode(
     ours: &[(i32, usize, Vec<u8>)],
     reference: Option<&[(i32, usize, Vec<u8>)]>,
