@@ -3,6 +3,7 @@
 use std::{
     fmt,
     num::NonZeroU64,
+    ops::Range,
     sync::{mpsc, Mutex},
 };
 
@@ -377,11 +378,95 @@ fn dispatch_grid(input_len: u32, max_dimension: u32) -> Result<(u32, u32), GpuMa
     Ok((columns, rows))
 }
 
+/// A conservative bound for each individual storage buffer and for the
+/// aligned contents of any buffer in one submission. Match records (four
+/// bytes per position) dominate input words, packed predecessors and readback;
+/// uniforms can be larger only for very short inputs.
+#[derive(Clone, Copy)]
+struct SearchGeometry {
+    max_part_len: usize,
+    max_group_bytes: u64,
+    alignment: u64,
+}
+
+impl SearchGeometry {
+    fn from_limits(limits: &Limits) -> Result<Self, GpuMatchError> {
+        let params_bytes = size_of::<[u32; 4]>() as u64;
+        let axis = u64::from(limits.max_compute_workgroups_per_dimension);
+        let grid_positions = axis
+            .saturating_mul(axis)
+            .saturating_mul(u64::from(WORKGROUP_SIZE));
+        let binding_positions = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size)
+            / size_of::<u32>() as u64;
+        let max_part_len = usize::try_from(
+            grid_positions
+                .min(binding_positions)
+                .min(u64::from(u32::MAX)),
+        )
+        .unwrap_or(usize::MAX);
+        if max_part_len == 0
+            || limits.max_buffer_size < params_bytes
+            || limits.max_uniform_buffer_binding_size < params_bytes
+        {
+            return Err(GpuMatchError(
+                "GPU limits cannot represent a match-search dispatch".into(),
+            ));
+        }
+        Ok(Self {
+            max_part_len,
+            max_group_bytes: limits.max_buffer_size,
+            alignment: u64::from(
+                limits
+                    .min_storage_buffer_offset_alignment
+                    .max(limits.min_uniform_buffer_offset_alignment)
+                    .max(1),
+            ),
+        })
+    }
+
+    fn append(self, used: u64, input_len: usize) -> Option<u64> {
+        if input_len == 0 {
+            return Some(used);
+        }
+        if input_len > self.max_part_len {
+            return None;
+        }
+        let size = (u64::try_from(input_len).ok()? * size_of::<u32>() as u64)
+            .max(size_of::<[u32; 4]>() as u64);
+        let mut next = used;
+        allocate_aligned(&mut next, size, self.alignment).ok()?;
+        (next <= self.max_group_bytes).then_some(next)
+    }
+
+    fn core_capacity(self, input_len: usize, max_dist: u32) -> Result<usize, GpuMatchError> {
+        if input_len <= self.max_part_len {
+            return Ok(input_len.max(1));
+        }
+        self.max_part_len
+            .checked_sub((max_dist - 1 + MAX_MATCH - 1) as usize)
+            .filter(|&length| length != 0)
+            .ok_or_else(|| {
+                GpuMatchError(
+                    "GPU binding cannot hold one position and its full DEFLATE history/lookahead"
+                        .into(),
+                )
+            })
+    }
+}
+
+struct SearchPart<'a> {
+    input_index: usize,
+    input: &'a [u8],
+    keep: Range<usize>,
+}
+
 /// Persistent Vulkan whole-input match-search engine.
 ///
 /// Device selection, shader compilation, and compute-pipeline creation happen once in [`Self::new`].
 /// Individual searches build a direct predecessor index, upload one input, dispatch the already-compiled
-/// kernel, and read back one `(length, absolute_start)` entry per input byte.
+/// kernel, and read back one packed length/distance record per input byte.
 pub struct GpuMatchSearcher {
     device: Device,
     queue: Queue,
@@ -439,10 +524,11 @@ impl GpuMatchSearcher {
         self.search_with_max_dist(input, search_budget, DEFAULT_MAX_DIST)
     }
 
-    /// Search several independent complete inputs in one GPU submission.
+    /// Search several independent complete inputs, returning tables in input order.
     ///
-    /// All inputs use the same search budget and DEFLATE default maximum distance. Dispatches and
-    /// result copies are encoded together, then all readbacks complete behind one device poll.
+    /// All inputs use the same search budget and DEFLATE default maximum distance.
+    /// Dispatches share a submission when they fit the device buffers; larger workloads
+    /// are partitioned while retaining exact history and lookahead at each boundary.
     pub fn search_batch(
         &self,
         inputs: &[&[u8]],
@@ -480,6 +566,110 @@ impl GpuMatchSearcher {
             ));
         }
 
+        self.search_with_geometry(
+            inputs,
+            search_budget,
+            max_dist,
+            SearchGeometry::from_limits(&self.device.limits())?,
+        )
+    }
+
+    fn search_with_geometry(
+        &self,
+        inputs: &[&[u8]],
+        search_budget: u32,
+        max_dist: u32,
+        geometry: SearchGeometry,
+    ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
+        for input in inputs {
+            u32::try_from(input.len()).map_err(|_| {
+                GpuMatchError("GPU match search input exceeds u32::MAX bytes".into())
+            })?;
+        }
+        // Common case: retain the existing single-submission path, without
+        // intermediate tables or segment metadata.
+        if inputs
+            .iter()
+            .try_fold(0, |used, input| geometry.append(used, input.len()))
+            .is_some()
+        {
+            return self.search_group(inputs, search_budget, max_dist);
+        }
+
+        let mut tables = inputs
+            .iter()
+            .map(|_| GpuMatchTable {
+                entries: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        let mut used = 0;
+        let history = (max_dist - 1) as usize;
+        let lookahead = (MAX_MATCH - 1) as usize;
+        for (input_index, &input) in inputs.iter().enumerate() {
+            let core_capacity = geometry.core_capacity(input.len(), max_dist)?;
+            if core_capacity < input.len() {
+                tables[input_index]
+                    .entries
+                    .try_reserve_exact(input.len())
+                    .map_err(|error| {
+                        GpuMatchError(format!("could not reserve GPU match table: {error}"))
+                    })?;
+            }
+            for core_start in (0..input.len()).step_by(core_capacity) {
+                let core_end = core_start.saturating_add(core_capacity).min(input.len());
+                let start = core_start.saturating_sub(history);
+                let end = core_end.saturating_add(lookahead).min(input.len());
+                let part = SearchPart {
+                    input_index,
+                    input: &input[start..end],
+                    keep: core_start - start..core_end - start,
+                };
+                if geometry.append(used, part.input.len()).is_none() {
+                    self.finish_group(&mut pending, &mut tables, search_budget, max_dist)?;
+                    used = 0;
+                }
+                used = geometry.append(used, part.input.len()).ok_or_else(|| {
+                    GpuMatchError("GPU part does not fit a single submission".into())
+                })?;
+                pending.push(part);
+            }
+        }
+        self.finish_group(&mut pending, &mut tables, search_budget, max_dist)?;
+        Ok(tables)
+    }
+
+    fn finish_group(
+        &self,
+        pending: &mut Vec<SearchPart<'_>>,
+        tables: &mut [GpuMatchTable],
+        search_budget: u32,
+        max_dist: u32,
+    ) -> Result<(), GpuMatchError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let inputs = pending.iter().map(|part| part.input).collect::<Vec<_>>();
+        let results = self.search_group(&inputs, search_budget, max_dist)?;
+        for (part, result) in pending.drain(..).zip(results) {
+            let target = &mut tables[part.input_index];
+            if part.keep == (0..result.len()) && target.is_empty() {
+                // An unsplit input retains its table without a copy.
+                *target = result;
+            } else {
+                // Relative distances are independent of each part's origin.
+                target.entries.extend_from_slice(&result.entries[part.keep]);
+            }
+        }
+        Ok(())
+    }
+
+    fn search_group(
+        &self,
+        inputs: &[&[u8]],
+        search_budget: u32,
+        max_dist: u32,
+    ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
         let mut tables = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -968,6 +1158,60 @@ mod tests {
                 .filter_map(|position| result.get(position))
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn group_geometry_counts_alignment_and_uniforms() -> Result<(), GpuMatchError> {
+        let geometry = SearchGeometry {
+            max_part_len: 1024,
+            max_group_bytes: 4096,
+            alignment: 256,
+        };
+        assert_eq!(geometry.append(0, 0), Some(0));
+        assert_eq!(geometry.append(0, 1), Some(16));
+        assert_eq!(geometry.append(16, 1), Some(272));
+        assert_eq!(geometry.append(0, 1024), Some(4096));
+        assert_eq!(geometry.append(16, 1024), None);
+        assert_eq!(geometry.append(0, 1025), None);
+        assert_eq!(geometry.core_capacity(2048, 64)?, 704);
+        assert!(geometry.core_capacity(2048, DEFAULT_MAX_DIST).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn partitioned_search_preserves_full_history_and_lookahead() -> Result<(), GpuMatchError> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let actual_geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let mut mixed = b"abc0123456".repeat(210);
+        for position in (0..mixed.len()).step_by(119) {
+            mixed[position] = b'X';
+        }
+        let mut long = b"abc0123456789abcdefghijk".repeat(4_600);
+        long[32_505] ^= 0x80;
+        long[65_010] ^= 0x40;
+        for (input, max_dist, budget, part_size) in [
+            (mixed.as_slice(), 64, 7, 512),
+            (long.as_slice(), DEFAULT_MAX_DIST, 4, 40_000),
+        ] {
+            let inputs = [b"".as_slice(), b"a", input, b"abcabc", input, b"", b"ab"];
+            let expected = searcher.search_batch_with_max_dist(&inputs, budget, max_dist)?;
+            let geometry = SearchGeometry {
+                max_part_len: part_size,
+                max_group_bytes: (part_size as u64 * 4).max(actual_geometry.alignment * 2),
+                alignment: actual_geometry.alignment,
+            };
+            let actual = searcher.search_with_geometry(&inputs, budget, max_dist, geometry)?;
+            assert_eq!(actual.len(), inputs.len());
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    actual.iter().eq(expected.iter()),
+                    "input {index}, window {max_dist}"
+                );
+                assert_eq!(actual.len(), inputs[index].len());
+            }
+        }
         Ok(())
     }
 
