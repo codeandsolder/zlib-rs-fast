@@ -523,7 +523,6 @@ pub enum Mode {
 enum Codes {
     #[default]
     Fixed,
-    CodeLengths,
     Len,
     Dist,
 }
@@ -792,7 +791,9 @@ pub struct State<'a> {
     /// table for dist codes
     dist_table: Table,
 
-    codes_codes: [Code; crate::ENOUGH_LENS],
+    // During CodeLens, this holds the code-length alphabet (at most 128
+    // root entries). Its lifetime ends before the dynamic literal/length
+    // table is constructed in this same storage.
     len_codes: [Code; crate::ENOUGH_LENS],
     dist_codes: [Code; crate::ENOUGH_DISTS],
 
@@ -851,7 +852,6 @@ impl<'a> State<'a> {
             dmax: 0,
             gzip_flags: 0,
 
-            codes_codes: [Code::default(); crate::ENOUGH_LENS],
             len_codes: [Code::default(); crate::ENOUGH_LENS],
             dist_codes: [Code::default(); crate::ENOUGH_DISTS],
 
@@ -899,7 +899,6 @@ impl<'a> State<'a> {
             dmax: self.dmax,
             len_table: self.len_table,
             dist_table: self.dist_table,
-            codes_codes: self.codes_codes,
             len_codes: self.len_codes,
             dist_codes: self.dist_codes,
             lens: self.lens,
@@ -954,7 +953,7 @@ impl<'a> State<'a> {
         let InflateTable::Success { root, used } = inflate_table(
             CodeType::Codes,
             &self.lens[..CODE_LENGTH_ORDER.len()],
-            &mut self.codes_codes,
+            &mut self.len_codes[..1 << 7],
             7,
             &mut self.work,
         ) else {
@@ -962,7 +961,7 @@ impl<'a> State<'a> {
         };
 
         self.next = used;
-        self.len_table.codes = Codes::CodeLengths;
+        self.len_table.codes = Codes::Len;
         self.len_table.bits = root;
         self.have = 0;
         Ok(())
@@ -1007,7 +1006,6 @@ impl<'a> State<'a> {
     const fn len_table_ref(&self) -> &[Code] {
         match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX,
-            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         }
@@ -1016,7 +1014,6 @@ impl<'a> State<'a> {
     const fn dist_table_ref(&self) -> &[Code] {
         match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX,
-            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         }
@@ -1489,7 +1486,6 @@ impl State<'_> {
     ) -> Result<Mode, DispatchExit> {
         let len_table = match self.len_table.codes {
             Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
-            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
@@ -1517,7 +1513,6 @@ impl State<'_> {
     ) -> Result<Mode, DispatchExit> {
         let dist_table = match self.dist_table.codes {
             Codes::Fixed => &self::inffixed_tbl::DISTFIX[..],
-            Codes::CodeLengths => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
@@ -4765,6 +4760,79 @@ mod tests {
 
         assert!(end(&mut copied).state.is_null());
         assert!(end(&mut source).state.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_table_storage_survives_copy_during_each_code_length_phase() -> Result<(), ReturnCode>
+    {
+        // Independent zlib fixture: two dynamic blocks, 4096 bytes each.
+        // The code-length alphabet is overwritten by the literal/length
+        // table at the end of each CodeLens phase.
+        let input = [
+            0x78, 0x9c, 0xec, 0xca, 0xbb, 0x09, 0x00, 0x20, 0x0c, 0x40, 0xc1, 0xd9, 0x0c, 0x0a,
+            0xa2, 0xb1, 0xb0, 0x49, 0xe1, 0x07, 0x41, 0x71, 0xff, 0x15, 0x9c, 0x43, 0x78, 0x57,
+            0x9f, 0x93, 0x90, 0x6a, 0xbb, 0x65, 0xc4, 0x9e, 0xb7, 0xa9, 0x3f, 0x6b, 0xce, 0x75,
+            0xbc, 0xda, 0xce, 0x3d, 0x8e, 0x72, 0x5b, 0x4d, 0x41, 0x1c, 0x89, 0x44, 0x22, 0x91,
+            0x48, 0x24, 0x12, 0x89, 0x44, 0x22, 0x91, 0x48, 0xa4, 0x9f, 0xd3, 0x6b, 0x4f, 0xde,
+            0x4d, 0x00, 0x00, 0x61, 0x00, 0x0a, 0xce, 0xaa, 0x12, 0xf1, 0x53, 0x04, 0x49, 0x6c,
+            0x02, 0xd9, 0xdd, 0x3d, 0xe4, 0x5d, 0x7b, 0xa5, 0xca, 0x3a, 0xd1, 0xad, 0xf9, 0xc8,
+            0xab, 0x7b, 0xce, 0xad, 0x37, 0x87, 0x37, 0xeb, 0x71, 0x96, 0xd0, 0x34, 0x4d, 0xd3,
+            0x34, 0x4d, 0xd3, 0x34, 0x4d, 0xd3, 0x34, 0xfd, 0x43, 0x3f, 0x3c, 0x4b, 0x00, 0xac,
+        ];
+        let expected: Vec<u8> = (0..4096)
+            .map(|i| u8::try_from(i * i % 37 + 65).unwrap_or_default())
+            .chain((0..4096).map(|i| u8::try_from(i * i % 31 + 97).unwrap_or_default()))
+            .collect();
+        let mut cloned_phases = [false; 2];
+        for split in 1..input.len() {
+            let mut source = InflateStream::new(InflateConfig::default())?;
+            let mut source_output = vec![0xa5; expected.len() + 16];
+            let mut copied_output = source_output.clone();
+            source.next_in = input.as_ptr().cast_mut();
+            source.avail_in = u32::try_from(split).map_err(|_| ReturnCode::StreamError)?;
+            source.next_out = source_output.as_mut_ptr();
+            source.avail_out =
+                u32::try_from(source_output.len()).map_err(|_| ReturnCode::StreamError)?;
+            // SAFETY: both ABI spans point into live, independent arrays and
+            // the avail counts are bounded by their lengths.
+            let status = unsafe { inflate(&mut source, InflateFlush::NoFlush) };
+            assert!(matches!(
+                status,
+                ReturnCode::Ok | ReturnCode::BufError | ReturnCode::StreamEnd
+            ));
+            if !matches!(source.state.mode, Mode::CodeLens) {
+                continue;
+            }
+            let consumed = usize::try_from(source.total_in).map_err(|_| ReturnCode::StreamError)?;
+            let produced =
+                usize::try_from(source.total_out).map_err(|_| ReturnCode::StreamError)?;
+            assert!(matches!(produced, 0 | 4096));
+            cloned_phases[usize::from(produced == 4096)] = true;
+            copied_output[..produced].copy_from_slice(&source_output[..produced]);
+            let mut copied = MaybeUninit::uninit();
+            assert_eq!(copy(&mut copied, &source), ReturnCode::Ok);
+            // SAFETY: successful inflateCopy initialized the owning stream.
+            let mut copied = unsafe { copied.assume_init() };
+            for (stream, output) in [
+                (&mut source, &mut source_output),
+                (&mut copied, &mut copied_output),
+            ] {
+                stream.next_in = input[consumed..].as_ptr().cast_mut();
+                stream.avail_in =
+                    u32::try_from(input.len() - consumed).map_err(|_| ReturnCode::StreamError)?;
+                stream.next_out = output[produced..].as_mut_ptr();
+                stream.avail_out =
+                    u32::try_from(output.len() - produced).map_err(|_| ReturnCode::StreamError)?;
+                // SAFETY: each cloned stream is rebound to its own live output
+                // span and the remaining immutable input.
+                let status = unsafe { inflate(stream, InflateFlush::NoFlush) };
+                assert_eq!(status, ReturnCode::StreamEnd);
+                assert_eq!(&output[..expected.len()], &expected);
+                assert_eq!(&output[expected.len()..], &[0xa5; 16]);
+            }
+        }
+        assert_eq!(cloned_phases, [true; 2]);
         Ok(())
     }
 
