@@ -11,8 +11,8 @@ mod measurement;
 use measurement::{approximately_f64, iterations_for, repeating_phase};
 
 use zlib_rs::{
-    compress_bound, compress_slice, compress_slices_batch, compress_slices_batch_with_backend,
-    BatchCompressJob, BatchMatchSearchBackend, DeflateConfig, ReturnCode,
+    compress_bound, compress_slice, compress_slices_batch, BatchCompressJob, DeflateConfig,
+    ReturnCode,
 };
 
 const MIB: f64 = (1024 * 1024) as f64;
@@ -42,7 +42,6 @@ struct Case {
 enum Mode {
     Independent,
     BatchScalar,
-    Threads(usize),
     #[cfg(feature = "parallel")]
     ParallelStreams(usize),
 }
@@ -52,7 +51,6 @@ impl Mode {
         match self {
             Self::Independent => "independent".into(),
             Self::BatchScalar => "batch-scalar".into(),
-            Self::Threads(workers) => format!("threads-{workers}"),
             #[cfg(feature = "parallel")]
             Self::ParallelStreams(workers) => format!("parallel-streams-{workers}"),
         }
@@ -67,7 +65,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let full = args.iter().any(|arg| arg == "--full");
-    let include_threads = args.iter().any(|arg| arg == "--threads");
     let cases = if full { full_cases() } else { quick_cases() };
 
     println!("zlib-rs batch scheduler benchmark");
@@ -77,13 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::available_parallelism().map_or(1, usize::from),
         if full { "full" } else { "quick" },
     );
-    println!(
-        "synthetic inputs; threaded backend: {} | use these measurements for scheduler/backend decisions, not general zlib claims\n",
-        if include_threads { "included" } else { "skipped (pass --threads)" }
-    );
-
+    println!("synthetic inputs; compare whole-stream CPU batch execution modes");
     for case in cases {
-        run_case(case, full, include_threads)?;
+        run_case(case, full)?;
     }
     Ok(())
 }
@@ -180,11 +173,7 @@ fn full_cases() -> Vec<Case> {
     cases
 }
 
-fn run_case(
-    case: Case,
-    full: bool,
-    include_threads: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_case(case: Case, full: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = DeflateConfig::new(case.level);
     let inputs = (0..case.streams)
         .map(|stream| {
@@ -209,24 +198,21 @@ fn run_case(
         approximately_f64(total_output) / approximately_f64(total_input.max(1))
     );
 
-    let mut modes = vec![Mode::Independent, Mode::BatchScalar];
-    if include_threads {
-        if full {
-            modes.extend([Mode::Threads(2), Mode::Threads(4), Mode::Threads(8)]);
-        } else {
-            modes.push(Mode::Threads(4));
-        }
-    }
+    let modes = vec![Mode::Independent, Mode::BatchScalar];
     #[cfg(feature = "parallel")]
-    if full {
-        modes.extend([
-            Mode::ParallelStreams(2),
-            Mode::ParallelStreams(4),
-            Mode::ParallelStreams(8),
-        ]);
-    } else {
-        modes.push(Mode::ParallelStreams(4));
-    }
+    let modes = {
+        let mut modes = modes;
+        if full {
+            modes.extend([
+                Mode::ParallelStreams(2),
+                Mode::ParallelStreams(4),
+                Mode::ParallelStreams(8),
+            ]);
+        } else {
+            modes.push(Mode::ParallelStreams(4));
+        }
+        modes
+    };
     let mut rows = Vec::new();
     for mode in modes {
         rows.push((
@@ -345,11 +331,6 @@ fn bench_batched(
         let mut run = || {
             let results = match mode {
                 Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
-                Mode::Threads(workers) => compress_slices_batch_with_backend(
-                    &mut jobs,
-                    config,
-                    BatchMatchSearchBackend::ScopedThreads { workers },
-                ),
                 #[cfg(feature = "parallel")]
                 Mode::ParallelStreams(_) => parallel_compressor
                     .as_ref()
@@ -379,11 +360,6 @@ fn bench_batched(
         let mut run = || {
             let results = match mode {
                 Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
-                Mode::Threads(workers) => compress_slices_batch_with_backend(
-                    &mut jobs,
-                    config,
-                    BatchMatchSearchBackend::ScopedThreads { workers },
-                ),
                 #[cfg(feature = "parallel")]
                 Mode::ParallelStreams(_) => parallel_compressor
                     .as_ref()
