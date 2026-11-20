@@ -23,10 +23,10 @@ pub enum HashCalcVariant {
 }
 
 impl HashCalcVariant {
-    /// Choose the hash representation when the history is empty. Deep
-    /// searches can use a rolling three-byte index; the default level-9
-    /// profile uses the more selective four-byte index with fewer links.
-    /// Tuning an existing stream never reinterprets its populated history.
+    /// Choose the hash representation while history is empty. The maximum-
+    /// quality level-9 preset uses a rolling three-byte index; the faster
+    /// presets use a four-byte index. Tuning populated history must never
+    /// reinterpret the existing hash buckets.
     pub const fn for_max_chain_length(max_chain_length: u16) -> Self {
         if max_chain_length > 1024 {
             Self::Roll

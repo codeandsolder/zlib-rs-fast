@@ -1008,6 +1008,14 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     let state = &mut *stream.state;
 
     if state.level != level {
+        // An empty index may adopt the target level's hash layout even
+        // after a zero-input call has emitted the wrapper header. A populated
+        // dictionary or previous input must retain its existing hash layout.
+        let empty_hash_history = state.strstart == 0
+            && state.lookahead == 0
+            && state.insert == 0
+            && state.matches == 0
+            && state.head.as_slice().iter().all(|&position| position == 0);
         if state.level == 0 && state.matches != 0 {
             if state.matches == 1 {
                 self::slide_hash::slide_hash(state);
@@ -1018,6 +1026,10 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         }
 
         lm_set_level(state, level, next_config);
+        if empty_hash_history {
+            state.hash_calc_variant = HashCalcVariant::for_max_chain_length(next_config.max_chain);
+            state.ins_h = 0;
+        }
     }
 
     state.strategy = strategy;
@@ -5513,6 +5525,80 @@ mod test {
         stream.state.level = original_level;
         assert_eq!(reset(&mut stream), ReturnCode::Ok);
         let _ = end(&mut stream);
+        Ok(())
+    }
+
+    #[test]
+    fn changing_level_before_input_matches_fresh_compressor() -> Result<(), ReturnCode> {
+        let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(1_300);
+
+        let encode = |stream: &mut DeflateStream<'_>| -> Result<Vec<u8>, ReturnCode> {
+            let mut output = vec![0u8; compress_bound(source.len()) + 64];
+            stream.next_in = source.as_ptr().cast_mut();
+            stream.avail_in =
+                crate::c_api::uInt::try_from(source.len()).map_err(|_| ReturnCode::StreamError)?;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out =
+                crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+            assert_eq!(stream.avail_in, 0);
+            let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+            assert!(end(stream).is_ok());
+            output.truncate(written);
+            Ok(output)
+        };
+
+        for (initial, final_level) in [(1, 9), (6, 9), (8, 9), (9, 8), (9, 6)] {
+            let mut changed = DeflateStream::new(DeflateConfig::new(initial))?;
+            assert_eq!(
+                params(&mut changed, final_level, Strategy::Default),
+                ReturnCode::Ok
+            );
+            let mut fresh = DeflateStream::new(DeflateConfig::new(final_level))?;
+            assert_eq!(
+                matches!(changed.state.hash_calc_variant, HashCalcVariant::Roll),
+                matches!(fresh.state.hash_calc_variant, HashCalcVariant::Roll),
+                "empty stream level change {initial} -> {final_level} selected a stale hash layout"
+            );
+            assert_eq!(
+                encode(&mut changed)?,
+                encode(&mut fresh)?,
+                "empty stream level change {initial} -> {final_level} changed the encoded bytes"
+            );
+        }
+        // The wrapper can be emitted before a caller supplies data. That
+        // changes the flush state, but it cannot populate the hash index.
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let mut output = vec![0u8; compress_bound(source.len()) + 64];
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.total_in, 0);
+        assert_ne!(stream.state.last_flush, -2);
+        assert_eq!(params(&mut stream, 9, Strategy::Default), ReturnCode::Ok);
+        assert!(matches!(
+            stream.state.hash_calc_variant,
+            HashCalcVariant::Roll
+        ));
+
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(source.len()).map_err(|_| ReturnCode::StreamError)?;
+        assert_eq!(
+            deflate(&mut stream, DeflateFlush::Finish),
+            ReturnCode::StreamEnd
+        );
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+        assert!(end(&mut stream).is_ok());
+        let mut restored = vec![0u8; source.len()];
+        let (decoded, status) = crate::decompress_slice(
+            &mut restored,
+            &output[..written],
+            crate::InflateConfig::default(),
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, source);
         Ok(())
     }
 
