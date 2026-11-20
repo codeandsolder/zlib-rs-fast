@@ -1,3 +1,4 @@
+#[cfg(any(feature = "gpu", test))]
 use core::marker::PhantomData;
 use std::vec::Vec;
 
@@ -5,18 +6,18 @@ use std::vec::Vec;
 use super::gpu_match::{GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 #[cfg(feature = "gpu")]
 use super::STD_MIN_MATCH;
+#[cfg(any(feature = "gpu", test))]
 use super::{
     algorithm::{
         Algorithm, EndBlockKind, MatchSourceKind, StandardDriver, StandardSegmentMode,
         StandardTurnOutcome,
     },
-    compress_slice, deflate,
-    longest_match::{
-        execute_match_search_batch_with_backend, MatchSearchError, MatchSearchRequest,
-        MatchSearchResult, MatchSearchWork, ScopedThreadMatchSearchBackend,
-    },
-    CallCursors, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode, Status,
+    deflate,
+    longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
+    CallCursors, DeflateFlush, DeflateStream, Status,
 };
+use super::{compress_slice, DeflateConfig, ReturnCode};
+#[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
 #[cfg(feature = "gpu")]
 use crate::{MAX_WBITS, MIN_WBITS};
@@ -43,38 +44,17 @@ pub struct BatchCompressResult {
     pub code: ReturnCode,
 }
 
-/// Match-search executor used by [`compress_slices_batch_with_backend`].
-///
-/// No automatic policy is applied: scalar remains the default, while scoped threads are an explicit
-/// caller choice. A scoped-thread worker count of zero is treated as one worker. The scoped-thread
-/// backend creates OS threads for each concurrent match-search batch; it is primarily a concrete
-/// backend-boundary implementation, not a promise that threading will improve throughput. Measure
-/// it on the intended workload before selecting it for performance.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BatchMatchSearchBackend {
-    #[default]
-    Scalar,
-    ScopedThreads {
-        workers: usize,
-    },
-}
-
 /// Compress several independent buffers with scalar per-stream compression.
 ///
 /// Every job uses the same configuration and produces the same bytes as an independent
-/// [`super::compress_slice`] call. The default scalar backend deliberately drives each stream to
-/// completion instead of round-robin scheduling compressor states: without a concurrent compute
-/// executor there is no cross-stream work to rendezvous, and preserving per-stream cache locality is
-/// both simpler and substantially cheaper.
-///
-/// Use [`compress_slices_batch_with_backend`] to opt into a backend that can execute detached
-/// longest-match searches concurrently. Stored and Quick compression always use the ordinary
-/// synchronous slice compressor because their block mechanics do not use that search backend.
+/// [`super::compress_slice`] call. Each stream is driven to completion to preserve cache locality.
+/// For concurrent CPU compression use `BatchCompressor` with the `parallel` feature; GPU
+/// compression has a separate whole-input match-table API.
 pub fn compress_slices_batch(
     jobs: &mut [BatchCompressJob<'_>],
     config: DeflateConfig,
 ) -> Vec<BatchCompressResult> {
-    compress_slices_batch_with_backend(jobs, config, BatchMatchSearchBackend::Scalar)
+    compress_synchronously(jobs, config)
 }
 
 /// Reusable worker pool for whole-stream batch compression.
@@ -117,6 +97,9 @@ impl BatchCompressor {
         jobs: &mut [BatchCompressJob<'_>],
         config: DeflateConfig,
     ) -> Vec<BatchCompressResult> {
+        if jobs.len() <= 1 || self.workers() == 1 {
+            return compress_synchronously(jobs, config);
+        }
         let mut results = vec![
             BatchCompressResult {
                 written: 0,
@@ -124,12 +107,6 @@ impl BatchCompressor {
             };
             jobs.len()
         ];
-        if jobs.is_empty() {
-            return results;
-        }
-        if jobs.len() == 1 || self.workers() == 1 {
-            return compress_synchronously(jobs, config);
-        }
 
         // Independent streams vary by orders of magnitude in real workloads. Scheduling one complete
         // stream per task lets the persistent pool steal remaining work instead of pinning an
@@ -150,47 +127,11 @@ impl BatchCompressor {
     }
 }
 
-/// Variant of [`compress_slices_batch`] with an explicit match-search executor.
-pub fn compress_slices_batch_with_backend(
-    jobs: &mut [BatchCompressJob<'_>],
-    config: DeflateConfig,
-    backend: BatchMatchSearchBackend,
-) -> Vec<BatchCompressResult> {
-    // With no concurrent search executor there is no cross-stream work to rendezvous. Driving each
-    // stream to completion preserves compressor-state cache locality and avoids paying scheduler
-    // turns for a batch that can never execute compute concurrently.
-    if matches!(
-        backend,
-        BatchMatchSearchBackend::Scalar | BatchMatchSearchBackend::ScopedThreads { workers: 0 | 1 }
-    ) {
-        return compress_synchronously(jobs, config);
-    }
-
-    let Some(algorithm) = configured_algorithm(config) else {
-        return compress_synchronously(jobs, config);
-    };
-    if !uses_match_search(algorithm) {
-        return compress_synchronously(jobs, config);
-    }
-
-    let BatchMatchSearchBackend::ScopedThreads { workers } = backend else {
-        unreachable!("scalar backends returned before scheduled compression")
-    };
-    let mut resolver = ScopedThreadResolver::new(workers);
-    compress_scheduled(
-        jobs,
-        config,
-        algorithm,
-        MatchSourceKind::HashChain,
-        &mut resolver,
-    )
-}
-
 /// Compress complete input buffers using a persistent GPU whole-input match table.
 ///
 /// The GPU device and compute pipeline belong to `searcher` and are reused across calls. Each input
 /// receives one whole-input table before compression begins; when the ordinary producer yields a
-/// detached match-search request, the scheduler resolves it from that table instead of walking the
+/// detached match-search request, the driver resolves it from that table instead of walking the
 /// hash chain on the CPU. Framing, parsing, token emission, Huffman coding, and output draining stay
 /// on the existing CPU path.
 ///
@@ -217,16 +158,27 @@ pub fn compress_slices_batch_gpu(
     };
     let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
     let tables = searcher.search_batch_with_max_dist(&inputs, search_budget, max_dist)?;
-    let mut resolver = WholeInputTableResolver { tables: &tables };
-    Ok(compress_scheduled(
+    Ok(compress_external(
         jobs,
         config,
         algorithm,
-        MatchSourceKind::External,
-        &mut resolver,
+        |runtime, search| resolve_table_match(runtime, search, &tables),
     ))
 }
 
+#[cfg(feature = "gpu")]
+fn resolve_table_match(
+    runtime: &BatchRuntime<'_>,
+    search: MatchSearchWork,
+    tables: &[GpuMatchTable],
+) -> Result<MatchSearchResult, MatchSearchError> {
+    if !search.is_external() {
+        return Err(MatchSearchError::WrongBackend);
+    }
+    Ok(runtime.match_from_table(&tables[runtime.job_index]))
+}
+
+#[cfg(any(feature = "gpu", test))]
 const fn uses_match_search(algorithm: Algorithm) -> bool {
     matches!(
         algorithm,
@@ -263,191 +215,46 @@ fn configured_max_dist(config: DeflateConfig) -> Option<u32> {
     (1u32.checked_shl(effective_bits)?).checked_sub(u32::try_from(super::MIN_LOOKAHEAD).ok()?)
 }
 
-trait MatchResolver {
-    /// Return one outcome per job. A malformed request must not abort another
-    /// independent stream in the same batch.
-    fn resolve(
-        &mut self,
-        runtimes: &[BatchRuntime<'_>],
-        work: &[(usize, MatchSearchWork)],
-        results: &mut [Result<MatchSearchResult, MatchSearchError>],
-    );
-}
-
-struct ScopedThreadResolver {
-    workers: usize,
-    // Reuse owned result/index buffers between scheduling turns. The borrowed
-    // request vector must be reconstructed for each live State snapshot.
-    request_indexes: Vec<usize>,
-    found: Vec<MatchSearchResult>,
-}
-
-impl ScopedThreadResolver {
-    const fn new(workers: usize) -> Self {
-        Self {
-            workers,
-            request_indexes: Vec::new(),
-            found: Vec::new(),
-        }
-    }
-}
-
-impl MatchResolver for ScopedThreadResolver {
-    fn resolve(
-        &mut self,
-        runtimes: &[BatchRuntime<'_>],
-        work: &[(usize, MatchSearchWork)],
-        results: &mut [Result<MatchSearchResult, MatchSearchError>],
-    ) {
-        if work.len() == 1 {
-            let (runtime_index, search) = work[0];
-            results[0] = runtimes[runtime_index]
-                .match_request(search)
-                .map(|request| request.execute());
-            return;
-        }
-
-        self.request_indexes.clear();
-        let mut requests = Vec::<MatchSearchRequest<'_>>::with_capacity(work.len());
-        for (index, (runtime_index, search)) in work.iter().copied().enumerate() {
-            match runtimes[runtime_index].match_request(search) {
-                Ok(request) => {
-                    requests.push(request);
-                    self.request_indexes.push(index);
-                }
-                Err(error) => results[index] = Err(error),
-            }
-        }
-        if requests.is_empty() {
-            return;
-        }
-
-        self.found.resize(
-            requests.len(),
-            MatchSearchResult {
-                length: 0,
-                start: 0,
-            },
-        );
-        execute_match_search_batch_with_backend(
-            &ScopedThreadMatchSearchBackend::new(self.workers),
-            &requests,
-            &mut self.found,
-        );
-        for (index, result) in self
-            .request_indexes
-            .iter()
-            .copied()
-            .zip(self.found.iter().copied())
-        {
-            results[index] = Ok(result);
-        }
-    }
-}
-
-#[cfg(feature = "gpu")]
-struct WholeInputTableResolver<'a> {
-    tables: &'a [GpuMatchTable],
-}
-
-#[cfg(feature = "gpu")]
-impl MatchResolver for WholeInputTableResolver<'_> {
-    fn resolve(
-        &mut self,
-        runtimes: &[BatchRuntime<'_>],
-        work: &[(usize, MatchSearchWork)],
-        results: &mut [Result<MatchSearchResult, MatchSearchError>],
-    ) {
-        for ((runtime_index, search), result) in work.iter().zip(results.iter_mut()) {
-            if !search.is_external() {
-                *result = Err(MatchSearchError::WrongBackend);
-                continue;
-            }
-            let runtime = &runtimes[*runtime_index];
-            *result = Ok(runtime.match_from_table(&self.tables[runtime.job_index]));
-        }
-    }
-}
-
-fn compress_scheduled(
+/// Match tables are complete before this stage. There is no further parallel search to
+/// rendezvous: run each independent producer to completion, resolving matches locally.
+#[cfg(any(feature = "gpu", test))]
+fn compress_external(
     jobs: &mut [BatchCompressJob<'_>],
     config: DeflateConfig,
     algorithm: Algorithm,
-    match_source: MatchSourceKind,
-    resolver: &mut impl MatchResolver,
+    mut resolve: impl FnMut(
+        &BatchRuntime<'_>,
+        MatchSearchWork,
+    ) -> Result<MatchSearchResult, MatchSearchError>,
 ) -> Vec<BatchCompressResult> {
-    let mut results = vec![
-        BatchCompressResult {
-            written: 0,
-            code: ReturnCode::StreamError,
-        };
-        jobs.len()
-    ];
-    let mut runtimes = Vec::with_capacity(jobs.len());
-
-    for (job_index, job) in jobs.iter_mut().enumerate() {
-        match BatchRuntime::new(
-            job_index,
-            job.input,
-            &mut *job.output,
-            config,
-            algorithm,
-            match_source,
-        ) {
-            Ok(runtime) => runtimes.push(runtime),
-            Err(result) => results[job_index] = result,
-        }
-    }
-
-    let mut active = runtimes.len();
-    let mut match_work = Vec::<(usize, MatchSearchWork)>::with_capacity(runtimes.len());
-    // Every resolver must overwrite all slots for its dispatched request count.
-    let mut match_results = vec![Err(MatchSearchError::InvalidHashHistory); runtimes.len()];
-
-    while active != 0 {
-        match_work.clear();
-
-        for (runtime_index, runtime) in runtimes.iter_mut().enumerate() {
-            if runtime.done {
-                continue;
-            }
-
-            match runtime.step() {
-                RuntimeStep::Progress => {}
-                RuntimeStep::MatchSearch(work) => match_work.push((runtime_index, work)),
-                RuntimeStep::Done(result) => {
-                    results[runtime.job_index] = result;
-                    active -= 1;
+    jobs.iter_mut()
+        .enumerate()
+        .map(|(job_index, job)| {
+            let mut runtime = match BatchRuntime::new(
+                job_index,
+                job.input,
+                &mut *job.output,
+                config,
+                algorithm,
+            ) {
+                Ok(runtime) => runtime,
+                Err(result) => return result,
+            };
+            loop {
+                match runtime.step() {
+                    RuntimeStep::Progress => {}
+                    RuntimeStep::MatchSearch(work) => {
+                        let completion = resolve(&runtime, work)
+                            .and_then(|result| runtime.complete_match_search(result));
+                        if completion.is_err() {
+                            return runtime.finish_error(ReturnCode::StreamError);
+                        }
+                    }
+                    RuntimeStep::Done(result) => return result,
                 }
             }
-        }
-
-        if match_work.is_empty() {
-            continue;
-        }
-
-        resolver.resolve(
-            &runtimes,
-            &match_work,
-            &mut match_results[..match_work.len()],
-        );
-        for ((runtime_index, _), result) in match_work
-            .iter()
-            .copied()
-            .zip(match_results.iter().copied())
-        {
-            let completion = result.and_then(|match_result| {
-                runtimes[runtime_index].complete_match_search(match_result)
-            });
-            if completion.is_err() {
-                let runtime = &mut runtimes[runtime_index];
-                results[runtime.job_index] = runtime.finish_error(ReturnCode::StreamError);
-                active -= 1;
-            }
-        }
-    }
-
-    results
+        })
+        .collect()
 }
 
 fn compress_synchronously(
@@ -465,6 +272,7 @@ fn compress_synchronously(
         .collect()
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
     let level = match config.level {
         crate::c_api::Z_DEFAULT_COMPRESSION => 6,
@@ -474,22 +282,24 @@ fn configured_algorithm(config: DeflateConfig) -> Option<Algorithm> {
     Algorithm::for_stream(level, config.strategy)
 }
 
+#[cfg(any(feature = "gpu", test))]
 struct BatchRuntime<'a> {
     job_index: usize,
     stream: DeflateStream<'static>,
     driver: StandardDriver,
     input_budget: SliceBudget,
     output_budget: SliceBudget,
-    done: bool,
     _buffers: PhantomData<(&'a [u8], &'a mut [u8])>,
 }
 
+#[cfg(any(feature = "gpu", test))]
 enum RuntimeStep {
     Progress,
     MatchSearch(MatchSearchWork),
     Done(BatchCompressResult),
 }
 
+#[cfg(any(feature = "gpu", test))]
 impl<'a> BatchRuntime<'a> {
     fn new(
         job_index: usize,
@@ -497,16 +307,17 @@ impl<'a> BatchRuntime<'a> {
         output: &'a mut [u8],
         config: DeflateConfig,
         algorithm: Algorithm,
-        match_source: MatchSourceKind,
     ) -> Result<Self, BatchCompressResult> {
         let mut stream =
             DeflateStream::new(config).map_err(|code| BatchCompressResult { written: 0, code })?;
         stream.next_out = output.as_mut_ptr();
         // The temporary Rust owner releases its State if construction of a
         // compatible token driver fails; no partially initialized C shell.
-        let Some(driver) =
-            StandardDriver::for_algorithm_with_match_source(algorithm, &stream.state, match_source)
-        else {
+        let Some(driver) = StandardDriver::for_algorithm_with_match_source(
+            algorithm,
+            &stream.state,
+            MatchSourceKind::External,
+        ) else {
             return Err(BatchCompressResult {
                 written: 0,
                 code: ReturnCode::StreamError,
@@ -519,7 +330,6 @@ impl<'a> BatchRuntime<'a> {
             driver,
             input_budget: SliceBudget::new(input.len()),
             output_budget: SliceBudget::new(output.len()),
-            done: false,
             _buffers: PhantomData,
         };
 
@@ -615,13 +425,6 @@ impl<'a> BatchRuntime<'a> {
         }
     }
 
-    fn match_request(
-        &self,
-        work: MatchSearchWork,
-    ) -> Result<MatchSearchRequest<'_>, MatchSearchError> {
-        work.request(&self.stream.state)
-    }
-
     /// Absolute index in the full input slice of the next token to resolve.
     /// The raw zlib total can wrap (notably 32-bit C long on Windows), while
     /// the issued-slice budget retains the full position without changing the
@@ -699,7 +502,6 @@ impl<'a> BatchRuntime<'a> {
 
             match deflate(&mut self.stream, DeflateFlush::Finish) {
                 ReturnCode::StreamEnd => {
-                    self.done = true;
                     return BatchCompressResult {
                         // The output slice budget remains full-width even
                         // when the C ABI's total_out counter wraps.
@@ -713,8 +515,7 @@ impl<'a> BatchRuntime<'a> {
         }
     }
 
-    const fn finish_error(&mut self, code: ReturnCode) -> BatchCompressResult {
-        self.done = true;
+    const fn finish_error(&self, code: ReturnCode) -> BatchCompressResult {
         BatchCompressResult {
             written: self.output_budget.processed(self.stream.avail_out),
             code,
@@ -749,14 +550,7 @@ mod tests {
         let algorithm = configured_algorithm(DeflateConfig::new(6))
             .ok_or("standard compressor must have an algorithm")?;
         assert!(matches!(
-            BatchRuntime::new(
-                0,
-                input,
-                &mut output,
-                invalid,
-                algorithm,
-                MatchSourceKind::HashChain,
-            ),
+            BatchRuntime::new(0, input, &mut output, invalid, algorithm),
             Err(BatchCompressResult {
                 code: ReturnCode::StreamError,
                 written: 0
@@ -766,14 +560,7 @@ mod tests {
         let stored = configured_algorithm(DeflateConfig::new(0))
             .ok_or("stored compressor must have an algorithm")?;
         assert!(matches!(
-            BatchRuntime::new(
-                0,
-                input,
-                &mut output,
-                DeflateConfig::new(0),
-                stored,
-                MatchSourceKind::HashChain,
-            ),
+            BatchRuntime::new(0, input, &mut output, DeflateConfig::new(0), stored),
             Err(BatchCompressResult {
                 code: ReturnCode::StreamError,
                 written: 0
@@ -790,15 +577,8 @@ mod tests {
         let input = b"scheduled output remains bounded by its caller buffer";
         let mut output = [0u8; 128];
         let output_capacity = output.len();
-        let mut runtime = BatchRuntime::new(
-            0,
-            input,
-            &mut output,
-            config,
-            algorithm,
-            MatchSourceKind::HashChain,
-        )
-        .map_err(|_| "batch runtime failed initialization")?;
+        let mut runtime = BatchRuntime::new(0, input, &mut output, config, algorithm)
+            .map_err(|_| "batch runtime failed initialization")?;
 
         let actual = runtime.output_budget.processed(runtime.stream.avail_out);
         assert!(actual <= output_capacity);
@@ -813,13 +593,23 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
-    fn gpu_resolver_rejects_hash_chain_work_without_a_gpu_device() {
-        let mut resolver = WholeInputTableResolver { tables: &[] };
-        let mut outcomes = [Err(MatchSearchError::InvalidHashHistory)];
+    fn gpu_resolver_rejects_hash_chain_work_without_a_gpu_device() -> Result<(), &'static str> {
+        let mut output = [0u8; 128];
+        let runtime = BatchRuntime::new(
+            0,
+            b"external match table",
+            &mut output,
+            DeflateConfig::new(2),
+            Algorithm::Fast,
+        )
+        .map_err(|_| "external runtime initialization failed")?;
         let request =
             MatchSearchWork::new(1, crate::deflate::longest_match::MatchSearchKind::Standard);
-        resolver.resolve(&[], &[(0, request)], &mut outcomes);
-        assert_eq!(outcomes[0], Err(MatchSearchError::WrongBackend));
+        assert_eq!(
+            resolve_table_match(&runtime, request, &[]),
+            Err(MatchSearchError::WrongBackend)
+        );
+        Ok(())
     }
 
     #[cfg(feature = "gpu")]
@@ -859,15 +649,8 @@ mod tests {
         let mut output = [0u8; 512];
         let config = DeflateConfig::new(2);
         let algorithm = configured_algorithm(config).ok_or("valid GPU test algorithm missing")?;
-        let mut runtime = BatchRuntime::new(
-            0,
-            &input,
-            &mut output,
-            config,
-            algorithm,
-            MatchSourceKind::HashChain,
-        )
-        .map_err(|_| "unable to initialize test compressor")?;
+        let mut runtime = BatchRuntime::new(0, &input, &mut output, config, algorithm)
+            .map_err(|_| "unable to initialize test compressor")?;
         // The whole input is offered but no bytes consumed yet. The live C
         // counter may have wrapped without affecting this absolute position.
         runtime.stream.total_in = crate::c_api::z_size::MAX;
@@ -893,46 +676,6 @@ mod tests {
         assert!(!uses_match_search(Algorithm::Rle));
     }
 
-    struct NoMatchExternalResolver;
-
-    impl MatchResolver for NoMatchExternalResolver {
-        fn resolve(
-            &mut self,
-            _runtimes: &[BatchRuntime<'_>],
-            work: &[(usize, MatchSearchWork)],
-            results: &mut [Result<MatchSearchResult, MatchSearchError>],
-        ) {
-            assert_eq!(work.len(), results.len());
-            for ((_, search), result) in work.iter().zip(results.iter_mut()) {
-                assert!(search.is_external());
-                *result = Ok(MatchSearchResult {
-                    length: 0,
-                    start: 0,
-                });
-            }
-        }
-    }
-
-    struct RejectFirstExternalResolver;
-
-    impl MatchResolver for RejectFirstExternalResolver {
-        fn resolve(
-            &mut self,
-            runtimes: &[BatchRuntime<'_>],
-            work: &[(usize, MatchSearchWork)],
-            results: &mut [Result<MatchSearchResult, MatchSearchError>],
-        ) {
-            for ((runtime_index, request), result) in work.iter().zip(results.iter_mut()) {
-                assert!(request.is_external());
-                *result = if runtimes[*runtime_index].job_index == 0 {
-                    Err(MatchSearchError::UninitializedWindow)
-                } else {
-                    Ok(MatchSearchResult::new(0, 0))
-                };
-            }
-        }
-    }
-
     #[test]
     fn malformed_match_request_only_fails_its_own_batch_job() {
         let inputs = [
@@ -949,12 +692,18 @@ mod tests {
                 .zip(outputs.iter_mut())
                 .map(|(input, output)| BatchCompressJob::new(input, output))
                 .collect::<Vec<_>>();
-            compress_scheduled(
+            compress_external(
                 &mut jobs,
                 DeflateConfig::new(2),
                 Algorithm::Fast,
-                MatchSourceKind::External,
-                &mut RejectFirstExternalResolver,
+                |runtime, search| {
+                    assert!(search.is_external());
+                    if runtime.job_index == 0 {
+                        Err(MatchSearchError::UninitializedWindow)
+                    } else {
+                        Ok(MatchSearchResult::new(0, 0))
+                    }
+                },
             )
         };
 
@@ -972,6 +721,54 @@ mod tests {
     }
 
     #[test]
+    fn external_batch_finishes_each_stream_before_starting_the_next() {
+        let inputs = [
+            b"alpha/".repeat(2_000),
+            b"skipped".repeat(2_000),
+            b"beta/".repeat(3_000),
+        ];
+        let mut first = vec![0u8; compress_bound(inputs[0].len()) + 64];
+        let mut short = [];
+        let mut last = vec![0u8; compress_bound(inputs[2].len()) + 64];
+        let mut observed = Vec::new();
+        let results = compress_external(
+            &mut [
+                BatchCompressJob::new(&inputs[0], &mut first),
+                BatchCompressJob::new(&inputs[1], &mut short),
+                BatchCompressJob::new(&inputs[2], &mut last),
+            ],
+            DeflateConfig::new(2),
+            Algorithm::Fast,
+            |runtime, work| {
+                assert!(work.is_external());
+                if observed.last() != Some(&runtime.job_index) {
+                    observed.push(runtime.job_index);
+                }
+                Ok(MatchSearchResult::new(0, 0))
+            },
+        );
+        assert_eq!(observed, [0, 2]);
+        assert_eq!(
+            results[1],
+            BatchCompressResult {
+                written: 0,
+                code: ReturnCode::BufError
+            }
+        );
+        for (index, output) in [(0, first), (2, last)] {
+            assert_eq!(results[index].code, ReturnCode::Ok);
+            let mut restored = vec![0; inputs[index].len()];
+            let (decoded, code) = decompress_slice(
+                &mut restored,
+                &output[..results[index].written],
+                InflateConfig::default(),
+            );
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(decoded, inputs[index]);
+        }
+    }
+
+    #[test]
     fn batch_runtime_propagates_unsolicited_completion_without_advancing(
     ) -> Result<(), &'static str> {
         let input = b"independent batch match completion";
@@ -982,7 +779,6 @@ mod tests {
             &mut output,
             DeflateConfig::new(2),
             Algorithm::Fast,
-            MatchSourceKind::HashChain,
         )
         .map_err(|_| "unable to construct independent batch runtime")?;
 
@@ -994,47 +790,6 @@ mod tests {
         );
         assert_eq!(runtime.stream.state.strstart, before_strstart);
         assert_eq!(runtime.stream.state.lookahead, before_lookahead);
-        assert!(!runtime.done);
-        Ok(())
-    }
-
-    #[test]
-    fn scoped_resolver_reports_invalid_state_per_job() -> Result<(), &'static str> {
-        let input = b"typed search window";
-        let mut first_output = [0u8; 256];
-        let mut second_output = [0u8; 256];
-        let config = DeflateConfig::new(2);
-        let mut first = BatchRuntime::new(
-            0,
-            input,
-            &mut first_output,
-            config,
-            Algorithm::Fast,
-            MatchSourceKind::HashChain,
-        )
-        .map_err(|_| "first runtime initialization failed")?;
-        let second = BatchRuntime::new(
-            1,
-            input,
-            &mut second_output,
-            config,
-            Algorithm::Fast,
-            MatchSourceKind::HashChain,
-        )
-        .map_err(|_| "second runtime initialization failed")?;
-        first.stream.state.strstart = 1;
-        first.stream.state.lookahead = usize::MAX;
-
-        let runtimes = [first, second];
-        let search =
-            MatchSearchWork::new(1, crate::deflate::longest_match::MatchSearchKind::Standard);
-        let mut results = [
-            Err(MatchSearchError::InvalidHashHistory),
-            Err(MatchSearchError::InvalidHashHistory),
-        ];
-        ScopedThreadResolver::new(2).resolve(&runtimes, &[(0, search), (1, search)], &mut results);
-        assert_eq!(results[0], Err(MatchSearchError::WindowPositionOverflow));
-        assert!(results[1].is_ok());
         Ok(())
     }
 
@@ -1057,14 +812,10 @@ mod tests {
             let mut output = vec![0u8; compress_bound(input.len()) + 64];
             let results = {
                 let mut jobs = [BatchCompressJob::new(&input, &mut output)];
-                let mut resolver = NoMatchExternalResolver;
-                compress_scheduled(
-                    &mut jobs,
-                    config,
-                    algorithm,
-                    MatchSourceKind::External,
-                    &mut resolver,
-                )
+                compress_external(&mut jobs, config, algorithm, |_, search| {
+                    assert!(search.is_external());
+                    Ok(MatchSearchResult::new(0, 0))
+                })
             };
 
             assert_eq!(results.len(), 1);
@@ -1180,73 +931,6 @@ mod tests {
                 assert_eq!(&outputs[index][..result.written], reference);
             }
         }
-    }
-
-    #[test]
-    fn scoped_thread_backend_matches_scalar_batch_output() -> Result<(), &'static str> {
-        let inputs = [
-            b"threaded-search-alpha/".repeat(6_000),
-            b"threaded-search-beta/beta/beta/".repeat(5_000),
-            (0..140_000)
-                .map(|i| {
-                    u8::try_from(((i / 17) * 31 + i % 7) % 251)
-                        .map_err(|_| "generated threaded-search input byte is out of range")
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            b"abcabcabcabcabcabcabcabcabcabcabcabc".repeat(4_500),
-        ];
-        let config = DeflateConfig {
-            level: 9,
-            method: Method::Deflated,
-            window_bits: 16 + crate::MAX_WBITS,
-            mem_level: 1,
-            strategy: Strategy::Default,
-        };
-
-        let capacities = inputs
-            .iter()
-            .map(|input| compress_bound(input.len()) + 64)
-            .collect::<Vec<_>>();
-        let mut scalar_outputs = capacities
-            .iter()
-            .map(|capacity| vec![0u8; *capacity])
-            .collect::<Vec<_>>();
-        let mut scalar_jobs = inputs
-            .iter()
-            .zip(scalar_outputs.iter_mut())
-            .map(|(input, output)| BatchCompressJob::new(input, output))
-            .collect::<Vec<_>>();
-        let scalar_results = compress_slices_batch(&mut scalar_jobs, config);
-        drop(scalar_jobs);
-
-        for workers in [0, 3] {
-            let mut threaded_outputs = capacities
-                .iter()
-                .map(|capacity| vec![0u8; *capacity])
-                .collect::<Vec<_>>();
-            let mut threaded_jobs = inputs
-                .iter()
-                .zip(threaded_outputs.iter_mut())
-                .map(|(input, output)| BatchCompressJob::new(input, output))
-                .collect::<Vec<_>>();
-
-            let threaded_results = compress_slices_batch_with_backend(
-                &mut threaded_jobs,
-                config,
-                BatchMatchSearchBackend::ScopedThreads { workers },
-            );
-            drop(threaded_jobs);
-
-            assert_eq!(threaded_results, scalar_results);
-            for (index, result) in threaded_results.iter().enumerate() {
-                assert_eq!(
-                    &threaded_outputs[index][..result.written],
-                    &scalar_outputs[index][..result.written],
-                    "scoped-thread backend changed job {index} with workers={workers}"
-                );
-            }
-        }
-        Ok(())
     }
 
     #[cfg(feature = "parallel")]

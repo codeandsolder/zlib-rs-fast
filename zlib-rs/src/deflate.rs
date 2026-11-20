@@ -47,10 +47,7 @@ pub use batch::compress_slices_batch_gpu;
 #[cfg(feature = "parallel")]
 pub use batch::BatchCompressor;
 #[cfg(feature = "std")]
-pub use batch::{
-    compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,
-    BatchCompressResult, BatchMatchSearchBackend,
-};
+pub use batch::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 
