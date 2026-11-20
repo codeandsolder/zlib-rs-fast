@@ -51,10 +51,7 @@ pub use deflate::compress_slice_near_optimal;
 pub use deflate::BatchCompressor;
 pub use deflate::{compress_bound, compress_slice};
 #[cfg(feature = "std")]
-pub use deflate::{
-    compress_slices_batch, compress_slices_batch_with_backend, BatchCompressJob,
-    BatchCompressResult, BatchMatchSearchBackend,
-};
+pub use deflate::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
 #[cfg(feature = "gpu")]
 pub use deflate::{
     compress_slices_batch_gpu, GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable,

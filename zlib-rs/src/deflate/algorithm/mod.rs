@@ -18,11 +18,13 @@ mod rle;
 mod slow;
 mod stored;
 
+#[cfg(test)]
 const LOCAL_MATCH_SEARCH_MAX_CHAIN: u16 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MatchSourceKind {
-    /// A batch scheduler can detach longer searches across streams.
+    /// Exercise suspended hash-chain requests in tests.
+    #[cfg(test)]
     HashChain,
     /// A synchronous caller benefits from continuing the current producer
     /// without suspending at a match-search event.
@@ -36,8 +38,11 @@ impl MatchSourceKind {
     }
 
     const fn should_search_locally(self, chain: u16) -> bool {
+        #[cfg(not(test))]
+        let _ = chain;
         match self {
             Self::LocalHashChain => true,
+            #[cfg(test)]
             Self::HashChain => chain <= LOCAL_MATCH_SEARCH_MAX_CHAIN,
             Self::External => false,
         }
@@ -542,6 +547,7 @@ impl StandardDriver {
         })
     }
 
+    #[cfg(any(feature = "gpu", test))]
     pub(super) fn step(
         &mut self,
         state: &mut State<'_>,

@@ -259,117 +259,16 @@ fn execute_slow(
     }
 }
 
-/// Backend contract for executing an ordered batch of independent immutable match searches.
-///
-/// Backends may parallelize or offload execution, but must preserve request/result indexing and may
-/// not mutate compressor state. Request lifetimes bound any borrowed window/hash snapshot to the
-/// dispatch scope.
-pub trait MatchSearchBackend {
-    fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]);
-}
-
-struct ScalarMatchSearchBackend;
-
-impl MatchSearchBackend for ScalarMatchSearchBackend {
-    fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]) {
-        for (request, result) in requests.iter().zip(results) {
-            *result = request.execute();
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-pub(super) struct ScopedThreadMatchSearchBackend {
-    workers: usize,
-}
-
-#[cfg(feature = "std")]
-impl ScopedThreadMatchSearchBackend {
-    pub(super) const fn new(workers: usize) -> Self {
-        Self { workers }
-    }
-}
-
-#[cfg(feature = "std")]
-impl MatchSearchBackend for ScopedThreadMatchSearchBackend {
-    fn execute(&self, requests: &[MatchSearchRequest<'_>], results: &mut [MatchSearchResult]) {
-        if requests.is_empty() {
-            return;
-        }
-
-        let workers = self.workers.max(1).min(requests.len());
-        if workers == 1 {
-            ScalarMatchSearchBackend.execute(requests, results);
-            return;
-        }
-
-        let chunk_len = requests.len().div_ceil(workers);
-        // Keep ownership of each mutable result chunk in a recoverable slot.
-        // If thread creation is unsupported or the OS refuses another thread,
-        // run the affected and remaining jobs synchronously. Scoped threads
-        // must finish before these borrowed slices leave the scope.
-        let jobs = requests
-            .chunks(chunk_len)
-            .zip(results.chunks_mut(chunk_len))
-            .map(|job| std::sync::Mutex::new(Some(job)))
-            .collect::<std::vec::Vec<_>>();
-        std::thread::scope(|scope| {
-            let mut can_spawn = true;
-            for job in &jobs {
-                if can_spawn {
-                    let result = std::thread::Builder::new().spawn_scoped(scope, move || {
-                        let Some((requests, results)) = job
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                        else {
-                            return;
-                        };
-                        ScalarMatchSearchBackend.execute(requests, results);
-                    });
-                    if result.is_ok() {
-                        continue;
-                    }
-                    can_spawn = false;
-                }
-
-                // This job was never started, so its mutable results remain
-                // exclusively owned by the main scope. Preserve input order.
-                let pending = job
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                if let Some((requests, results)) = pending {
-                    ScalarMatchSearchBackend.execute(requests, results);
-                }
-            }
-        });
-    }
-}
-
-pub fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
-    backend: &B,
-    requests: &[MatchSearchRequest<'_>],
-    results: &mut [MatchSearchResult],
-) {
-    assert_eq!(
-        requests.len(),
-        results.len(),
-        "match-search batch result count must equal request count"
-    );
-    backend.execute(requests, results);
-}
-
-/// Execute one match-search batch with the default scalar backend.
-///
-/// The default remains allocation-free and synchronous. Backend choice is deliberately outside the
-/// token producers so later CPU/device executors do not contaminate compression semantics.
+/// Test helper for independent detached requests; production CPU compression runs whole streams.
 #[cfg(test)]
 pub fn execute_match_search_batch(
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
 ) {
-    execute_match_search_batch_with_backend(&ScalarMatchSearchBackend, requests, results);
+    assert_eq!(requests.len(), results.len());
+    for (request, result) in requests.iter().zip(results) {
+        *result = request.execute();
+    }
 }
 
 #[expect(
@@ -853,17 +752,6 @@ mod tests {
             start: 0,
         }; 2];
         execute_match_search_batch(&requests, &mut results);
-
-        let mut parallel_results = [MatchSearchResult {
-            length: 0,
-            start: 0,
-        }; 2];
-        execute_match_search_batch_with_backend(
-            &ScopedThreadMatchSearchBackend::new(2),
-            &requests,
-            &mut parallel_results,
-        );
-        assert_eq!(parallel_results, results);
 
         assert_eq!(
             results[0],
