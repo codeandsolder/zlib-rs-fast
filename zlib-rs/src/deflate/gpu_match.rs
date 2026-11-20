@@ -175,7 +175,7 @@ impl std::error::Error for GpuMatchError {}
 
 /// Match table with one 32-bit word per input byte: length in the low
 /// half-word and backward distance in the high half-word.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GpuMatchTable {
     entries: Vec<u32>,
 }
@@ -598,9 +598,7 @@ impl GpuMatchSearcher {
 
         let mut tables = inputs
             .iter()
-            .map(|_| GpuMatchTable {
-                entries: Vec::new(),
-            })
+            .map(|_| GpuMatchTable::default())
             .collect::<Vec<_>>();
         let mut pending = Vec::new();
         let mut used = 0;
@@ -670,7 +668,10 @@ impl GpuMatchSearcher {
         search_budget: u32,
         max_dist: u32,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
-        let mut tables = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        let mut tables = inputs
+            .iter()
+            .map(|_| GpuMatchTable::default())
+            .collect::<Vec<_>>();
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -693,9 +694,6 @@ impl GpuMatchSearcher {
                 GpuMatchError("GPU match search input exceeds u32::MAX bytes".into())
             })?;
             if input.is_empty() {
-                tables[input_index] = Some(GpuMatchTable {
-                    entries: Vec::new(),
-                });
                 continue;
             }
 
@@ -753,12 +751,7 @@ impl GpuMatchSearcher {
         }
 
         if prepared.is_empty() {
-            return tables
-                .into_iter()
-                .map(|table| {
-                    table.ok_or_else(|| GpuMatchError("GPU empty-input result missing".into()))
-                })
-                .collect();
+            return Ok(tables);
         }
 
         let mut workspace = self
@@ -900,18 +893,12 @@ impl GpuMatchSearcher {
                 .copied()
                 .map(u32::from_le_bytes)
                 .collect();
-            tables[item.input_index] = Some(GpuMatchTable { entries });
+            tables[item.input_index] = GpuMatchTable { entries };
         }
         drop(mapped);
         workspace.download.buffer.unmap();
 
-        tables
-            .into_iter()
-            .enumerate()
-            .map(|(index, table)| {
-                table.ok_or_else(|| GpuMatchError(format!("GPU result missing for input {index}")))
-            })
-            .collect()
+        Ok(tables)
     }
 }
 
@@ -1235,6 +1222,31 @@ mod tests {
         assert!(x <= u32::from(u16::MAX) && y <= u32::from(u16::MAX));
         assert!(x * y >= u32::MAX.div_ceil(group));
         assert!((x - 1) + (y - 1) * x < u32::MAX / group + x);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan and crosses the actual storage-binding limit"]
+    fn search_crosses_actual_binding_limit() -> Result<(), GpuMatchError> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let length = geometry.max_part_len + 17;
+        let input = (0..length).map(|i| b"abc"[i % 3]).collect::<Vec<_>>();
+        let table = searcher.search(&input, 1)?;
+        assert_eq!(table.len(), length);
+        for (position, actual) in table.iter().enumerate() {
+            let expected = if position < 3 || length - position < 3 {
+                GpuMatch::default()
+            } else {
+                GpuMatch {
+                    start: u32::try_from(position - 3)
+                        .map_err(|_| GpuMatchError("test position overflow".into()))?,
+                    length: u32::try_from((length - position).min(MAX_MATCH as usize))
+                        .map_err(|_| GpuMatchError("test length overflow".into()))?,
+                }
+            };
+            assert_eq!(actual, expected, "position {position}");
+        }
         Ok(())
     }
 
