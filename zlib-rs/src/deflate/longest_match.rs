@@ -356,6 +356,7 @@ pub fn execute_match_search_batch_with_backend<B: MatchSearchBackend + ?Sized>(
 ///
 /// The default remains allocation-free and synchronous. Backend choice is deliberately outside the
 /// token producers so later CPU/device executors do not contaminate compression semantics.
+#[cfg(test)]
 pub fn execute_match_search_batch(
     requests: &[MatchSearchRequest<'_>],
     results: &mut [MatchSearchResult],
