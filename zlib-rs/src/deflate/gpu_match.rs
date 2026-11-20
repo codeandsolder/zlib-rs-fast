@@ -17,6 +17,7 @@ use wgpu::{
 
 const HASH_SIZE: usize = 1 << 16;
 const NO_PREDECESSOR: u32 = u32::MAX;
+const PACKED_DISTANCE_LIMIT: u32 = u16::MAX as u32 + 1;
 const WORKGROUP_SIZE: u32 = 128;
 const MAX_MATCH: u32 = 258;
 const DEFAULT_MAX_DIST: u32 = 32_768 - (258 + 3 + 1);
@@ -31,7 +32,7 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> input_words: array<u32>;
 @group(0) @binding(1) var<storage, read> predecessors: array<u32>;
-@group(0) @binding(2) var<storage, read_write> results: array<vec2<u32>>;
+@group(0) @binding(2) var<storage, read_write> results: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
 fn load_byte(index: u32) -> u32 {
@@ -49,6 +50,12 @@ fn load_u32(index: u32) -> u32 {
     return low | (input_words[word_index + 1u] << (32u - shift));
 }
 
+// Each 32-bit word carries two unsigned 16-bit backward distances.
+// Zero terminates a chain; a nonzero distance can never denote the current byte.
+fn predecessor_distance(position: u32) -> u32 {
+    return (predecessors[position >> 1u] >> ((position & 1u) * 16u)) & 0xffffu;
+}
+
 @compute @workgroup_size(128)
 fn search(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -62,7 +69,7 @@ fn search(
     let position = group_index * 128u + lane;
     if position >= params.input_len { return; }
     if params.input_len - position < 3u {
-        results[position] = vec2<u32>(0u, 0u);
+        results[position] = 0u;
         return;
     }
 
@@ -72,21 +79,24 @@ fn search(
         minimum_start = position - params.max_dist + 1u;
     }
 
-    var cursor = predecessors[position];
+    var cursor = position;
+    var distance = predecessor_distance(cursor);
     let max_len = min(params.max_match, params.input_len - position);
 
     var best_len = 0u;
-    var best_start = 0u;
+    var best_distance = 0u;
     var visited = 0u;
 
     // The predecessor index walks the same hash bucket newest to oldest.
     // Once one entry is outside the history bound, all later entries are too.
     loop {
-        if best_len == max_len || cursor == 0xffffffffu || cursor < minimum_start || visited >= params.search_budget {
+        if best_len == max_len || distance == 0u || visited >= params.search_budget {
             break;
         }
-        let candidate = cursor;
-        cursor = predecessors[candidate];
+        let candidate = cursor - distance;
+        if candidate < minimum_start { break; }
+        cursor = candidate;
+        distance = predecessor_distance(cursor);
         visited += 1u;
 
         if best_len >= 3u && load_byte(position + best_len) != load_byte(candidate + best_len) {
@@ -134,13 +144,14 @@ fn search(
             length += 1u;
         }
 
-        if length >= 3u && (length > best_len || (length == best_len && candidate > best_start)) {
+        // Equal lengths keep the nearest match because predecessors are descending.
+        if length >= 3u && length > best_len {
             best_len = length;
-            best_start = candidate;
+            best_distance = position - candidate;
         }
     }
 
-    results[position] = vec2<u32>(best_len, best_start);
+    results[position] = (best_distance << 16u) | best_len;
 }
 "#;
 
@@ -161,19 +172,49 @@ impl fmt::Display for GpuMatchError {
 
 impl std::error::Error for GpuMatchError {}
 
+/// Match table with one 32-bit word per input byte: length in the low
+/// half-word and backward distance in the high half-word.
 #[derive(Debug)]
 pub struct GpuMatchTable {
-    entries: Vec<GpuMatch>,
+    entries: Vec<u32>,
 }
 
 impl GpuMatchTable {
     #[inline]
     pub fn get(&self, absolute_position: usize) -> Option<GpuMatch> {
-        self.entries.get(absolute_position).copied()
+        let position = u32::try_from(absolute_position).ok()?;
+        self.entries
+            .get(absolute_position)
+            .map(|&entry| decode_match(position, entry))
     }
 
-    pub fn as_slice(&self) -> &[GpuMatch] {
-        &self.entries
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = GpuMatch> + '_ {
+        (0..u32::MAX)
+            .zip(self.entries.iter().copied())
+            .map(|(position, entry)| decode_match(position, entry))
+    }
+}
+
+#[inline]
+const fn decode_match(position: u32, entry: u32) -> GpuMatch {
+    if entry == 0 {
+        GpuMatch {
+            length: 0,
+            start: 0,
+        }
+    } else {
+        GpuMatch {
+            length: entry & 0xffff,
+            start: position - (entry >> 16),
+        }
     }
 }
 
@@ -296,7 +337,7 @@ impl PreparedGpuInput {
     }
 
     fn result_size(&self) -> u64 {
-        u64::from(self.input_len) * 2 * size_of::<u32>() as u64
+        u64::from(self.input_len) * size_of::<u32>() as u64
     }
 }
 
@@ -428,6 +469,11 @@ impl GpuMatchSearcher {
         search_budget: u32,
         max_dist: u32,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
+        if !(1..=PACKED_DISTANCE_LIMIT).contains(&max_dist) {
+            return Err(GpuMatchError(format!(
+                "GPU match distance must be between 1 and {PACKED_DISTANCE_LIMIT}"
+            )));
+        }
         if search_budget == 0 {
             return Err(GpuMatchError(
                 "GPU match search budget must be nonzero".into(),
@@ -464,7 +510,7 @@ impl GpuMatchSearcher {
             }
 
             let dispatch = dispatch_grid(input_len, limits.max_compute_workgroups_per_dimension)?;
-            let predecessors = build_predecessors(input)?;
+            let predecessors = build_predecessors(input, max_dist)?;
             let input_words = pack_words(input);
             let mut item = PreparedGpuInput {
                 input_index,
@@ -658,11 +704,11 @@ impl GpuMatchSearcher {
             let start = item.download_offset as usize;
             let end = start + item.result_size() as usize;
             let entries = mapped[start..end]
-                .chunks_exact(8)
-                .map(|bytes| GpuMatch {
-                    length: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-                    start: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
                 .collect();
             tables[item.input_index] = Some(GpuMatchTable { entries });
         }
@@ -724,23 +770,31 @@ fn pack_words(input: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// Store the immediately preceding position in the same three-byte hash bucket.
-/// A descending chain enumerates exactly the old CSR bucket prefix in reverse.
-fn build_predecessors(input: &[u8]) -> Result<Vec<u32>, GpuMatchError> {
+/// Encode the preceding same-bucket position as a backward distance.
+/// An out-of-window predecessor terminates the chain: all older positions
+/// are necessarily outside the window as well.
+fn build_predecessors(input: &[u8], max_dist: u32) -> Result<Vec<u32>, GpuMatchError> {
     let valid_positions = input.len().saturating_sub(2);
     let positions = u32::try_from(valid_positions)
         .map_err(|_| GpuMatchError("GPU hash index exceeds u32::MAX positions".into()))?;
     let mut heads = vec![NO_PREDECESSOR; HASH_SIZE];
     // Nonempty short inputs still need a nonzero-sized storage binding.
-    let mut predecessors = Vec::with_capacity(valid_positions.max(1));
+    let mut predecessors = vec![0; valid_positions.div_ceil(2).max(1)];
     for (position, bytes) in (0..positions).zip(input.windows(3)) {
-        let hash = hash3(bytes);
-        predecessors.push(core::mem::replace(&mut heads[hash], position));
-    }
-    if predecessors.is_empty() {
-        predecessors.push(NO_PREDECESSOR);
+        let previous = core::mem::replace(&mut heads[hash3(bytes)], position);
+        if previous != NO_PREDECESSOR {
+            let distance = position - previous;
+            if distance < max_dist {
+                predecessors[position as usize / 2] |= distance << ((position & 1) * 16);
+            }
+        }
     }
     Ok(predecessors)
+}
+
+#[cfg(test)]
+fn predecessor_distance(words: &[u32], position: usize) -> usize {
+    ((words[position / 2] >> ((position & 1) * 16)) & 0xffff) as usize
 }
 
 fn hash3(bytes: &[u8]) -> usize {
@@ -767,7 +821,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let predecessors = build_predecessors(&input)?;
+        let predecessors = build_predecessors(&input, DEFAULT_MAX_DIST)?;
         let mut found_collision = false;
         for position in 0..input.len() - 2 {
             let bytes = &input[position..position + 3];
@@ -777,13 +831,16 @@ mod tests {
                 .filter(|&candidate| hash3(&input[candidate..candidate + 3]) == hash)
                 .collect::<Vec<_>>();
             let mut actual = Vec::new();
-            let mut next = predecessors[position];
-            while next != NO_PREDECESSOR {
-                let candidate = next as usize;
-                assert!(candidate < position);
-                found_collision |= &input[candidate..candidate + 3] != bytes;
-                actual.push(candidate);
-                next = predecessors[candidate];
+            let mut cursor = position;
+            loop {
+                let distance = predecessor_distance(&predecessors, cursor);
+                if distance == 0 {
+                    break;
+                }
+                cursor -= distance;
+                assert!(cursor < position);
+                found_collision |= &input[cursor..cursor + 3] != bytes;
+                actual.push(cursor);
             }
             assert_eq!(actual, expected);
             // Also preserve finite-budget and limited-history traversal.
@@ -832,8 +889,8 @@ mod tests {
             let tables = searcher.search_batch_with_max_dist(&inputs, budget, max_dist)?;
             assert_eq!(tables.len(), inputs.len());
             for (input, table) in inputs.iter().zip(tables) {
-                assert_eq!(table.as_slice().len(), input.len());
-                for (position, &actual) in table.as_slice().iter().enumerate() {
+                assert_eq!(table.len(), input.len());
+                for (position, actual) in table.iter().enumerate() {
                     let mut expected = GpuMatch::default();
                     let max_len = (input.len() - position).min(MAX_MATCH as usize);
                     if max_len >= 3 {
@@ -874,8 +931,43 @@ mod tests {
     #[test]
     fn short_inputs_have_a_valid_storage_binding() -> Result<(), GpuMatchError> {
         for input in [b"".as_slice(), b"a", b"ab", b"abc"] {
-            assert_eq!(build_predecessors(input)?, [NO_PREDECESSOR]);
+            assert_eq!(build_predecessors(input, DEFAULT_MAX_DIST)?, [0]);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_distances_preserve_zero_and_window_boundaries() -> Result<(), GpuMatchError> {
+        // The first triple starts at zero, then repeat at distances straddling the window.
+        let mut input = b"abc".to_vec();
+        input.resize(32_505, 0);
+        input.extend_from_slice(b"abc");
+        input.resize(65_011, 0);
+        input.extend_from_slice(b"abc");
+        let words = build_predecessors(&input, DEFAULT_MAX_DIST)?;
+        assert_eq!(predecessor_distance(&words, 0), 0);
+        assert_eq!(predecessor_distance(&words, 32_505), 32_505);
+        assert_eq!(predecessor_distance(&words, 65_011), 0);
+        assert_eq!(words.len(), (input.len() - 2).div_ceil(2));
+        let result = GpuMatchTable {
+            entries: vec![0, (1 << 16) | 3, 0],
+        };
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.get(0), Some(GpuMatch::default()));
+        assert_eq!(
+            result.get(1),
+            Some(GpuMatch {
+                length: 3,
+                start: 0
+            })
+        );
+        assert_eq!(result.get(3), None);
+        assert_eq!(
+            result.iter().collect::<Vec<_>>(),
+            (0..result.len())
+                .filter_map(|position| result.get(position))
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -917,8 +1009,8 @@ mod tests {
         // Three unique cyclic triples; at budget one the nearest predecessor is at distance three.
         let input = (0..length).map(|i| b"abc"[i % 3]).collect::<Vec<_>>();
         let table = searcher.search(&input, 1)?;
-        assert_eq!(table.as_slice().len(), length);
-        for (position, &actual) in table.as_slice().iter().enumerate() {
+        assert_eq!(table.len(), length);
+        for (position, actual) in table.iter().enumerate() {
             let expected = if position < 3 || length - position < 3 {
                 GpuMatch::default()
             } else {

@@ -62,11 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // First search proves the production match-table implementation against the independent CPU
     // oracle. A second timed search shows steady-state cost with device and pipeline already alive.
     let first = timed("GPU first table", || searcher.search(&input, search_budget))?;
-    assert_eq!(first.as_slice(), expected.as_slice());
+    assert!(first.iter().eq(expected.iter().copied()));
     let steady = timed("GPU steady table", || {
         searcher.search(&input, search_budget)
     })?;
-    assert_eq!(steady.as_slice(), expected.as_slice());
+    assert!(steady.iter().eq(expected.iter().copied()));
 
     let batch_inputs = vec![input.as_slice(); batch];
     let sequential_tables = timed("GPU sequential tables", || {
@@ -76,13 +76,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Result<Vec<_>, _>>()
     })?;
     for table in &sequential_tables {
-        assert_eq!(table.as_slice(), expected.as_slice());
+        assert!(table.iter().eq(expected.iter().copied()));
     }
     let batch_tables = timed("GPU batched tables", || {
         searcher.search_batch(&batch_inputs, search_budget)
     })?;
     for table in &batch_tables {
-        assert_eq!(table.as_slice(), expected.as_slice());
+        assert!(table.iter().eq(expected.iter().copied()));
     }
 
     let config = DeflateConfig::new(level);
@@ -121,16 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(decoded, input.as_slice());
     }
 
-    let matches = steady
-        .as_slice()
-        .iter()
-        .filter(|item| item.length >= 3)
-        .count();
-    let matched_bytes: u64 = steady
-        .as_slice()
-        .iter()
-        .map(|item| u64::from(item.length))
-        .sum();
+    let matches = steady.iter().filter(|item| item.length >= 3).count();
+    let matched_bytes: u64 = steady.iter().map(|item| u64::from(item.length)).sum();
     println!(
         "validated batch {} x {} {:?} bytes at budget {} on {}: {} matches/input, {} total matched bytes/input; level {} scalar {} bytes ({:.3}%) in {:?}; GPU-fed {} bytes ({:.3}%) in {:?}",
         batch,
