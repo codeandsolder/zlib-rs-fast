@@ -256,7 +256,7 @@ fn make_input(corpus: Corpus, len: usize) -> Vec<u8> {
                     row,
                     row % 37,
                     (row.wrapping_mul(2_654_435_761) >> 11) % 100_000,
-                    if row % 11 == 0 { "warn" } else { "ok" }
+                    if row.is_multiple_of(11) { "warn" } else { "ok" }
                 );
                 let take = (len - out.len()).min(line.len());
                 out.extend_from_slice(&line.as_bytes()[..take]);
