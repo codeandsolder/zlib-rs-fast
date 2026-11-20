@@ -780,7 +780,7 @@ jobs:
   miri-simd:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: "Miri SIMD"
-    runs-on: ubuntu-24.04-arm # so we don't need to install gcc 
+    runs-on: ubuntu-26.04-arm # so we don't need to install gcc 
     strategy:
       matrix:
         include:
