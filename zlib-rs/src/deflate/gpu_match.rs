@@ -57,6 +57,40 @@ fn predecessor_distance(position: u32) -> u32 {
     return (predecessors[position >> 1u] >> ((position & 1u) * 16u)) & 0xffffu;
 }
 
+// Return as soon as an unequal word identifies the first differing byte.
+// No subsequent smaller-width loop needs to repeat that comparison.
+fn common_length(position: u32, candidate: u32, max_len: u32, probe: u32) -> u32 {
+    var length = 0u;
+    if max_len >= 4u {
+        let difference = probe ^ load_u32(candidate);
+        if difference != 0u { return countTrailingZeros(difference) >> 3u; }
+        length = 4u;
+    }
+    loop {
+        if max_len - length < 16u { break; }
+        var difference = load_u32(position + length) ^ load_u32(candidate + length);
+        if difference != 0u { return length + (countTrailingZeros(difference) >> 3u); }
+        difference = load_u32(position + length + 4u) ^ load_u32(candidate + length + 4u);
+        if difference != 0u { return length + 4u + (countTrailingZeros(difference) >> 3u); }
+        difference = load_u32(position + length + 8u) ^ load_u32(candidate + length + 8u);
+        if difference != 0u { return length + 8u + (countTrailingZeros(difference) >> 3u); }
+        difference = load_u32(position + length + 12u) ^ load_u32(candidate + length + 12u);
+        if difference != 0u { return length + 12u + (countTrailingZeros(difference) >> 3u); }
+        length += 16u;
+    }
+    loop {
+        if max_len - length < 4u { break; }
+        let difference = load_u32(position + length) ^ load_u32(candidate + length);
+        if difference != 0u { return length + (countTrailingZeros(difference) >> 3u); }
+        length += 4u;
+    }
+    loop {
+        if length >= max_len || load_byte(position + length) != load_byte(candidate + length) { break; }
+        length += 1u;
+    }
+    return length;
+}
+
 @compute @workgroup_size(128)
 fn search(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -83,6 +117,8 @@ fn search(
     var cursor = position;
     var distance = predecessor_distance(cursor);
     let max_len = min(params.max_match, params.input_len - position);
+    var probe = 0u;
+    if max_len >= 4u { probe = load_u32(position); }
 
     var best_len = 0u;
     var best_distance = 0u;
@@ -104,46 +140,7 @@ fn search(
             continue;
         }
 
-        var length = 0u;
-        loop {
-            if length + 16u > max_len { break; }
-            var difference = load_u32(position + length) ^ load_u32(candidate + length);
-            if difference != 0u {
-                length += countTrailingZeros(difference) >> 3u;
-                break;
-            }
-            difference = load_u32(position + length + 4u) ^ load_u32(candidate + length + 4u);
-            if difference != 0u {
-                length += 4u + (countTrailingZeros(difference) >> 3u);
-                break;
-            }
-            difference = load_u32(position + length + 8u) ^ load_u32(candidate + length + 8u);
-            if difference != 0u {
-                length += 8u + (countTrailingZeros(difference) >> 3u);
-                break;
-            }
-            difference = load_u32(position + length + 12u) ^ load_u32(candidate + length + 12u);
-            if difference != 0u {
-                length += 12u + (countTrailingZeros(difference) >> 3u);
-                break;
-            }
-            length += 16u;
-        }
-        loop {
-            if length + 4u > max_len { break; }
-            let difference = load_u32(position + length) ^ load_u32(candidate + length);
-            if difference != 0u {
-                length += countTrailingZeros(difference) >> 3u;
-                break;
-            }
-            length += 4u;
-        }
-        loop {
-            if length >= max_len || load_byte(position + length) != load_byte(candidate + length) {
-                break;
-            }
-            length += 1u;
-        }
+        let length = common_length(position, candidate, max_len, probe);
 
         // Equal lengths keep the nearest match because predecessors are descending.
         if length >= 3u && length > best_len {
