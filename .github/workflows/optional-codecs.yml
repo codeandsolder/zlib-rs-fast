@@ -1,0 +1,43 @@
+name: Optional codec features
+
+on:
+  pull_request:
+    paths: &codec_paths
+      - '.github/workflows/optional-codecs.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - 'zlib-rs/Cargo.toml'
+      - 'zlib-rs/src/lib.rs'
+      - 'zlib-rs/src/abi_cursor.rs'
+      - 'zlib-rs/src/c_api.rs'
+      - 'zlib-rs/src/deflate.rs'
+      - 'zlib-rs/src/deflate/**'
+      - 'zlib-rs/benches/**'
+      - 'zlib-rs/examples/**'
+  push:
+    branches: [main]
+    paths: *codec_paths
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  optional-codecs:
+    name: GPU, parallel and near-optimal
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    with:
+      validation-tier: routine
+      rust-toolchain: nightly-2026-08-01
+      rust-components: clippy
+      rustflags: ""
+      command: |
+        cargo clippy --locked -p zlib-rs --all-targets --features gpu,parallel,near-optimal,__internal-api -- -D warnings
+        cargo test --locked --workspace --lib --features gz,gpu,parallel,near-optimal
