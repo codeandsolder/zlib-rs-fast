@@ -50,10 +50,18 @@ fn load_u32(index: u32) -> u32 {
 }
 
 @compute @workgroup_size(128)
-fn search(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let position = gid.x;
+fn search(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(num_workgroups) grid: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    // Flatten rows of workgroups. Guard padded groups before multiplying so
+    // position arithmetic is valid even at the u32 input-length boundary.
+    let group_index = group.y * grid.x + group.x;
+    if group_index > (params.input_len - 1u) / 128u { return; }
+    let position = group_index * 128u + lane;
     if position >= params.input_len { return; }
-    if position + 2u >= params.input_len {
+    if params.input_len - position < 3u {
         results[position] = vec2<u32>(0u, 0u);
         return;
     }
@@ -267,6 +275,7 @@ impl GpuWorkspace {
 struct PreparedGpuInput {
     input_index: usize,
     input_len: u32,
+    dispatch: (u32, u32),
     input_words: Vec<u32>,
     predecessors: Vec<u32>,
     params: [u32; 4],
@@ -305,6 +314,26 @@ fn allocate_aligned(cursor: &mut u64, size: u64, alignment: u64) -> Result<u64, 
         .checked_add(size)
         .ok_or_else(|| GpuMatchError("GPU batch buffer layout overflowed".into()))?;
     Ok(offset)
+}
+
+/// Construct a two-dimensional grid within the device's per-axis limit.
+/// Every nonempty input byte maps to exactly one invocation; the shader
+/// discards the padded final row and the padded final workgroup.
+fn dispatch_grid(input_len: u32, max_dimension: u32) -> Result<(u32, u32), GpuMatchError> {
+    let groups = input_len.div_ceil(WORKGROUP_SIZE);
+    let columns = groups.min(max_dimension);
+    if columns == 0 {
+        return Err(GpuMatchError(
+            "GPU dispatch requires a nonempty input and grid".into(),
+        ));
+    }
+    let rows = groups.div_ceil(columns);
+    if rows > max_dimension {
+        return Err(GpuMatchError(format!(
+            "GPU match dispatch requires {groups} workgroups, device grid is limited to {max_dimension} per axis"
+        )));
+    }
+    Ok((columns, rows))
 }
 
 /// Persistent Vulkan whole-input match-search engine.
@@ -434,11 +463,13 @@ impl GpuMatchSearcher {
                 continue;
             }
 
+            let dispatch = dispatch_grid(input_len, limits.max_compute_workgroups_per_dimension)?;
             let predecessors = build_predecessors(input)?;
             let input_words = pack_words(input);
             let mut item = PreparedGpuInput {
                 input_index,
                 input_len,
+                dispatch,
                 input_words,
                 predecessors,
                 params: [input_len, max_dist, MAX_MATCH, search_budget],
@@ -589,7 +620,7 @@ impl GpuMatchSearcher {
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(item.input_len.div_ceil(WORKGROUP_SIZE), 1, 1);
+                pass.dispatch_workgroups(item.dispatch.0, item.dispatch.1, 1);
             }
             encoder.copy_buffer_to_buffer(
                 &workspace.results.buffer,
@@ -844,6 +875,61 @@ mod tests {
     fn short_inputs_have_a_valid_storage_binding() -> Result<(), GpuMatchError> {
         for input in [b"".as_slice(), b"a", b"ab", b"abc"] {
             assert_eq!(build_predecessors(input)?, [NO_PREDECESSOR]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_grid_covers_workgroup_boundaries() -> Result<(), GpuMatchError> {
+        let group = WORKGROUP_SIZE;
+        for (length, x, y) in [
+            (1, 1, 1),
+            (group, 1, 1),
+            (group + 1, 2, 1),
+            (group * 7, 7, 1),
+            (group * 7 + 1, 7, 2),
+            (group * 49, 7, 7),
+        ] {
+            assert_eq!(dispatch_grid(length, 7)?, (x, y));
+        }
+        assert!(dispatch_grid(0, 7).is_err());
+        assert!(dispatch_grid(1, 0).is_err());
+        assert!(dispatch_grid(group * 49 + 1, 7).is_err());
+        let (x, y) = dispatch_grid(u32::MAX, u16::MAX.into())?;
+        assert!(x <= u32::from(u16::MAX) && y <= u32::from(u16::MAX));
+        assert!(x * y >= u32::MAX.div_ceil(group));
+        assert!((x - 1) + (y - 1) * x < u32::MAX / group + x);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan and dispatches over eight MiB"]
+    fn gpu_search_crosses_single_axis_limit() -> Result<(), GpuMatchError> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let limit = searcher
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        let length = usize::try_from(limit)
+            .map_err(|_| GpuMatchError("grid limit too large".into()))?
+            * WORKGROUP_SIZE as usize
+            + 17;
+        // Three unique cyclic triples; at budget one the nearest predecessor is at distance three.
+        let input = (0..length).map(|i| b"abc"[i % 3]).collect::<Vec<_>>();
+        let table = searcher.search(&input, 1)?;
+        assert_eq!(table.as_slice().len(), length);
+        for (position, &actual) in table.as_slice().iter().enumerate() {
+            let expected = if position < 3 || length - position < 3 {
+                GpuMatch::default()
+            } else {
+                GpuMatch {
+                    start: u32::try_from(position - 3)
+                        .map_err(|_| GpuMatchError("test position overflow".into()))?,
+                    length: u32::try_from((length - position).min(MAX_MATCH as usize))
+                        .map_err(|_| GpuMatchError("test length overflow".into()))?,
+                }
+            };
+            assert_eq!(actual, expected, "position {position}");
         }
         Ok(())
     }

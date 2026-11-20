@@ -15,7 +15,7 @@ enum SlowPhase {
 }
 
 pub(super) struct SlowProducer {
-    use_longest_match_slow: bool,
+    use_rolling_offset_search: bool,
     match_available: bool,
     phase: SlowPhase,
     match_source: MatchSourceKind,
@@ -27,7 +27,7 @@ impl SlowProducer {
             // The specialized search probes rolling-hash buckets for shifted matches.
             // deflateTune may cross the chain threshold after hash history was built;
             // never reinterpret a Standard-hash table as a rolling-hash table.
-            use_longest_match_slow: state.max_chain_length > 1024
+            use_rolling_offset_search: state.max_chain_length > 1024
                 && matches!(state.hash_calc_variant, HashCalcVariant::Roll),
             match_available: state.match_available,
             phase: SlowPhase::Ready,
@@ -87,8 +87,8 @@ impl SlowProducer {
                             && state.recent_hash_distance(hash_head).is_some()
                             && state.prev_length < state.max_lazy_match
                         {
-                            let kind = if self.use_longest_match_slow {
-                                MatchSearchKind::Slow
+                            let kind = if self.use_rolling_offset_search {
+                                MatchSearchKind::RollingOffset
                             } else {
                                 MatchSearchKind::Standard
                             };
@@ -263,7 +263,8 @@ mod tests {
             };
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             assert_eq!(
-                SlowProducer::new(&stream.state, MatchSourceKind::HashChain).use_longest_match_slow,
+                SlowProducer::new(&stream.state, MatchSourceKind::HashChain)
+                    .use_rolling_offset_search,
                 use_rolling_history && chain > 1024,
                 "level {level}, tuned chain {chain}, rolling history {use_rolling_history}",
             );
