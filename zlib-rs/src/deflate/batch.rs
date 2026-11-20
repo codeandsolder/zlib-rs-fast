@@ -503,24 +503,16 @@ fn match_from_table(
     let Some(absolute_position) = absolute_position else {
         return incumbent;
     };
-    let Some(candidate) = table.get(absolute_position) else {
+    let Some((length, distance)) = table.length_distance(absolute_position) else {
         return incumbent;
     };
-    let Ok(candidate_length) = usize::try_from(candidate.length) else {
-        return incumbent;
-    };
-    let candidate_length = candidate_length.min(state.lookahead);
+    let candidate_length = usize::from(length).min(state.lookahead);
     if candidate_length <= incumbent_length {
         return incumbent;
     }
 
-    let Ok(candidate_start) = usize::try_from(candidate.start) else {
-        return incumbent;
-    };
-    let Some(distance) = absolute_position.checked_sub(candidate_start) else {
-        return incumbent;
-    };
-    if !(1..=state.max_dist()).contains(&distance) {
+    let distance = usize::from(distance);
+    if !(1..=state.max_dist()).contains(&distance) || distance > absolute_position {
         return incumbent;
     }
     let Some(local_start) = state.strstart.checked_sub(distance) else {
