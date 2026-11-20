@@ -2085,6 +2085,42 @@ fn chunked_deflate_output<const CHUNK: usize>(
     output
 }
 
+/// Cross-decode every chunked stream and retain bit-exact checks for
+/// levels whose matching configuration is unchanged.
+fn assert_chunked_streams_decode(
+    ours: &[(i32, usize, Vec<u8>)],
+    reference: Option<&[(i32, usize, Vec<u8>)]>,
+) {
+    let original: Vec<u8> = (0u32..4096).map(|x| x.to_le_bytes()[0]).collect();
+    let validate = |compressed: &[u8]| {
+        let mut decoded = vec![0u8; original.len()];
+        let (plain, status) = zlib_rs::inflate::decompress_slice(
+            &mut decoded,
+            compressed,
+            zlib_rs::inflate::InflateConfig::default(),
+        );
+        assert_eq!(status, zlib_rs::ReturnCode::Ok);
+        assert_eq!(plain, original);
+    };
+    for (_, _, compressed) in ours {
+        validate(compressed);
+    }
+    if let Some(reference) = reference {
+        assert_eq!(ours.len(), reference.len());
+        for ((level, chunk, encoded), (ref_level, ref_chunk, ref_encoded)) in
+            ours.iter().zip(reference)
+        {
+            assert_eq!((level, chunk), (ref_level, ref_chunk));
+            validate(ref_encoded);
+            // Level -1 uses the default (6). Only levels 0-5 retain the
+            // exact reference encoder's match decisions.
+            if (0..=5).contains(level) {
+                assert_eq!(encoded, ref_encoded, "level {level}, chunk {chunk}");
+            }
+        }
+    }
+}
+
 #[test]
 fn deflate_chunked_input_all_levels() {
     use std::io::{Cursor, Read, Write};
@@ -2212,34 +2248,7 @@ fn deflate_chunked_input_all_levels() {
         outputs
     });
 
-    let original: Vec<u8> = (0u32..4096).map(|x| x.to_le_bytes()[0]).collect();
-    let validate = |compressed: &[u8]| {
-        let mut decoded = vec![0u8; original.len()];
-        let (plain, status) = zlib_rs::inflate::decompress_slice(
-            &mut decoded,
-            compressed,
-            zlib_rs::inflate::InflateConfig::default(),
-        );
-        assert_eq!(status, zlib_rs::ReturnCode::Ok);
-        assert_eq!(plain, original);
-    };
-    for (_, _, compressed) in &ours {
-        validate(compressed);
-    }
-    if let Some(reference) = reference {
-        assert_eq!(ours.len(), reference.len());
-        for ((level, chunk, encoded), (ref_level, ref_chunk, ref_encoded)) in
-            ours.iter().zip(&reference)
-        {
-            assert_eq!((level, chunk), (ref_level, ref_chunk));
-            validate(ref_encoded);
-            // Level -1 uses the default (6). Only levels 0-5 retain the
-            // exact reference encoder's match decisions.
-            if (0..=5).contains(level) {
-                assert_eq!(encoded, ref_encoded, "level {level}, chunk {chunk}");
-            }
-        }
-    }
+    assert_chunked_streams_decode(&ours, reference.as_deref());
 }
 #[test]
 fn inflate_strict_is_off() {
