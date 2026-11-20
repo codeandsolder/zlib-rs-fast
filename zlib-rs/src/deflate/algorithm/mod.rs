@@ -910,14 +910,14 @@ const LEVEL_CONFIGS: [LevelConfig; 10] = [
     LevelConfig::new(4, 6, 16, 6, Algorithm::Medium),
     LevelConfig::new(4, 12, 32, 24, Algorithm::Medium),
     LevelConfig::new(8, 16, 32, 32, Algorithm::Medium),
-    LevelConfig::new(8, 16, 128, 128, Algorithm::Medium),
-    LevelConfig::new(8, 32, 128, 256, Algorithm::Slow),
-    LevelConfig::new(32, 128, 258, 1024, Algorithm::Slow),
-    // A 76-link four-byte chain retains long-match quality while
-    // avoiding the high cost of deeper searches at level 9. A shorter
-    // good-match threshold also limits repeated searches once a useful
-    // lazy match was found. Both trade a little ratio for throughput.
+    // Medium: fast bounded search plus useful match quality.
+    LevelConfig::new(8, 32, 128, 64, Algorithm::Medium),
+    // Slow: substantially deeper matching without a large search budget.
+    LevelConfig::new(8, 32, 128, 64, Algorithm::Slow),
+    // Preserve the optimized four-byte search as the speed-oriented deep preset.
     LevelConfig::new(18, 258, 258, 76, Algorithm::Slow),
+    // Highest quality: rolling three-byte hash, longer matching search.
+    LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
 ];
 
 /// Resolve a compressor's signed level without permitting invalid table indices.

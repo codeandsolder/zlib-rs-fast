@@ -5517,9 +5517,19 @@ mod test {
     }
 
     #[test]
-    fn level_change_flushes_block_with_origin_outside_window() -> Result<(), &'static str> {
+    fn level_changes_handle_long_unflushed_block_and_preserve_hash_layout(
+    ) -> Result<(), &'static str> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
-        for (initial_level, next_level) in [(1, 6), (6, 9), (9, 1)] {
+        for (initial_level, next_level) in [
+            (1, 6),
+            (6, 9),
+            (9, 1),
+            (6, 8),
+            (8, 9),
+            (9, 8),
+            (9, 6),
+            (8, 6),
+        ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))
                 .map_err(|_| "valid deflate initialization failed")?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
@@ -5538,17 +5548,38 @@ mod test {
                     > stream.state.w_size
             );
 
+            let hash_layout = stream.state.hash_calc_variant;
+            let requires_boundary = algorithm::change_requires_block_boundary(
+                i8::try_from(initial_level).map_err(|_| "invalid source level")?,
+                Strategy::Default,
+                i8::try_from(next_level).map_err(|_| "invalid destination level")?,
+                Strategy::Default,
+            )
+            .ok_or("invalid level transition")?;
             assert_eq!(
                 params(&mut stream, next_level, Strategy::Default),
                 ReturnCode::Ok,
                 "level transition {initial_level} -> {next_level} failed"
             );
             assert_eq!(i32::from(stream.state.level), next_level);
-            assert!(stream.state.block_start >= 0);
-            assert_eq!(
-                stream.state.block_start.unsigned_abs(),
-                stream.state.strstart
-            );
+            // A change between Slow presets must not force an unnecessary
+            // block boundary; switching between algorithm families must.
+            if requires_boundary {
+                assert!(stream.state.block_start >= 0);
+                assert_eq!(
+                    stream.state.block_start.unsigned_abs(),
+                    stream.state.strstart
+                );
+            } else {
+                assert!(stream.state.block_start < 0);
+            }
+            // A populated index cannot be safely reinterpreted, even if
+            // the new level would initialize a different hash algorithm.
+            assert!(matches!(
+                (stream.state.hash_calc_variant, hash_layout),
+                (HashCalcVariant::Standard, HashCalcVariant::Standard)
+                    | (HashCalcVariant::Roll, HashCalcVariant::Roll),
+            ));
             assert_eq!(
                 deflate(&mut stream, DeflateFlush::Finish),
                 ReturnCode::StreamEnd
@@ -5784,10 +5815,13 @@ mod test {
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(level))
                 .map_err(|_| "valid deflate initialization failed")?;
-            if use_rolling_history {
-                // Only switch hash representations while the history is empty.
-                stream.state.hash_calc_variant = HashCalcVariant::Roll;
-            }
+            // Both history variants must seed correctly regardless of the
+            // selected level's initial search budget and default hash mode.
+            stream.state.hash_calc_variant = if use_rolling_history {
+                HashCalcVariant::Roll
+            } else {
+                HashCalcVariant::Standard
+            };
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             let mut input = InputCursor::from_slice(&source, stream.total_in)
                 .ok_or("test source length must fit zlib uInt")?;
@@ -5810,15 +5844,24 @@ mod test {
             .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
             .collect();
 
-        for (old_level, new_level, use_rolling_history) in
-            [(7, 9, false), (9, 7, false), (6, 9, false), (9, 7, true)]
-        {
+        for (old_level, new_level, use_rolling_history) in [
+            (7, 9, false),
+            (9, 7, false),
+            (6, 9, false),
+            (9, 7, true),
+            (8, 9, false),
+            (9, 8, true),
+            (9, 6, true),
+            (6, 8, false),
+        ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(old_level))?;
-            if use_rolling_history {
-                // Build the dictionary in rolling-hash mode to verify a
-                // subsequent level change preserves its live index.
-                stream.state.hash_calc_variant = HashCalcVariant::Roll;
-            }
+            // Build the dictionary with each supported live hash layout.
+            // Changing compression level must not reinterpret its entries.
+            stream.state.hash_calc_variant = if use_rolling_history {
+                HashCalcVariant::Roll
+            } else {
+                HashCalcVariant::Standard
+            };
             assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
             assert!(stream.state.strstart > 0);
             assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
@@ -9326,7 +9369,20 @@ mod test {
             160, 197, 192, 192, 96, 196, 0, 0, 3, 228, 25, 128,
         ];
 
-        fuzz_based_test(&input, config, &expected);
+        let mut output = vec![0u8; 1 << 17];
+        let (encoded, status) = compress_slice(&mut output, &input, config);
+        assert_eq!(status, ReturnCode::Ok);
+
+        for stream in [encoded, expected.as_slice()] {
+            let mut decoded = vec![0u8; input.len()];
+            let (restored, status) = crate::decompress_slice(
+                &mut decoded,
+                stream,
+                crate::InflateConfig { window_bits: 9 },
+            );
+            assert_eq!(status, ReturnCode::Ok);
+            assert_eq!(restored, input);
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

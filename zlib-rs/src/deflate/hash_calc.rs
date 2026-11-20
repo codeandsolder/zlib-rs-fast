@@ -187,18 +187,21 @@ mod tests {
     }
 
     #[test]
-    fn level9_defaults_to_the_bounded_four_byte_hash() -> Result<(), crate::ReturnCode> {
+    fn deep_compression_presets_select_their_hash_history() -> Result<(), crate::ReturnCode> {
         use crate::deflate::{end, DeflateConfig, DeflateStream};
 
-        let mut stream = DeflateStream::new(DeflateConfig::new(9))?;
-        assert!(matches!(
-            stream.state.hash_calc_variant,
-            HashCalcVariant::Standard
-        ));
-        assert_eq!(stream.state.max_chain_length, 76);
-        assert_eq!(stream.state.good_match, 18);
-        assert_eq!(stream.state.level, 9);
-        assert!(end(&mut stream).is_ok());
+        for (level, rolling, max_chain, good_match) in [(8, false, 76, 18), (9, true, 4_096, 32)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))?;
+            assert_eq!(
+                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
+                rolling,
+                "level {level} selected an incompatible hash representation",
+            );
+            assert_eq!(stream.state.max_chain_length, max_chain);
+            assert_eq!(stream.state.good_match, good_match);
+            assert_eq!(i32::from(stream.state.level), level);
+            assert!(end(&mut stream).is_ok());
+        }
         Ok(())
     }
 

@@ -220,16 +220,18 @@ mod tests {
         for (level, chain, use_rolling_history) in [
             (7, 4_096, false), // tuning a Standard-hash stream cannot change its index
             (7, 128, false),
-            (9, 4_096, false), // level 9 now initializes the four-byte index
+            (9, 4_096, false), // explicitly test a Standard-hash history at level 9
             (9, 128, false),
             (9, 4_096, true), // separately exercise a live rolling-hash history
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(level))?;
-            if use_rolling_history {
-                // History is still empty: selecting its representation here
-                // is safe. Once populated, tuning must not reinterpret it.
-                stream.state.hash_calc_variant = HashCalcVariant::Roll;
-            }
+            // The representation of a live history must be independent of
+            // later tuning. Select both variants while this history is empty.
+            stream.state.hash_calc_variant = if use_rolling_history {
+                HashCalcVariant::Roll
+            } else {
+                HashCalcVariant::Standard
+            };
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             assert_eq!(
                 SlowProducer::new(&stream.state, MatchSourceKind::HashChain).use_longest_match_slow,
