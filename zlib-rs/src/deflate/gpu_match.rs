@@ -488,8 +488,8 @@ impl GpuMatchSearcher {
         let limits = self.device.limits();
         let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment.max(1));
         let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment.max(1));
-        let max_storage_binding_size = u64::from(limits.max_storage_buffer_binding_size);
-        let max_uniform_binding_size = u64::from(limits.max_uniform_buffer_binding_size);
+        let max_storage_binding_size = limits.max_storage_buffer_binding_size;
+        let max_uniform_binding_size = limits.max_uniform_buffer_binding_size;
 
         let mut input_cursor = 0u64;
         let mut predecessors_cursor = 0u64;
@@ -563,12 +563,12 @@ impl GpuMatchSearcher {
         }
 
         if prepared.is_empty() {
-            return Ok(tables
+            return tables
                 .into_iter()
                 .map(|table| {
                     table.ok_or_else(|| GpuMatchError("GPU empty-input result missing".into()))
                 })
-                .collect::<Result<Vec<_>, _>>()?);
+                .collect();
         }
 
         let mut workspace = self
@@ -715,13 +715,13 @@ impl GpuMatchSearcher {
         drop(mapped);
         workspace.download.buffer.unmap();
 
-        Ok(tables
+        tables
             .into_iter()
             .enumerate()
             .map(|(index, table)| {
                 table.ok_or_else(|| GpuMatchError(format!("GPU result missing for input {index}")))
             })
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect()
     }
 }
 
