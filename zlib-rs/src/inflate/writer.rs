@@ -191,48 +191,87 @@ impl<'a> Writer<'a> {
         self.filled = end;
     }
 
-    /// Repeat a short initialized period without reading newly written
-    /// output. Fixed endpoint values cover the whole period.
+    /// Load two fixed-width endpoints once and store one or more periods.
     ///
     /// # Safety
-    /// N <= distance < 2*N, distance bytes of initialized history precede
-    /// current, and length bytes from current are writable.
+    /// The initialized source period is disjoint from the entire destination
+    /// span. N <= period < 2*N and period <= length. If `REPEAT` is false,
+    /// length == period; otherwise repeat it and copy the final partial period.
     #[inline]
-    unsafe fn repeat_period<const N: usize>(
+    unsafe fn copy_period_endpoints<const N: usize, const REPEAT: bool>(
         ptr: *mut MaybeUninit<u8>,
-        current: usize,
-        distance: usize,
+        src: usize,
+        dst: usize,
+        period: usize,
         length: usize,
     ) {
-        debug_assert!(distance >= N && distance < 2 * N);
-        let start = current - distance;
-        let tail = distance - N;
-        // SAFETY: both loads lie in the initialized history period.
-        let first = unsafe { ptr.add(start).cast::<[u8; N]>().read_unaligned() };
-        // SAFETY: the second endpoint ends exactly at current.
-        let last = unsafe { ptr.add(start + tail).cast::<[u8; N]>().read_unaligned() };
+        debug_assert!(period >= N && period < 2 * N && period <= length);
+        debug_assert!(REPEAT || period == length);
+        let tail = period - N;
+        // SAFETY: both endpoints lie in the initialized source period.
+        let first = unsafe { ptr.add(src).cast::<[u8; N]>().read_unaligned() };
+        // SAFETY: the second endpoint ends at the source period's end.
+        let last = unsafe { ptr.add(src + tail).cast::<[u8; N]>().read_unaligned() };
         let mut written = 0;
-        while length - written >= distance {
-            // SAFETY: the two endpoint stores cover exactly one complete
-            // period within the validated output range.
+        loop {
+            // SAFETY: the two endpoint stores cover one complete period
+            // within the validated writable destination.
             unsafe {
-                ptr.add(current + written)
+                ptr.add(dst + written)
                     .cast::<[u8; N]>()
                     .write_unaligned(first);
-                ptr.add(current + written + tail)
+                ptr.add(dst + written + tail)
                     .cast::<[u8; N]>()
                     .write_unaligned(last);
             }
-            written += distance;
+            written += period;
+            if !REPEAT || length - written < period {
+                break;
+            }
         }
-        // SAFETY: the remaining prefix of the period is initialized history,
-        // disjoint from all output, and the destination has exactly this space.
+        if REPEAT {
+            // SAFETY: the remaining prefix is initialized history, disjoint
+            // from the destination and exactly as long as the writable tail.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ptr.add(src),
+                    ptr.add(dst + written),
+                    length - written,
+                );
+            }
+        }
+    }
+
+    /// Select the largest endpoint width fitting the period.
+    ///
+    /// # Safety
+    /// 1 <= period < 64. The source period is initialized, disjoint from
+    /// the complete writable destination of length bytes. Period <= length,
+    /// and equality is required for the non-repeating specialization.
+    #[inline]
+    unsafe fn copy_period_span<const REPEAT: bool>(
+        ptr: *mut MaybeUninit<u8>,
+        src: usize,
+        dst: usize,
+        period: usize,
+        length: usize,
+    ) {
+        // SAFETY: each selected width satisfies N <= period < 2*N,
+        // and the caller establishes the source and destination invariants.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                ptr.add(start),
-                ptr.add(current + written),
-                length - written,
-            );
+            if period >= 32 {
+                Self::copy_period_endpoints::<32, REPEAT>(ptr, src, dst, period, length);
+            } else if period >= 16 {
+                Self::copy_period_endpoints::<16, REPEAT>(ptr, src, dst, period, length);
+            } else if period >= 8 {
+                Self::copy_period_endpoints::<8, REPEAT>(ptr, src, dst, period, length);
+            } else if period >= 4 {
+                Self::copy_period_endpoints::<4, REPEAT>(ptr, src, dst, period, length);
+            } else if period >= 2 {
+                Self::copy_period_endpoints::<2, REPEAT>(ptr, src, dst, period, length);
+            } else {
+                Self::copy_period_endpoints::<1, REPEAT>(ptr, src, dst, period, length);
+            }
         }
     }
 
@@ -295,19 +334,7 @@ impl<'a> Writer<'a> {
                 32 => return Self::repeat_aligned_period::<32>(ptr, current, length),
                 _ => {}
             }
-            if distance >= 32 {
-                Self::repeat_period::<32>(ptr, current, distance, length);
-            } else if distance >= 16 {
-                Self::repeat_period::<16>(ptr, current, distance, length);
-            } else if distance >= 8 {
-                Self::repeat_period::<8>(ptr, current, distance, length);
-            } else if distance >= 4 {
-                Self::repeat_period::<4>(ptr, current, distance, length);
-            } else if distance >= 2 {
-                Self::repeat_period::<2>(ptr, current, distance, length);
-            } else {
-                Self::repeat_period::<1>(ptr, current, distance, length);
-            }
+            Self::copy_period_span::<true>(ptr, current - distance, current, distance, length);
         }
     }
 
@@ -358,32 +385,6 @@ impl<'a> Writer<'a> {
         unsafe { Self::copy_disjoint_chunk::<N>(ptr, src + length - N, dst + length - N) };
     }
 
-    /// Copy a span whose size is in [N, 2*N). Both endpoint loads happen
-    /// before either store; no length-dependent loop or branch is needed.
-    ///
-    /// # Safety
-    /// The source and destination spans of length bytes are disjoint,
-    /// initialized/readable and writable respectively, and N <= length < 2*N.
-    #[inline]
-    unsafe fn copy_disjoint_endpoints<const N: usize>(
-        ptr: *mut MaybeUninit<u8>,
-        src: usize,
-        dst: usize,
-        length: usize,
-    ) {
-        debug_assert!(length >= N && length < 2 * N);
-        let tail = length - N;
-        // SAFETY: both endpoint ranges lie within the disjoint validated spans.
-        let first = unsafe { ptr.add(src).cast::<[u8; N]>().read_unaligned() };
-        // SAFETY: tail + N == length, so the second load is also initialized.
-        let last = unsafe { ptr.add(src + tail).cast::<[u8; N]>().read_unaligned() };
-        // SAFETY: both endpoint stores fit the exact destination span.
-        unsafe {
-            ptr.add(dst).cast::<[u8; N]>().write_unaligned(first);
-            ptr.add(dst + tail).cast::<[u8; N]>().write_unaligned(last);
-        }
-    }
-
     /// Fast ordinary-inflate copy for a non-overlapping DEFLATE reference.
     /// The callback writer uses the original, exact match copy instead.
     // The large fast-path dispatch needs to be inlined at its one-shot
@@ -423,16 +424,8 @@ impl<'a> Writer<'a> {
         unsafe {
             if length >= MATCH_COPY_WIDTH {
                 Self::copy_disjoint_chunks::<MATCH_COPY_WIDTH>(ptr, start, current, length);
-            } else if length >= 16 {
-                Self::copy_disjoint_endpoints::<16>(ptr, start, current, length);
-            } else if length >= 8 {
-                Self::copy_disjoint_endpoints::<8>(ptr, start, current, length);
-            } else if length >= 4 {
-                Self::copy_disjoint_endpoints::<4>(ptr, start, current, length);
-            } else if length >= 2 {
-                Self::copy_disjoint_endpoints::<2>(ptr, start, current, length);
             } else {
-                Self::copy_disjoint_endpoints::<1>(ptr, start, current, length);
+                Self::copy_period_span::<false>(ptr, start, current, length, length);
             }
         }
 
