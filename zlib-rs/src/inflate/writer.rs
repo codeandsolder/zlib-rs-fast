@@ -10,6 +10,11 @@ use super::window::BackWindow;
 // seed and repeatedly double an initialized prefix. Longer matches use
 // disjoint block copies instead of doing one load/store per output byte.
 const SCALAR_OVERLAP_COPY_LIMIT: usize = 32;
+// Endpoint values cover periods smaller than twice the largest 32-byte
+// fixed value. For non-power-of-two periods, cap the number of stores:
+// the measured long distance-2/3/4 recurrences favor prefix doubling.
+const MAX_REPLICATED_PERIOD: usize = 64;
+const MAX_PERIOD_REPETITIONS: usize = 64;
 // A fixed-size byte-array copy lets LLVM choose efficient native vector
 // loads and stores without handwritten SIMD intrinsics.
 #[cfg(target_arch = "x86_64")]
@@ -157,6 +162,13 @@ impl<'a> Writer<'a> {
                 for i in 0..length {
                     buf[current + i] = buf[start + i];
                 }
+            } else if offset_from_end < MAX_REPLICATED_PERIOD
+                && (offset_from_end.is_power_of_two()
+                    || length <= MAX_PERIOD_REPETITIONS * offset_from_end)
+            {
+                // SAFETY: the validated distance and output capacity
+                // establish the initialized period and writable span.
+                unsafe { self.copy_short_period(offset_from_end, length) };
             } else {
                 // Seed one distance from disjoint history, then repeatedly
                 // double the initialized output prefix with disjoint copies.
@@ -177,6 +189,126 @@ impl<'a> Writer<'a> {
         }
         // Commit the initialized extent only after every copy succeeds.
         self.filled = end;
+    }
+
+    /// Repeat a short initialized period without reading newly written
+    /// output. Fixed endpoint values cover the whole period.
+    ///
+    /// # Safety
+    /// N <= distance < 2*N, distance bytes of initialized history precede
+    /// current, and length bytes from current are writable.
+    #[inline]
+    unsafe fn repeat_period<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        current: usize,
+        distance: usize,
+        length: usize,
+    ) {
+        debug_assert!(distance >= N && distance < 2 * N);
+        let start = current - distance;
+        let tail = distance - N;
+        // SAFETY: both loads lie in the initialized history period.
+        let first = unsafe { ptr.add(start).cast::<[u8; N]>().read_unaligned() };
+        // SAFETY: the second endpoint ends exactly at current.
+        let last = unsafe { ptr.add(start + tail).cast::<[u8; N]>().read_unaligned() };
+        let mut written = 0;
+        while length - written >= distance {
+            // SAFETY: the two endpoint stores cover exactly one complete
+            // period within the validated output range.
+            unsafe {
+                ptr.add(current + written)
+                    .cast::<[u8; N]>()
+                    .write_unaligned(first);
+                ptr.add(current + written + tail)
+                    .cast::<[u8; N]>()
+                    .write_unaligned(last);
+            }
+            written += distance;
+        }
+        // SAFETY: the remaining prefix of the period is initialized history,
+        // disjoint from all output, and the destination has exactly this space.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ptr.add(start),
+                ptr.add(current + written),
+                length - written,
+            );
+        }
+    }
+
+    /// Repeat an aligned power-of-two period using an expanded 32-byte
+    /// chunk. This stays separate from arbitrary-period endpoint copying.
+    ///
+    /// # Safety
+    /// N is a power of two <= 32; N initialized bytes precede current,
+    /// and length writable bytes follow current.
+    #[inline(never)]
+    unsafe fn repeat_aligned_period<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        current: usize,
+        length: usize,
+    ) {
+        // SAFETY: the fixed source period is initialized.
+        let seed = unsafe { ptr.add(current - N).cast::<[u8; N]>().read_unaligned() };
+        let chunk: [u8; 32] = core::array::from_fn(|i| seed[i % N]);
+        let mut written = 0;
+        while length - written >= chunk.len() {
+            // SAFETY: the next full chunk lies in the writable output span.
+            unsafe {
+                ptr.add(current + written)
+                    .cast::<[u8; 32]>()
+                    .write_unaligned(chunk)
+            };
+            written += chunk.len();
+        }
+        // SAFETY: the remaining prefix is fully initialized within chunk,
+        // and the destination has precisely the remaining writable bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                chunk.as_ptr().cast(),
+                ptr.add(current + written),
+                length - written,
+            );
+        }
+    }
+
+    /// Replicate one initialized short period without reading new output.
+    ///
+    /// # Safety
+    /// Distance is positive and less than MAX_REPLICATED_PERIOD, the
+    /// preceding distance bytes are initialized, and length bytes fit
+    /// in the output capacity. The caller commits the final extent.
+    #[cold]
+    #[inline(never)]
+    unsafe fn copy_short_period(&mut self, distance: usize, length: usize) {
+        let current = self.filled;
+        let ptr = self.buf.as_mut_ptr();
+        // SAFETY: the caller guarantees the initialized source period
+        // and writable destination. Width is the largest power of two
+        // not exceeding distance, which is less than 64.
+        unsafe {
+            match distance {
+                2 => return Self::repeat_aligned_period::<2>(ptr, current, length),
+                4 => return Self::repeat_aligned_period::<4>(ptr, current, length),
+                8 => return Self::repeat_aligned_period::<8>(ptr, current, length),
+                16 => return Self::repeat_aligned_period::<16>(ptr, current, length),
+                32 => return Self::repeat_aligned_period::<32>(ptr, current, length),
+                _ => {}
+            }
+            if distance >= 32 {
+                Self::repeat_period::<32>(ptr, current, distance, length);
+            } else if distance >= 16 {
+                Self::repeat_period::<16>(ptr, current, distance, length);
+            } else if distance >= 8 {
+                Self::repeat_period::<8>(ptr, current, distance, length);
+            } else if distance >= 4 {
+                Self::repeat_period::<4>(ptr, current, distance, length);
+            } else if distance >= 2 {
+                Self::repeat_period::<2>(ptr, current, distance, length);
+            } else {
+                Self::repeat_period::<1>(ptr, current, distance, length);
+            }
+        }
     }
 
     /// Copy one fixed-size initialized chunk between disjoint buffers.
