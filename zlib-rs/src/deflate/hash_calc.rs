@@ -16,24 +16,10 @@ pub(super) const fn hash_chain_position(position: usize) -> u16 {
 // Standard hashing deliberately uses all sixteen hash bits.
 const _: () = assert!(HASH_SIZE == (1usize << u16::BITS));
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashCalcVariant {
     Standard,
     Roll,
-}
-
-impl HashCalcVariant {
-    /// Choose the hash representation while history is empty. The maximum-
-    /// quality level-9 preset uses a rolling three-byte index; the faster
-    /// presets use a four-byte index. Tuning populated history must never
-    /// reinterpret the existing hash buckets.
-    pub const fn for_max_chain_length(max_chain_length: u16) -> Self {
-        if max_chain_length > 1024 {
-            Self::Roll
-        } else {
-            Self::Standard
-        }
-    }
 }
 
 pub struct StandardHashCalc;

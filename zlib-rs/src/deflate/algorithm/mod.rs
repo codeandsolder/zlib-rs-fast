@@ -10,6 +10,8 @@ use crate::{
     DeflateFlush,
 };
 
+use super::hash_calc::HashCalcVariant;
+
 mod fast;
 mod huff;
 mod medium;
@@ -883,6 +885,7 @@ pub struct LevelConfig {
     pub nice_length: u16,
     pub max_chain: u16,
     pub algorithm: Algorithm,
+    pub hash_layout: HashCalcVariant,
 }
 
 impl LevelConfig {
@@ -892,6 +895,7 @@ impl LevelConfig {
         nice_length: u16,
         max_chain: u16,
         algorithm: Algorithm,
+        hash_layout: HashCalcVariant,
     ) -> Self {
         Self {
             good_length,
@@ -899,26 +903,32 @@ impl LevelConfig {
             nice_length,
             max_chain,
             algorithm,
+            hash_layout,
         }
     }
 }
 
-const LEVEL_CONFIGS: [LevelConfig; 10] = [
-    LevelConfig::new(0, 0, 0, 0, Algorithm::Stored),
-    LevelConfig::new(0, 0, 0, 0, Algorithm::Quick),
-    LevelConfig::new(4, 4, 8, 4, Algorithm::Fast),
-    LevelConfig::new(4, 6, 16, 6, Algorithm::Medium),
-    LevelConfig::new(4, 12, 32, 24, Algorithm::Medium),
-    LevelConfig::new(8, 16, 32, 32, Algorithm::Medium),
-    // Medium: fast bounded search plus useful match quality.
-    LevelConfig::new(8, 32, 128, 64, Algorithm::Medium),
-    // Slow: substantially deeper matching without a large search budget.
-    LevelConfig::new(8, 32, 128, 64, Algorithm::Slow),
-    // Preserve the optimized four-byte search as the speed-oriented deep preset.
-    LevelConfig::new(18, 258, 258, 76, Algorithm::Slow),
-    // Highest quality: rolling three-byte hash, longer matching search.
-    LevelConfig::new(32, 258, 258, 4096, Algorithm::Slow),
-];
+const LEVEL_CONFIGS: [LevelConfig; 10] = {
+    use Algorithm::{Fast, Medium, Quick, Slow, Stored};
+    use HashCalcVariant::{Roll, Standard};
+
+    [
+        LevelConfig::new(0, 0, 0, 0, Stored, Standard),
+        LevelConfig::new(0, 0, 0, 0, Quick, Standard),
+        LevelConfig::new(4, 4, 8, 4, Fast, Standard),
+        LevelConfig::new(4, 6, 16, 6, Medium, Standard),
+        LevelConfig::new(4, 12, 32, 24, Medium, Standard),
+        LevelConfig::new(8, 16, 32, 32, Medium, Standard),
+        // Medium: fast bounded search plus useful match quality.
+        LevelConfig::new(8, 32, 128, 64, Medium, Standard),
+        // Slow: substantially deeper matching without a large search budget.
+        LevelConfig::new(8, 32, 128, 64, Slow, Standard),
+        // Preserve the optimized four-byte search as the speed-oriented deep preset.
+        LevelConfig::new(18, 258, 258, 76, Slow, Standard),
+        // Highest quality: rolling three-byte hash, longer matching search.
+        LevelConfig::new(32, 258, 258, 4096, Slow, Roll),
+    ]
+};
 
 /// Resolve a compressor's signed level without permitting invalid table indices.
 pub fn level_config(level: i8) -> Option<LevelConfig> {
@@ -933,7 +943,11 @@ pub fn change_requires_block_boundary(
 ) -> Option<bool> {
     let current = level_config(current_level)?;
     let next = level_config(next_level)?;
-    Some(current_strategy != next_strategy || current.algorithm != next.algorithm)
+    Some(
+        current_strategy != next_strategy
+            || current.algorithm != next.algorithm
+            || current.hash_layout != next.hash_layout,
+    )
 }
 
 #[cfg(test)]
@@ -1090,14 +1104,18 @@ mod tests {
     }
 
     #[test]
-    fn parameter_changes_flush_only_across_algorithm_or_strategy_boundaries() {
+    fn parameter_changes_flush_only_across_algorithm_strategy_or_hash_boundaries() {
         assert_eq!(
             change_requires_block_boundary(3, Strategy::Default, 6, Strategy::Default),
             Some(false)
         );
         assert_eq!(
-            change_requires_block_boundary(7, Strategy::Default, 9, Strategy::Default),
+            change_requires_block_boundary(7, Strategy::Default, 8, Strategy::Default),
             Some(false)
+        );
+        assert_eq!(
+            change_requires_block_boundary(8, Strategy::Default, 9, Strategy::Default),
+            Some(true)
         );
         assert_eq!(
             change_requires_block_boundary(6, Strategy::Default, 7, Strategy::Default),

@@ -988,7 +988,9 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     else {
         return ReturnCode::StreamError;
     };
-    if requires_boundary && state.last_flush != -2 {
+    let next_hash = next_config.hash_layout;
+    let changes_hash = state.level != level && state.hash_calc_variant != next_hash;
+    if (requires_boundary || changes_hash) && state.last_flush != -2 {
         // Flush the last buffer.
         let err = deflate(stream, DeflateFlush::Block);
         if err == ReturnCode::StreamError {
@@ -1008,17 +1010,10 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     let state = &mut *stream.state;
 
     if state.level != level {
-        // Every path setting strstart to zero also clears head: initialization,
-        // dictionary replacement and a completed full flush. This lets an empty
-        // index adopt the target level's hash layout in constant time. Live
-        // history retains its representation even when the level changes.
-        let empty_hash_history =
-            state.strstart == 0 && state.lookahead == 0 && state.insert == 0 && state.matches == 0;
-        debug_assert!(
-            !empty_hash_history || state.head.as_slice().iter().all(|&position| position == 0),
-            "zero-position hash history must have empty heads"
-        );
-        if state.level == 0 && state.matches != 0 {
+        if changes_hash {
+            rebuild_hash_history(state, next_hash);
+            state.matches = 0;
+        } else if state.level == 0 && state.matches != 0 {
             if state.matches == 1 {
                 self::slide_hash::slide_hash(state);
             } else {
@@ -1028,15 +1023,52 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
         }
 
         lm_set_level(state, level, next_config);
-        if empty_hash_history {
-            state.hash_calc_variant = HashCalcVariant::for_max_chain_length(next_config.max_chain);
-            state.ins_h = 0;
-        }
     }
 
     state.strategy = strategy;
 
     ReturnCode::Ok
+}
+
+/// Reindex the surviving window at a completed block boundary or before the
+/// first block. Producers that use direct four-byte insertions must never
+/// inherit a rolling three-byte table. Rebuilding, rather than clearing
+/// history, retains cross-block matches and preset dictionary matches.
+fn rebuild_hash_history(state: &mut State<'_>, variant: HashCalcVariant) {
+    let end = state.strstart;
+    let start = end.saturating_sub(state.w_size);
+    let history_len = end - start;
+
+    if history_len != 0 || state.matches != 0 {
+        state.head.as_mut_slice().fill(0);
+    } else {
+        debug_assert!(state.head.as_slice().iter().all(|&position| position == 0));
+    }
+    state.hash_calc_variant = variant;
+    state.ins_h = 0;
+    state.match_start = 0;
+    state.prev_length = 0;
+    state.match_available = false;
+
+    // ResetKeep can retain buffered lookahead before the first block.
+    // Index only consumed positions, using available lookahead for complete
+    // probes that straddle the cursor. The standard refill path inserts its
+    // extra preceding four-byte position separately.
+    let probe_width = match variant {
+        HashCalcVariant::Standard => WANT_MIN_MATCH,
+        HashCalcVariant::Roll => STD_MIN_MATCH,
+    };
+    let available = history_len + state.lookahead;
+    let count = history_len.min(available.saturating_sub(probe_width - 1));
+    state.insert = (history_len - count).min(STD_MIN_MATCH - 1);
+    if variant == HashCalcVariant::Roll && available >= STD_MIN_MATCH - 1 {
+        let bytes = state.window.filled();
+        state.ins_h =
+            RollHashCalc::update_hash(u32::from(bytes[start]), u32::from(bytes[start + 1]));
+    }
+    if count != 0 {
+        state.insert_string(start, count);
+    }
 }
 
 pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> ReturnCode {
@@ -1287,7 +1319,7 @@ fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
     // Hashes are a property of the live history representation, not a tunable
     // search budget. Choose the representation only while the history is empty.
     lm_set_level(state, state.level, config);
-    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
+    state.hash_calc_variant = config.hash_layout;
 
     state.strstart = 0;
     state.block_start = 0;
@@ -1307,9 +1339,8 @@ const fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConf
     state.nice_match = config.nice_length;
     state.max_chain_length = config.max_chain;
 
-    // Do not change the hash representation here. deflateParams() may update the
-    // level while a nonempty head/prev table still describes earlier input.
-    // Reinterpreting those buckets with a different hash algorithm breaks searches.
+    // The caller initializes or rebuilds the hash table when its layout changes.
+    // Merely changing the tuning must never reinterpret existing buckets.
     state.level = level;
 }
 
@@ -5605,6 +5636,53 @@ mod test {
     }
 
     #[test]
+    fn level_change_after_reset_keep_retains_buffered_lookahead() -> Result<(), ReturnCode> {
+        let source = b"buffered reset-keep data/".repeat(5);
+        let mut stream = DeflateStream::new(DeflateConfig {
+            window_bits: -crate::MAX_WBITS,
+            ..DeflateConfig::new(6)
+        })?;
+        let mut output = vec![0u8; compress_bound(source.len()) + 64];
+        stream.next_in = source.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(source.len()).map_err(|_| ReturnCode::StreamError)?;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+
+        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.state.strstart, 0);
+        assert_eq!(stream.state.lookahead, source.len());
+        assert_eq!(reset_keep(&mut stream), ReturnCode::Ok);
+        assert_eq!(params(&mut stream, 9, Strategy::Default), ReturnCode::Ok);
+        assert_eq!(stream.state.hash_calc_variant, HashCalcVariant::Roll);
+        assert_eq!(stream.state.lookahead, source.len());
+        assert_eq!(
+            stream.state.ins_h,
+            RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]))
+        );
+        assert_eq!(
+            deflate(&mut stream, DeflateFlush::Finish),
+            ReturnCode::StreamEnd
+        );
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+        assert!(end(&mut stream).is_ok());
+
+        let mut decoded = vec![0u8; source.len()];
+        let (restored, status) = crate::decompress_slice(
+            &mut decoded,
+            &output[..written],
+            InflateConfig {
+                window_bits: -crate::MAX_WBITS,
+            },
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(restored, source);
+        Ok(())
+    }
+
+    #[test]
     fn full_flush_reselects_native_hash_layout_after_discarding_history() -> Result<(), ReturnCode>
     {
         let prefix = b"repeating-prefix-abc123/".repeat(1_500);
@@ -5661,13 +5739,19 @@ mod test {
     }
 
     #[test]
-    fn level_changes_handle_long_unflushed_block_and_preserve_hash_layout(
-    ) -> Result<(), &'static str> {
+    fn level_changes_handle_long_unflushed_block_and_reindex_history() -> Result<(), &'static str> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
+        let (prefix, suffix) = source.split_at(source.len() - 8_192);
         for (initial_level, next_level) in [
             (1, 6),
             (6, 9),
             (9, 1),
+            (9, 2),
+            (9, 3),
+            (9, 4),
+            (9, 5),
+            (9, 7),
+            (7, 9),
             (6, 8),
             (8, 9),
             (9, 8),
@@ -5677,8 +5761,8 @@ mod test {
             let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))
                 .map_err(|_| "valid deflate initialization failed")?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
-            stream.next_in = source.as_ptr().cast_mut();
-            stream.avail_in = crate::c_api::uInt::try_from(source.len())
+            stream.next_in = prefix.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(prefix.len())
                 .map_err(|_| "test input exceeds ABI length")?;
             stream.next_out = output.as_mut_ptr();
             stream.avail_out = crate::c_api::uInt::try_from(output.len())
@@ -5692,22 +5776,25 @@ mod test {
                     > stream.state.w_size
             );
 
-            let hash_layout = stream.state.hash_calc_variant;
+            let target_level = i8::try_from(next_level).map_err(|_| "invalid destination level")?;
+            let target_hash = level_config(target_level)
+                .ok_or("invalid level configuration")?
+                .hash_layout;
             let requires_boundary = algorithm::change_requires_block_boundary(
                 i8::try_from(initial_level).map_err(|_| "invalid source level")?,
                 Strategy::Default,
                 i8::try_from(next_level).map_err(|_| "invalid destination level")?,
                 Strategy::Default,
             )
-            .ok_or("invalid level transition")?;
+            .ok_or("invalid level transition")?
+                || stream.state.hash_calc_variant != target_hash;
             assert_eq!(
                 params(&mut stream, next_level, Strategy::Default),
                 ReturnCode::Ok,
                 "level transition {initial_level} -> {next_level} failed"
             );
             assert_eq!(i32::from(stream.state.level), next_level);
-            // A change between Slow presets must not force an unnecessary
-            // block boundary; switching between algorithm families must.
+            // Only algorithm or hash-layout changes require a block boundary.
             if requires_boundary {
                 assert!(stream.state.block_start >= 0);
                 assert_eq!(
@@ -5717,13 +5804,10 @@ mod test {
             } else {
                 assert!(stream.state.block_start < 0);
             }
-            // A populated index cannot be safely reinterpreted, even if
-            // the new level would initialize a different hash algorithm.
-            assert!(matches!(
-                (stream.state.hash_calc_variant, hash_layout),
-                (HashCalcVariant::Standard, HashCalcVariant::Standard)
-                    | (HashCalcVariant::Roll, HashCalcVariant::Roll),
-            ));
+            assert_eq!(stream.state.hash_calc_variant, target_hash);
+            stream.next_in = suffix.as_ptr().cast_mut();
+            stream.avail_in = crate::c_api::uInt::try_from(suffix.len())
+                .map_err(|_| "test suffix exceeds ABI length")?;
             assert_eq!(
                 deflate(&mut stream, DeflateFlush::Finish),
                 ReturnCode::StreamEnd
@@ -5820,7 +5904,7 @@ mod test {
             .map(|index| ((index * 17) ^ (index / 43)).to_le_bytes()[0])
             .collect();
         let after = b"level-transition-stored-and-huffman/".repeat(3_000);
-        for (old_level, new_level) in [(0, 6), (6, 0)] {
+        for (old_level, new_level) in [(0, 6), (6, 0), (0, 9), (9, 0)] {
             let mut raw = z_stream::default();
             let config = DeflateConfig {
                 mem_level: 1,
@@ -5983,7 +6067,7 @@ mod test {
     }
 
     #[test]
-    fn level_changes_preserve_live_hash_table_representation() -> Result<(), crate::ReturnCode> {
+    fn level_changes_rebuild_preset_dictionary_hash_table() -> Result<(), crate::ReturnCode> {
         let dictionary: Vec<u8> = (0..4_096usize)
             .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
             .collect();
@@ -5996,11 +6080,15 @@ mod test {
             (8, 9, false),
             (9, 8, true),
             (9, 6, true),
+            (9, 1, true),
+            (9, 2, true),
+            (9, 0, true),
+            (0, 9, false),
             (6, 8, false),
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(old_level))?;
-            // Build the dictionary with each supported live hash layout.
-            // Changing compression level must not reinterpret its entries.
+            // Build the dictionary with the requested source layout, including
+            // a non-native representation, then compare the destination index.
             stream.state.hash_calc_variant = if use_rolling_history {
                 HashCalcVariant::Roll
             } else {
@@ -6014,11 +6102,15 @@ mod test {
                 ReturnCode::Ok
             );
 
+            let mut fresh = DeflateStream::new(DeflateConfig::new(new_level))?;
+            assert_eq!(set_dictionary(&mut fresh, &dictionary), ReturnCode::Ok);
             assert_eq!(
-                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
-                use_rolling_history,
-                "level change {old_level} to {new_level} reinterpreted existing hash history",
+                stream.state.hash_calc_variant,
+                fresh.state.hash_calc_variant
             );
+            assert_eq!(stream.state.head.as_slice(), fresh.state.head.as_slice());
+            assert_eq!(stream.state.insert, fresh.state.insert);
+            assert!(end(&mut fresh).is_ok());
             assert!(end(&mut stream).is_ok());
         }
         Ok(())
