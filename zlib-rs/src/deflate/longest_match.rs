@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::deflate::{
-    hash_calc::{HashCalcVariant, RollHashCalc, StandardHashCalc},
+    hash_calc::{HashCalcVariant, RollHashCalc},
     Pos, State, STD_MAX_MATCH, STD_MIN_MATCH,
 };
 
@@ -29,7 +29,8 @@ impl SearchCursor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchSearchKind {
     Standard,
-    Slow,
+    /// Shifted-chain search over the three-byte rolling hash layout.
+    RollingOffset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +83,8 @@ pub enum MatchSearchError {
     UninitializedWindow,
     /// The advertised history index cannot be represented by the allocated table.
     InvalidHashHistory,
+    /// Offset search requires the three-byte rolling hash history.
+    IncompatibleHashLayout,
     /// A token producer was asked to advance before its prior search completed.
     OutstandingSearch,
     /// A match result was delivered without a pending request.
@@ -144,7 +147,6 @@ pub struct MatchSearchParams {
     good_match: u16,
     nice_match: u16,
     level: i8,
-    hash_calc_variant: HashCalcVariant,
     kind: MatchSearchKind,
 }
 
@@ -171,14 +173,6 @@ impl MatchSearchParams {
         };
         (best_len, chain_remaining)
     }
-
-    #[inline]
-    const fn update_hash(self, hash: u32, value: u32) -> u32 {
-        match self.hash_calc_variant {
-            HashCalcVariant::Standard => StandardHashCalc::update_hash(hash, value),
-            HashCalcVariant::Roll => RollHashCalc::update_hash(hash, value),
-        }
-    }
 }
 
 impl<'a> MatchSearchRequest<'a> {
@@ -188,6 +182,11 @@ impl<'a> MatchSearchRequest<'a> {
         cur_match: Pos,
         kind: MatchSearchKind,
     ) -> Result<Self, MatchSearchError> {
+        if kind == MatchSearchKind::RollingOffset
+            && state.hash_calc_variant != HashCalcVariant::Roll
+        {
+            return Err(MatchSearchError::IncompatibleHashLayout);
+        }
         let initialized_end = state
             .strstart
             .checked_add(state.lookahead)
@@ -222,7 +221,6 @@ impl<'a> MatchSearchRequest<'a> {
                 good_match: state.good_match,
                 nice_match: state.nice_match,
                 level: state.level,
-                hash_calc_variant: state.hash_calc_variant,
                 kind,
             },
         })
@@ -232,7 +230,7 @@ impl<'a> MatchSearchRequest<'a> {
     pub(crate) fn execute(&self) -> MatchSearchResult {
         match self.params.kind {
             MatchSearchKind::Standard => execute_standard(self.resources, self.params),
-            MatchSearchKind::Slow => execute_slow(self.resources, self.params),
+            MatchSearchKind::RollingOffset => execute_slow(self.resources, self.params),
         }
     }
 }
@@ -403,8 +401,7 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
     };
 
     if SLOW && best_len >= STD_MIN_MATCH {
-        let Some(next) = initial_slow_cursor(resources, params, scan, best_len, cursor, limit_base)
-        else {
+        let Some(next) = initial_slow_cursor(resources, scan, best_len, cursor, limit_base) else {
             return break_matching(params, best_len, match_start);
         };
         cursor = next;
@@ -475,7 +472,6 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
             if SLOW && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
                 let Some(next) = next_slow_cursor(
                     resources,
-                    params,
                     scan,
                     candidate_pos,
                     len,
@@ -508,7 +504,6 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
 
 fn initial_slow_cursor(
     resources: MatchSearchResources<'_>,
-    params: MatchSearchParams,
     scan: &[u8],
     best_len: usize,
     mut cursor: SearchCursor,
@@ -516,14 +511,14 @@ fn initial_slow_cursor(
 ) -> Option<SearchCursor> {
     let probe = scan.get(..best_len + 1)?;
     let mut hash = 0;
-    hash = params.update_hash(hash, u32::from(probe[1]));
-    hash = params.update_hash(hash, u32::from(probe[2]));
+    hash = RollHashCalc::update_hash(hash, u32::from(probe[1]));
+    hash = RollHashCalc::update_hash(hash, u32::from(probe[2]));
 
     // Each update below hashes the next three-byte substring beginning at
     // offsets 1..=best_len-2. Prefer a more distant chain exactly as the old
     // slow matcher did.
     for (index, byte) in probe[3..].iter().enumerate() {
-        hash = params.update_hash(hash, u32::from(*byte));
+        hash = RollHashCalc::update_hash(hash, u32::from(*byte));
         let hash_pos = resources.head[hash as usize];
         if hash_pos < cursor.hash_pos {
             cursor = SearchCursor {
@@ -538,7 +533,6 @@ fn initial_slow_cursor(
 
 fn next_slow_cursor(
     resources: MatchSearchResources<'_>,
-    params: MatchSearchParams,
     scan: &[u8],
     candidate_start: Pos,
     match_len: usize,
@@ -568,7 +562,7 @@ fn next_slow_cursor(
     let bytes = scan.get(offset..offset + STD_MIN_MATCH)?;
     let mut hash = 0;
     for byte in bytes {
-        hash = params.update_hash(hash, u32::from(*byte));
+        hash = RollHashCalc::update_hash(hash, u32::from(*byte));
     }
     let hash_pos = resources.head[hash as usize];
     if hash_pos < next.hash_pos {
@@ -758,7 +752,6 @@ mod tests {
                 good_match: 4,
                 nice_match: 16,
                 level: 6,
-                hash_calc_variant: HashCalcVariant::Standard,
                 kind: MatchSearchKind::Standard,
             },
         }
@@ -801,6 +794,26 @@ mod tests {
             Err(MatchSearchError::InvalidHashHistory)
         ));
         state.w_size = window_size;
+        Ok(())
+    }
+
+    #[test]
+    fn offset_search_requires_rolling_hash_history() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{DeflateConfig, DeflateStream};
+        for level in 0..=9 {
+            let stream = DeflateStream::new(DeflateConfig::new(level))?;
+            let offset = MatchSearchWork::new(0, MatchSearchKind::RollingOffset);
+            let standard = MatchSearchWork::new(0, MatchSearchKind::Standard);
+            assert!(standard.request(&stream.state).is_ok());
+            if stream.state.hash_calc_variant == HashCalcVariant::Roll {
+                assert!(offset.request(&stream.state).is_ok());
+            } else {
+                assert!(matches!(
+                    offset.request(&stream.state),
+                    Err(MatchSearchError::IncompatibleHashLayout)
+                ));
+            }
+        }
         Ok(())
     }
 
