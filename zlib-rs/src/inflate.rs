@@ -12,7 +12,7 @@ mod inftrees;
 mod window;
 mod writer;
 
-use crate::abi_cursor::{advance_abi_bytes, SliceBudget};
+use crate::abi_cursor::advance_abi_bytes;
 use crate::allocate::{AlignedAllocationBlock, Allocator, ALLOCATION_BLOCK_BYTES};
 use crate::c_api::{in_func, internal_state, out_func};
 use crate::output_buffer::{assume_init_prefix, WritableBytes};
@@ -367,6 +367,10 @@ const MAX_DIST_EXTRA_BITS: u8 = 13; // maximum number of extra distance bits
 
 /// Decompresses `input` into the provided `output` buffer.
 ///
+/// Whole-buffer decoding uses call-local state on the stack and the already
+/// produced output as its history. It requires neither a heap allocation nor
+/// a separate sliding window, including when allocator features are disabled.
+///
 /// Returns a subslice of `output` containing the decompressed bytes and a
 /// [`ReturnCode`] indicating the result of the operation. Returns [`ReturnCode::BufError`] if
 /// there is insufficient output space.
@@ -390,7 +394,8 @@ pub fn decompress_slice<'a>(
     (&mut output[..produced], ret)
 }
 
-/// Inflates `source` into `dest`, and writes the final inflated size into `dest_len`.
+/// Inflates into caller-owned, potentially uninitialized storage without
+/// allocating decoder state. Returns only the initialized output prefix.
 pub fn uncompress<'a>(
     output: &'a mut [MaybeUninit<u8>],
     input: &[u8],
@@ -405,6 +410,8 @@ pub fn uncompress<'a>(
 /// Decompress into caller-owned storage, returning the number of *input bytes consumed*.
 ///
 /// Any bytes after the end of the compressed stream are excluded from the count.
+/// Like [`decompress_slice`], this uses stack-local decoder state and the caller's
+/// output as history.
 pub fn uncompress2<'a>(
     output: &'a mut [MaybeUninit<u8>],
     input: &[u8],
@@ -421,65 +428,45 @@ fn uncompress2_into<O: WritableBytes + ?Sized>(
     input: &[u8],
     config: InflateConfig,
 ) -> (usize, usize, ReturnCode) {
+    let Some(window) = parse_inflate_window_bits(config.window_bits) else {
+        return (0, 0, ReturnCode::StreamError);
+    };
     let output_len = output.len();
-
-    // For zero-capacity output, zlib needs one scratch byte to distinguish an empty
-    // stream from a stream that would produce data. This byte is never exposed to Rust.
+    // An empty destination still needs one byte to distinguish exhaustion
+    // from an empty DEFLATE stream, as in the streaming ABI.
     let mut scratch = [0u8];
-    let mut output_budget = SliceBudget::new(if output_len == 0 { 1 } else { output_len });
-    let mut input_budget = SliceBudget::new(input.len());
-    let dest = if output_len == 0 {
-        scratch.as_mut_ptr()
+    let (dest, capacity) = if output_len == 0 {
+        (scratch.as_mut_ptr(), scratch.len())
     } else {
-        output.byte_ptr()
+        (output.byte_ptr(), output_len)
     };
-
-    // Use the owned constructor instead of constructing a raw C stream and
-    // reinterpreting it after initialization. Drop releases the decoder state
-    // on every return path; caller buffer borrows remain scoped to this call.
-    let mut stream = match InflateStream::new(config) {
-        Ok(stream) => stream,
-        Err(code) => return (0, 0, code),
-    };
-    stream.next_in = input.as_ptr().cast_mut();
-    stream.avail_in = 0;
-    stream.next_out = dest;
-    stream.avail_out = 0;
-
-    let err = loop {
-        output_budget.refill(&mut stream.avail_out);
-        input_budget.refill(&mut stream.avail_in);
-
-        // SAFETY: both live caller spans are advanced only by the SliceBudget,
-        // which caps each ABI count at its remaining readable/writable length.
-        let err = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
-
-        if err != ReturnCode::Ok {
-            break err;
-        }
-    };
-
-    // Unoffered or unconsumed input is not part of the processed prefix.
-    let consumed = input_budget.processed(stream.avail_in);
-    // Preserve full Rust slice lengths even if the C total_out counter wraps.
-    let produced = if output_len == 0 {
-        0
-    } else {
-        output_budget.processed(stream.avail_out)
-    };
-
-    // A scratch byte means a zero-capacity caller destination was too small.
-    let scratch_overflow = output_len == 0 && stream.total_out != 0;
-    let capacity_left = output_budget.pending() != 0 || stream.avail_out != 0;
-    drop(stream);
-
-    let ret = match err {
+    // A whole-buffer decoder never returns a resumable state to its caller.
+    // All previous output remains in this same writer, so no history copy,
+    // ABI cursor, or separately allocated ring is needed.
+    let mut state = State::new(InflateStateKind::Regular);
+    state.wrap = window.wrap;
+    state.wbits = window.wbits;
+    state.reset_decode();
+    let mut reader = BitReader::from_buffer(state.bit_buffer, input);
+    // SAFETY: dest/capacity describes the exclusively borrowed caller
+    // destination or the live one-byte stack scratch.
+    let mut writer = unsafe { InflateOutput::new_uninit(dest, capacity) };
+    let status = state.dispatch(&mut reader, &mut writer, InflateFlush::NoFlush);
+    let consumed = input.len() - reader.bytes_remaining();
+    let written = writer.len();
+    let produced = written.min(output_len);
+    let ret = match status {
         ReturnCode::StreamEnd => ReturnCode::Ok,
         ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if capacity_left || scratch_overflow => ReturnCode::DataError,
-        _ => err,
+        ReturnCode::Ok | ReturnCode::BufError => {
+            if writer.remaining() != 0 || (output_len == 0 && written != 0) {
+                ReturnCode::DataError
+            } else {
+                ReturnCode::BufError
+            }
+        }
+        other => other,
     };
-
     (consumed, produced, ret)
 }
 
@@ -3002,35 +2989,34 @@ pub fn reset(stream: &mut InflateStream) -> ReturnCode {
 pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
     stream.total_in = 0;
     stream.total_out = 0;
-    stream.state.total = 0;
-
     stream.msg = core::ptr::null_mut();
-
     let state = &mut *stream.state;
-
     if state.wrap != 0 {
         // to support ill-conceived Java test suite
         stream.adler = (state.wrap & 1).into();
     }
-
-    state.mode = Mode::Head;
-    state.checksum = crate::ADLER32_INITIAL_VALUE;
-
-    state.flags.update(Flags::IS_LAST_BLOCK, false);
-    state.flags.update(Flags::HAVE_DICT, false);
-    state.flags.update(Flags::SANE, true);
-    state.gzip_flags = -1;
-    state.dmax = 32768;
-    state.head = None;
-    state.bit_buffer = BitBuffer::default();
-
-    state.next = 0;
-    state.len_table = Table::default();
-    state.dist_table = Table::default();
-
-    state.back = usize::MAX;
-
+    state.reset_decode();
     ReturnCode::Ok
+}
+
+impl State<'_> {
+    /// Reset payload and wrapper decoding without changing the bound history.
+    fn reset_decode(&mut self) {
+        self.total = 0;
+        self.mode = Mode::Head;
+        self.checksum = crate::ADLER32_INITIAL_VALUE;
+        self.flags.update(Flags::IS_LAST_BLOCK, false);
+        self.flags.update(Flags::HAVE_DICT, false);
+        self.flags.update(Flags::SANE, true);
+        self.gzip_flags = -1;
+        self.dmax = 32768;
+        self.head = None;
+        self.bit_buffer = BitBuffer::default();
+        self.next = 0;
+        self.len_table = Table::default();
+        self.dist_table = Table::default();
+        self.back = usize::MAX;
+    }
 }
 
 #[must_use]
@@ -4295,6 +4281,96 @@ mod tests {
             assert_eq!(decoded, plain);
             assert_eq!(consumed, compressed.len(), "trailing {trailing} bytes");
         }
+    }
+
+    #[test]
+    fn whole_buffer_decode_matches_streaming_at_every_input_prefix() -> Result<(), ReturnCode> {
+        // Independent zlib raw, zlib-wrapped and gzip fixtures.
+        let expected: Vec<u8> = (0..512)
+            .map(|i| u8::try_from(i * i % 37 + 65).unwrap_or_default())
+            .collect();
+        for (window_bits, input) in [
+            (
+                -15,
+                &[
+                    0x73, 0x74, 0x72, 0xf5, 0x0a, 0x8c, 0x4a, 0xf5, 0x8d, 0xf1, 0x88, 0xf6, 0x4e,
+                    0x0a, 0xf3, 0x71, 0x49, 0x8e, 0x8f, 0x8d, 0x8d, 0x4f, 0x76, 0xf1, 0x09, 0x4b,
+                    0xf2, 0x8e, 0xf6, 0x88, 0xf1, 0x4d, 0x8d, 0x0a, 0xf4, 0x72, 0x75, 0x72, 0x1c,
+                    0x55, 0x34, 0x5c, 0x15, 0x01, 0x00,
+                ][..],
+            ),
+            (
+                15,
+                &[
+                    0x78, 0x9c, 0x73, 0x74, 0x72, 0xf5, 0x0a, 0x8c, 0x4a, 0xf5, 0x8d, 0xf1, 0x88,
+                    0xf6, 0x4e, 0x0a, 0xf3, 0x71, 0x49, 0x8e, 0x8f, 0x8d, 0x8d, 0x4f, 0x76, 0xf1,
+                    0x09, 0x4b, 0xf2, 0x8e, 0xf6, 0x88, 0xf1, 0x4d, 0x8d, 0x0a, 0xf4, 0x72, 0x75,
+                    0x72, 0x1c, 0x55, 0x34, 0x5c, 0x15, 0x01, 0x00, 0x4b, 0xdf, 0xa6, 0x12,
+                ][..],
+            ),
+            (
+                31,
+                &[
+                    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x73, 0x74, 0x72,
+                    0xf5, 0x0a, 0x8c, 0x4a, 0xf5, 0x8d, 0xf1, 0x88, 0xf6, 0x4e, 0x0a, 0xf3, 0x71,
+                    0x49, 0x8e, 0x8f, 0x8d, 0x8d, 0x4f, 0x76, 0xf1, 0x09, 0x4b, 0xf2, 0x8e, 0xf6,
+                    0x88, 0xf1, 0x4d, 0x8d, 0x0a, 0xf4, 0x72, 0x75, 0x72, 0x1c, 0x55, 0x34, 0x5c,
+                    0x15, 0x01, 0x00, 0x49, 0x47, 0x14, 0xb7, 0x00, 0x02, 0x00, 0x00,
+                ][..],
+            ),
+        ] {
+            let config = InflateConfig { window_bits };
+            for n in 0..=input.len() {
+                for cap in [0, 1, 2, 7, 31, 259, 260, 511, 512, 528] {
+                    let mut direct = vec![MaybeUninit::new(0xa5); cap + 16];
+                    let mut streamed = vec![0xa5; cap.max(1) + 16];
+                    let (consumed, decoded, code) =
+                        uncompress2(&mut direct[..cap], &input[..n], config);
+                    let mut stream = InflateStream::new(config)?;
+                    stream.next_in = input.as_ptr().cast_mut();
+                    stream.avail_in = u32::try_from(n).map_err(|_| ReturnCode::StreamError)?;
+                    stream.next_out = streamed.as_mut_ptr();
+                    stream.avail_out =
+                        u32::try_from(cap.max(1)).map_err(|_| ReturnCode::StreamError)?;
+                    let err = loop {
+                        // SAFETY: each cursor describes an exclusive, live output
+                        // span or the bounded immutable input prefix above.
+                        let status = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
+                        if status != ReturnCode::Ok {
+                            break status;
+                        }
+                    };
+                    let written =
+                        usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+                    let used = n - usize::try_from(stream.avail_in)
+                        .map_err(|_| ReturnCode::StreamError)?;
+                    let expected_status = match err {
+                        ReturnCode::StreamEnd => ReturnCode::Ok,
+                        ReturnCode::NeedDict => ReturnCode::DataError,
+                        ReturnCode::BufError
+                            if stream.avail_out != 0 || (cap == 0 && written != 0) =>
+                        {
+                            ReturnCode::DataError
+                        }
+                        other => other,
+                    };
+                    assert_eq!(
+                        (consumed, decoded.len(), code),
+                        (used, written.min(cap), expected_status)
+                    );
+                    assert_eq!(decoded, &streamed[..written.min(cap)]);
+                    if n == input.len() && cap >= expected.len() {
+                        assert_eq!(decoded, expected);
+                    }
+                    let written = decoded.len();
+                    // SAFETY: every slot originally contained 0xa5; decode
+                    // writes bytes and never deinitializes the destination.
+                    let direct = unsafe { direct.assume_init_ref() };
+                    assert_eq!(&direct[written..], &vec![0xa5; cap + 16 - written]);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
