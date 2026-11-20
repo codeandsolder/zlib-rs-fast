@@ -102,6 +102,7 @@ impl MatchSearchWork {
         matches!(self, Self::External)
     }
 
+    #[inline]
     pub(crate) fn request<'a>(
         self,
         state: &'a State<'_>,
@@ -181,6 +182,7 @@ impl MatchSearchParams {
 }
 
 impl<'a> MatchSearchRequest<'a> {
+    #[inline]
     pub(crate) fn from_state(
         state: &'a State<'_>,
         cur_match: Pos,
