@@ -779,6 +779,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn gpu_predecessor_tables_match_budgeted_cpu_oracle() -> Result<(), GpuMatchError> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let mut seed = 0x42bd_9431u32;
+        let mixed = (0..512)
+            .map(|index| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if index % 7 > 1 {
+                    b"abc"[index % 3]
+                } else {
+                    seed.to_le_bytes()[0]
+                }
+            })
+            .collect::<Vec<_>>();
+        let repetitive = b"abc".repeat(100);
+        let inputs = [b"".as_slice(), b"a", b"ab", b"abc", &mixed, &repetitive];
+        for (max_dist, budget) in [(1, 1), (8, 7), (64, 1), (64, 31), (DEFAULT_MAX_DIST, 64)] {
+            let tables = searcher.search_batch_with_max_dist(&inputs, budget, max_dist)?;
+            assert_eq!(tables.len(), inputs.len());
+            for (input, table) in inputs.iter().zip(tables) {
+                assert_eq!(table.as_slice().len(), input.len());
+                for (position, &actual) in table.as_slice().iter().enumerate() {
+                    let mut expected = GpuMatch::default();
+                    let max_len = (input.len() - position).min(MAX_MATCH as usize);
+                    if max_len >= 3 {
+                        let hash = hash3(&input[position..position + 3]);
+                        let first = if position >= max_dist as usize {
+                            position - max_dist as usize + 1
+                        } else {
+                            0
+                        };
+                        for candidate in (first..position)
+                            .rev()
+                            .filter(|&candidate| hash3(&input[candidate..candidate + 3]) == hash)
+                            .take(budget as usize)
+                        {
+                            let len = input[position..position + max_len]
+                                .iter()
+                                .zip(&input[candidate..candidate + max_len])
+                                .take_while(|(left, right)| left == right)
+                                .count();
+                            if len >= 3 && len > expected.length as usize {
+                                expected = GpuMatch {
+                                    length: len as u32,
+                                    start: candidate as u32,
+                                };
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "max_dist={max_dist}, budget={budget}, position={position}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn short_inputs_have_a_valid_storage_binding() -> Result<(), GpuMatchError> {
         for input in [b"".as_slice(), b"a", b"ab", b"abc"] {
             assert_eq!(build_predecessors(input)?, [NO_PREDECESSOR]);
