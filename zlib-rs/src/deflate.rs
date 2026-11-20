@@ -1008,14 +1008,16 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     let state = &mut *stream.state;
 
     if state.level != level {
-        // An empty index may adopt the target level's hash layout even
-        // after a zero-input call has emitted the wrapper header. A populated
-        // dictionary or previous input must retain its existing hash layout.
-        let empty_hash_history = state.strstart == 0
-            && state.lookahead == 0
-            && state.insert == 0
-            && state.matches == 0
-            && state.head.as_slice().iter().all(|&position| position == 0);
+        // Every path setting strstart to zero also clears head: initialization,
+        // dictionary replacement and a completed full flush. This lets an empty
+        // index adopt the target level's hash layout in constant time. Live
+        // history retains its representation even when the level changes.
+        let empty_hash_history =
+            state.strstart == 0 && state.lookahead == 0 && state.insert == 0 && state.matches == 0;
+        debug_assert!(
+            !empty_hash_history || state.head.as_slice().iter().all(|&position| position == 0),
+            "zero-position hash history must have empty heads"
+        );
         if state.level == 0 && state.matches != 0 {
             if state.matches == 1 {
                 self::slide_hash::slide_hash(state);
@@ -5004,7 +5006,7 @@ mod test {
                 value ^= value << 13;
                 value ^= value >> 17;
                 value ^= value << 5;
-                *frequency = if (seed as usize + index) % 7 == 0 {
+                *frequency = if (seed as usize + index).is_multiple_of(7) {
                     0
                 } else {
                     u16::from(value.to_le_bytes()[0] % 64) + 1
@@ -5088,14 +5090,14 @@ mod test {
         let mut kraft = 0usize;
         let mut exact_cost = 0usize;
         let max_length = usize::from(StaticTreeDesc::BL.max_length);
-        for symbol in 0..BL_CODES {
+        for (symbol, frequency) in original_frequencies.iter().copied().enumerate() {
             let value = desc.dyn_tree[symbol];
             let length = usize::from(value.len());
             assert!((1..=max_length).contains(&length));
             kraft += 1usize << (max_length - length);
             // After gen_codes, Value::a holds the codeword, not frequency.
             // Compute the cost using the independently retained histogram.
-            exact_cost += usize::from(original_frequencies[symbol])
+            exact_cost += usize::from(frequency)
                 * (length + usize::from(StaticTreeDesc::EXTRA_BLBITS[symbol]));
         }
         assert_eq!(
@@ -5599,6 +5601,62 @@ mod test {
         );
         assert_eq!(status, ReturnCode::Ok);
         assert_eq!(decoded, source);
+        Ok(())
+    }
+
+    #[test]
+    fn full_flush_reselects_native_hash_layout_after_discarding_history() -> Result<(), ReturnCode>
+    {
+        let prefix = b"repeating-prefix-abc123/".repeat(1_500);
+        let suffix = b"repeating-suffix-xyz987/".repeat(1_500);
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let mut output = vec![0u8; compress_bound(prefix.len() + suffix.len()) + 64];
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+        stream.next_in = prefix.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(prefix.len()).map_err(|_| ReturnCode::StreamError)?;
+
+        assert_eq!(
+            deflate(&mut stream, DeflateFlush::FullFlush),
+            ReturnCode::Ok
+        );
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.state.strstart, 0);
+        assert!(stream
+            .state
+            .head
+            .as_slice()
+            .iter()
+            .all(|&position| position == 0));
+
+        assert_eq!(params(&mut stream, 9, Strategy::Default), ReturnCode::Ok);
+        assert!(matches!(
+            stream.state.hash_calc_variant,
+            HashCalcVariant::Roll
+        ));
+
+        stream.next_in = suffix.as_ptr().cast_mut();
+        stream.avail_in =
+            crate::c_api::uInt::try_from(suffix.len()).map_err(|_| ReturnCode::StreamError)?;
+        assert_eq!(
+            deflate(&mut stream, DeflateFlush::Finish),
+            ReturnCode::StreamEnd
+        );
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+        assert!(end(&mut stream).is_ok());
+
+        let mut expected = prefix;
+        expected.extend_from_slice(&suffix);
+        let mut decoded = vec![0u8; expected.len()];
+        let (restored, status) = crate::decompress_slice(
+            &mut decoded,
+            &output[..written],
+            crate::InflateConfig::default(),
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(restored, expected);
         Ok(())
     }
 
