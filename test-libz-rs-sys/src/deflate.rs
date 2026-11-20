@@ -14,7 +14,7 @@ use zlib_rs::{
 
 use super::inflate::{test_c_stream_size, test_c_uint_len, test_c_ulong_len};
 
-use crate::assert_eq_rs_ng;
+use crate::{assert_eq_rs_ng, evaluate_rs_ng};
 
 const VERSION: *const c_char = libz_rs_sys::zlibVersion();
 
@@ -2397,7 +2397,7 @@ fn assert_zlib_decodes_exact(compressed: &[u8], expected: &[u8]) {
 /// The copy is made after half the data and a sync flush.
 fn test_deflate_copy_help(input: &[u8]) {
     let config = DeflateConfig::default();
-    let compressed = assert_eq_rs_ng!({
+    let (compressed, reference) = evaluate_rs_ng!({
         // Each expansion uses its own z_stream type and deflateInit2_
         // binding, while sharing checked initialization and teardown.
         fn init_stream<'a>(
@@ -2522,6 +2522,9 @@ fn test_deflate_copy_help(input: &[u8]) {
     });
 
     assert_zlib_decodes_exact(&compressed, input);
+    if let Some(reference) = reference {
+        assert_zlib_decodes_exact(&reference, input);
+    }
 }
 
 #[test]
@@ -2866,10 +2869,11 @@ fn gzip_with_header() {
 
 mod fuzz_based_tests {
     use super::{FIREWORKS, LCET10, PAPER_100K};
-    use crate::helpers::compress_slice_ng;
+    use crate::helpers::{compress_slice_ng, uncompress_slice_ng};
     use libz_rs_sys::gz_header;
     use zlib_rs::{
         deflate::{compress_slice, DeflateConfig, Method, Strategy},
+        inflate::{decompress_slice, InflateConfig},
         ReturnCode,
     };
 
@@ -2878,15 +2882,47 @@ mod fuzz_based_tests {
         let (output_rs, err) = compress_slice(&mut output_rs, input, config);
         assert_eq!(err, ReturnCode::Ok);
 
+        let inflate_config = InflateConfig {
+            window_bits: match config.window_bits {
+                8 => 9,
+                width => width,
+            },
+        };
+        let mut decoded_rs = vec![0; input.len()];
+        let (decoded, err) = decompress_slice(&mut decoded_rs, output_rs, inflate_config);
+        assert_eq!(err, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+
         if !cfg!(miri) {
             let mut output_ng = vec![0; 1 << 19];
             let (output_ng, err) = compress_slice_ng(&mut output_ng, input, config);
             assert_eq!(err, Ok(ReturnCode::Ok));
 
-            assert_eq!(output_rs, output_ng);
+            // Levels 6-9 deliberately use retuned match finders, so their
+            // valid DEFLATE streams need not be byte-identical to zlib-ng.
+            if (0..=5).contains(&config.level) {
+                assert_eq!(output_rs, output_ng);
+            }
+            if !expected.is_empty() {
+                assert_eq!(output_ng, expected);
+            }
+
+            for compressed in [&*output_rs, &*output_ng] {
+                let (decoded, err) = decompress_slice(&mut decoded_rs, compressed, inflate_config);
+                assert_eq!(err, ReturnCode::Ok);
+                assert_eq!(decoded, input);
+
+                let mut decoded_ng = vec![0; input.len()];
+                let (decoded, err) =
+                    uncompress_slice_ng(&mut decoded_ng, compressed, inflate_config);
+                assert_eq!(err, Ok(ReturnCode::Ok));
+                assert_eq!(decoded, input);
+            }
         }
 
-        if !expected.is_empty() {
+        // zlib-ng is unavailable under Miri. Keep byte-exact fixtures for
+        // the levels whose encoding has not changed.
+        if cfg!(miri) && (0..=5).contains(&config.level) && !expected.is_empty() {
             assert_eq!(output_rs, expected);
         }
     }
@@ -4098,7 +4134,7 @@ fn gzip_block_config_fixture() -> Input {
 fn test_gzip_deflate_config() {
     let input = gzip_block_config_fixture();
 
-    let compressed = assert_eq_rs_ng!({
+    let (compressed, reference) = evaluate_rs_ng!({
         let Input {
             ref source,
             config,
@@ -4184,6 +4220,9 @@ fn test_gzip_deflate_config() {
     });
 
     assert_gzip_decodes_exact(&compressed, input.source.as_bytes());
+    if let Some(reference) = reference {
+        assert_gzip_decodes_exact(&reference, input.source.as_bytes());
+    }
 }
 
 #[test]

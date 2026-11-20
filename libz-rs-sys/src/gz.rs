@@ -1596,8 +1596,10 @@ fn checked_gz_transfer_len(state: &mut GzState, size: size_t, nitems: size_t) ->
 }
 
 /// Read and decompress up to `nitems` items of size `size` from `file` into `buf`,
-/// otherwise operating as [`gzread`] does. This duplicates the interface of
-/// C stdio's `fread()`, with `size_t` request and return types.
+/// otherwise operating as [`gzread`] does.
+///
+/// This duplicates C stdio's `fread()` interface, with `size_t` request and
+/// return types.
 ///
 /// `gzfread` returns the number of full items read of size `size`, or zero if
 /// the end of the file was reached and a full item could not be read, or if

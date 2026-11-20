@@ -16,22 +16,10 @@ pub(super) const fn hash_chain_position(position: usize) -> u16 {
 // Standard hashing deliberately uses all sixteen hash bits.
 const _: () = assert!(HASH_SIZE == (1usize << u16::BITS));
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashCalcVariant {
     Standard,
     Roll,
-}
-
-impl HashCalcVariant {
-    /// Use rolling hash for `deflate_slow` algorithm with level 9. It allows us to
-    /// properly lookup different hash chains to speed up `longest_match` search.
-    pub const fn for_max_chain_length(max_chain_length: u16) -> Self {
-        if max_chain_length > 1024 {
-            Self::Roll
-        } else {
-            Self::Standard
-        }
-    }
 }
 
 pub struct StandardHashCalc;
@@ -182,6 +170,25 @@ mod tests {
         ] {
             assert_eq!(hash_chain_position(position), expected);
         }
+    }
+
+    #[test]
+    fn deep_compression_presets_select_their_hash_history() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{end, DeflateConfig, DeflateStream};
+
+        for (level, rolling, max_chain, good_match) in [(8, false, 76, 18), (9, true, 4_096, 32)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(level))?;
+            assert_eq!(
+                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
+                rolling,
+                "level {level} selected an incompatible hash representation",
+            );
+            assert_eq!(stream.state.max_chain_length, max_chain);
+            assert_eq!(stream.state.good_match, good_match);
+            assert_eq!(i32::from(stream.state.level), level);
+            assert!(end(&mut stream).is_ok());
+        }
+        Ok(())
     }
 
     #[test]

@@ -137,6 +137,30 @@ macro_rules! assert_eq_rs_ng {
     };
 }
 
+/// Evaluate both compressors without requiring their valid DEFLATE encodings
+/// to be byte-identical. Callers must verify both decompress correctly.
+#[cfg(test)]
+#[macro_export]
+macro_rules! evaluate_rs_ng {
+    ($ng:expr, $rs:expr) => {{
+        #[cfg(not(miri))]
+        let ng = {
+            use $crate::ng_ffi::*;
+            Some($ng)
+        };
+        #[cfg(miri)]
+        let ng = None;
+        let rs = {
+            use libz_rs_sys::*;
+            $rs
+        };
+        (rs, ng)
+    }};
+    ($both:expr) => {
+        $crate::evaluate_rs_ng!($both, $both)
+    };
+}
+
 /// a bit of a sanity check that nothing weird happened with symbol resolution
 #[cfg(not(miri))]
 #[cfg(test)]
@@ -2061,12 +2085,49 @@ fn chunked_deflate_output<const CHUNK: usize>(
     output
 }
 
+/// Cross-decode every chunked stream and retain bit-exact checks for
+/// levels whose matching configuration is unchanged.
+#[cfg(test)]
+fn assert_chunked_streams_decode(
+    ours: &[(i32, usize, Vec<u8>)],
+    reference: Option<&[(i32, usize, Vec<u8>)]>,
+) {
+    let original: Vec<u8> = (0u32..4096).map(|x| x.to_le_bytes()[0]).collect();
+    let validate = |compressed: &[u8]| {
+        let mut decoded = vec![0u8; original.len()];
+        let (plain, status) = zlib_rs::inflate::decompress_slice(
+            &mut decoded,
+            compressed,
+            zlib_rs::inflate::InflateConfig::default(),
+        );
+        assert_eq!(status, zlib_rs::ReturnCode::Ok);
+        assert_eq!(plain, original);
+    };
+    for (_, _, compressed) in ours {
+        validate(compressed);
+    }
+    if let Some(reference) = reference {
+        assert_eq!(ours.len(), reference.len());
+        for ((level, chunk, encoded), (ref_level, ref_chunk, ref_encoded)) in
+            ours.iter().zip(reference)
+        {
+            assert_eq!((level, chunk), (ref_level, ref_chunk));
+            validate(ref_encoded);
+            // Level -1 uses the default (6). Only levels 0-5 retain the
+            // exact reference encoder's match decisions.
+            if (0..=5).contains(level) {
+                assert_eq!(encoded, ref_encoded, "level {level}, chunk {chunk}");
+            }
+        }
+    }
+}
+
 #[test]
 fn deflate_chunked_input_all_levels() {
     use std::io::{Cursor, Read, Write};
     use std::mem::MaybeUninit;
 
-    assert_eq_rs_ng!({
+    let (ours, reference) = evaluate_rs_ng!({
         // translated from zpipe.c
         fn def<R: Read, W: Write, const CHUNK: usize>(
             source: &mut R,
@@ -2187,8 +2248,9 @@ fn deflate_chunked_input_all_levels() {
 
         outputs
     });
-}
 
+    assert_chunked_streams_decode(&ours, reference.as_deref());
+}
 #[test]
 fn inflate_strict_is_off() {
     // this input will hit the `invalid distance too far back` error message when INFLATE_STRICT is

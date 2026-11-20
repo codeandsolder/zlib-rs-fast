@@ -988,7 +988,9 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     else {
         return ReturnCode::StreamError;
     };
-    if requires_boundary && state.last_flush != -2 {
+    let next_hash = next_config.hash_layout;
+    let changes_hash = state.level != level && state.hash_calc_variant != next_hash;
+    if (requires_boundary || changes_hash) && state.last_flush != -2 {
         // Flush the last buffer.
         let err = deflate(stream, DeflateFlush::Block);
         if err == ReturnCode::StreamError {
@@ -1008,7 +1010,10 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     let state = &mut *stream.state;
 
     if state.level != level {
-        if state.level == 0 && state.matches != 0 {
+        if changes_hash {
+            rebuild_hash_history(state, next_hash);
+            state.matches = 0;
+        } else if state.level == 0 && state.matches != 0 {
             if state.matches == 1 {
                 self::slide_hash::slide_hash(state);
             } else {
@@ -1023,6 +1028,47 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
     state.strategy = strategy;
 
     ReturnCode::Ok
+}
+
+/// Reindex the surviving window at a completed block boundary or before the
+/// first block. Producers that use direct four-byte insertions must never
+/// inherit a rolling three-byte table. Rebuilding, rather than clearing
+/// history, retains cross-block matches and preset dictionary matches.
+fn rebuild_hash_history(state: &mut State<'_>, variant: HashCalcVariant) {
+    let end = state.strstart;
+    let start = end.saturating_sub(state.w_size);
+    let history_len = end - start;
+
+    if history_len != 0 || state.matches != 0 {
+        state.head.as_mut_slice().fill(0);
+    } else {
+        debug_assert!(state.head.as_slice().iter().all(|&position| position == 0));
+    }
+    state.hash_calc_variant = variant;
+    state.ins_h = 0;
+    state.match_start = 0;
+    state.prev_length = 0;
+    state.match_available = false;
+
+    // ResetKeep can retain buffered lookahead before the first block.
+    // Index only consumed positions, using available lookahead for complete
+    // probes that straddle the cursor. The standard refill path inserts its
+    // extra preceding four-byte position separately.
+    let probe_width = match variant {
+        HashCalcVariant::Standard => WANT_MIN_MATCH,
+        HashCalcVariant::Roll => STD_MIN_MATCH,
+    };
+    let available = history_len + state.lookahead;
+    let count = history_len.min(available.saturating_sub(probe_width - 1));
+    state.insert = (history_len - count).min(STD_MIN_MATCH - 1);
+    if variant == HashCalcVariant::Roll && available >= STD_MIN_MATCH - 1 {
+        let bytes = state.window.filled();
+        state.ins_h =
+            RollHashCalc::update_hash(u32::from(bytes[start]), u32::from(bytes[start + 1]));
+    }
+    if count != 0 {
+        state.insert_string(start, count);
+    }
 }
 
 pub fn set_dictionary(stream: &mut DeflateStream, mut dictionary: &[u8]) -> ReturnCode {
@@ -1273,7 +1319,7 @@ fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
     // Hashes are a property of the live history representation, not a tunable
     // search budget. Choose the representation only while the history is empty.
     lm_set_level(state, state.level, config);
-    state.hash_calc_variant = HashCalcVariant::for_max_chain_length(state.max_chain_length);
+    state.hash_calc_variant = config.hash_layout;
 
     state.strstart = 0;
     state.block_start = 0;
@@ -1293,9 +1339,8 @@ const fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConf
     state.nice_match = config.nice_length;
     state.max_chain_length = config.max_chain;
 
-    // Do not change the hash representation here. deflateParams() may update the
-    // level while a nonempty head/prev table still describes earlier input.
-    // Reinterpreting those buckets with a different hash algorithm breaks searches.
+    // The caller initializes or rebuilds the hash table when its layout changes.
+    // Merely changing the tuning must never reinterpret existing buckets.
     state.level = level;
 }
 
@@ -4992,7 +5037,7 @@ mod test {
                 value ^= value << 13;
                 value ^= value >> 17;
                 value ^= value << 5;
-                *frequency = if (seed as usize + index) % 7 == 0 {
+                *frequency = if (seed as usize + index).is_multiple_of(7) {
                     0
                 } else {
                     u16::from(value.to_le_bytes()[0] % 64) + 1
@@ -5076,14 +5121,14 @@ mod test {
         let mut kraft = 0usize;
         let mut exact_cost = 0usize;
         let max_length = usize::from(StaticTreeDesc::BL.max_length);
-        for symbol in 0..BL_CODES {
+        for (symbol, frequency) in original_frequencies.iter().copied().enumerate() {
             let value = desc.dyn_tree[symbol];
             let length = usize::from(value.len());
             assert!((1..=max_length).contains(&length));
             kraft += 1usize << (max_length - length);
             // After gen_codes, Value::a holds the codeword, not frequency.
             // Compute the cost using the independently retained histogram.
-            exact_cost += usize::from(original_frequencies[symbol])
+            exact_cost += usize::from(frequency)
                 * (length + usize::from(StaticTreeDesc::EXTRA_BLBITS[symbol]));
         }
         assert_eq!(
@@ -5516,19 +5561,186 @@ mod test {
         Ok(())
     }
 
+    fn set_test_input(stream: &mut DeflateStream<'_>, input: &[u8]) -> Result<(), ReturnCode> {
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
+        stream.next_in = input.as_ptr().cast_mut();
+        Ok(())
+    }
+
+    fn set_test_output(
+        stream: &mut DeflateStream<'_>,
+        output: &mut [u8],
+    ) -> Result<(), ReturnCode> {
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+        stream.next_out = output.as_mut_ptr();
+        Ok(())
+    }
+
+    fn finish_test_stream(stream: &mut DeflateStream<'_>) -> Result<usize, ReturnCode> {
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        assert_eq!(stream.avail_in, 0);
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+        assert!(end(stream).is_ok());
+        Ok(written)
+    }
+
+    fn assert_test_roundtrip(encoded: &[u8], original: &[u8], config: InflateConfig) {
+        let mut output = vec![0u8; original.len()];
+        let (decoded, status) = crate::decompress_slice(&mut output, encoded, config);
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, original);
+    }
+
     #[test]
-    fn level_change_flushes_block_with_origin_outside_window() -> Result<(), &'static str> {
+    fn changing_level_before_input_matches_fresh_compressor() -> Result<(), ReturnCode> {
+        let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(1_300);
+
+        let encode = |stream: &mut DeflateStream<'_>| -> Result<Vec<u8>, ReturnCode> {
+            let mut output = vec![0u8; compress_bound(source.len()) + 64];
+            set_test_input(stream, &source)?;
+            set_test_output(stream, &mut output)?;
+            let written = finish_test_stream(stream)?;
+            output.truncate(written);
+            Ok(output)
+        };
+
+        for (initial, final_level) in [(1, 9), (6, 9), (8, 9), (9, 8), (9, 6)] {
+            let mut changed = DeflateStream::new(DeflateConfig::new(initial))?;
+            assert_eq!(
+                params(&mut changed, final_level, Strategy::Default),
+                ReturnCode::Ok
+            );
+            let mut fresh = DeflateStream::new(DeflateConfig::new(final_level))?;
+            assert_eq!(
+                matches!(changed.state.hash_calc_variant, HashCalcVariant::Roll),
+                matches!(fresh.state.hash_calc_variant, HashCalcVariant::Roll),
+                "empty stream level change {initial} -> {final_level} selected a stale hash layout"
+            );
+            assert_eq!(
+                encode(&mut changed)?,
+                encode(&mut fresh)?,
+                "empty stream level change {initial} -> {final_level} changed the encoded bytes"
+            );
+        }
+        // The wrapper can be emitted before a caller supplies data. That
+        // changes the flush state, but it cannot populate the hash index.
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let mut output = vec![0u8; compress_bound(source.len()) + 64];
+        set_test_output(&mut stream, &mut output)?;
+        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.total_in, 0);
+        assert_ne!(stream.state.last_flush, -2);
+        assert_eq!(params(&mut stream, 9, Strategy::Default), ReturnCode::Ok);
+        assert!(matches!(
+            stream.state.hash_calc_variant,
+            HashCalcVariant::Roll
+        ));
+
+        set_test_input(&mut stream, &source)?;
+        let written = finish_test_stream(&mut stream)?;
+        assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn level_change_after_reset_keep_retains_buffered_lookahead() -> Result<(), ReturnCode> {
+        let source = b"buffered reset-keep data/".repeat(5);
+        let mut stream = DeflateStream::new(DeflateConfig {
+            window_bits: -crate::MAX_WBITS,
+            ..DeflateConfig::new(6)
+        })?;
+        let mut output = vec![0u8; compress_bound(source.len()) + 64];
+        set_test_input(&mut stream, &source)?;
+        set_test_output(&mut stream, &mut output)?;
+
+        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.state.strstart, 0);
+        assert_eq!(stream.state.lookahead, source.len());
+        assert_eq!(reset_keep(&mut stream), ReturnCode::Ok);
+        assert_eq!(params(&mut stream, 9, Strategy::Default), ReturnCode::Ok);
+        assert_eq!(stream.state.hash_calc_variant, HashCalcVariant::Roll);
+        assert_eq!(stream.state.lookahead, source.len());
+        assert_eq!(
+            stream.state.ins_h,
+            RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]))
+        );
+        let written = finish_test_stream(&mut stream)?;
+
+        assert_test_roundtrip(
+            &output[..written],
+            &source,
+            InflateConfig {
+                window_bits: -crate::MAX_WBITS,
+            },
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_flush_reselects_native_hash_layout_after_discarding_history() -> Result<(), ReturnCode>
+    {
+        let prefix = b"repeating-prefix-abc123/".repeat(1_500);
+        let suffix = b"repeating-suffix-xyz987/".repeat(1_500);
+        let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
+        let mut output = vec![0u8; compress_bound(prefix.len() + suffix.len()) + 64];
+        set_test_output(&mut stream, &mut output)?;
+        set_test_input(&mut stream, &prefix)?;
+
+        assert_eq!(
+            deflate(&mut stream, DeflateFlush::FullFlush),
+            ReturnCode::Ok
+        );
+        assert_eq!(stream.avail_in, 0);
+        assert_eq!(stream.state.strstart, 0);
+        assert!(stream
+            .state
+            .head
+            .as_slice()
+            .iter()
+            .all(|&position| position == 0));
+
+        assert_eq!(params(&mut stream, 9, Strategy::Default), ReturnCode::Ok);
+        assert!(matches!(
+            stream.state.hash_calc_variant,
+            HashCalcVariant::Roll
+        ));
+
+        set_test_input(&mut stream, &suffix)?;
+        let written = finish_test_stream(&mut stream)?;
+
+        let mut expected = prefix;
+        expected.extend_from_slice(&suffix);
+        assert_test_roundtrip(&output[..written], &expected, InflateConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn level_changes_handle_long_unflushed_block_and_reindex_history() -> Result<(), ReturnCode> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
-        for (initial_level, next_level) in [(1, 6), (6, 9), (9, 1)] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))
-                .map_err(|_| "valid deflate initialization failed")?;
+        let (prefix, suffix) = source.split_at(source.len() - 8_192);
+        for (initial_level, next_level) in [
+            (1, 6),
+            (6, 9),
+            (9, 1),
+            (9, 2),
+            (9, 3),
+            (9, 4),
+            (9, 5),
+            (9, 7),
+            (7, 9),
+            (6, 8),
+            (8, 9),
+            (9, 8),
+            (9, 6),
+            (8, 6),
+        ] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
-            stream.next_in = source.as_ptr().cast_mut();
-            stream.avail_in = crate::c_api::uInt::try_from(source.len())
-                .map_err(|_| "test input exceeds ABI length")?;
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out = crate::c_api::uInt::try_from(output.len())
-                .map_err(|_| "test output exceeds ABI length")?;
+            set_test_input(&mut stream, prefix)?;
+            set_test_output(&mut stream, &mut output)?;
 
             assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
             assert_eq!(stream.avail_in, 0);
@@ -5538,32 +5750,38 @@ mod test {
                     > stream.state.w_size
             );
 
+            let target_level = i8::try_from(next_level).map_err(|_| ReturnCode::StreamError)?;
+            let target_hash = level_config(target_level)
+                .ok_or(ReturnCode::StreamError)?
+                .hash_layout;
+            let requires_boundary = algorithm::change_requires_block_boundary(
+                i8::try_from(initial_level).map_err(|_| ReturnCode::StreamError)?,
+                Strategy::Default,
+                i8::try_from(next_level).map_err(|_| ReturnCode::StreamError)?,
+                Strategy::Default,
+            )
+            .ok_or(ReturnCode::StreamError)?
+                || stream.state.hash_calc_variant != target_hash;
             assert_eq!(
                 params(&mut stream, next_level, Strategy::Default),
                 ReturnCode::Ok,
                 "level transition {initial_level} -> {next_level} failed"
             );
             assert_eq!(i32::from(stream.state.level), next_level);
-            assert!(stream.state.block_start >= 0);
-            assert_eq!(
-                stream.state.block_start.unsigned_abs(),
-                stream.state.strstart
-            );
-            assert_eq!(
-                deflate(&mut stream, DeflateFlush::Finish),
-                ReturnCode::StreamEnd
-            );
-            let written =
-                usize::try_from(stream.total_out).map_err(|_| "test output exceeds host usize")?;
-            assert!(end(&mut stream).is_ok());
-            let mut decoded = vec![0u8; source.len()];
-            let (restored, status) = crate::decompress_slice(
-                &mut decoded,
-                &output[..written],
-                crate::InflateConfig::default(),
-            );
-            assert_eq!(status, ReturnCode::Ok);
-            assert_eq!(restored, source);
+            // Only algorithm or hash-layout changes require a block boundary.
+            if requires_boundary {
+                assert!(stream.state.block_start >= 0);
+                assert_eq!(
+                    stream.state.block_start.unsigned_abs(),
+                    stream.state.strstart
+                );
+            } else {
+                assert!(stream.state.block_start < 0);
+            }
+            assert_eq!(stream.state.hash_calc_variant, target_hash);
+            set_test_input(&mut stream, suffix)?;
+            let written = finish_test_stream(&mut stream)?;
+            assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
         }
         Ok(())
     }
@@ -5645,7 +5863,7 @@ mod test {
             .map(|index| ((index * 17) ^ (index / 43)).to_le_bytes()[0])
             .collect();
         let after = b"level-transition-stored-and-huffman/".repeat(3_000);
-        for (old_level, new_level) in [(0, 6), (6, 0)] {
+        for (old_level, new_level) in [(0, 6), (6, 0), (0, 9), (9, 0)] {
             let mut raw = z_stream::default();
             let config = DeflateConfig {
                 mem_level: 1,
@@ -5775,14 +5993,22 @@ mod test {
         let source = b"ABCDABCD0123456789".repeat(32);
         let rolling_seed = RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]));
 
-        for (level, chain, expected_seed) in [
-            (7, 4_096, 0),
-            (7, 128, 0),
-            (9, 128, rolling_seed),
-            (9, 4_096, rolling_seed),
+        for (level, chain, use_rolling_history, expected_seed) in [
+            (7, 4_096, false, 0),
+            (7, 128, false, 0),
+            (9, 128, false, 0),
+            (9, 4_096, false, 0),
+            (9, 4_096, true, rolling_seed),
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(level))
                 .map_err(|_| "valid deflate initialization failed")?;
+            // Both history variants must seed correctly regardless of the
+            // selected level's initial search budget and default hash mode.
+            stream.state.hash_calc_variant = if use_rolling_history {
+                HashCalcVariant::Roll
+            } else {
+                HashCalcVariant::Standard
+            };
             assert_eq!(tune(&mut stream, 8, 16, 128, chain), ReturnCode::Ok);
             let mut input = InputCursor::from_slice(&source, stream.total_in)
                 .ok_or("test source length must fit zlib uInt")?;
@@ -5800,13 +6026,33 @@ mod test {
     }
 
     #[test]
-    fn level_changes_preserve_live_hash_table_representation() -> Result<(), crate::ReturnCode> {
+    fn level_changes_rebuild_preset_dictionary_hash_table() -> Result<(), crate::ReturnCode> {
         let dictionary: Vec<u8> = (0..4_096usize)
             .map(|i| (i * 29 + i / 97).to_le_bytes()[0])
             .collect();
 
-        for (old_level, new_level, expected_roll) in [(7, 9, false), (9, 7, true), (6, 9, false)] {
+        for (old_level, new_level, use_rolling_history) in [
+            (7, 9, false),
+            (9, 7, false),
+            (6, 9, false),
+            (9, 7, true),
+            (8, 9, false),
+            (9, 8, true),
+            (9, 6, true),
+            (9, 1, true),
+            (9, 2, true),
+            (9, 0, true),
+            (0, 9, false),
+            (6, 8, false),
+        ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(old_level))?;
+            // Build the dictionary with the requested source layout, including
+            // a non-native representation, then compare the destination index.
+            stream.state.hash_calc_variant = if use_rolling_history {
+                HashCalcVariant::Roll
+            } else {
+                HashCalcVariant::Standard
+            };
             assert_eq!(set_dictionary(&mut stream, &dictionary), ReturnCode::Ok);
             assert!(stream.state.strstart > 0);
             assert!(stream.state.head.as_slice().iter().any(|entry| *entry != 0));
@@ -5815,11 +6061,15 @@ mod test {
                 ReturnCode::Ok
             );
 
+            let mut fresh = DeflateStream::new(DeflateConfig::new(new_level))?;
+            assert_eq!(set_dictionary(&mut fresh, &dictionary), ReturnCode::Ok);
             assert_eq!(
-                matches!(stream.state.hash_calc_variant, HashCalcVariant::Roll),
-                expected_roll,
-                "level change {old_level} to {new_level} reinterpreted existing hash history",
+                stream.state.hash_calc_variant,
+                fresh.state.hash_calc_variant
             );
+            assert_eq!(stream.state.head.as_slice(), fresh.state.head.as_slice());
+            assert_eq!(stream.state.insert, fresh.state.insert);
+            assert!(end(&mut fresh).is_ok());
             assert!(end(&mut stream).is_ok());
         }
         Ok(())
@@ -9314,7 +9564,20 @@ mod test {
             160, 197, 192, 192, 96, 196, 0, 0, 3, 228, 25, 128,
         ];
 
-        fuzz_based_test(&input, config, &expected);
+        let mut output = vec![0u8; 1 << 17];
+        let (encoded, status) = compress_slice(&mut output, &input, config);
+        assert_eq!(status, ReturnCode::Ok);
+
+        for stream in [encoded, expected.as_slice()] {
+            let mut decoded = vec![0u8; input.len()];
+            let (restored, status) = crate::decompress_slice(
+                &mut decoded,
+                stream,
+                crate::InflateConfig { window_bits: 9 },
+            );
+            assert_eq!(status, ReturnCode::Ok);
+            assert_eq!(restored, input);
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
