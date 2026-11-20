@@ -1,9 +1,7 @@
 use crate::{
     deflate::{
         drain_pending_output, fill_window_core, fill_window_core_with_hash_maintenance,
-        longest_match::{
-            execute_match_search_batch, MatchSearchError, MatchSearchResult, MatchSearchWork,
-        },
+        longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
         BlockState, Compressor, DrainOutcome, InputCursor, State, Strategy, StreamChecksum,
         MIN_LOOKAHEAD,
     },
@@ -24,13 +22,25 @@ const LOCAL_MATCH_SEARCH_MAX_CHAIN: u16 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MatchSourceKind {
+    /// A batch scheduler can detach longer searches across streams.
     HashChain,
+    /// A synchronous caller benefits from continuing the current producer
+    /// without suspending at a match-search event.
+    LocalHashChain,
     External,
 }
 
 impl MatchSourceKind {
-    fn maintains_hash_chain(self) -> bool {
-        self == Self::HashChain
+    const fn maintains_hash_chain(self) -> bool {
+        !matches!(self, Self::External)
+    }
+
+    const fn should_search_locally(self, chain: u16) -> bool {
+        match self {
+            Self::LocalHashChain => true,
+            Self::HashChain => chain <= LOCAL_MATCH_SEARCH_MAX_CHAIN,
+            Self::External => false,
+        }
     }
 }
 
@@ -516,6 +526,7 @@ pub(super) struct StandardDriver {
 }
 
 impl StandardDriver {
+    #[cfg(test)]
     pub(super) fn for_algorithm(algorithm: Algorithm, state: &State<'_>) -> Option<Self> {
         Self::for_algorithm_with_match_source(algorithm, state, MatchSourceKind::HashChain)
     }
@@ -793,12 +804,8 @@ pub(super) fn drive_standard(
                 let Ok(request) = work.request(state) else {
                     return BlockState::InvalidState;
                 };
-                let mut results = [MatchSearchResult {
-                    length: 0,
-                    start: 0,
-                }];
-                execute_match_search_batch(core::slice::from_ref(&request), &mut results);
-                if driver.complete_match_search(state, results[0]).is_err() {
+                let result = request.execute();
+                if driver.complete_match_search(state, result).is_err() {
                     return BlockState::InvalidState;
                 }
             }
@@ -854,8 +861,11 @@ impl Algorithm {
             Self::Stored => stored::deflate_stored(stream, flush),
             Self::Quick => quick::deflate_quick(stream, flush),
             algorithm => {
-                let Some(mut driver) = StandardDriver::for_algorithm(algorithm, stream.state)
-                else {
+                let Some(mut driver) = StandardDriver::for_algorithm_with_match_source(
+                    algorithm,
+                    stream.state,
+                    MatchSourceKind::LocalHashChain,
+                ) else {
                     return BlockState::InvalidState;
                 };
                 drive_standard(

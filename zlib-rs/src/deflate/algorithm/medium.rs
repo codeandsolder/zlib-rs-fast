@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{
-    BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN,
-};
+use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::{hash_chain_position, StandardHashCalc};
 use crate::deflate::longest_match::{
     MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
@@ -79,13 +77,15 @@ impl MediumProducer {
         }
     }
 
-    /// Stock Medium levels never need scheduler suspension: their longest hash chain is 128.
-    /// Keep their hot-loop match state local so LLVM can retain it in registers, while the
-    /// resumable path below remains available for streams tuned beyond the local-search limit.
+    /// Keep current/future match state local when all searches execute
+    /// synchronously. The resumable path remains available to batch
+    /// schedulers and external match sources.
     fn produce_local(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         debug_assert_eq!(self.phase, MediumPhase::Ready);
-        debug_assert_eq!(self.match_source, MatchSourceKind::HashChain);
-        debug_assert!(state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN);
+        debug_assert!(self.match_source.maintains_hash_chain());
+        debug_assert!(self
+            .match_source
+            .should_search_locally(state.max_chain_length));
 
         let mut current_match = Match::EMPTY;
         let mut next_match = self.next_match;
@@ -130,7 +130,7 @@ impl MediumProducer {
                 }
             }
 
-            insert_match(state, current_match, MatchSourceKind::HashChain);
+            insert_match(state, current_match, self.match_source);
 
             let current_len = usize::from(current_match.match_length);
             let future_start = usize::from(current_match.strstart) + current_len;
@@ -230,7 +230,10 @@ impl MediumProducer {
             };
             if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                 let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
-                if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                if self
+                    .match_source
+                    .should_search_locally(state.max_chain_length)
+                {
                     let result = match work.request(state) {
                         Ok(request) => request.execute(),
                         Err(error) => return Some(ProduceStatus::MatchSearchError(error)),
@@ -279,7 +282,10 @@ impl MediumProducer {
             let hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
             if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                 let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
-                if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                if self
+                    .match_source
+                    .should_search_locally(state.max_chain_length)
+                {
                     let result = match work.request(state) {
                         Ok(request) => request.execute(),
                         Err(error) => return Some(ProduceStatus::MatchSearchError(error)),
@@ -308,9 +314,10 @@ impl MediumProducer {
 
 impl TokenProducer for MediumProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
-        if self.match_source == MatchSourceKind::HashChain
-            && self.phase == MediumPhase::Ready
-            && state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN
+        if self.phase == MediumPhase::Ready
+            && self
+                .match_source
+                .should_search_locally(state.max_chain_length)
         {
             return self.produce_local(state, allow_short_tail);
         }

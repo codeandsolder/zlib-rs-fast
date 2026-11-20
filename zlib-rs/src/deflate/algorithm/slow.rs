@@ -36,8 +36,21 @@ impl SlowProducer {
     }
 }
 
-impl TokenProducer for SlowProducer {
-    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+fn apply_search(state: &mut State<'_>, result: MatchSearchResult) -> u16 {
+    state.match_start = result.start;
+    if result.length <= 5 && state.strategy == Strategy::Filtered {
+        2
+    } else {
+        result.length
+    }
+}
+
+impl SlowProducer {
+    fn produce_inner<const LOCAL: bool>(
+        &mut self,
+        state: &mut State<'_>,
+        allow_short_tail: bool,
+    ) -> ProduceStatus {
         // The detached search result already carries a bounded u16 length.
         // Keep that type through the lazy-match state machine.
         const NO_MATCH_LENGTH: u16 = 2;
@@ -46,12 +59,7 @@ impl TokenProducer for SlowProducer {
             let match_len = match self.phase {
                 SlowPhase::SearchReady(result) => {
                     self.phase = SlowPhase::Ready;
-                    state.match_start = result.start;
-                    let mut length = result.length;
-                    if length <= 5 && state.strategy == Strategy::Filtered {
-                        length = NO_MATCH_LENGTH;
-                    }
-                    length
+                    apply_search(state, result)
                 }
                 SlowPhase::Ready => {
                     if state.lookahead == 0
@@ -61,6 +69,7 @@ impl TokenProducer for SlowProducer {
                     }
 
                     state.prev_match = state.match_start;
+                    let mut match_len = NO_MATCH_LENGTH;
                     if self.match_source == MatchSourceKind::External {
                         if state.lookahead >= WANT_MIN_MATCH
                             && state.prev_length < state.max_lazy_match
@@ -83,14 +92,21 @@ impl TokenProducer for SlowProducer {
                             } else {
                                 MatchSearchKind::Standard
                             };
-                            self.phase = SlowPhase::AwaitingSearch;
-                            return ProduceStatus::MatchSearch(MatchSearchWork::new(
-                                hash_head, kind,
-                            ));
+                            let work = MatchSearchWork::new(hash_head, kind);
+                            if LOCAL {
+                                let result = match work.request(state) {
+                                    Ok(request) => request.execute(),
+                                    Err(error) => return ProduceStatus::MatchSearchError(error),
+                                };
+                                match_len = apply_search(state, result);
+                            } else {
+                                self.phase = SlowPhase::AwaitingSearch;
+                                return ProduceStatus::MatchSearch(work);
+                            }
                         }
                     }
 
-                    NO_MATCH_LENGTH
+                    match_len
                 }
                 SlowPhase::AwaitingSearch => {
                     return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
@@ -108,7 +124,7 @@ impl TokenProducer for SlowProducer {
                 state.lookahead -= usize::from(state.prev_length);
 
                 let move_forward = usize::from(state.prev_length) - 1;
-                if self.match_source == MatchSourceKind::HashChain && max_insert > state.strstart {
+                if self.match_source.maintains_hash_chain() && max_insert > state.strstart {
                     let insert_count = move_forward.min(max_insert - state.strstart);
                     state.insert_string(state.strstart + 1, insert_count);
                 }
@@ -141,6 +157,19 @@ impl TokenProducer for SlowProducer {
                 state.strstart += 1;
                 state.lookahead -= 1;
             }
+        }
+    }
+}
+
+impl TokenProducer for SlowProducer {
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        // The ordinary frontend can run its search immediately. A batch
+        // frontend must retain the opportunity to detach *every* Slow
+        // search, even a short chain. Select the loop once per invocation.
+        if matches!(self.match_source, MatchSourceKind::LocalHashChain) {
+            self.produce_inner::<true>(state, allow_short_tail)
+        } else {
+            self.produce_inner::<false>(state, allow_short_tail)
         }
     }
 

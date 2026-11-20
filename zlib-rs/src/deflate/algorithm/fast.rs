@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-use super::{
-    BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer, LOCAL_MATCH_SEARCH_MAX_CHAIN,
-};
+use super::{BlockContinuation, MatchSourceKind, ProduceStatus, TokenProducer};
 use crate::deflate::hash_calc::StandardHashCalc;
 use crate::deflate::longest_match::{
     MatchSearchError, MatchSearchKind, MatchSearchResult, MatchSearchWork,
@@ -50,7 +48,7 @@ impl TokenProducer for FastProducer {
                     );
 
                     state.lookahead -= match_len;
-                    if self.match_source == MatchSourceKind::HashChain {
+                    if self.match_source.maintains_hash_chain() {
                         if match_len <= usize::from(state.max_insert_length)
                             && state.lookahead >= WANT_MIN_MATCH
                         {
@@ -113,7 +111,10 @@ impl TokenProducer for FastProducer {
 
                 if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
                     let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
-                    if state.max_chain_length <= LOCAL_MATCH_SEARCH_MAX_CHAIN {
+                    if self
+                        .match_source
+                        .should_search_locally(state.max_chain_length)
+                    {
                         let result = match work.request(state) {
                             Ok(request) => request.execute(),
                             Err(error) => return ProduceStatus::MatchSearchError(error),
