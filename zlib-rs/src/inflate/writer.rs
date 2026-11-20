@@ -226,6 +226,32 @@ impl<'a> Writer<'a> {
         unsafe { Self::copy_disjoint_chunk::<N>(ptr, src + length - N, dst + length - N) };
     }
 
+    /// Copy a span whose size is in [N, 2*N). Both endpoint loads happen
+    /// before either store; no length-dependent loop or branch is needed.
+    ///
+    /// # Safety
+    /// The source and destination spans of length bytes are disjoint,
+    /// initialized/readable and writable respectively, and N <= length < 2*N.
+    #[inline]
+    unsafe fn copy_disjoint_endpoints<const N: usize>(
+        ptr: *mut MaybeUninit<u8>,
+        src: usize,
+        dst: usize,
+        length: usize,
+    ) {
+        debug_assert!(length >= N && length < 2 * N);
+        let tail = length - N;
+        // SAFETY: both endpoint ranges lie within the disjoint validated spans.
+        let first = unsafe { ptr.add(src).cast::<[u8; N]>().read_unaligned() };
+        // SAFETY: tail + N == length, so the second load is also initialized.
+        let last = unsafe { ptr.add(src + tail).cast::<[u8; N]>().read_unaligned() };
+        // SAFETY: both endpoint stores fit the exact destination span.
+        unsafe {
+            ptr.add(dst).cast::<[u8; N]>().write_unaligned(first);
+            ptr.add(dst + tail).cast::<[u8; N]>().write_unaligned(last);
+        }
+    }
+
     /// Fast ordinary-inflate copy for a non-overlapping DEFLATE reference.
     /// The callback writer uses the original, exact match copy instead.
     // The large fast-path dispatch needs to be inlined at its one-shot
@@ -266,15 +292,15 @@ impl<'a> Writer<'a> {
             if length >= MATCH_COPY_WIDTH {
                 Self::copy_disjoint_chunks::<MATCH_COPY_WIDTH>(ptr, start, current, length);
             } else if length >= 16 {
-                Self::copy_disjoint_chunks::<16>(ptr, start, current, length);
+                Self::copy_disjoint_endpoints::<16>(ptr, start, current, length);
             } else if length >= 8 {
-                Self::copy_disjoint_chunks::<8>(ptr, start, current, length);
+                Self::copy_disjoint_endpoints::<8>(ptr, start, current, length);
             } else if length >= 4 {
-                Self::copy_disjoint_chunks::<4>(ptr, start, current, length);
+                Self::copy_disjoint_endpoints::<4>(ptr, start, current, length);
             } else if length >= 2 {
-                Self::copy_disjoint_chunks::<2>(ptr, start, current, length);
+                Self::copy_disjoint_endpoints::<2>(ptr, start, current, length);
             } else {
-                Self::copy_disjoint_chunks::<1>(ptr, start, current, length);
+                Self::copy_disjoint_endpoints::<1>(ptr, start, current, length);
             }
         }
 
