@@ -720,6 +720,80 @@ mod tests {
         assert_eq!(decoded, inputs[1]);
     }
 
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn gpu_batch_matches_independent_gpu_jobs() -> Result<(), Box<dyn std::error::Error>> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let inputs = [
+            Vec::new(),
+            b"abc".to_vec(),
+            b"short output buffer/".repeat(50),
+            b"long repeated prefix/".repeat(4_000),
+            (0..70_123u32)
+                .map(|i| (i.wrapping_mul(731) ^ (i / 13)).to_le_bytes()[0])
+                .collect(),
+        ];
+        for (level, window_bits) in [(2, -15), (6, 9), (9, 31)] {
+            let config = DeflateConfig {
+                level,
+                window_bits,
+                ..DeflateConfig::default()
+            };
+            let capacities = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    if index == 2 {
+                        1
+                    } else {
+                        compress_bound(input.len()) + 64
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut batch_outputs = capacities.iter().map(|&n| vec![0; n]).collect::<Vec<_>>();
+            let results = {
+                let mut jobs = inputs
+                    .iter()
+                    .zip(&mut batch_outputs)
+                    .map(|(input, output)| BatchCompressJob::new(input, output))
+                    .collect::<Vec<_>>();
+                compress_slices_batch_gpu(&mut jobs, config, &searcher, 32)?
+            };
+            for (index, ((input, &capacity), result)) in
+                inputs.iter().zip(&capacities).zip(results).enumerate()
+            {
+                let mut expected = vec![0u8; capacity];
+                let reference = compress_slices_batch_gpu(
+                    &mut [BatchCompressJob::new(input, &mut expected)],
+                    config,
+                    &searcher,
+                    32,
+                )?;
+                assert_eq!(reference, [result]);
+                assert_eq!(
+                    expected[..result.written],
+                    batch_outputs[index][..result.written]
+                );
+                if index == 2 {
+                    assert_eq!(result.code, ReturnCode::BufError);
+                    continue;
+                }
+                assert_eq!(result.code, ReturnCode::Ok);
+                let mut decoded = vec![0u8; input.len()];
+                let inflate_config = InflateConfig { window_bits };
+                let (decoded, code) = decompress_slice(
+                    &mut decoded,
+                    &batch_outputs[index][..result.written],
+                    inflate_config,
+                );
+                assert_eq!(code, ReturnCode::Ok, "level {level} index {index}");
+                assert_eq!(decoded, input.as_slice());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn external_batch_finishes_each_stream_before_starting_the_next() {
         let inputs = [
