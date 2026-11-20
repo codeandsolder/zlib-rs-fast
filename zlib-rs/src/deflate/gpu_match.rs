@@ -1231,23 +1231,7 @@ mod tests {
         let searcher = GpuMatchSearcher::new(None)?;
         let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
         let length = geometry.max_part_len + 17;
-        let input = (0..length).map(|i| b"abc"[i % 3]).collect::<Vec<_>>();
-        let table = searcher.search(&input, 1)?;
-        assert_eq!(table.len(), length);
-        for (position, actual) in table.iter().enumerate() {
-            let expected = if position < 3 || length - position < 3 {
-                GpuMatch::default()
-            } else {
-                GpuMatch {
-                    start: u32::try_from(position - 3)
-                        .map_err(|_| GpuMatchError("test position overflow".into()))?,
-                    length: u32::try_from((length - position).min(MAX_MATCH as usize))
-                        .map_err(|_| GpuMatchError("test length overflow".into()))?,
-                }
-            };
-            assert_eq!(actual, expected, "position {position}");
-        }
-        Ok(())
+        verify_periodic_search(&searcher, length)
     }
 
     #[test]
@@ -1262,6 +1246,13 @@ mod tests {
             .map_err(|_| GpuMatchError("grid limit too large".into()))?
             * WORKGROUP_SIZE as usize
             + 17;
+        verify_periodic_search(&searcher, length)
+    }
+
+    fn verify_periodic_search(
+        searcher: &GpuMatchSearcher,
+        length: usize,
+    ) -> Result<(), GpuMatchError> {
         // Three unique cyclic triples; at budget one the nearest predecessor is at distance three.
         let input = (0..length).map(|i| b"abc"[i % 3]).collect::<Vec<_>>();
         let table = searcher.search(&input, 1)?;
