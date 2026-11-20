@@ -5561,22 +5561,47 @@ mod test {
         Ok(())
     }
 
+    fn set_test_input(stream: &mut DeflateStream<'_>, input: &[u8]) -> Result<(), ReturnCode> {
+        stream.avail_in =
+            crate::c_api::uInt::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
+        stream.next_in = input.as_ptr().cast_mut();
+        Ok(())
+    }
+
+    fn set_test_output(
+        stream: &mut DeflateStream<'_>,
+        output: &mut [u8],
+    ) -> Result<(), ReturnCode> {
+        stream.avail_out =
+            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+        stream.next_out = output.as_mut_ptr();
+        Ok(())
+    }
+
+    fn finish_test_stream(stream: &mut DeflateStream<'_>) -> Result<usize, ReturnCode> {
+        assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
+        assert_eq!(stream.avail_in, 0);
+        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
+        assert!(end(stream).is_ok());
+        Ok(written)
+    }
+
+    fn assert_test_roundtrip(encoded: &[u8], original: &[u8], config: InflateConfig) {
+        let mut output = vec![0u8; original.len()];
+        let (decoded, status) = crate::decompress_slice(&mut output, encoded, config);
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(decoded, original);
+    }
+
     #[test]
     fn changing_level_before_input_matches_fresh_compressor() -> Result<(), ReturnCode> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(1_300);
 
         let encode = |stream: &mut DeflateStream<'_>| -> Result<Vec<u8>, ReturnCode> {
             let mut output = vec![0u8; compress_bound(source.len()) + 64];
-            stream.next_in = source.as_ptr().cast_mut();
-            stream.avail_in =
-                crate::c_api::uInt::try_from(source.len()).map_err(|_| ReturnCode::StreamError)?;
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out =
-                crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
-            assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
-            assert_eq!(stream.avail_in, 0);
-            let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
-            assert!(end(stream).is_ok());
+            set_test_input(stream, &source)?;
+            set_test_output(stream, &mut output)?;
+            let written = finish_test_stream(stream)?;
             output.truncate(written);
             Ok(output)
         };
@@ -5603,9 +5628,7 @@ mod test {
         // changes the flush state, but it cannot populate the hash index.
         let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
         let mut output = vec![0u8; compress_bound(source.len()) + 64];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out =
-            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+        set_test_output(&mut stream, &mut output)?;
         assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
         assert_eq!(stream.total_in, 0);
         assert_ne!(stream.state.last_flush, -2);
@@ -5615,23 +5638,9 @@ mod test {
             HashCalcVariant::Roll
         ));
 
-        stream.next_in = source.as_ptr().cast_mut();
-        stream.avail_in =
-            crate::c_api::uInt::try_from(source.len()).map_err(|_| ReturnCode::StreamError)?;
-        assert_eq!(
-            deflate(&mut stream, DeflateFlush::Finish),
-            ReturnCode::StreamEnd
-        );
-        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
-        assert!(end(&mut stream).is_ok());
-        let mut restored = vec![0u8; source.len()];
-        let (decoded, status) = crate::decompress_slice(
-            &mut restored,
-            &output[..written],
-            crate::InflateConfig::default(),
-        );
-        assert_eq!(status, ReturnCode::Ok);
-        assert_eq!(decoded, source);
+        set_test_input(&mut stream, &source)?;
+        let written = finish_test_stream(&mut stream)?;
+        assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
         Ok(())
     }
 
@@ -5643,12 +5652,8 @@ mod test {
             ..DeflateConfig::new(6)
         })?;
         let mut output = vec![0u8; compress_bound(source.len()) + 64];
-        stream.next_in = source.as_ptr().cast_mut();
-        stream.avail_in =
-            crate::c_api::uInt::try_from(source.len()).map_err(|_| ReturnCode::StreamError)?;
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out =
-            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
+        set_test_input(&mut stream, &source)?;
+        set_test_output(&mut stream, &mut output)?;
 
         assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
         assert_eq!(stream.avail_in, 0);
@@ -5662,23 +5667,15 @@ mod test {
             stream.state.ins_h,
             RollHashCalc::update_hash(u32::from(source[0]), u32::from(source[1]))
         );
-        assert_eq!(
-            deflate(&mut stream, DeflateFlush::Finish),
-            ReturnCode::StreamEnd
-        );
-        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
-        assert!(end(&mut stream).is_ok());
+        let written = finish_test_stream(&mut stream)?;
 
-        let mut decoded = vec![0u8; source.len()];
-        let (restored, status) = crate::decompress_slice(
-            &mut decoded,
+        assert_test_roundtrip(
             &output[..written],
+            &source,
             InflateConfig {
                 window_bits: -crate::MAX_WBITS,
             },
         );
-        assert_eq!(status, ReturnCode::Ok);
-        assert_eq!(restored, source);
         Ok(())
     }
 
@@ -5689,12 +5686,8 @@ mod test {
         let suffix = b"repeating-suffix-xyz987/".repeat(1_500);
         let mut stream = DeflateStream::new(DeflateConfig::new(6))?;
         let mut output = vec![0u8; compress_bound(prefix.len() + suffix.len()) + 64];
-        stream.next_out = output.as_mut_ptr();
-        stream.avail_out =
-            crate::c_api::uInt::try_from(output.len()).map_err(|_| ReturnCode::StreamError)?;
-        stream.next_in = prefix.as_ptr().cast_mut();
-        stream.avail_in =
-            crate::c_api::uInt::try_from(prefix.len()).map_err(|_| ReturnCode::StreamError)?;
+        set_test_output(&mut stream, &mut output)?;
+        set_test_input(&mut stream, &prefix)?;
 
         assert_eq!(
             deflate(&mut stream, DeflateFlush::FullFlush),
@@ -5715,31 +5708,17 @@ mod test {
             HashCalcVariant::Roll
         ));
 
-        stream.next_in = suffix.as_ptr().cast_mut();
-        stream.avail_in =
-            crate::c_api::uInt::try_from(suffix.len()).map_err(|_| ReturnCode::StreamError)?;
-        assert_eq!(
-            deflate(&mut stream, DeflateFlush::Finish),
-            ReturnCode::StreamEnd
-        );
-        let written = usize::try_from(stream.total_out).map_err(|_| ReturnCode::StreamError)?;
-        assert!(end(&mut stream).is_ok());
+        set_test_input(&mut stream, &suffix)?;
+        let written = finish_test_stream(&mut stream)?;
 
         let mut expected = prefix;
         expected.extend_from_slice(&suffix);
-        let mut decoded = vec![0u8; expected.len()];
-        let (restored, status) = crate::decompress_slice(
-            &mut decoded,
-            &output[..written],
-            crate::InflateConfig::default(),
-        );
-        assert_eq!(status, ReturnCode::Ok);
-        assert_eq!(restored, expected);
+        assert_test_roundtrip(&output[..written], &expected, InflateConfig::default());
         Ok(())
     }
 
     #[test]
-    fn level_changes_handle_long_unflushed_block_and_reindex_history() -> Result<(), &'static str> {
+    fn level_changes_handle_long_unflushed_block_and_reindex_history() -> Result<(), ReturnCode> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
         let (prefix, suffix) = source.split_at(source.len() - 8_192);
         for (initial_level, next_level) in [
@@ -5758,15 +5737,10 @@ mod test {
             (9, 6),
             (8, 6),
         ] {
-            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))
-                .map_err(|_| "valid deflate initialization failed")?;
+            let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
-            stream.next_in = prefix.as_ptr().cast_mut();
-            stream.avail_in = crate::c_api::uInt::try_from(prefix.len())
-                .map_err(|_| "test input exceeds ABI length")?;
-            stream.next_out = output.as_mut_ptr();
-            stream.avail_out = crate::c_api::uInt::try_from(output.len())
-                .map_err(|_| "test output exceeds ABI length")?;
+            set_test_input(&mut stream, prefix)?;
+            set_test_output(&mut stream, &mut output)?;
 
             assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
             assert_eq!(stream.avail_in, 0);
@@ -5776,17 +5750,17 @@ mod test {
                     > stream.state.w_size
             );
 
-            let target_level = i8::try_from(next_level).map_err(|_| "invalid destination level")?;
+            let target_level = i8::try_from(next_level).map_err(|_| ReturnCode::StreamError)?;
             let target_hash = level_config(target_level)
-                .ok_or("invalid level configuration")?
+                .ok_or(ReturnCode::StreamError)?
                 .hash_layout;
             let requires_boundary = algorithm::change_requires_block_boundary(
-                i8::try_from(initial_level).map_err(|_| "invalid source level")?,
+                i8::try_from(initial_level).map_err(|_| ReturnCode::StreamError)?,
                 Strategy::Default,
-                i8::try_from(next_level).map_err(|_| "invalid destination level")?,
+                i8::try_from(next_level).map_err(|_| ReturnCode::StreamError)?,
                 Strategy::Default,
             )
-            .ok_or("invalid level transition")?
+            .ok_or(ReturnCode::StreamError)?
                 || stream.state.hash_calc_variant != target_hash;
             assert_eq!(
                 params(&mut stream, next_level, Strategy::Default),
@@ -5805,24 +5779,9 @@ mod test {
                 assert!(stream.state.block_start < 0);
             }
             assert_eq!(stream.state.hash_calc_variant, target_hash);
-            stream.next_in = suffix.as_ptr().cast_mut();
-            stream.avail_in = crate::c_api::uInt::try_from(suffix.len())
-                .map_err(|_| "test suffix exceeds ABI length")?;
-            assert_eq!(
-                deflate(&mut stream, DeflateFlush::Finish),
-                ReturnCode::StreamEnd
-            );
-            let written =
-                usize::try_from(stream.total_out).map_err(|_| "test output exceeds host usize")?;
-            assert!(end(&mut stream).is_ok());
-            let mut decoded = vec![0u8; source.len()];
-            let (restored, status) = crate::decompress_slice(
-                &mut decoded,
-                &output[..written],
-                crate::InflateConfig::default(),
-            );
-            assert_eq!(status, ReturnCode::Ok);
-            assert_eq!(restored, source);
+            set_test_input(&mut stream, suffix)?;
+            let written = finish_test_stream(&mut stream)?;
+            assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
         }
         Ok(())
     }
