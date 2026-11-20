@@ -14,7 +14,7 @@ use super::{
     },
     deflate,
     longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
-    CallCursors, DeflateFlush, DeflateStream, Status,
+    CallCursors, DeflateFlush, DeflateStream, State, Status,
 };
 use super::{compress_slice, DeflateConfig, ReturnCode};
 #[cfg(any(feature = "gpu", test))]
@@ -162,20 +162,28 @@ pub fn compress_slices_batch_gpu(
         jobs,
         config,
         algorithm,
-        |runtime, search| resolve_table_match(runtime, search, &tables),
+        |job_index, state, position, search| {
+            resolve_table_match(job_index, state, position, search, &tables)
+        },
     ))
 }
 
 #[cfg(feature = "gpu")]
 fn resolve_table_match(
-    runtime: &BatchRuntime<'_>,
+    job_index: usize,
+    state: &State<'_>,
+    absolute_position: Option<usize>,
     search: MatchSearchWork,
     tables: &[GpuMatchTable],
 ) -> Result<MatchSearchResult, MatchSearchError> {
     if !search.is_external() {
         return Err(MatchSearchError::WrongBackend);
     }
-    Ok(runtime.match_from_table(&tables[runtime.job_index]))
+    Ok(match_from_table(
+        state,
+        absolute_position,
+        &tables[job_index],
+    ))
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -223,7 +231,9 @@ fn compress_external(
     config: DeflateConfig,
     algorithm: Algorithm,
     mut resolve: impl FnMut(
-        &BatchRuntime<'_>,
+        usize,
+        &State<'_>,
+        Option<usize>,
         MatchSearchWork,
     ) -> Result<MatchSearchResult, MatchSearchError>,
 ) -> Vec<BatchCompressResult> {
@@ -240,19 +250,7 @@ fn compress_external(
                 Ok(runtime) => runtime,
                 Err(result) => return result,
             };
-            loop {
-                match runtime.step() {
-                    RuntimeStep::Progress => {}
-                    RuntimeStep::MatchSearch(work) => {
-                        let completion = resolve(&runtime, work)
-                            .and_then(|result| runtime.complete_match_search(result));
-                        if completion.is_err() {
-                            return runtime.finish_error(ReturnCode::StreamError);
-                        }
-                    }
-                    RuntimeStep::Done(result) => return result,
-                }
-            }
+            runtime.run(&mut resolve)
         })
         .collect()
 }
@@ -290,13 +288,6 @@ struct BatchRuntime<'a> {
     input_budget: SliceBudget,
     output_budget: SliceBudget,
     _buffers: PhantomData<(&'a [u8], &'a mut [u8])>,
-}
-
-#[cfg(any(feature = "gpu", test))]
-enum RuntimeStep {
-    Progress,
-    MatchSearch(MatchSearchWork),
-    Done(BatchCompressResult),
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -372,117 +363,79 @@ impl<'a> BatchRuntime<'a> {
         self.stream.avail_out != 0
     }
 
-    fn step(&mut self) -> RuntimeStep {
-        if self.stream.avail_in == 0 {
-            self.offer_input();
-        }
-        if self.stream.avail_out == 0 && !self.offer_output() {
-            return RuntimeStep::Done(self.finish_error(ReturnCode::BufError));
-        }
-
-        let mode = if self.input_budget.pending() == 0 {
-            StandardSegmentMode::Final
-        } else {
-            StandardSegmentMode::Continue
-        };
-
-        let Self { stream, driver, .. } = self;
-        let outcome = CallCursors::with_state(stream, |state, cursors| {
-            driver.step(
+    /// Drive the entire externally searched body using one cursor snapshot.
+    /// Slice budgets are updated against the live local cursors, including
+    /// when the ABI's narrow availability/total fields wrap.
+    fn run(
+        &mut self,
+        resolve: &mut impl FnMut(
+            usize,
+            &State<'_>,
+            Option<usize>,
+            MatchSearchWork,
+        ) -> Result<MatchSearchResult, MatchSearchError>,
+    ) -> BatchCompressResult {
+        let Self {
+            job_index,
+            stream,
+            driver,
+            input_budget,
+            output_budget,
+            ..
+        } = self;
+        let body = CallCursors::with_state(stream, |state, cursors| loop {
+            input_budget.refill(&mut cursors.input.avail_in);
+            output_budget.refill(&mut cursors.output.remaining);
+            if cursors.output.remaining == 0 {
+                return Err(ReturnCode::BufError);
+            }
+            let mode = if input_budget.pending() == 0 {
+                StandardSegmentMode::Final
+            } else {
+                StandardSegmentMode::Continue
+            };
+            match driver.step(
                 state,
                 &mut cursors.input,
                 &mut cursors.output,
                 &mut cursors.checksum,
                 mode,
-            )
+            ) {
+                StandardTurnOutcome::Progress => {}
+                StandardTurnOutcome::MatchSearch(work) => {
+                    let position = absolute_match_position(
+                        input_budget,
+                        cursors.input.avail_in,
+                        state.lookahead,
+                    );
+                    resolve(*job_index, state, position, work)
+                        .and_then(|result| driver.complete_match_search(state, result))
+                        .map_err(|_| ReturnCode::StreamError)?;
+                }
+                StandardTurnOutcome::NeedMoreCallerInput => {
+                    input_budget.refill(&mut cursors.input.avail_in);
+                    if cursors.input.avail_in == 0 {
+                        return Err(ReturnCode::StreamError);
+                    }
+                }
+                StandardTurnOutcome::NeedMoreOutput { .. } => {
+                    output_budget.refill(&mut cursors.output.remaining);
+                    if cursors.output.remaining == 0 {
+                        return Err(ReturnCode::BufError);
+                    }
+                }
+                StandardTurnOutcome::SegmentDone(EndBlockKind::Final) => return Ok(()),
+                StandardTurnOutcome::MatchSearchError(_)
+                | StandardTurnOutcome::InvalidSegmentMode
+                | StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
+                    return Err(ReturnCode::StreamError);
+                }
+            }
         });
-
-        match outcome {
-            StandardTurnOutcome::Progress => RuntimeStep::Progress,
-            StandardTurnOutcome::MatchSearch(work) => RuntimeStep::MatchSearch(work),
-            StandardTurnOutcome::NeedMoreCallerInput => {
-                if self.offer_input() {
-                    RuntimeStep::Progress
-                } else {
-                    RuntimeStep::Done(self.finish_error(ReturnCode::StreamError))
-                }
-            }
-            StandardTurnOutcome::NeedMoreOutput { .. } => {
-                if self.offer_output() {
-                    RuntimeStep::Progress
-                } else {
-                    RuntimeStep::Done(self.finish_error(ReturnCode::BufError))
-                }
-            }
-            StandardTurnOutcome::SegmentDone(EndBlockKind::Final) => {
-                RuntimeStep::Done(self.finish_stream())
-            }
-            StandardTurnOutcome::MatchSearchError(_)
-            | StandardTurnOutcome::InvalidSegmentMode
-            | StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
-                RuntimeStep::Done(self.finish_error(ReturnCode::StreamError))
-            }
+        match body {
+            Ok(()) => self.finish_stream(),
+            Err(code) => self.finish_error(code),
         }
-    }
-
-    /// Absolute index in the full input slice of the next token to resolve.
-    /// The raw zlib total can wrap (notably 32-bit C long on Windows), while
-    /// the issued-slice budget retains the full position without changing the
-    /// C stream representation.
-    #[cfg(feature = "gpu")]
-    fn absolute_match_position(&self) -> Option<usize> {
-        self.input_budget
-            .processed(self.stream.avail_in)
-            .checked_sub(self.stream.state.lookahead)
-    }
-
-    #[cfg(feature = "gpu")]
-    fn match_from_table(&self, table: &GpuMatchTable) -> MatchSearchResult {
-        let state = &*self.stream.state;
-        let incumbent_length = if state.prev_length == 0 {
-            STD_MIN_MATCH - 1
-        } else {
-            usize::from(state.prev_length)
-        }
-        .min(state.lookahead);
-        let incumbent = MatchSearchResult::new(incumbent_length, state.match_start);
-
-        let Some(absolute_position) = self.absolute_match_position() else {
-            return incumbent;
-        };
-        let Some(candidate) = table.get(absolute_position) else {
-            return incumbent;
-        };
-        let Ok(candidate_length) = usize::try_from(candidate.length) else {
-            return incumbent;
-        };
-        let candidate_length = candidate_length.min(state.lookahead);
-        if candidate_length <= incumbent_length {
-            return incumbent;
-        }
-
-        let Ok(candidate_start) = usize::try_from(candidate.start) else {
-            return incumbent;
-        };
-        let Some(distance) = absolute_position.checked_sub(candidate_start) else {
-            return incumbent;
-        };
-        if !(1..=state.max_dist()).contains(&distance) {
-            return incumbent;
-        }
-        let Some(local_start) = state.strstart.checked_sub(distance) else {
-            return incumbent;
-        };
-        let Ok(local_start) = u16::try_from(local_start) else {
-            return incumbent;
-        };
-
-        MatchSearchResult::new(candidate_length, local_start)
-    }
-
-    fn complete_match_search(&mut self, result: MatchSearchResult) -> Result<(), MatchSearchError> {
-        let Self { stream, driver, .. } = self;
-        driver.complete_match_search(&mut stream.state, result)
     }
 
     fn finish_stream(&mut self) -> BatchCompressResult {
@@ -521,6 +474,63 @@ impl<'a> BatchRuntime<'a> {
             code,
         }
     }
+}
+
+/// Full-width absolute match position, independent of wrapping C totals.
+#[cfg(any(feature = "gpu", test))]
+const fn absolute_match_position(
+    budget: &SliceBudget,
+    available: crate::c_api::uInt,
+    lookahead: usize,
+) -> Option<usize> {
+    budget.processed(available).checked_sub(lookahead)
+}
+
+#[cfg(feature = "gpu")]
+fn match_from_table(
+    state: &State<'_>,
+    absolute_position: Option<usize>,
+    table: &GpuMatchTable,
+) -> MatchSearchResult {
+    let incumbent_length = if state.prev_length == 0 {
+        STD_MIN_MATCH - 1
+    } else {
+        usize::from(state.prev_length)
+    }
+    .min(state.lookahead);
+    let incumbent = MatchSearchResult::new(incumbent_length, state.match_start);
+
+    let Some(absolute_position) = absolute_position else {
+        return incumbent;
+    };
+    let Some(candidate) = table.get(absolute_position) else {
+        return incumbent;
+    };
+    let Ok(candidate_length) = usize::try_from(candidate.length) else {
+        return incumbent;
+    };
+    let candidate_length = candidate_length.min(state.lookahead);
+    if candidate_length <= incumbent_length {
+        return incumbent;
+    }
+
+    let Ok(candidate_start) = usize::try_from(candidate.start) else {
+        return incumbent;
+    };
+    let Some(distance) = absolute_position.checked_sub(candidate_start) else {
+        return incumbent;
+    };
+    if !(1..=state.max_dist()).contains(&distance) {
+        return incumbent;
+    }
+    let Some(local_start) = state.strstart.checked_sub(distance) else {
+        return incumbent;
+    };
+    let Ok(local_start) = u16::try_from(local_start) else {
+        return incumbent;
+    };
+
+    MatchSearchResult::new(candidate_length, local_start)
 }
 
 #[cfg(test)]
@@ -606,7 +616,7 @@ mod tests {
         let request =
             MatchSearchWork::new(1, crate::deflate::longest_match::MatchSearchKind::Standard);
         assert_eq!(
-            resolve_table_match(&runtime, request, &[]),
+            resolve_table_match(0, &runtime.stream.state, Some(0), request, &[]),
             Err(MatchSearchError::WrongBackend)
         );
         Ok(())
@@ -654,14 +664,35 @@ mod tests {
         // The whole input is offered but no bytes consumed yet. The live C
         // counter may have wrapped without affecting this absolute position.
         runtime.stream.total_in = crate::c_api::z_size::MAX;
-        assert_eq!(runtime.absolute_match_position(), Some(0));
+        assert_eq!(
+            absolute_match_position(
+                &runtime.input_budget,
+                runtime.stream.avail_in,
+                runtime.stream.state.lookahead
+            ),
+            Some(0)
+        );
 
         // Simulate 23 bytes consumed and 11 bytes retained in lookahead.
         runtime.stream.avail_in -= 23;
         runtime.stream.state.lookahead = 11;
-        assert_eq!(runtime.absolute_match_position(), Some(12));
+        assert_eq!(
+            absolute_match_position(
+                &runtime.input_budget,
+                runtime.stream.avail_in,
+                runtime.stream.state.lookahead
+            ),
+            Some(12)
+        );
         runtime.stream.state.lookahead = 24;
-        assert_eq!(runtime.absolute_match_position(), None);
+        assert_eq!(
+            absolute_match_position(
+                &runtime.input_budget,
+                runtime.stream.avail_in,
+                runtime.stream.state.lookahead
+            ),
+            None
+        );
         Ok(())
     }
 
@@ -696,9 +727,9 @@ mod tests {
                 &mut jobs,
                 DeflateConfig::new(2),
                 Algorithm::Fast,
-                |runtime, search| {
+                |job_index, _, _, search| {
                     assert!(search.is_external());
-                    if runtime.job_index == 0 {
+                    if job_index == 0 {
                         Err(MatchSearchError::UninitializedWindow)
                     } else {
                         Ok(MatchSearchResult::new(0, 0))
@@ -813,10 +844,10 @@ mod tests {
             ],
             DeflateConfig::new(2),
             Algorithm::Fast,
-            |runtime, work| {
+            |job_index, _, _, work| {
                 assert!(work.is_external());
-                if observed.last() != Some(&runtime.job_index) {
-                    observed.push(runtime.job_index);
+                if observed.last() != Some(&job_index) {
+                    observed.push(job_index);
                 }
                 Ok(MatchSearchResult::new(0, 0))
             },
@@ -859,7 +890,9 @@ mod tests {
         let before_strstart = runtime.stream.state.strstart;
         let before_lookahead = runtime.stream.state.lookahead;
         assert_eq!(
-            runtime.complete_match_search(MatchSearchResult::new(4, 1)),
+            runtime
+                .driver
+                .complete_match_search(&mut runtime.stream.state, MatchSearchResult::new(4, 1)),
             Err(MatchSearchError::UnexpectedMatchResult)
         );
         assert_eq!(runtime.stream.state.strstart, before_strstart);
@@ -886,7 +919,7 @@ mod tests {
             let mut output = vec![0u8; compress_bound(input.len()) + 64];
             let results = {
                 let mut jobs = [BatchCompressJob::new(&input, &mut output)];
-                compress_external(&mut jobs, config, algorithm, |_, search| {
+                compress_external(&mut jobs, config, algorithm, |_, _, _, search| {
                     assert!(search.is_external());
                     Ok(MatchSearchResult::new(0, 0))
                 })
