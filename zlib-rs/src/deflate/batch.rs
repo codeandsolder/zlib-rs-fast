@@ -14,7 +14,7 @@ use super::{
     },
     deflate,
     longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
-    CallCursors, DeflateFlush, DeflateStream, Status,
+    CallCursors, DeflateFlush, DeflateStream, State, Status,
 };
 use super::{compress_slice, DeflateConfig, ReturnCode};
 #[cfg(any(feature = "gpu", test))]
@@ -62,8 +62,9 @@ pub fn compress_slices_batch(
 /// Each scheduled task owns one complete independent stream, preserving per-stream cache locality
 /// while allowing the pool to work-steal streams with very different compression costs. The worker
 /// count is explicit and belongs to this object; no process-global Rayon pool is consulted or
-/// configured. Output bytes and return codes match independent [`super::compress_slice`] calls
-/// job-for-job.
+/// configured. CPU-only output bytes and return codes match independent
+/// [`super::compress_slice`] calls job-for-job. GPU-assisted encoding uses the same pool when
+/// explicitly requested.
 ///
 /// The pool is available only with the optional `parallel` feature. Construct it once and reuse it
 /// across batches so thread creation is not part of the compression hot path.
@@ -97,8 +98,54 @@ impl BatchCompressor {
         jobs: &mut [BatchCompressJob<'_>],
         config: DeflateConfig,
     ) -> Vec<BatchCompressResult> {
+        self.run_jobs(jobs, |_, job| compress_cpu_job(job, config))
+    }
+
+    /// Search all jobs on the GPU, then encode independent streams concurrently on this pool.
+    ///
+    /// The GPU phase runs once before CPU workers start; each worker owns its stream and
+    /// reads only its corresponding immutable match table. Results retain input order and
+    /// match the sequential GPU-assisted API byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same GPU search errors as [`compress_slices_batch_gpu`].
+    #[cfg(feature = "gpu")]
+    pub fn compress_gpu(
+        &self,
+        jobs: &mut [BatchCompressJob<'_>],
+        config: DeflateConfig,
+        searcher: &GpuMatchSearcher,
+        search_budget: u32,
+    ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
+        let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, searcher, search_budget)?
+        else {
+            return Ok(self.compress(jobs, config));
+        };
+        Ok(self.run_jobs(jobs, |job_index, job| {
+            compress_external_job(
+                job_index,
+                job,
+                config,
+                algorithm,
+                &mut |index, state, position, work| {
+                    resolve_table_match(index, state, position, work, &tables)
+                },
+            )
+        }))
+    }
+
+    fn run_jobs(
+        &self,
+        jobs: &mut [BatchCompressJob<'_>],
+        run: impl Fn(usize, &mut BatchCompressJob<'_>) -> BatchCompressResult + Sync,
+    ) -> Vec<BatchCompressResult> {
         if jobs.len() <= 1 || self.workers() == 1 {
-            return compress_synchronously(jobs, config);
+            return jobs
+                .iter_mut()
+                .enumerate()
+                .map(|(index, job)| run(index, job))
+                .collect();
         }
         let mut results = vec![
             BatchCompressResult {
@@ -112,13 +159,10 @@ impl BatchCompressor {
         // stream per task lets the persistent pool steal remaining work instead of pinning an
         // arbitrary equal-count chunk of streams to one worker and waiting for its largest member.
         self.pool.scope(|scope| {
-            for (job, result) in jobs.iter_mut().zip(&mut results) {
+            let run = &run;
+            for (index, (job, result)) in jobs.iter_mut().zip(&mut results).enumerate() {
                 scope.spawn(move |_| {
-                    let (output, code) = compress_slice(&mut *job.output, job.input, config);
-                    *result = BatchCompressResult {
-                        written: output.len(),
-                        code,
-                    };
+                    *result = run(index, job);
                 });
             }
         });
@@ -146,36 +190,56 @@ pub fn compress_slices_batch_gpu(
     searcher: &GpuMatchSearcher,
     search_budget: u32,
 ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
-    let Some(algorithm) = configured_algorithm(config) else {
+    let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, searcher, search_budget)?
+    else {
         return Ok(compress_synchronously(jobs, config));
     };
-    if !uses_match_search(algorithm) {
-        return Ok(compress_synchronously(jobs, config));
-    }
-
-    let Some(max_dist) = configured_max_dist(config) else {
-        return Ok(compress_synchronously(jobs, config));
-    };
-    let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
-    let tables = searcher.search_batch_with_max_dist(&inputs, search_budget, max_dist)?;
     Ok(compress_external(
         jobs,
         config,
         algorithm,
-        |runtime, search| resolve_table_match(runtime, search, &tables),
+        |job_index, state, position, search| {
+            resolve_table_match(job_index, state, position, search, &tables)
+        },
     ))
 }
 
 #[cfg(feature = "gpu")]
+fn prepare_gpu_matches(
+    jobs: &[BatchCompressJob<'_>],
+    config: DeflateConfig,
+    searcher: &GpuMatchSearcher,
+    search_budget: u32,
+) -> Result<Option<(Algorithm, Vec<GpuMatchTable>)>, GpuMatchError> {
+    let Some(algorithm) =
+        configured_algorithm(config).filter(|&algorithm| uses_match_search(algorithm))
+    else {
+        return Ok(None);
+    };
+    let Some(max_dist) = configured_max_dist(config) else {
+        return Ok(None);
+    };
+    let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
+    let tables = searcher.search_batch_with_max_dist(&inputs, search_budget, max_dist)?;
+    Ok(Some((algorithm, tables)))
+}
+
+#[cfg(feature = "gpu")]
 fn resolve_table_match(
-    runtime: &BatchRuntime<'_>,
+    job_index: usize,
+    state: &State<'_>,
+    absolute_position: Option<usize>,
     search: MatchSearchWork,
     tables: &[GpuMatchTable],
 ) -> Result<MatchSearchResult, MatchSearchError> {
     if !search.is_external() {
         return Err(MatchSearchError::WrongBackend);
     }
-    Ok(runtime.match_from_table(&tables[runtime.job_index]))
+    Ok(match_from_table(
+        state,
+        absolute_position,
+        &tables[job_index],
+    ))
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -223,38 +287,47 @@ fn compress_external(
     config: DeflateConfig,
     algorithm: Algorithm,
     mut resolve: impl FnMut(
-        &BatchRuntime<'_>,
+        usize,
+        &State<'_>,
+        Option<usize>,
         MatchSearchWork,
     ) -> Result<MatchSearchResult, MatchSearchError>,
 ) -> Vec<BatchCompressResult> {
     jobs.iter_mut()
         .enumerate()
         .map(|(job_index, job)| {
-            let mut runtime = match BatchRuntime::new(
-                job_index,
-                job.input,
-                &mut *job.output,
-                config,
-                algorithm,
-            ) {
-                Ok(runtime) => runtime,
-                Err(result) => return result,
-            };
-            loop {
-                match runtime.step() {
-                    RuntimeStep::Progress => {}
-                    RuntimeStep::MatchSearch(work) => {
-                        let completion = resolve(&runtime, work)
-                            .and_then(|result| runtime.complete_match_search(result));
-                        if completion.is_err() {
-                            return runtime.finish_error(ReturnCode::StreamError);
-                        }
-                    }
-                    RuntimeStep::Done(result) => return result,
-                }
-            }
+            compress_external_job(job_index, job, config, algorithm, &mut resolve)
         })
         .collect()
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn compress_external_job(
+    job_index: usize,
+    job: &mut BatchCompressJob<'_>,
+    config: DeflateConfig,
+    algorithm: Algorithm,
+    resolve: &mut impl FnMut(
+        usize,
+        &State<'_>,
+        Option<usize>,
+        MatchSearchWork,
+    ) -> Result<MatchSearchResult, MatchSearchError>,
+) -> BatchCompressResult {
+    let mut runtime =
+        match BatchRuntime::new(job_index, job.input, &mut *job.output, config, algorithm) {
+            Ok(runtime) => runtime,
+            Err(result) => return result,
+        };
+    runtime.run(resolve)
+}
+
+fn compress_cpu_job(job: &mut BatchCompressJob<'_>, config: DeflateConfig) -> BatchCompressResult {
+    let (output, code) = compress_slice(&mut *job.output, job.input, config);
+    BatchCompressResult {
+        written: output.len(),
+        code,
+    }
 }
 
 fn compress_synchronously(
@@ -262,13 +335,7 @@ fn compress_synchronously(
     config: DeflateConfig,
 ) -> Vec<BatchCompressResult> {
     jobs.iter_mut()
-        .map(|job| {
-            let (output, code) = compress_slice(&mut *job.output, job.input, config);
-            BatchCompressResult {
-                written: output.len(),
-                code,
-            }
-        })
+        .map(|job| compress_cpu_job(job, config))
         .collect()
 }
 
@@ -290,13 +357,6 @@ struct BatchRuntime<'a> {
     input_budget: SliceBudget,
     output_budget: SliceBudget,
     _buffers: PhantomData<(&'a [u8], &'a mut [u8])>,
-}
-
-#[cfg(any(feature = "gpu", test))]
-enum RuntimeStep {
-    Progress,
-    MatchSearch(MatchSearchWork),
-    Done(BatchCompressResult),
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -372,117 +432,79 @@ impl<'a> BatchRuntime<'a> {
         self.stream.avail_out != 0
     }
 
-    fn step(&mut self) -> RuntimeStep {
-        if self.stream.avail_in == 0 {
-            self.offer_input();
-        }
-        if self.stream.avail_out == 0 && !self.offer_output() {
-            return RuntimeStep::Done(self.finish_error(ReturnCode::BufError));
-        }
-
-        let mode = if self.input_budget.pending() == 0 {
-            StandardSegmentMode::Final
-        } else {
-            StandardSegmentMode::Continue
-        };
-
-        let Self { stream, driver, .. } = self;
-        let outcome = CallCursors::with_state(stream, |state, cursors| {
-            driver.step(
+    /// Drive the entire externally searched body using one cursor snapshot.
+    /// Slice budgets are updated against the live local cursors, including
+    /// when the ABI's narrow availability/total fields wrap.
+    fn run(
+        &mut self,
+        resolve: &mut impl FnMut(
+            usize,
+            &State<'_>,
+            Option<usize>,
+            MatchSearchWork,
+        ) -> Result<MatchSearchResult, MatchSearchError>,
+    ) -> BatchCompressResult {
+        let Self {
+            job_index,
+            stream,
+            driver,
+            input_budget,
+            output_budget,
+            ..
+        } = self;
+        let body = CallCursors::with_state(stream, |state, cursors| loop {
+            input_budget.refill(&mut cursors.input.avail_in);
+            output_budget.refill(&mut cursors.output.remaining);
+            if cursors.output.remaining == 0 {
+                return Err(ReturnCode::BufError);
+            }
+            let mode = if input_budget.pending() == 0 {
+                StandardSegmentMode::Final
+            } else {
+                StandardSegmentMode::Continue
+            };
+            match driver.step(
                 state,
                 &mut cursors.input,
                 &mut cursors.output,
                 &mut cursors.checksum,
                 mode,
-            )
+            ) {
+                StandardTurnOutcome::Progress => {}
+                StandardTurnOutcome::MatchSearch(work) => {
+                    let position = absolute_match_position(
+                        input_budget,
+                        cursors.input.avail_in,
+                        state.lookahead,
+                    );
+                    resolve(*job_index, state, position, work)
+                        .and_then(|result| driver.complete_match_search(state, result))
+                        .map_err(|_| ReturnCode::StreamError)?;
+                }
+                StandardTurnOutcome::NeedMoreCallerInput => {
+                    input_budget.refill(&mut cursors.input.avail_in);
+                    if cursors.input.avail_in == 0 {
+                        return Err(ReturnCode::StreamError);
+                    }
+                }
+                StandardTurnOutcome::NeedMoreOutput { .. } => {
+                    output_budget.refill(&mut cursors.output.remaining);
+                    if cursors.output.remaining == 0 {
+                        return Err(ReturnCode::BufError);
+                    }
+                }
+                StandardTurnOutcome::SegmentDone(EndBlockKind::Final) => return Ok(()),
+                StandardTurnOutcome::MatchSearchError(_)
+                | StandardTurnOutcome::InvalidSegmentMode
+                | StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
+                    return Err(ReturnCode::StreamError);
+                }
+            }
         });
-
-        match outcome {
-            StandardTurnOutcome::Progress => RuntimeStep::Progress,
-            StandardTurnOutcome::MatchSearch(work) => RuntimeStep::MatchSearch(work),
-            StandardTurnOutcome::NeedMoreCallerInput => {
-                if self.offer_input() {
-                    RuntimeStep::Progress
-                } else {
-                    RuntimeStep::Done(self.finish_error(ReturnCode::StreamError))
-                }
-            }
-            StandardTurnOutcome::NeedMoreOutput { .. } => {
-                if self.offer_output() {
-                    RuntimeStep::Progress
-                } else {
-                    RuntimeStep::Done(self.finish_error(ReturnCode::BufError))
-                }
-            }
-            StandardTurnOutcome::SegmentDone(EndBlockKind::Final) => {
-                RuntimeStep::Done(self.finish_stream())
-            }
-            StandardTurnOutcome::MatchSearchError(_)
-            | StandardTurnOutcome::InvalidSegmentMode
-            | StandardTurnOutcome::SegmentDone(EndBlockKind::FlushBoundary) => {
-                RuntimeStep::Done(self.finish_error(ReturnCode::StreamError))
-            }
+        match body {
+            Ok(()) => self.finish_stream(),
+            Err(code) => self.finish_error(code),
         }
-    }
-
-    /// Absolute index in the full input slice of the next token to resolve.
-    /// The raw zlib total can wrap (notably 32-bit C long on Windows), while
-    /// the issued-slice budget retains the full position without changing the
-    /// C stream representation.
-    #[cfg(feature = "gpu")]
-    fn absolute_match_position(&self) -> Option<usize> {
-        self.input_budget
-            .processed(self.stream.avail_in)
-            .checked_sub(self.stream.state.lookahead)
-    }
-
-    #[cfg(feature = "gpu")]
-    fn match_from_table(&self, table: &GpuMatchTable) -> MatchSearchResult {
-        let state = &*self.stream.state;
-        let incumbent_length = if state.prev_length == 0 {
-            STD_MIN_MATCH - 1
-        } else {
-            usize::from(state.prev_length)
-        }
-        .min(state.lookahead);
-        let incumbent = MatchSearchResult::new(incumbent_length, state.match_start);
-
-        let Some(absolute_position) = self.absolute_match_position() else {
-            return incumbent;
-        };
-        let Some(candidate) = table.get(absolute_position) else {
-            return incumbent;
-        };
-        let Ok(candidate_length) = usize::try_from(candidate.length) else {
-            return incumbent;
-        };
-        let candidate_length = candidate_length.min(state.lookahead);
-        if candidate_length <= incumbent_length {
-            return incumbent;
-        }
-
-        let Ok(candidate_start) = usize::try_from(candidate.start) else {
-            return incumbent;
-        };
-        let Some(distance) = absolute_position.checked_sub(candidate_start) else {
-            return incumbent;
-        };
-        if !(1..=state.max_dist()).contains(&distance) {
-            return incumbent;
-        }
-        let Some(local_start) = state.strstart.checked_sub(distance) else {
-            return incumbent;
-        };
-        let Ok(local_start) = u16::try_from(local_start) else {
-            return incumbent;
-        };
-
-        MatchSearchResult::new(candidate_length, local_start)
-    }
-
-    fn complete_match_search(&mut self, result: MatchSearchResult) -> Result<(), MatchSearchError> {
-        let Self { stream, driver, .. } = self;
-        driver.complete_match_search(&mut stream.state, result)
     }
 
     fn finish_stream(&mut self) -> BatchCompressResult {
@@ -521,6 +543,55 @@ impl<'a> BatchRuntime<'a> {
             code,
         }
     }
+}
+
+/// Full-width absolute match position, independent of wrapping C totals.
+#[cfg(any(feature = "gpu", test))]
+const fn absolute_match_position(
+    budget: &SliceBudget,
+    available: crate::c_api::uInt,
+    lookahead: usize,
+) -> Option<usize> {
+    budget.processed(available).checked_sub(lookahead)
+}
+
+#[cfg(feature = "gpu")]
+fn match_from_table(
+    state: &State<'_>,
+    absolute_position: Option<usize>,
+    table: &GpuMatchTable,
+) -> MatchSearchResult {
+    let incumbent_length = if state.prev_length == 0 {
+        STD_MIN_MATCH - 1
+    } else {
+        usize::from(state.prev_length)
+    }
+    .min(state.lookahead);
+    let incumbent = MatchSearchResult::new(incumbent_length, state.match_start);
+
+    let Some(absolute_position) = absolute_position else {
+        return incumbent;
+    };
+    let Some((length, distance)) = table.length_distance(absolute_position) else {
+        return incumbent;
+    };
+    let candidate_length = usize::from(length).min(state.lookahead);
+    if candidate_length <= incumbent_length {
+        return incumbent;
+    }
+
+    let distance = usize::from(distance);
+    if !(1..=state.max_dist()).contains(&distance) || distance > absolute_position {
+        return incumbent;
+    }
+    let Some(local_start) = state.strstart.checked_sub(distance) else {
+        return incumbent;
+    };
+    let Ok(local_start) = u16::try_from(local_start) else {
+        return incumbent;
+    };
+
+    MatchSearchResult::new(candidate_length, local_start)
 }
 
 #[cfg(test)]
@@ -606,7 +677,7 @@ mod tests {
         let request =
             MatchSearchWork::new(1, crate::deflate::longest_match::MatchSearchKind::Standard);
         assert_eq!(
-            resolve_table_match(&runtime, request, &[]),
+            resolve_table_match(0, &runtime.stream.state, Some(0), request, &[]),
             Err(MatchSearchError::WrongBackend)
         );
         Ok(())
@@ -654,14 +725,35 @@ mod tests {
         // The whole input is offered but no bytes consumed yet. The live C
         // counter may have wrapped without affecting this absolute position.
         runtime.stream.total_in = crate::c_api::z_size::MAX;
-        assert_eq!(runtime.absolute_match_position(), Some(0));
+        assert_eq!(
+            absolute_match_position(
+                &runtime.input_budget,
+                runtime.stream.avail_in,
+                runtime.stream.state.lookahead
+            ),
+            Some(0)
+        );
 
         // Simulate 23 bytes consumed and 11 bytes retained in lookahead.
         runtime.stream.avail_in -= 23;
         runtime.stream.state.lookahead = 11;
-        assert_eq!(runtime.absolute_match_position(), Some(12));
+        assert_eq!(
+            absolute_match_position(
+                &runtime.input_budget,
+                runtime.stream.avail_in,
+                runtime.stream.state.lookahead
+            ),
+            Some(12)
+        );
         runtime.stream.state.lookahead = 24;
-        assert_eq!(runtime.absolute_match_position(), None);
+        assert_eq!(
+            absolute_match_position(
+                &runtime.input_budget,
+                runtime.stream.avail_in,
+                runtime.stream.state.lookahead
+            ),
+            None
+        );
         Ok(())
     }
 
@@ -696,9 +788,9 @@ mod tests {
                 &mut jobs,
                 DeflateConfig::new(2),
                 Algorithm::Fast,
-                |runtime, search| {
+                |job_index, _, _, search| {
                     assert!(search.is_external());
-                    if runtime.job_index == 0 {
+                    if job_index == 0 {
                         Err(MatchSearchError::UninitializedWindow)
                     } else {
                         Ok(MatchSearchResult::new(0, 0))
@@ -760,6 +852,25 @@ mod tests {
                     .collect::<Vec<_>>();
                 compress_slices_batch_gpu(&mut jobs, config, &searcher, 32)?
             };
+            #[cfg(feature = "parallel")]
+            for workers in [
+                core::num::NonZeroUsize::MIN,
+                core::num::NonZeroUsize::new(4).ok_or("four workers is nonzero")?,
+            ] {
+                let pool = BatchCompressor::new(workers)?;
+                let mut parallel_outputs =
+                    capacities.iter().map(|&n| vec![0; n]).collect::<Vec<_>>();
+                let mut jobs = inputs
+                    .iter()
+                    .zip(&mut parallel_outputs)
+                    .map(|(input, output)| BatchCompressJob::new(input, output))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pool.compress_gpu(&mut jobs, config, &searcher, 32)?,
+                    results
+                );
+                assert_eq!(parallel_outputs, batch_outputs);
+            }
             for (index, ((input, &capacity), result)) in
                 inputs.iter().zip(&capacities).zip(results).enumerate()
             {
@@ -813,10 +924,10 @@ mod tests {
             ],
             DeflateConfig::new(2),
             Algorithm::Fast,
-            |runtime, work| {
+            |job_index, _, _, work| {
                 assert!(work.is_external());
-                if observed.last() != Some(&runtime.job_index) {
-                    observed.push(runtime.job_index);
+                if observed.last() != Some(&job_index) {
+                    observed.push(job_index);
                 }
                 Ok(MatchSearchResult::new(0, 0))
             },
@@ -859,7 +970,9 @@ mod tests {
         let before_strstart = runtime.stream.state.strstart;
         let before_lookahead = runtime.stream.state.lookahead;
         assert_eq!(
-            runtime.complete_match_search(MatchSearchResult::new(4, 1)),
+            runtime
+                .driver
+                .complete_match_search(&mut runtime.stream.state, MatchSearchResult::new(4, 1)),
             Err(MatchSearchError::UnexpectedMatchResult)
         );
         assert_eq!(runtime.stream.state.strstart, before_strstart);
@@ -886,7 +999,7 @@ mod tests {
             let mut output = vec![0u8; compress_bound(input.len()) + 64];
             let results = {
                 let mut jobs = [BatchCompressJob::new(&input, &mut output)];
-                compress_external(&mut jobs, config, algorithm, |_, search| {
+                compress_external(&mut jobs, config, algorithm, |_, _, _, search| {
                     assert!(search.is_external());
                     Ok(MatchSearchResult::new(0, 0))
                 })
