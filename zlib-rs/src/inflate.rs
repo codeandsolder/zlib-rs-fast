@@ -1680,6 +1680,7 @@ impl State<'_> {
         if (self.wrap & 2) != 0 && bit_reader.hold() == 0x8b1f {
             if self.wbits == 0 {
                 self.wbits = 15;
+                self.window.set_size(1 << self.wbits);
             }
             self.checksum = crc32(
                 crate::CRC32_INITIAL_VALUE,
@@ -1704,11 +1705,12 @@ impl State<'_> {
 
         bit_reader.drop_bits(4);
         let len = bit_reader.bits_u16(4).to_le_bytes()[0] + 8;
+        if i32::from(len) > MAX_WBITS || (self.wbits != 0 && len > self.wbits) {
+            return Err(self.invalid_header("invalid window size\0"));
+        }
         if self.wbits == 0 {
             self.wbits = len;
-        }
-        if i32::from(len) > MAX_WBITS || len > self.wbits {
-            return Err(self.invalid_header("invalid window size\0"));
+            self.window.set_size(1 << len);
         }
 
         self.dmax = 1 << len;
@@ -2849,7 +2851,7 @@ impl InflateAllocOffsets {
         if source.kind != InflateStateKind::Regular
             || source.total_allocation_size != self.total_size
             || !source.back_window.is_empty()
-            || source.window.size() != 1 << MAX_WBITS
+            || source.window.capacity() != 1 << MAX_WBITS
         {
             return Err(ReturnCode::StreamError);
         }
@@ -2973,6 +2975,12 @@ pub fn reset_with_config(stream: &mut InflateStream, config: InflateConfig) -> R
     // encoded history-window width have been fully validated.
     stream.state.wrap = window.wrap;
     stream.state.wbits = window.wbits;
+    let size = if window.wbits == 0 {
+        1 << MAX_WBITS
+    } else {
+        1 << window.wbits
+    };
+    stream.state.window.set_size(size);
 
     reset(stream)
 }
@@ -4836,6 +4844,137 @@ mod tests {
 
         assert!(end(&mut copied).state.is_null());
         assert!(end(&mut source).state.is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn configured_history_capacity_survives_copy_and_reset() -> Result<(), ReturnCode> {
+        // Distinguish logical history from the full reserved allocation,
+        // including shrinking and growing it repeatedly without reallocating.
+        let mut source = InflateStream::new(InflateConfig::default())?;
+        let storage = source.state.window.as_ptr();
+        let input: Vec<u8> = (0u32..32768)
+            .map(|i| (i.wrapping_mul(41) ^ (i >> 8)).to_le_bytes()[0])
+            .collect();
+        for width in (8..=15).chain((8..=15).rev()) {
+            assert_eq!(
+                reset_with_config(
+                    &mut source,
+                    InflateConfig {
+                        window_bits: -width
+                    }
+                ),
+                ReturnCode::Ok
+            );
+            let capacity = 1 << width;
+            assert_eq!(source.state.window.as_ptr(), storage);
+            assert_eq!(source.state.window.size(), capacity);
+            assert_eq!(source.state.window.have(), 0);
+            assert_eq!(set_dictionary(&mut source, &input), ReturnCode::Ok);
+            // Cross the ring boundary as well, so clone preserves both
+            // logical capacity and nonzero write cursor.
+            assert_eq!(set_dictionary(&mut source, b"next"), ReturnCode::Ok);
+            let expected = [&input[input.len() - capacity + 4..], b"next"].concat();
+            let segments: [&[u8]; 2] = dictionary(&source).into();
+            assert_eq!(segments.concat(), expected);
+            let mut dest = MaybeUninit::uninit();
+            assert_eq!(copy(&mut dest, &source), ReturnCode::Ok);
+            // SAFETY: successful copy initializes an independently owned stream.
+            let mut dest = unsafe { dest.assume_init() };
+            assert_eq!(dest.state.window.size(), capacity);
+            assert_ne!(dest.state.window.as_ptr(), storage);
+            let segments: [&[u8]; 2] = dictionary(&dest).into();
+            assert_eq!(segments.concat(), expected);
+            assert_eq!(reset_keep(&mut dest), ReturnCode::Ok);
+            let segments: [&[u8]; 2] = dictionary(&dest).into();
+            assert_eq!(segments.concat(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_small_gzip_window_limits_cross_call_history() -> Result<(), ReturnCode> {
+        // Independently constructed gzip: 1024 stored bytes followed by a
+        // fixed-Huffman length-three, distance-1024 match. Python zlib
+        // verifies the checksum, complete output and small-window failure.
+        let mut input = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 0, 0, 4, 0xff, 0xfb];
+        let plain: Vec<u8> = (0u32..1024)
+            .map(|i| (i * 41 + 7).to_le_bytes()[0])
+            .collect();
+        input.extend_from_slice(&plain);
+        input.extend_from_slice(&[
+            0x03, 0xe6, 0x7f, 0x00, 0x51, 0x62, 0x5b, 0x9f, 0x03, 0x04, 0x00, 0x00,
+        ]);
+        let expected = [&plain[..], &plain[..3]].concat();
+        for (bits, expected_status) in [
+            (25, ReturnCode::DataError),
+            (26, ReturnCode::StreamEnd),
+            (31, ReturnCode::StreamEnd),
+            (32, ReturnCode::StreamEnd),
+        ] {
+            let mut stream = InflateStream::new(InflateConfig { window_bits: bits })?;
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = u32::try_from(input.len()).map_err(|_| ReturnCode::StreamError)?;
+            let mut decoded = Vec::new();
+            let mut chunk = [0u8; 256];
+            let status = loop {
+                stream.next_out = chunk.as_mut_ptr();
+                stream.avail_out = 256;
+                // SAFETY: input is immutable and live; output is the exclusive
+                // 256-byte chunk rebound before every call.
+                let status = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
+                let written = chunk.len() - stream.avail_out as usize;
+                decoded.extend_from_slice(&chunk[..written]);
+                if !matches!(status, ReturnCode::Ok) {
+                    break status;
+                }
+                assert!(written != 0 || stream.avail_in != 0);
+            };
+            assert_eq!(status, expected_status);
+            if status == ReturnCode::StreamEnd {
+                assert_eq!(decoded, expected);
+            } else {
+                assert_eq!(decoded, plain);
+            }
+            // Like C zlib, one-shot output itself is available as history;
+            // the configured ring only limits already-returned output.
+            let mut output = vec![0u8; expected.len()];
+            let (decoded, status) =
+                decompress_slice(&mut output, &input, InflateConfig { window_bits: bits });
+            assert_eq!(status, ReturnCode::Ok);
+            assert_eq!(decoded, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inferred_zlib_window_sets_logical_extent_only_after_validation() -> Result<(), ReturnCode> {
+        let mut stream = InflateStream::new(InflateConfig { window_bits: 0 })?;
+        let mut output = [0u8; 1];
+        // CMF=0x18 advertises 512 bytes; 0x19 makes CMF/FLG divisible by 31.
+        let header = [0x18, 0x19];
+        stream.next_in = header.as_ptr().cast_mut();
+        stream.avail_in = 2;
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = 1;
+        // SAFETY: two live immutable header bytes and one exclusive output byte.
+        let status = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
+        assert_eq!(status, ReturnCode::Ok);
+        assert_eq!(stream.state.wbits, 9);
+        assert_eq!(stream.state.window.size(), 512);
+        assert_eq!(
+            reset_with_config(&mut stream, InflateConfig { window_bits: 0 }),
+            ReturnCode::Ok
+        );
+        // A valid FCHECK with impossible CINFO=8 must not resize or panic.
+        let invalid = [0x88, 0x1c];
+        stream.next_in = invalid.as_ptr().cast_mut();
+        stream.avail_in = 2;
+        // SAFETY: same live writable output and independent invalid header.
+        let status = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
+        assert_eq!(status, ReturnCode::DataError);
+        assert_eq!(stream.state.window.size(), 32768);
+        assert_eq!(stream.state.wbits, 0);
         Ok(())
     }
 

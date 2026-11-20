@@ -11,7 +11,8 @@ use crate::{adler32::adler32, crc32::Crc32Fold, weak_slice::WeakSliceMut};
 pub struct Window<'a> {
     buf: WeakSliceMut<'a, MaybeUninit<u8>>,
 
-    have: usize, // number of initialized/logically available bytes, bounded by the backing buffer
+    size: usize, // configured logical history capacity, at most the backing allocation
+    have: usize, // number of initialized/logically available bytes, bounded by size
     next: usize, // write head
 }
 
@@ -31,6 +32,7 @@ impl Window<'_> {
         Self {
             // SAFETY: the constructor contract grants this exact writable span uniquely.
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) },
+            size: len,
             have: 0,
             next: 0,
         }
@@ -50,7 +52,25 @@ impl Window<'_> {
 
     #[must_use]
     pub const fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Physical storage remains allocated across resets and size changes.
+    pub(super) const fn capacity(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Select the configured history extent within the owned storage.
+    /// The whole-buffer decoder has no history allocation and remains empty.
+    pub(super) fn set_size(&mut self, size: usize) {
+        if self.buf.is_empty() {
+            return;
+        }
+        assert!(size <= self.buf.len());
+        if size != self.size {
+            self.clear();
+            self.size = size;
+        }
     }
 
     /// Number of initialized logical history bytes, saturating at `size()`.
@@ -69,6 +89,7 @@ impl Window<'_> {
     pub const fn empty() -> Self {
         Self {
             buf: WeakSliceMut::empty(),
+            size: 0,
             have: 0,
             next: 0,
         }
@@ -86,11 +107,8 @@ impl Window<'_> {
     /// window's write cursor differs from the initialized prefix length.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        assert!(
-            self.have <= self.buf.len(),
-            "inflate history stays in-bounds"
-        );
-        if self.have < self.buf.len() {
+        assert!(self.have <= self.size, "inflate history stays in-bounds");
+        if self.have < self.size {
             assert_eq!(self.next, self.have, "partial inflate history is a prefix");
         }
         // SAFETY: before the circular window fills, `extend` initializes exactly `0..have` and
@@ -202,6 +220,7 @@ impl Window<'_> {
         Self {
             // SAFETY: clone_to guarantees the destination is uniquely writable for len bytes.
             buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr.cast(), len) },
+            size: self.size,
             have: self.have,
             next: self.next,
         }
