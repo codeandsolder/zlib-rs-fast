@@ -33,22 +33,79 @@ impl FastProducer {
     }
 }
 
-impl TokenProducer for FastProducer {
-    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+impl FastProducer {
+    fn produce_inner<const LOCAL: bool>(
+        &mut self,
+        state: &mut State<'_>,
+        allow_short_tail: bool,
+    ) -> ProduceStatus {
         loop {
-            if let FastPhase::SearchReady { literal, result } = self.phase {
-                self.phase = FastPhase::Ready;
+            let (literal, result) = match self.phase {
+                FastPhase::SearchReady { literal, result } if !LOCAL => {
+                    self.phase = FastPhase::Ready;
+                    (literal, Some(result))
+                }
+                _ => {
+                    if !LOCAL && self.phase != FastPhase::Ready {
+                        return ProduceStatus::MatchSearchError(
+                            MatchSearchError::OutstandingSearch,
+                        );
+                    }
+                    if state.lookahead == 0
+                        || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD)
+                    {
+                        return ProduceStatus::NeedInput;
+                    }
+
+                    if state.lookahead >= WANT_MIN_MATCH {
+                        if !LOCAL && self.match_source == MatchSourceKind::External {
+                            let literal = state.window.filled()[state.strstart];
+                            self.phase = FastPhase::AwaitingSearch { literal };
+                            return ProduceStatus::MatchSearch(MatchSearchWork::external());
+                        }
+                        let value = StandardHashCalc::first_four_bytes(
+                            &state.window.filled()[state.strstart..],
+                        );
+                        let literal = value.to_le_bytes()[0];
+                        let hash_head =
+                            StandardHashCalc::quick_insert_value(state, state.strstart, value);
+                        let result = if hash_head != 0
+                            && state.recent_hash_distance(hash_head).is_some()
+                        {
+                            let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
+                            if LOCAL
+                                || self
+                                    .match_source
+                                    .should_search_locally(state.max_chain_length)
+                            {
+                                match work.request(state) {
+                                    Ok(request) => Some(request.execute()),
+                                    Err(error) => return ProduceStatus::MatchSearchError(error),
+                                }
+                            } else {
+                                self.phase = FastPhase::AwaitingSearch { literal };
+                                return ProduceStatus::MatchSearch(work);
+                            }
+                        } else {
+                            None
+                        };
+                        (literal, result)
+                    } else {
+                        (state.window.filled()[state.strstart], None)
+                    }
+                }
+            };
+
+            if let Some(result) = result {
                 state.match_start = result.start;
                 let mut match_len = usize::from(result.length);
-
                 if match_len >= WANT_MIN_MATCH {
                     let block_ready = state.tally_dist(
                         state.strstart - usize::from(result.start),
                         match_len - STD_MIN_MATCH,
                     );
-
                     state.lookahead -= match_len;
-                    if self.match_source.maintains_hash_chain() {
+                    if LOCAL || self.match_source.maintains_hash_chain() {
                         if match_len <= usize::from(state.max_insert_length)
                             && state.lookahead >= WANT_MIN_MATCH
                         {
@@ -58,9 +115,8 @@ impl TokenProducer for FastProducer {
                             state.strstart += match_len;
                         } else {
                             state.strstart += match_len;
-
-                            // zlib-ng performs this insertion unconditionally and relies on its
-                            // high-water zero padding when fewer than STD_MIN_MATCH tail bytes remain.
+                            // Preserve the normal hash insert when a complete
+                            // tail probe is available.
                             if state.lookahead >= STD_MIN_MATCH {
                                 StandardHashCalc::quick_insert_string(
                                     state,
@@ -71,71 +127,31 @@ impl TokenProducer for FastProducer {
                     } else {
                         state.strstart += match_len;
                     }
-
                     if block_ready {
                         return ProduceStatus::BlockReady(BlockContinuation::None);
                     }
                     continue;
                 }
-
-                let block_ready = state.tally_lit(literal);
-                state.lookahead -= 1;
-                state.strstart += 1;
-                if block_ready {
-                    return ProduceStatus::BlockReady(BlockContinuation::None);
-                }
-                continue;
             }
-
-            if self.phase != FastPhase::Ready {
-                return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
-            }
-
-            if state.lookahead == 0 || (!allow_short_tail && state.lookahead < MIN_LOOKAHEAD) {
-                return ProduceStatus::NeedInput;
-            }
-
-            let literal = if state.lookahead >= WANT_MIN_MATCH {
-                if self.match_source == MatchSourceKind::External {
-                    let literal = state.window.filled()[state.strstart];
-                    self.phase = FastPhase::AwaitingSearch { literal };
-                    return ProduceStatus::MatchSearch(MatchSearchWork::external());
-                }
-
-                let value =
-                    StandardHashCalc::first_four_bytes(&state.window.filled()[state.strstart..]);
-                // The low byte of this little-endian four-byte probe is exactly
-                // the literal at strstart; keep its byte identity explicit.
-                let literal = value.to_le_bytes()[0];
-                let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, value);
-
-                if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
-                    let work = MatchSearchWork::new(hash_head, MatchSearchKind::Standard);
-                    if self
-                        .match_source
-                        .should_search_locally(state.max_chain_length)
-                    {
-                        let result = match work.request(state) {
-                            Ok(request) => request.execute(),
-                            Err(error) => return ProduceStatus::MatchSearchError(error),
-                        };
-                        self.phase = FastPhase::SearchReady { literal, result };
-                        continue;
-                    }
-                    self.phase = FastPhase::AwaitingSearch { literal };
-                    return ProduceStatus::MatchSearch(work);
-                }
-                literal
-            } else {
-                state.window.filled()[state.strstart]
-            };
-
             let block_ready = state.tally_lit(literal);
             state.lookahead -= 1;
             state.strstart += 1;
             if block_ready {
                 return ProduceStatus::BlockReady(BlockContinuation::None);
             }
+        }
+    }
+}
+
+impl TokenProducer for FastProducer {
+    fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        if matches!(self.match_source, MatchSourceKind::LocalHashChain) {
+            if self.phase != FastPhase::Ready {
+                return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
+            }
+            self.produce_inner::<true>(state, allow_short_tail)
+        } else {
+            self.produce_inner::<false>(state, allow_short_tail)
         }
     }
 
