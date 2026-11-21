@@ -2588,17 +2588,12 @@ fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
     ))
 }
 
-/// Continue the fast loop using a reserved iteration, or reserve a new group.
+/// Reserve a bounded group of iterations from the actual cursor state.
 #[inline]
-fn fast_iteration_continues<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
-    quota: &mut usize,
+fn fast_iteration_count<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
     reader: &BitReader<'_>,
     output: &O,
-) -> bool {
-    if *quota != 0 {
-        *quota -= 1;
-        return true;
-    }
+) -> usize {
     // Logical whole bytes decrease by at most rounded-up bit consumption;
     // raw input decreases by at most both refills' combined advancement.
     // Reserve the entry minima in addition to every unchecked continuation.
@@ -2612,11 +2607,10 @@ fn fast_iteration_continues<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutpu
     };
     let left = output.remaining();
     if remaining < INFLATE_FAST_MIN_HAVE || left < INFLATE_FAST_MIN_LEFT {
-        return false;
+        return 0;
     }
-    *quota = ((remaining - INFLATE_FAST_MIN_HAVE) / bytes_per_iteration)
-        .min((left - INFLATE_FAST_MIN_LEFT) / INFLATE_FAST_MIN_LEFT);
-    true
+    1 + ((remaining - INFLATE_FAST_MIN_HAVE) / bytes_per_iteration)
+        .min((left - INFLATE_FAST_MIN_LEFT) / INFLATE_FAST_MIN_LEFT)
 }
 
 /// Fast literal/length/distance decoder.
@@ -2648,7 +2642,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
     };
 
     let mut bad = None;
-    let mut quota = 0usize;
+    let mut iterations = 1usize;
 
     if bit_reader.bits_in_buffer() < 10 {
         // The entry precondition already guarantees 15 unread input bytes.
@@ -2656,49 +2650,40 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
     }
 
     'outer: loop {
-        // This condition is ensured above for the first iteration of the `outer` loop. For
-        // subsequent iterations, the loop continuation condition is
-        // `bit_reader.bytes_remaining_including_buffer() > 15`. And because the buffer
-        // contributes at most 7 bytes to the result of bit_reader.bytes_remaining_including_buffer(),
-        // that means that the slice contains at least 8 bytes.
-        debug_assert!(
-            bit_reader.bytes_remaining() >= 8
-                && bit_reader.bytes_remaining_including_buffer() >= 15
-        );
+        for _ in 0..iterations {
+            // This condition is ensured above for the first iteration of the `outer` loop. For
+            // subsequent iterations, the loop continuation condition is
+            // `bit_reader.bytes_remaining_including_buffer() > 15`. And because the buffer
+            // contributes at most 7 bytes to the result of bit_reader.bytes_remaining_including_buffer(),
+            // that means that the slice contains at least 8 bytes.
+            debug_assert!(
+                bit_reader.bytes_remaining() >= 8
+                    && bit_reader.bytes_remaining_including_buffer() >= 15
+            );
 
-        debug_assert!(output.remaining() >= INFLATE_FAST_MIN_LEFT);
-        let mut here = {
-            let bits = bit_reader.bits_in_buffer();
-            let hold = bit_reader.hold();
+            debug_assert!(output.remaining() >= INFLATE_FAST_MIN_LEFT);
+            let mut here = {
+                let bits = bit_reader.bits_in_buffer();
+                let hold = bit_reader.hold();
 
-            // Safety: As described in the comments for the debug_assert at the start of
-            // the `outer` loop, it is guaranteed that `bit_reader.bytes_remaining() >= 8` here,
-            // which satisfies `refill`'s eight-byte requirement. And, because the total
-            // number of bytes in `bit_reader`'s buffer plus its slice is at least 15, and
-            // `refill` moves at most 7 bytes from the slice to the buffer, the slice will still
-            // contain at least 8 bytes after this `refill` call.
-            bit_reader.refill();
-            // After the refill, there will be at least 8 bytes left in the bit_reader's slice.
-            debug_assert!(bit_reader.bytes_remaining() >= 8);
+                // Safety: As described in the comments for the debug_assert at the start of
+                // the `outer` loop, it is guaranteed that `bit_reader.bytes_remaining() >= 8` here,
+                // which satisfies `refill`'s eight-byte requirement. And, because the total
+                // number of bytes in `bit_reader`'s buffer plus its slice is at least 15, and
+                // `refill` moves at most 7 bytes from the slice to the buffer, the slice will still
+                // contain at least 8 bytes after this `refill` call.
+                bit_reader.refill();
+                // After the refill, there will be at least 8 bytes left in the bit_reader's slice.
+                debug_assert!(bit_reader.bytes_remaining() >= 8);
 
-            // in most cases, the read can be interleaved with the logic
-            // based on benchmarks this matters in practice. wild.
-            if bits as usize >= state.len_table.bits {
-                lcode[BitBuffer::lookup_index(hold, lmask)]
-            } else {
-                lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)]
-            }
-        };
-
-        if here.op == 0 {
-            let Ok(literal) = u8::try_from(here.val) else {
-                bad = Some("invalid literal/length code\0");
-                state.mode = Mode::Bad;
-                break 'outer;
+                // in most cases, the read can be interleaved with the logic
+                // based on benchmarks this matters in practice. wild.
+                if bits as usize >= state.len_table.bits {
+                    lcode[BitBuffer::lookup_index(hold, lmask)]
+                } else {
+                    lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)]
+                }
             };
-            output.push(literal);
-            bit_reader.drop_bits(here.bits);
-            here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
 
             if here.op == 0 {
                 let Ok(literal) = u8::try_from(here.val) else {
@@ -2709,54 +2694,63 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 output.push(literal);
                 bit_reader.drop_bits(here.bits);
                 here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
+
+                if here.op == 0 {
+                    let Ok(literal) = u8::try_from(here.val) else {
+                        bad = Some("invalid literal/length code\0");
+                        state.mode = Mode::Bad;
+                        break 'outer;
+                    };
+                    output.push(literal);
+                    bit_reader.drop_bits(here.bits);
+                    here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
+                }
             }
-        }
 
-        'dolen: loop {
-            bit_reader.drop_bits(here.bits);
-            let op = here.op;
+            'dolen: loop {
+                bit_reader.drop_bits(here.bits);
+                let op = here.op;
 
-            if op == 0 {
-                let Ok(literal) = u8::try_from(here.val) else {
+                if op == 0 {
+                    let Ok(literal) = u8::try_from(here.val) else {
+                        bad = Some("invalid literal/length code\0");
+                        state.mode = Mode::Bad;
+                        break 'outer;
+                    };
+                    output.push(literal);
+                } else if op & 16 != 0 {
+                    let op = op & MAX_BITS;
+                    let len = here.val + bit_reader.bits_u16(usize::from(op));
+                    bit_reader.drop_bits(op);
+
+                    if let Err(msg) =
+                        decode_fast_distance(state, &mut bit_reader, output, dcode, dmask, len)
+                    {
+                        bad = Some(msg);
+                        state.mode = Mode::Bad;
+                        break 'outer;
+                    }
+                } else if (op & 64) == 0 {
+                    // 2nd level length code
+                    here = lcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
+                    continue 'dolen;
+                } else if op & 32 != 0 {
+                    // end of block
+                    state.mode = Mode::Type;
+                    break 'outer;
+                } else {
                     bad = Some("invalid literal/length code\0");
                     state.mode = Mode::Bad;
                     break 'outer;
-                };
-                output.push(literal);
-            } else if op & 16 != 0 {
-                let op = op & MAX_BITS;
-                let len = here.val + bit_reader.bits_u16(usize::from(op));
-                bit_reader.drop_bits(op);
-
-                if let Err(msg) =
-                    decode_fast_distance(state, &mut bit_reader, output, dcode, dmask, len)
-                {
-                    bad = Some(msg);
-                    state.mode = Mode::Bad;
-                    break 'outer;
                 }
-            } else if (op & 64) == 0 {
-                // 2nd level length code
-                here = lcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
-                continue 'dolen;
-            } else if op & 32 != 0 {
-                // end of block
-                state.mode = Mode::Type;
-                break 'outer;
-            } else {
-                bad = Some("invalid literal/length code\0");
-                state.mode = Mode::Bad;
-                break 'outer;
+
+                break 'dolen;
             }
-
-            break 'dolen;
         }
-
-        if fast_iteration_continues::<COUNT_BUFFERED_INPUT, _>(&mut quota, &bit_reader, output) {
-            continue;
+        iterations = fast_iteration_count::<COUNT_BUFFERED_INPUT, _>(&bit_reader, output);
+        if iterations == 0 {
+            break 'outer;
         }
-
-        break 'outer;
     }
 
     // return unused bytes (on entry, bits < 8, so in won't go too far back)
