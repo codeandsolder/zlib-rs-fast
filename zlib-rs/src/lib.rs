@@ -34,6 +34,8 @@ cfg_select! {
 }
 
 mod abi_cursor;
+#[cfg(feature = "std")]
+mod batch;
 mod cpu_features;
 mod output_buffer;
 mod stable;
@@ -45,13 +47,15 @@ pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};
 pub use deflate::{DeflateConfig, Method, Strategy};
 pub use inflate::InflateConfig;
 
+#[cfg(feature = "parallel")]
+pub use batch::BatchCodec;
+#[cfg(feature = "std")]
+pub use batch::{decompress_slices_batch, BatchDecompressResult, BatchJob};
 #[cfg(feature = "near-optimal")]
 pub use deflate::compress_slice_near_optimal;
-#[cfg(feature = "parallel")]
-pub use deflate::BatchCompressor;
 pub use deflate::{compress_bound, compress_slice};
 #[cfg(feature = "std")]
-pub use deflate::{compress_slices_batch, BatchCompressJob, BatchCompressResult};
+pub use deflate::{compress_slices_batch, BatchCompressResult};
 #[cfg(feature = "gpu")]
 pub use deflate::{
     compress_slices_batch_gpu, GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable,
