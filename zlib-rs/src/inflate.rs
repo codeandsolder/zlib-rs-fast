@@ -363,6 +363,7 @@ impl Drop for InflateStream<'_> {
 }
 
 const MAX_BITS: u8 = 15; // maximum number of bits in a code
+const MAX_LENGTH_EXTRA_BITS: u8 = 5;
 const MAX_DIST_EXTRA_BITS: u8 = 13; // maximum number of extra distance bits
 
 /// Decompresses `input` into the provided `output` buffer.
@@ -1021,7 +1022,16 @@ const fn zswap32(q: u32) -> u32 {
 }
 
 const INFLATE_FAST_MIN_HAVE: usize = 15;
-const INFLATE_FAST_MIN_LEFT: usize = 260;
+// One outer iteration can produce two literals and one maximum-length match.
+const INFLATE_FAST_MIN_LEFT: usize = 2 + crate::deflate::STD_MAX_MATCH;
+// Two literal symbols, one length symbol, and one distance symbol, each
+// up to MAX_BITS, followed by their maximum extra-bit fields.
+const MAX_FAST_ITERATION_BITS: usize =
+    4 * MAX_BITS as usize + MAX_LENGTH_EXTRA_BITS as usize + MAX_DIST_EXTRA_BITS as usize;
+const MAX_FAST_ITERATION_BYTES: usize = MAX_FAST_ITERATION_BITS.div_ceil(8);
+// Callback decoding counts raw input rather than the logical bit reservoir.
+// One loop iteration performs at most two eight-byte refills.
+const MAX_FAST_ITERATION_RAW_BYTES: usize = 2 * bitreader::MAX_REFILL_BYTES as usize;
 
 /// Caller-output cursor for one ordinary inflate call.
 ///
@@ -2578,6 +2588,37 @@ fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
     ))
 }
 
+/// Continue the fast loop using a reserved iteration, or reserve a new group.
+#[inline]
+fn fast_iteration_continues<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
+    quota: &mut usize,
+    reader: &BitReader<'_>,
+    output: &O,
+) -> bool {
+    if *quota != 0 {
+        *quota -= 1;
+        return true;
+    }
+    // Logical whole bytes decrease by at most rounded-up bit consumption;
+    // raw input decreases by at most both refills' combined advancement.
+    // Reserve the entry minima in addition to every unchecked continuation.
+    let (remaining, bytes_per_iteration) = if COUNT_BUFFERED_INPUT {
+        (
+            reader.bytes_remaining_including_buffer(),
+            MAX_FAST_ITERATION_BYTES,
+        )
+    } else {
+        (reader.bytes_remaining(), MAX_FAST_ITERATION_RAW_BYTES)
+    };
+    let left = output.remaining();
+    if remaining < INFLATE_FAST_MIN_HAVE || left < INFLATE_FAST_MIN_LEFT {
+        return false;
+    }
+    *quota = ((remaining - INFLATE_FAST_MIN_HAVE) / bytes_per_iteration)
+        .min((left - INFLATE_FAST_MIN_LEFT) / INFLATE_FAST_MIN_LEFT);
+    true
+}
+
 /// Fast literal/length/distance decoder.
 ///
 /// Callers enter only when at least `INFLATE_FAST_MIN_HAVE` bytes and
@@ -2607,6 +2648,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
     };
 
     let mut bad = None;
+    let mut quota = 0usize;
 
     if bit_reader.bits_in_buffer() < 10 {
         // The entry precondition already guarantees 15 unread input bytes.
@@ -2624,6 +2666,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 && bit_reader.bytes_remaining_including_buffer() >= 15
         );
 
+        debug_assert!(output.remaining() >= INFLATE_FAST_MIN_LEFT);
         let mut here = {
             let bits = bit_reader.bits_in_buffer();
             let hold = bit_reader.hold();
@@ -2709,16 +2752,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             break 'dolen;
         }
 
-        // For normal `inflate`, include the bits in the bit_reader buffer in the count of available bytes.
-        // Ordinary inflate considers retained bytes in the bit reservoir for
-        // its fast-loop threshold, while the callback decoder counts only the
-        // unread callback span. Specialize that input policy at compile time.
-        let remaining = if COUNT_BUFFERED_INPUT {
-            bit_reader.bytes_remaining_including_buffer()
-        } else {
-            bit_reader.bytes_remaining()
-        };
-        if remaining >= INFLATE_FAST_MIN_HAVE && output.remaining() >= INFLATE_FAST_MIN_LEFT {
+        if fast_iteration_continues::<COUNT_BUFFERED_INPUT, _>(&mut quota, &bit_reader, output) {
             continue;
         }
 
@@ -5277,8 +5311,8 @@ mod tests {
         assert_eq!(code, ReturnCode::Ok);
         let compressed = compressed.to_vec();
 
-        for input_chunk in [1, 2, 3, 5, 7, 13] {
-            for output_chunk in [1, 3, 7, 31] {
+        for input_chunk in [1, 2, 3, 5, 7, 13, 14, 15, 24, 25, 26, 35, 127] {
+            for output_chunk in [1, 3, 7, 31, 259, 260, 261, 519, 520, 521, 1024] {
                 inflate_fragmented(&compressed, &input, input_chunk, output_chunk)?;
             }
         }
