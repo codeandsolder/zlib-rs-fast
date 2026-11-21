@@ -2,6 +2,8 @@
 use core::marker::PhantomData;
 use std::vec::Vec;
 
+#[cfg(test)]
+use super::compress_slice;
 #[cfg(feature = "gpu")]
 use super::gpu_match::{GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 #[cfg(feature = "gpu")]
@@ -16,9 +18,10 @@ use super::{
     longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
     CallCursors, DeflateFlush, DeflateStream, State, Status,
 };
-use super::{compress_slice, DeflateConfig, ReturnCode};
+use super::{compress_into, DeflateConfig, ReturnCode};
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
+use crate::output_buffer::WritableBytes;
 #[cfg(feature = "parallel")]
 use crate::BatchCodec;
 use crate::BatchJob;
@@ -248,19 +251,27 @@ fn compress_external_job(
         MatchSearchWork,
     ) -> Result<MatchSearchResult, MatchSearchError>,
 ) -> BatchCompressResult {
-    let mut runtime =
-        match BatchRuntime::new(job_index, job.input, &mut *job.output, config, algorithm) {
-            Ok(runtime) => runtime,
-            Err(result) => return result,
-        };
-    runtime.run(resolve)
+    // SAFETY: BatchRuntime accounts for only initialized output bytes via
+    // the full-width output budget, including all failure paths.
+    unsafe {
+        job.write(|input, output| {
+            let result = match BatchRuntime::new(job_index, input, output, config, algorithm) {
+                Ok(mut runtime) => runtime.run(resolve),
+                Err(result) => result,
+            };
+            (result.written, result)
+        })
+    }
 }
 
 fn compress_cpu_job(job: &mut BatchJob<'_>, config: DeflateConfig) -> BatchCompressResult {
-    let (output, code) = compress_slice(&mut *job.output, job.input, config);
-    BatchCompressResult {
-        written: output.len(),
-        code,
+    // SAFETY: compress_into reports only initialized bytes within its
+    // destination capacity and retains no reference after returning.
+    unsafe {
+        job.write(|input, output| {
+            let (written, code) = compress_into(output, input, config, crate::DeflateFlush::Finish);
+            (written, BatchCompressResult { written, code })
+        })
     }
 }
 
@@ -298,13 +309,13 @@ impl<'a> BatchRuntime<'a> {
     fn new(
         job_index: usize,
         input: &'a [u8],
-        output: &'a mut [u8],
+        output: &'a mut (impl WritableBytes + ?Sized),
         config: DeflateConfig,
         algorithm: Algorithm,
     ) -> Result<Self, BatchCompressResult> {
         let mut stream =
             DeflateStream::new(config).map_err(|code| BatchCompressResult { written: 0, code })?;
-        stream.next_out = output.as_mut_ptr();
+        stream.next_out = output.byte_ptr();
         // The temporary Rust owner releases its State if construction of a
         // compatible token driver fails; no partially initialized C shell.
         let Some(driver) = StandardDriver::for_algorithm_with_match_source(
@@ -555,7 +566,7 @@ mod tests {
         let algorithm = configured_algorithm(DeflateConfig::new(6))
             .ok_or("standard compressor must have an algorithm")?;
         assert!(matches!(
-            BatchRuntime::new(0, input, &mut output, invalid, algorithm),
+            BatchRuntime::new(0, input, &mut output[..], invalid, algorithm),
             Err(BatchCompressResult {
                 code: ReturnCode::StreamError,
                 written: 0
@@ -565,7 +576,7 @@ mod tests {
         let stored = configured_algorithm(DeflateConfig::new(0))
             .ok_or("stored compressor must have an algorithm")?;
         assert!(matches!(
-            BatchRuntime::new(0, input, &mut output, DeflateConfig::new(0), stored),
+            BatchRuntime::new(0, input, &mut output[..], DeflateConfig::new(0), stored),
             Err(BatchCompressResult {
                 code: ReturnCode::StreamError,
                 written: 0
@@ -582,7 +593,7 @@ mod tests {
         let input = b"scheduled output remains bounded by its caller buffer";
         let mut output = [0u8; 128];
         let output_capacity = output.len();
-        let mut runtime = BatchRuntime::new(0, input, &mut output, config, algorithm)
+        let mut runtime = BatchRuntime::new(0, input, &mut output[..], config, algorithm)
             .map_err(|_| "batch runtime failed initialization")?;
 
         let actual = runtime.output_budget.processed(runtime.stream.avail_out);
@@ -603,7 +614,7 @@ mod tests {
         let runtime = BatchRuntime::new(
             0,
             b"external match table",
-            &mut output,
+            &mut output[..],
             DeflateConfig::new(2),
             Algorithm::Fast,
         )
@@ -654,7 +665,7 @@ mod tests {
         let mut output = [0u8; 512];
         let config = DeflateConfig::new(2);
         let algorithm = configured_algorithm(config).ok_or("valid GPU test algorithm missing")?;
-        let mut runtime = BatchRuntime::new(0, &input, &mut output, config, algorithm)
+        let mut runtime = BatchRuntime::new(0, &input, &mut output[..], config, algorithm)
             .map_err(|_| "unable to initialize test compressor")?;
         // The whole input is offered but no bytes consumed yet. The live C
         // counter may have wrapped without affecting this absolute position.
@@ -805,6 +816,32 @@ mod tests {
                 );
                 assert_eq!(parallel_outputs, batch_outputs);
             }
+            let mut vector_outputs = vec![vec![0x79; 3]; inputs.len()];
+            let mut vector_jobs = inputs
+                .iter()
+                .zip(&capacities)
+                .zip(&mut vector_outputs)
+                .map(|((input, &capacity), output)| BatchJob::with_vec(input, output, capacity))
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                compress_slices_batch_gpu(&mut vector_jobs, config, &searcher, 32)?,
+                results
+            );
+            #[cfg(feature = "parallel")]
+            {
+                let pool = BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("worker count")?)?;
+                assert_eq!(
+                    pool.compress_gpu(&mut vector_jobs, config, &searcher, 32)?,
+                    results
+                );
+            }
+            drop(vector_jobs);
+            for (vector, (reference, result)) in vector_outputs
+                .iter()
+                .zip(batch_outputs.iter().zip(&results))
+            {
+                assert_eq!(vector, &reference[..result.written]);
+            }
             for (index, ((input, &capacity), result)) in
                 inputs.iter().zip(&capacities).zip(results).enumerate()
             {
@@ -895,7 +932,7 @@ mod tests {
         let mut runtime = BatchRuntime::new(
             0,
             input,
-            &mut output,
+            &mut output[..],
             DeflateConfig::new(2),
             Algorithm::Fast,
         )
@@ -1144,6 +1181,38 @@ mod tests {
                     reference,
                     "parallel output changed for job {index}, {config:?}"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_vectors_reuse_capacity_and_commit_only_written_prefix(
+    ) -> Result<(), std::collections::TryReserveError> {
+        let input = b"vector-backed-batch/".repeat(8000);
+        for level in [0, 1, 6, 9] {
+            let config = DeflateConfig::new(level);
+            for cap in [0, 1, 31, compress_bound(input.len())] {
+                let (reference, code) = independent(&input, config, cap);
+                let mut vector = Vec::with_capacity(cap.max(16));
+                vector.extend_from_slice(b"previous output");
+                let original = vector.as_ptr();
+                let mut slice = vec![0u8; cap];
+                let mut jobs = [
+                    BatchJob::with_vec(&input, &mut vector, cap)?,
+                    BatchJob::new(&input, &mut slice),
+                ];
+                let expected = [BatchCompressResult {
+                    written: reference.len(),
+                    code,
+                }; 2];
+                for _ in 0..2 {
+                    assert_eq!(compress_slices_batch(&mut jobs, config), expected);
+                }
+                drop(jobs);
+                assert_eq!(vector.as_ptr(), original);
+                assert_eq!(vector, reference);
+                assert_eq!(&slice[..reference.len()], reference);
             }
         }
         Ok(())
