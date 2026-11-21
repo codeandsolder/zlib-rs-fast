@@ -1509,8 +1509,6 @@ impl PackedBits {
 
 #[inline]
 const fn encode_len(ltree: &[Value], lc: usize) -> PackedBits {
-    let mut lc = lc;
-
     /* Send the length code, len is the match length - STD_MIN_MATCH */
     let code = self::trees_tbl::LENGTH_CODE[lc] as usize;
     let c = code + LITERALS + 1;
@@ -1518,10 +1516,10 @@ const fn encode_len(ltree: &[Value], lc: usize) -> PackedBits {
 
     let mut encoded = PackedBits::code(ltree[c]);
     let extra = StaticTreeDesc::EXTRA_LBITS[code];
-    if extra != 0 {
-        lc -= self::trees_tbl::BASE_LENGTH[code] as usize;
-        encoded.append(PackedBits::new(lc as u64, extra));
-    }
+    // Exact zero-extra symbols have a base equal to their length,
+    // including the special 258-byte match (delta 255).
+    let delta = lc - self::trees_tbl::BASE_LENGTH[code] as usize;
+    encoded.append(PackedBits::new(delta as u64, extra));
 
     encoded
 }
@@ -1529,16 +1527,14 @@ const fn encode_len(ltree: &[Value], lc: usize) -> PackedBits {
 #[inline]
 const fn encode_dist(dtree: &[Value], dist: u16) -> PackedBits {
     assert!(dist != 0, "DEFLATE match distance must be nonzero");
-    let mut dist = dist - 1;
+    let dist = dist - 1;
     let code = State::d_code(dist as usize) as usize;
     assert!(code < D_CODES, "bad d_code");
 
     let mut encoded = PackedBits::code(dtree[code]);
     let extra = StaticTreeDesc::EXTRA_DBITS[code];
-    if extra != 0 {
-        dist -= self::trees_tbl::BASE_DIST[code];
-        encoded.append(PackedBits::new(dist as u64, extra));
-    }
+    let delta = dist - self::trees_tbl::BASE_DIST[code];
+    encoded.append(PackedBits::new(delta as u64, extra));
 
     encoded
 }
@@ -5197,6 +5193,40 @@ mod test {
             assert!(end(&mut stream).is_ok());
         }
         Ok(())
+    }
+
+    #[test]
+    fn extra_bits_cover_the_complete_wire_domain() {
+        // The final length symbol represents exactly 258, not a second
+        // range starting at delta zero. Every valid zero-extra symbol
+        // must have a delta of zero; all others fit their stated width.
+        for length in 0..=u8::MAX {
+            let lc = usize::from(length);
+            let code = usize::from(trees_tbl::LENGTH_CODE[lc]);
+            let delta = lc - usize::from(trees_tbl::BASE_LENGTH[code]);
+            let extra = StaticTreeDesc::EXTRA_LBITS[code];
+            assert!(delta < (1usize << extra));
+            let symbol = trees_tbl::STATIC_LTREE[code + LITERALS + 1];
+            let packed = encode_len(&trees_tbl::STATIC_LTREE, lc);
+            assert_eq!(
+                packed.value,
+                u64::from(symbol.code()) | ((delta as u64) << symbol.len())
+            );
+            assert_eq!(u16::from(packed.len), symbol.len() + u16::from(extra));
+        }
+        for distance in 1..=32768u16 {
+            let code = usize::from(State::d_code(usize::from(distance - 1)));
+            let delta = distance - 1 - trees_tbl::BASE_DIST[code];
+            let extra = StaticTreeDesc::EXTRA_DBITS[code];
+            assert!(delta < (1u16 << extra));
+            let symbol = trees_tbl::STATIC_DTREE[code];
+            let packed = encode_dist(&trees_tbl::STATIC_DTREE, distance);
+            assert_eq!(
+                packed.value,
+                u64::from(symbol.code()) | (u64::from(delta) << symbol.len())
+            );
+            assert_eq!(u16::from(packed.len), symbol.len() + u16::from(extra));
+        }
     }
 
     #[test]
