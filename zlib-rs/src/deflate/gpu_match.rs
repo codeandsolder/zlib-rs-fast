@@ -1050,11 +1050,74 @@ fn build_predecessors(input: &[u8], max_dist: u32) -> Result<Vec<u32>, GpuMatchE
     let valid_positions = input.len().saturating_sub(2);
     let positions = u32::try_from(valid_positions)
         .map_err(|_| GpuMatchError("GPU hash index exceeds u32::MAX positions".into()))?;
-    let mut heads = vec![NO_PREDECESSOR; HASH_SIZE];
-    // Nonempty short inputs still need a nonzero-sized storage binding.
-    let mut predecessors = vec![0; valid_positions.div_ceil(2).max(1)];
+    // For short inputs the dense 65,536-entry head array dominates
+    // preparation. A small exact-key table retains the same bucket
+    // identity (including collisions in hash3) with at most half occupancy.
+    if valid_positions <= SMALL_HEADS_CAPACITY / 2 {
+        let mut heads = SmallHeads::default();
+        Ok(build_predecessor_words(
+            input,
+            positions,
+            max_dist,
+            |hash, position| heads.replace(hash, position),
+        ))
+    } else {
+        let mut heads = vec![NO_PREDECESSOR; HASH_SIZE];
+        Ok(build_predecessor_words(
+            input,
+            positions,
+            max_dist,
+            |hash, position| core::mem::replace(&mut heads[hash], position),
+        ))
+    }
+}
+
+// At most 256 distinct keys in a 512-slot table. Position+1 fits in
+// the low 16 bits and reserves zero for an unused slot, even for hash 0.
+const SMALL_HEADS_CAPACITY: usize = 512;
+struct SmallHeads([u32; SMALL_HEADS_CAPACITY]);
+
+impl Default for SmallHeads {
+    fn default() -> Self {
+        Self([0; SMALL_HEADS_CAPACITY])
+    }
+}
+
+impl SmallHeads {
+    #[inline]
+    fn replace(&mut self, hash: usize, position: u32) -> u32 {
+        let mask = SMALL_HEADS_CAPACITY - 1;
+        let Ok(key) = u16::try_from(hash) else {
+            unreachable!("GPU hash key exceeds its 16-bit domain");
+        };
+        let key = u32::from(key) << 16;
+        debug_assert!(position as usize <= SMALL_HEADS_CAPACITY / 2);
+        let mut slot = hash & mask;
+        loop {
+            let old = self.0[slot];
+            if old == 0 || old & 0xffff_0000 == key {
+                self.0[slot] = key | (position + 1);
+                return if old == 0 {
+                    NO_PREDECESSOR
+                } else {
+                    (old & 0xffff) - 1
+                };
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
+fn build_predecessor_words(
+    input: &[u8],
+    positions: u32,
+    max_dist: u32,
+    mut replace_head: impl FnMut(usize, u32) -> u32,
+) -> Vec<u32> {
+    // Nonempty short inputs still require a nonzero-sized array.
+    let mut predecessors = vec![0; (positions as usize).div_ceil(2).max(1)];
     for (position, bytes) in (0..positions).zip(input.windows(3)) {
-        let previous = core::mem::replace(&mut heads[hash3(bytes)], position);
+        let previous = replace_head(hash3(bytes), position);
         if previous != NO_PREDECESSOR {
             let distance = position - previous;
             if distance < max_dist {
@@ -1062,7 +1125,7 @@ fn build_predecessors(input: &[u8], max_dist: u32) -> Result<Vec<u32>, GpuMatchE
             }
         }
     }
-    Ok(predecessors)
+    predecessors
 }
 
 #[cfg(test)]
@@ -1078,6 +1141,49 @@ fn hash3(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_heads_preserve_dense_chain_semantics() -> Result<(), GpuMatchError> {
+        let mut seed = 12345u32;
+        let mut random = [0; 260];
+        for value in &mut random {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *value = seed.to_le_bytes()[0];
+        }
+        let repeats = b"abc01234".repeat(33);
+        for input in [&random[..], repeats.as_slice()] {
+            for len in 0..=input.len() {
+                let input = &input[..len];
+                let positions = u32::try_from(input.len().saturating_sub(2))
+                    .map_err(|e| GpuMatchError(e.to_string()))?;
+                for max_dist in [1, 2, 15, 64, DEFAULT_MAX_DIST] {
+                    let mut dense = vec![NO_PREDECESSOR; HASH_SIZE];
+                    let expected =
+                        build_predecessor_words(input, positions, max_dist, |hash, position| {
+                            core::mem::replace(&mut dense[hash], position)
+                        });
+                    assert_eq!(
+                        build_predecessors(input, max_dist)?,
+                        expected,
+                        "len={len}, dist={max_dist}"
+                    );
+                }
+            }
+        }
+        // All keys probe the same initial slot; exact identities and
+        // replacement values remain distinct at maximum occupancy.
+        let mut heads = SmallHeads::default();
+        for i in 0..128usize {
+            for key in [i * 512, i * 512 + 1] {
+                let pos = u32::try_from(i).map_err(|e| GpuMatchError(e.to_string()))?;
+                assert_eq!(heads.replace(key, pos), NO_PREDECESSOR);
+                assert_eq!(heads.replace(key, 256), pos);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn predecessors_match_reverse_bucket_prefixes() -> Result<(), GpuMatchError> {
