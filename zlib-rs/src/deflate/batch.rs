@@ -21,6 +21,7 @@ use super::{
 use super::{compress_into, DeflateConfig, ReturnCode};
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
+#[cfg(any(feature = "gpu", test))]
 use crate::output_buffer::WritableBytes;
 #[cfg(feature = "parallel")]
 use crate::BatchCodec;
@@ -301,7 +302,7 @@ struct BatchRuntime<'a> {
     driver: StandardDriver,
     input_budget: SliceBudget,
     output_budget: SliceBudget,
-    _buffers: PhantomData<(&'a [u8], &'a mut [u8])>,
+    _buffers: PhantomData<(&'a [u8], &'a mut [core::mem::MaybeUninit<u8>])>,
 }
 
 #[cfg(any(feature = "gpu", test))]

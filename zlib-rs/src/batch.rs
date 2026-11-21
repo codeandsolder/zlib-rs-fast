@@ -13,7 +13,9 @@ pub struct BatchJob<'a> {
 }
 
 /// Both destinations expose only the capacity explicitly selected by the caller.
-pub(crate) enum BatchOutput<'a> {
+pub(crate) struct BatchOutput<'a>(Destination<'a>);
+
+enum Destination<'a> {
     Slice(&'a mut [u8]),
     Vector {
         output: &'a mut Vec<u8>,
@@ -24,17 +26,20 @@ pub(crate) enum BatchOutput<'a> {
 impl WritableBytes for BatchOutput<'_> {
     #[inline]
     fn byte_ptr(&mut self) -> *mut u8 {
-        match self {
-            Self::Slice(output) => output.as_mut_ptr(),
-            Self::Vector { output, .. } => output.as_mut_ptr(),
+        match &mut self.0 {
+            Destination::Slice(output) => output.as_mut_ptr(),
+            Destination::Vector { output, limit } => {
+                debug_assert!(output.is_empty() && output.capacity() >= *limit);
+                output.spare_capacity_mut()[..*limit].as_mut_ptr().cast()
+            }
         }
     }
 
     #[inline]
     fn len(&self) -> usize {
-        match self {
-            Self::Slice(output) => output.len(),
-            Self::Vector { limit, .. } => *limit,
+        match &self.0 {
+            Destination::Slice(output) => output.len(),
+            Destination::Vector { limit, .. } => *limit,
         }
     }
 }
@@ -45,7 +50,7 @@ impl<'a> BatchJob<'a> {
     pub const fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
         Self {
             input,
-            output: BatchOutput::Slice(output),
+            output: BatchOutput(Destination::Slice(output)),
         }
     }
 
@@ -64,7 +69,7 @@ impl<'a> BatchJob<'a> {
         output.try_reserve_exact(limit.saturating_sub(output.len()))?;
         Ok(Self {
             input,
-            output: BatchOutput::Vector { output, limit },
+            output: BatchOutput(Destination::Vector { output, limit }),
         })
     }
 
@@ -77,7 +82,7 @@ impl<'a> BatchJob<'a> {
         &mut self,
         operation: impl FnOnce(&[u8], &mut BatchOutput<'_>) -> (usize, R),
     ) -> R {
-        if let BatchOutput::Vector { output, .. } = &mut self.output {
+        if let Destination::Vector { output, .. } = &mut self.output.0 {
             output.clear();
         }
         let (written, result) = operation(self.input, &mut self.output);
@@ -85,7 +90,7 @@ impl<'a> BatchJob<'a> {
             written <= self.output.len(),
             "codec prefix exceeds destination limit"
         );
-        if let BatchOutput::Vector { output, .. } = &mut self.output {
+        if let Destination::Vector { output, .. } = &mut self.output.0 {
             // SAFETY: reservation establishes capacity >= limit; the codec
             // operation reports only its initialized prefix. The exclusive
             // borrow prevents changing capacity during codec execution.
@@ -272,6 +277,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn vector_reservation_failure_preserves_previous_contents() {
+        let mut output = b"prior contents".to_vec();
+        assert!(BatchJob::with_vec(b"input", &mut output, usize::MAX).is_err());
+        assert_eq!(output, b"prior contents");
+    }
+
+    fn verify_vector_decode(
+        decode: &mut impl FnMut(&mut [BatchJob<'_>], InflateConfig) -> Vec<BatchDecompressResult>,
+        inputs: &[&[u8]],
+        capacity: usize,
+        config: InflateConfig,
+        expected: &[Vec<u8>],
+        refs: &[BatchDecompressResult],
+    ) {
+        let mut vectors = vec![vec![0x79; 3]; inputs.len()];
+        let destinations = inputs
+            .iter()
+            .zip(&mut vectors)
+            .map(|(src, dst)| BatchJob::with_vec(src, dst, capacity))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(mut jobs) = destinations else {
+            panic!("vector destination reservation failed");
+        };
+        // Repeated execution replaces the initialized extent rather than
+        // appending or exposing the previous contents.
+        for _ in 0..2 {
+            assert_eq!(decode(&mut jobs, config), refs);
+        }
+        drop(jobs);
+        for (vector, (reference, result)) in vectors.iter().zip(expected.iter().zip(refs)) {
+            assert_eq!(vector, &reference[..result.written]);
+        }
+    }
+
     fn run_decode_cases(
         mut decode: impl FnMut(&mut [BatchJob<'_>], InflateConfig) -> Vec<BatchDecompressResult>,
     ) {
@@ -331,25 +371,7 @@ mod tests {
                 };
                 assert_eq!(results, refs);
                 assert_eq!(actual, expected);
-                let mut vectors = vec![vec![0x79; 3]; inputs.len()];
-                let vector_results = {
-                    let mut jobs = inputs
-                        .iter()
-                        .zip(&mut vectors)
-                        .map(|(src, dst)| BatchJob::with_vec(src, dst, capacity))
-                        .collect::<Result<Vec<_>, _>>();
-                    // Test allocation sizes are small; let the ordinary
-                    // assertion report reservation failure without unwrap.
-                    let Ok(mut jobs) = jobs else {
-                        panic!("vector destination reservation failed");
-                    };
-                    decode(&mut jobs, config)
-                };
-                assert_eq!(vector_results, refs);
-                for (vector, (reference, result)) in vectors.iter().zip(expected.iter().zip(&refs))
-                {
-                    assert_eq!(vector, &reference[..result.written]);
-                }
+                verify_vector_decode(&mut decode, &inputs, capacity, config, &expected, &refs);
                 if capacity >= input.len() {
                     for index in 0..2 {
                         assert_eq!(results[index].code, ReturnCode::Ok);
