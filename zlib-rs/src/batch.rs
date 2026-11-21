@@ -53,7 +53,8 @@ fn decompress_job(job: &mut BatchJob<'_>, config: InflateConfig) -> BatchDecompr
 ///
 /// Both compression and decompression run complete streams on this pool.
 /// CPU-only and explicitly selected GPU-assisted encoding share its worker
-/// budget; it never consults or configures Rayon's global pool.
+/// budget, including simultaneous calls from different threads; it never
+/// consults or configures Rayon's global pool.
 /// Requires the optional `parallel` feature.
 #[cfg(feature = "parallel")]
 pub struct BatchCodec {
@@ -103,12 +104,18 @@ impl BatchCodec {
         initial: R,
         run: impl Fn(usize, &mut BatchJob<'_>) -> R + Sync,
     ) -> Vec<R> {
-        if jobs.len() <= 1 || self.workers() == 1 {
-            return jobs
-                .iter_mut()
-                .enumerate()
-                .map(|(index, job)| run(index, job))
-                .collect();
+        if jobs.is_empty() {
+            return Vec::new();
+        }
+        if jobs.len() == 1 || self.workers() == 1 {
+            // Even single-job calls share the pool budget with concurrent
+            // callers; running on their threads would exceed that budget.
+            return self.pool.install(|| {
+                jobs.iter_mut()
+                    .enumerate()
+                    .map(|(index, job)| run(index, job))
+                    .collect()
+            });
         }
         let mut results = vec![initial; jobs.len()];
         // Each task owns the independent input/output pair and its result slot.
@@ -130,6 +137,33 @@ impl BatchCodec {
 mod tests {
     use super::*;
     use crate::{compress_bound, compress_slice, DeflateConfig};
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn even_single_job_runs_in_the_owned_pool() -> Result<(), &'static str> {
+        for workers in [
+            core::num::NonZeroUsize::MIN,
+            core::num::NonZeroUsize::new(4).ok_or("worker count")?,
+        ] {
+            let codec = BatchCodec::new(workers).map_err(|_| "worker pool")?;
+            // Separate caller threads must both run inside this pool, not
+            // bypass it when submitting single-job batches.
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let codec = &codec;
+                    scope.spawn(move || {
+                        let mut output = [0u8; 1];
+                        let mut jobs = [BatchJob::new(b"x", &mut output)];
+                        let results = codec.run_jobs(&mut jobs, false, |_, _| {
+                            codec.pool.current_thread_index().is_some()
+                        });
+                        assert_eq!(results, [true]);
+                    });
+                }
+            });
+        }
+        Ok(())
+    }
 
     #[test]
     fn batch_decode_preserves_independent_results_and_canaries() -> Result<(), &'static str> {
@@ -162,6 +196,12 @@ mod tests {
                 corrupted.as_slice(),
                 &[],
             ];
+            #[cfg(feature = "parallel")]
+            let codecs = [
+                BatchCodec::new(core::num::NonZeroUsize::MIN).map_err(|_| "worker pool")?,
+                BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("worker count")?)
+                    .map_err(|_| "worker pool")?,
+            ];
             // Whole buffers, short and zero destinations, valid and failed jobs.
             for capacity in [0, 1, 23, input.len(), input.len() + 31] {
                 let mut expected = vec![vec![0xa5; capacity]; inputs.len()];
@@ -189,12 +229,17 @@ mod tests {
                 };
                 assert_eq!(results, refs);
                 assert_eq!(actual, expected);
+                if capacity >= input.len() {
+                    for index in 0..2 {
+                        assert_eq!(results[index].code, ReturnCode::Ok);
+                        assert_eq!(results[index].read, compressed.len());
+                        assert_eq!(results[index].written, input.len());
+                        assert_eq!(&actual[index][..input.len()], input);
+                        assert!(actual[index][input.len()..].iter().all(|&b| b == 0xa5));
+                    }
+                }
                 #[cfg(feature = "parallel")]
-                for workers in [
-                    core::num::NonZeroUsize::MIN,
-                    core::num::NonZeroUsize::new(4).ok_or("worker count")?,
-                ] {
-                    let codec = BatchCodec::new(workers).map_err(|_| "worker pool")?;
+                for codec in &codecs {
                     for output in &mut actual {
                         output.fill(0xa5);
                     }
