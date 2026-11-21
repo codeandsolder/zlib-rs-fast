@@ -146,7 +146,9 @@ impl FastProducer {
 impl TokenProducer for FastProducer {
     fn produce(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
         if matches!(self.match_source, MatchSourceKind::LocalHashChain) {
-            debug_assert_eq!(self.phase, FastPhase::Ready);
+            if self.phase != FastPhase::Ready {
+                return ProduceStatus::MatchSearchError(MatchSearchError::OutstandingSearch);
+            }
             self.produce_inner::<true>(state, allow_short_tail)
         } else {
             self.produce_inner::<false>(state, allow_short_tail)
