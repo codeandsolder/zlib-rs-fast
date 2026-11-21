@@ -1,7 +1,7 @@
 use std::{env, hint::black_box, time::Instant};
 
 use zlib_rs::{
-    compress_bound, compress_slice, compress_slices_batch_gpu, decompress_slice, BatchCompressJob,
+    compress_bound, compress_slice, compress_slices_batch_gpu, decompress_slice, BatchJob,
     DeflateConfig, GpuMatch, GpuMatchSearcher, InflateConfig, ReturnCode,
 };
 
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let mut jobs = compressed
         .iter_mut()
-        .map(|output| BatchCompressJob::new(&input, output))
+        .map(|output| BatchJob::new(&input, output))
         .collect::<Vec<_>>();
     let started = Instant::now();
     let results = compress_slices_batch_gpu(&mut jobs, config, &searcher, search_budget)?;

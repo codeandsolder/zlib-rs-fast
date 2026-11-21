@@ -5,14 +5,13 @@ use std::{
 };
 
 #[cfg(feature = "parallel")]
-use zlib_rs::BatchCompressor;
+use zlib_rs::BatchCodec;
 #[path = "shared/measurement.rs"]
 mod measurement;
 use measurement::{approximately_f64, iterations_for, repeating_phase};
 
 use zlib_rs::{
-    compress_bound, compress_slice, compress_slices_batch, BatchCompressJob, DeflateConfig,
-    ReturnCode,
+    compress_bound, compress_slice, compress_slices_batch, BatchJob, DeflateConfig, ReturnCode,
 };
 
 const MIB: f64 = (1024 * 1024) as f64;
@@ -316,7 +315,7 @@ fn bench_batched(
     let parallel_compressor = if let Mode::ParallelStreams(workers) = mode {
         let workers = std::num::NonZeroUsize::new(workers)
             .ok_or("parallel benchmark needs a nonzero worker count")?;
-        Some(BatchCompressor::new(workers)?)
+        Some(BatchCodec::new(workers)?)
     } else {
         None
     };
@@ -326,7 +325,7 @@ fn bench_batched(
         let mut jobs = inputs
             .iter()
             .zip(outputs.iter_mut())
-            .map(|(input, output)| BatchCompressJob::new(input, output))
+            .map(|(input, output)| BatchJob::new(input, output))
             .collect::<Vec<_>>();
         let mut run = || {
             let results = match mode {
@@ -355,7 +354,7 @@ fn bench_batched(
         let mut jobs = inputs
             .iter()
             .zip(outputs.iter_mut())
-            .map(|(input, output)| BatchCompressJob::new(input, output))
+            .map(|(input, output)| BatchJob::new(input, output))
             .collect::<Vec<_>>();
         let mut run = || {
             let results = match mode {
