@@ -19,23 +19,11 @@ use super::{
 use super::{compress_slice, DeflateConfig, ReturnCode};
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
+#[cfg(feature = "parallel")]
+use crate::BatchCodec;
+use crate::BatchJob;
 #[cfg(feature = "gpu")]
 use crate::{MAX_WBITS, MIN_WBITS};
-
-/// One independent input/output pair for [`compress_slices_batch`].
-///
-/// The output buffer may be smaller than the compressed stream. In that case the corresponding
-/// [`BatchCompressResult`] reports [`ReturnCode::BufError`] and `written` is the initialized prefix.
-pub struct BatchCompressJob<'a> {
-    pub input: &'a [u8],
-    pub output: &'a mut [u8],
-}
-
-impl<'a> BatchCompressJob<'a> {
-    pub const fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
-        Self { input, output }
-    }
-}
 
 /// Result for one job passed to [`compress_slices_batch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,57 +36,31 @@ pub struct BatchCompressResult {
 ///
 /// Every job uses the same configuration and produces the same bytes as an independent
 /// [`super::compress_slice`] call. Each stream is driven to completion to preserve cache locality.
-/// For concurrent CPU compression use `BatchCompressor` with the `parallel` feature; GPU
+/// For concurrent CPU compression use `BatchCodec` with the `parallel` feature; GPU
 /// compression has a separate whole-input match-table API.
 pub fn compress_slices_batch(
-    jobs: &mut [BatchCompressJob<'_>],
+    jobs: &mut [BatchJob<'_>],
     config: DeflateConfig,
 ) -> Vec<BatchCompressResult> {
     compress_synchronously(jobs, config)
 }
 
-/// Reusable worker pool for whole-stream batch compression.
-///
-/// Each scheduled task owns one complete independent stream, preserving per-stream cache locality
-/// while allowing the pool to work-steal streams with very different compression costs. The worker
-/// count is explicit and belongs to this object; no process-global Rayon pool is consulted or
-/// configured. CPU-only output bytes and return codes match independent
-/// [`super::compress_slice`] calls job-for-job. GPU-assisted encoding uses the same pool when
-/// explicitly requested.
-///
-/// The pool is available only with the optional `parallel` feature. Construct it once and reuse it
-/// across batches so thread creation is not part of the compression hot path.
 #[cfg(feature = "parallel")]
-pub struct BatchCompressor {
-    pool: rayon_core::ThreadPool,
-}
-
-#[cfg(feature = "parallel")]
-impl BatchCompressor {
-    /// Create a reusable batch compressor with exactly `workers` worker threads.
-    /// # Errors
-    ///
-    /// Returns a Rayon pool-construction error if the worker threads cannot be created.
-    pub fn new(workers: core::num::NonZeroUsize) -> Result<Self, rayon_core::ThreadPoolBuildError> {
-        rayon_core::ThreadPoolBuilder::new()
-            .num_threads(workers.get())
-            .build()
-            .map(|pool| Self { pool })
-    }
-
-    /// Number of workers owned by this compressor.
-    #[must_use]
-    pub fn workers(&self) -> usize {
-        self.pool.current_num_threads()
-    }
-
-    /// Compress several independent buffers concurrently on this compressor's worker pool.
+impl BatchCodec {
+    /// Compress several independent buffers concurrently on this codec's worker pool.
     pub fn compress(
         &self,
-        jobs: &mut [BatchCompressJob<'_>],
+        jobs: &mut [BatchJob<'_>],
         config: DeflateConfig,
     ) -> Vec<BatchCompressResult> {
-        self.run_jobs(jobs, |_, job| compress_cpu_job(job, config))
+        self.run_jobs(
+            jobs,
+            BatchCompressResult {
+                written: 0,
+                code: ReturnCode::StreamError,
+            },
+            |_, job| compress_cpu_job(job, config),
+        )
     }
 
     /// Search all jobs on the GPU, then encode independent streams concurrently on this pool.
@@ -113,7 +75,7 @@ impl BatchCompressor {
     #[cfg(feature = "gpu")]
     pub fn compress_gpu(
         &self,
-        jobs: &mut [BatchCompressJob<'_>],
+        jobs: &mut [BatchJob<'_>],
         config: DeflateConfig,
         searcher: &GpuMatchSearcher,
         search_budget: u32,
@@ -122,52 +84,24 @@ impl BatchCompressor {
         else {
             return Ok(self.compress(jobs, config));
         };
-        Ok(self.run_jobs(jobs, |job_index, job| {
-            compress_external_job(
-                job_index,
-                job,
-                config,
-                algorithm,
-                &mut |index, state, position, work| {
-                    resolve_table_match(index, state, position, work, &tables)
-                },
-            )
-        }))
-    }
-
-    fn run_jobs(
-        &self,
-        jobs: &mut [BatchCompressJob<'_>],
-        run: impl Fn(usize, &mut BatchCompressJob<'_>) -> BatchCompressResult + Sync,
-    ) -> Vec<BatchCompressResult> {
-        if jobs.len() <= 1 || self.workers() == 1 {
-            return jobs
-                .iter_mut()
-                .enumerate()
-                .map(|(index, job)| run(index, job))
-                .collect();
-        }
-        let mut results = vec![
+        Ok(self.run_jobs(
+            jobs,
             BatchCompressResult {
                 written: 0,
                 code: ReturnCode::StreamError,
-            };
-            jobs.len()
-        ];
-
-        // Independent streams vary by orders of magnitude in real workloads. Scheduling one complete
-        // stream per task lets the persistent pool steal remaining work instead of pinning an
-        // arbitrary equal-count chunk of streams to one worker and waiting for its largest member.
-        self.pool.scope(|scope| {
-            let run = &run;
-            for (index, (job, result)) in jobs.iter_mut().zip(&mut results).enumerate() {
-                scope.spawn(move |_| {
-                    *result = run(index, job);
-                });
-            }
-        });
-
-        results
+            },
+            |job_index, job| {
+                compress_external_job(
+                    job_index,
+                    job,
+                    config,
+                    algorithm,
+                    &mut |index, state, position, work| {
+                        resolve_table_match(index, state, position, work, &tables)
+                    },
+                )
+            },
+        ))
     }
 }
 
@@ -185,7 +119,7 @@ impl BatchCompressor {
 /// allocate, dispatch, or retrieve its results.
 #[cfg(feature = "gpu")]
 pub fn compress_slices_batch_gpu(
-    jobs: &mut [BatchCompressJob<'_>],
+    jobs: &mut [BatchJob<'_>],
     config: DeflateConfig,
     searcher: &GpuMatchSearcher,
     search_budget: u32,
@@ -206,7 +140,7 @@ pub fn compress_slices_batch_gpu(
 
 #[cfg(feature = "gpu")]
 fn prepare_gpu_matches(
-    jobs: &[BatchCompressJob<'_>],
+    jobs: &[BatchJob<'_>],
     config: DeflateConfig,
     searcher: &GpuMatchSearcher,
     search_budget: u32,
@@ -283,7 +217,7 @@ fn configured_max_dist(config: DeflateConfig) -> Option<u32> {
 /// rendezvous: run each independent producer to completion, resolving matches locally.
 #[cfg(any(feature = "gpu", test))]
 fn compress_external(
-    jobs: &mut [BatchCompressJob<'_>],
+    jobs: &mut [BatchJob<'_>],
     config: DeflateConfig,
     algorithm: Algorithm,
     mut resolve: impl FnMut(
@@ -304,7 +238,7 @@ fn compress_external(
 #[cfg(any(feature = "gpu", test))]
 fn compress_external_job(
     job_index: usize,
-    job: &mut BatchCompressJob<'_>,
+    job: &mut BatchJob<'_>,
     config: DeflateConfig,
     algorithm: Algorithm,
     resolve: &mut impl FnMut(
@@ -322,7 +256,7 @@ fn compress_external_job(
     runtime.run(resolve)
 }
 
-fn compress_cpu_job(job: &mut BatchCompressJob<'_>, config: DeflateConfig) -> BatchCompressResult {
+fn compress_cpu_job(job: &mut BatchJob<'_>, config: DeflateConfig) -> BatchCompressResult {
     let (output, code) = compress_slice(&mut *job.output, job.input, config);
     BatchCompressResult {
         written: output.len(),
@@ -331,7 +265,7 @@ fn compress_cpu_job(job: &mut BatchCompressJob<'_>, config: DeflateConfig) -> Ba
 }
 
 fn compress_synchronously(
-    jobs: &mut [BatchCompressJob<'_>],
+    jobs: &mut [BatchJob<'_>],
     config: DeflateConfig,
 ) -> Vec<BatchCompressResult> {
     jobs.iter_mut()
@@ -782,7 +716,7 @@ mod tests {
             let mut jobs = inputs
                 .iter()
                 .zip(outputs.iter_mut())
-                .map(|(input, output)| BatchCompressJob::new(input, output))
+                .map(|(input, output)| BatchJob::new(input, output))
                 .collect::<Vec<_>>();
             compress_external(
                 &mut jobs,
@@ -848,7 +782,7 @@ mod tests {
                 let mut jobs = inputs
                     .iter()
                     .zip(&mut batch_outputs)
-                    .map(|(input, output)| BatchCompressJob::new(input, output))
+                    .map(|(input, output)| BatchJob::new(input, output))
                     .collect::<Vec<_>>();
                 compress_slices_batch_gpu(&mut jobs, config, &searcher, 32)?
             };
@@ -857,13 +791,13 @@ mod tests {
                 core::num::NonZeroUsize::MIN,
                 core::num::NonZeroUsize::new(4).ok_or("four workers is nonzero")?,
             ] {
-                let pool = BatchCompressor::new(workers)?;
+                let pool = BatchCodec::new(workers)?;
                 let mut parallel_outputs =
                     capacities.iter().map(|&n| vec![0; n]).collect::<Vec<_>>();
                 let mut jobs = inputs
                     .iter()
                     .zip(&mut parallel_outputs)
-                    .map(|(input, output)| BatchCompressJob::new(input, output))
+                    .map(|(input, output)| BatchJob::new(input, output))
                     .collect::<Vec<_>>();
                 assert_eq!(
                     pool.compress_gpu(&mut jobs, config, &searcher, 32)?,
@@ -876,7 +810,7 @@ mod tests {
             {
                 let mut expected = vec![0u8; capacity];
                 let reference = compress_slices_batch_gpu(
-                    &mut [BatchCompressJob::new(input, &mut expected)],
+                    &mut [BatchJob::new(input, &mut expected)],
                     config,
                     &searcher,
                     32,
@@ -918,9 +852,9 @@ mod tests {
         let mut observed = Vec::new();
         let results = compress_external(
             &mut [
-                BatchCompressJob::new(&inputs[0], &mut first),
-                BatchCompressJob::new(&inputs[1], &mut short),
-                BatchCompressJob::new(&inputs[2], &mut last),
+                BatchJob::new(&inputs[0], &mut first),
+                BatchJob::new(&inputs[1], &mut short),
+                BatchJob::new(&inputs[2], &mut last),
             ],
             DeflateConfig::new(2),
             Algorithm::Fast,
@@ -998,7 +932,7 @@ mod tests {
 
             let mut output = vec![0u8; compress_bound(input.len()) + 64];
             let results = {
-                let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+                let mut jobs = [BatchJob::new(&input, &mut output)];
                 compress_external(&mut jobs, config, algorithm, |_, _, _, search| {
                     assert!(search.is_external());
                     Ok(MatchSearchResult::new(0, 0))
@@ -1062,7 +996,7 @@ mod tests {
                 let mut jobs = inputs
                     .iter()
                     .zip(outputs.iter_mut())
-                    .map(|(input, output)| BatchCompressJob::new(input, output))
+                    .map(|(input, output)| BatchJob::new(input, output))
                     .collect::<Vec<_>>();
 
                 let results = compress_slices_batch(&mut jobs, config);
@@ -1106,7 +1040,7 @@ mod tests {
             let mut jobs = inputs
                 .iter()
                 .zip(outputs.iter_mut())
-                .map(|(input, output)| BatchCompressJob::new(input, output))
+                .map(|(input, output)| BatchJob::new(input, output))
                 .collect::<Vec<_>>();
 
             let results = compress_slices_batch(&mut jobs, config);
@@ -1127,10 +1061,10 @@ mod tests {
         let config = DeflateConfig::new(9);
         let (reference, code) = independent(&input, config, compress_bound(input.len()) + 64);
         let mut output = vec![0u8; compress_bound(input.len()) + 64];
-        let compressor = BatchCompressor::new(core::num::NonZeroUsize::MIN)
+        let compressor = BatchCodec::new(core::num::NonZeroUsize::MIN)
             .map_err(|_| "one-worker batch compressor failed initialization")?;
         let results = {
-            let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+            let mut jobs = [BatchJob::new(&input, &mut output)];
             compressor.compress(&mut jobs, config)
         };
 
@@ -1188,11 +1122,11 @@ mod tests {
             let mut jobs = inputs
                 .iter()
                 .zip(outputs.iter_mut())
-                .map(|(input, output)| BatchCompressJob::new(input, output))
+                .map(|(input, output)| BatchJob::new(input, output))
                 .collect::<Vec<_>>();
 
             let workers = core::num::NonZeroUsize::new(4).ok_or("four workers must be nonzero")?;
-            let compressor = BatchCompressor::new(workers)
+            let compressor = BatchCodec::new(workers)
                 .map_err(|_| "four-worker batch compressor failed initialization")?;
             assert_eq!(compressor.workers(), 4);
             let results = compressor.compress(&mut jobs, config);
@@ -1222,7 +1156,7 @@ mod tests {
         let (reference, reference_code) = independent(&input, config, 4);
         let mut output = [0u8; 4];
         let results = {
-            let mut jobs = [BatchCompressJob::new(&input, &mut output)];
+            let mut jobs = [BatchJob::new(&input, &mut output)];
             compress_slices_batch(&mut jobs, config)
         };
 

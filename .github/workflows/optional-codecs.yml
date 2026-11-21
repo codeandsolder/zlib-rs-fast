@@ -8,11 +8,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain*'
       - 'zlib-rs/Cargo.toml'
-      - 'zlib-rs/src/lib.rs'
-      - 'zlib-rs/src/abi_cursor.rs'
-      - 'zlib-rs/src/c_api.rs'
-      - 'zlib-rs/src/deflate.rs'
-      - 'zlib-rs/src/deflate/**'
+      - 'zlib-rs/src/**'
       - 'zlib-rs/benches/**'
       - 'zlib-rs/examples/**'
   push:

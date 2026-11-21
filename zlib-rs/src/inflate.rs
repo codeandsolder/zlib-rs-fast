@@ -423,7 +423,7 @@ pub fn uncompress2<'a>(
     (consumed, output, ret)
 }
 
-fn uncompress2_into<O: WritableBytes + ?Sized>(
+pub(crate) fn uncompress2_into<O: WritableBytes + ?Sized>(
     output: &mut O,
     input: &[u8],
     config: InflateConfig,
