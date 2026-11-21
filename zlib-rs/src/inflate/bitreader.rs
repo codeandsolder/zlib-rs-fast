@@ -2,6 +2,9 @@
 
 use crate::ReturnCode;
 
+/// Maximum whole bytes incorporated by one eight-byte refill.
+pub(super) const MAX_REFILL_BYTES: u8 = 7;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BitBuffer {
     bit_buffer: u64,
@@ -105,7 +108,7 @@ impl BitBuffer {
     fn refill_from_word(&mut self, lookahead: u64) -> usize {
         let previous_bits = self.bits_used;
         debug_assert!(previous_bits < 64);
-        let loaded_bytes = usize::from(7 - (previous_bits >> 3));
+        let loaded_bytes = usize::from(MAX_REFILL_BYTES - (previous_bits >> 3));
         // The high byte of the lookahead may be speculative. It becomes
         // valid only after the next refill, and return_unused_bytes masks it.
         self.bit_buffer |= lookahead << previous_bits;
