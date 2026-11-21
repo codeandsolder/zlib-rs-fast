@@ -2588,12 +2588,17 @@ fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
     ))
 }
 
-/// Reserve additional complete fast iterations after checking a group boundary.
+/// Continue the fast loop using a reserved iteration, or reserve a new group.
 #[inline]
-fn fast_iteration_quota<const COUNT_BUFFERED_INPUT: bool>(
+fn fast_iteration_continues<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>(
+    quota: &mut usize,
     reader: &BitReader<'_>,
-    left: usize,
-) -> Option<usize> {
+    output: &O,
+) -> bool {
+    if *quota != 0 {
+        *quota -= 1;
+        return true;
+    }
     // Logical whole bytes decrease by at most rounded-up bit consumption;
     // raw input decreases by at most both refills' combined advancement.
     // Reserve the entry minima in addition to every unchecked continuation.
@@ -2605,9 +2610,13 @@ fn fast_iteration_quota<const COUNT_BUFFERED_INPUT: bool>(
     } else {
         (reader.bytes_remaining(), MAX_FAST_ITERATION_RAW_BYTES)
     };
-    let input = remaining.checked_sub(INFLATE_FAST_MIN_HAVE)?;
-    let output = left.checked_sub(INFLATE_FAST_MIN_LEFT)?;
-    Some((input / bytes_per_iteration).min(output / INFLATE_FAST_MIN_LEFT))
+    let left = output.remaining();
+    if remaining < INFLATE_FAST_MIN_HAVE || left < INFLATE_FAST_MIN_LEFT {
+        return false;
+    }
+    *quota = ((remaining - INFLATE_FAST_MIN_HAVE) / bytes_per_iteration)
+        .min((left - INFLATE_FAST_MIN_LEFT) / INFLATE_FAST_MIN_LEFT);
+    true
 }
 
 /// Fast literal/length/distance decoder.
@@ -2743,15 +2752,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             break 'dolen;
         }
 
-        if quota != 0 {
-            quota -= 1;
-            continue;
-        }
-
-        if let Some(next) =
-            fast_iteration_quota::<COUNT_BUFFERED_INPUT>(&bit_reader, output.remaining())
-        {
-            quota = next;
+        if fast_iteration_continues::<COUNT_BUFFERED_INPUT, _>(&mut quota, &bit_reader, output) {
             continue;
         }
 
