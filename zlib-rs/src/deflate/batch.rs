@@ -57,9 +57,9 @@ impl BatchCodec {
         jobs: &mut [BatchJob<'_>],
         config: DeflateConfig,
     ) -> Vec<BatchCompressResult> {
-        self.run_jobs(
+        self.run_items(
             jobs,
-            BatchCompressResult {
+            || BatchCompressResult {
                 written: 0,
                 code: ReturnCode::StreamError,
             },
@@ -69,7 +69,7 @@ impl BatchCodec {
 
     /// Search all jobs on the GPU, then encode independent streams concurrently on this pool.
     ///
-    /// The GPU phase runs once before CPU workers start; each worker owns its stream and
+    /// Input preparation and encoding use this pool; each encoder owns its stream and
     /// reads only its corresponding immutable match table. Results retain input order and
     /// match the sequential GPU-assisted API byte-for-byte.
     ///
@@ -84,13 +84,15 @@ impl BatchCodec {
         searcher: &GpuMatchSearcher,
         search_budget: u32,
     ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
-        let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, searcher, search_budget)?
+        let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, |inputs, max_dist| {
+            searcher.search_batch_with_pool(inputs, search_budget, max_dist, self)
+        })?
         else {
             return Ok(self.compress(jobs, config));
         };
-        Ok(self.run_jobs(
+        Ok(self.run_items(
             jobs,
-            BatchCompressResult {
+            || BatchCompressResult {
                 written: 0,
                 code: ReturnCode::StreamError,
             },
@@ -128,7 +130,9 @@ pub fn compress_slices_batch_gpu(
     searcher: &GpuMatchSearcher,
     search_budget: u32,
 ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
-    let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, searcher, search_budget)?
+    let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, |inputs, max_dist| {
+        searcher.search_batch_with_max_dist(inputs, search_budget, max_dist)
+    })?
     else {
         return Ok(compress_synchronously(jobs, config));
     };
@@ -146,8 +150,7 @@ pub fn compress_slices_batch_gpu(
 fn prepare_gpu_matches(
     jobs: &[BatchJob<'_>],
     config: DeflateConfig,
-    searcher: &GpuMatchSearcher,
-    search_budget: u32,
+    search: impl FnOnce(&[&[u8]], u32) -> Result<Vec<GpuMatchTable>, GpuMatchError>,
 ) -> Result<Option<(Algorithm, Vec<GpuMatchTable>)>, GpuMatchError> {
     let Some(algorithm) =
         configured_algorithm(config).filter(|&algorithm| uses_match_search(algorithm))
@@ -158,7 +161,7 @@ fn prepare_gpu_matches(
         return Ok(None);
     };
     let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
-    let tables = searcher.search_batch_with_max_dist(&inputs, search_budget, max_dist)?;
+    let tables = search(&inputs, max_dist)?;
     Ok(Some((algorithm, tables)))
 }
 
