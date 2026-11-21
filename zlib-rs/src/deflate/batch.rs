@@ -1199,18 +1199,19 @@ mod tests {
                 vector.extend_from_slice(b"previous output");
                 let original = vector.as_ptr();
                 let mut slice = vec![0u8; cap];
-                let mut jobs = [
-                    BatchJob::with_vec(&input, &mut vector, cap)?,
-                    BatchJob::new(&input, &mut slice),
-                ];
-                let expected = [BatchCompressResult {
-                    written: reference.len(),
-                    code,
-                }; 2];
-                for _ in 0..2 {
-                    assert_eq!(compress_slices_batch(&mut jobs, config), expected);
+                {
+                    let mut jobs = [
+                        BatchJob::with_vec(&input, &mut vector, cap)?,
+                        BatchJob::new(&input, &mut slice),
+                    ];
+                    let expected = [BatchCompressResult {
+                        written: reference.len(),
+                        code,
+                    }; 2];
+                    for _ in 0..2 {
+                        assert_eq!(compress_slices_batch(&mut jobs, config), expected);
+                    }
                 }
-                drop(jobs);
                 assert_eq!(vector.as_ptr(), original);
                 assert_eq!(vector, reference);
                 assert_eq!(&slice[..reference.len()], reference);
