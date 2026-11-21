@@ -319,6 +319,74 @@ impl GpuWorkspace {
     }
 }
 
+type PrepareInputs<'a> =
+    dyn Fn(&[&[u8]], u32, u32, u32) -> Result<Vec<PreparedGpuInput>, GpuMatchError> + 'a;
+
+fn prepare_input(
+    input_index: usize,
+    input: &[u8],
+    search_budget: u32,
+    max_dist: u32,
+    max_workgroups: u32,
+) -> Result<Option<PreparedGpuInput>, GpuMatchError> {
+    let input_len = u32::try_from(input.len())
+        .map_err(|_| GpuMatchError("GPU match search input exceeds u32::MAX bytes".into()))?;
+    if input.is_empty() {
+        return Ok(None);
+    }
+
+    let dispatch = dispatch_grid(input_len, max_workgroups)?;
+    let predecessors = build_predecessors(input, max_dist)?;
+    let input_words = pack_words(input);
+    Ok(Some(PreparedGpuInput {
+        input_index,
+        input_len,
+        dispatch,
+        input_words,
+        predecessors,
+        params: [input_len, max_dist, MAX_MATCH, search_budget],
+        input_offset: 0,
+        predecessors_offset: 0,
+        result_offset: 0,
+        params_offset: 0,
+        download_offset: 0,
+    }))
+}
+
+fn prepare_serial(
+    inputs: &[&[u8]],
+    search_budget: u32,
+    max_dist: u32,
+    max_workgroups: u32,
+) -> Result<Vec<PreparedGpuInput>, GpuMatchError> {
+    inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            prepare_input(index, input, search_budget, max_dist, max_workgroups).transpose()
+        })
+        .collect()
+}
+
+#[cfg(feature = "parallel")]
+fn prepare_parallel(
+    inputs: &[&[u8]],
+    search_budget: u32,
+    max_dist: u32,
+    max_workgroups: u32,
+    pool: &crate::BatchCodec,
+) -> Result<Vec<PreparedGpuInput>, GpuMatchError> {
+    let mut inputs = inputs.to_vec();
+    pool.run_items(
+        &mut inputs,
+        || Ok(None),
+        |index, input| prepare_input(index, input, search_budget, max_dist, max_workgroups),
+    )
+    .into_iter()
+    .filter_map(Result::transpose)
+    .collect()
+}
+
 struct PreparedGpuInput {
     input_index: usize,
     input_len: u32,
@@ -560,6 +628,34 @@ impl GpuMatchSearcher {
         search_budget: u32,
         max_dist: u32,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
+        self.search_batch_with_preparation(inputs, search_budget, max_dist, &prepare_serial)
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn search_batch_with_pool(
+        &self,
+        inputs: &[&[u8]],
+        search_budget: u32,
+        max_dist: u32,
+        pool: &crate::BatchCodec,
+    ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
+        self.search_batch_with_preparation(
+            inputs,
+            search_budget,
+            max_dist,
+            &|inputs, budget, distance, workgroups| {
+                prepare_parallel(inputs, budget, distance, workgroups, pool)
+            },
+        )
+    }
+
+    fn search_batch_with_preparation(
+        &self,
+        inputs: &[&[u8]],
+        search_budget: u32,
+        max_dist: u32,
+        prepare: &PrepareInputs<'_>,
+    ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
         if !(1..=PACKED_DISTANCE_LIMIT).contains(&max_dist) {
             return Err(GpuMatchError(format!(
                 "GPU match distance must be between 1 and {PACKED_DISTANCE_LIMIT}"
@@ -576,6 +672,7 @@ impl GpuMatchSearcher {
             search_budget,
             max_dist,
             SearchGeometry::from_limits(&self.device.limits())?,
+            prepare,
         )
     }
 
@@ -585,6 +682,7 @@ impl GpuMatchSearcher {
         search_budget: u32,
         max_dist: u32,
         geometry: SearchGeometry,
+        prepare: &PrepareInputs<'_>,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
         for input in inputs {
             u32::try_from(input.len()).map_err(|_| {
@@ -598,7 +696,7 @@ impl GpuMatchSearcher {
             .try_fold(0, |used, input| geometry.append(used, input.len()))
             .is_some()
         {
-            return self.search_group(inputs, search_budget, max_dist);
+            return self.search_group(inputs, search_budget, max_dist, prepare);
         }
 
         let mut tables = inputs
@@ -629,7 +727,7 @@ impl GpuMatchSearcher {
                     keep: core_start - start..core_end - start,
                 };
                 if geometry.append(used, part.input.len()).is_none() {
-                    self.finish_group(&mut pending, &mut tables, search_budget, max_dist)?;
+                    self.finish_group(&mut pending, &mut tables, search_budget, max_dist, prepare)?;
                     used = 0;
                 }
                 used = geometry.append(used, part.input.len()).ok_or_else(|| {
@@ -638,7 +736,7 @@ impl GpuMatchSearcher {
                 pending.push(part);
             }
         }
-        self.finish_group(&mut pending, &mut tables, search_budget, max_dist)?;
+        self.finish_group(&mut pending, &mut tables, search_budget, max_dist, prepare)?;
         Ok(tables)
     }
 
@@ -648,12 +746,13 @@ impl GpuMatchSearcher {
         tables: &mut [GpuMatchTable],
         search_budget: u32,
         max_dist: u32,
+        prepare: &PrepareInputs<'_>,
     ) -> Result<(), GpuMatchError> {
         if pending.is_empty() {
             return Ok(());
         }
         let inputs = pending.iter().map(|part| part.input).collect::<Vec<_>>();
-        let results = self.search_group(&inputs, search_budget, max_dist)?;
+        let results = self.search_group(&inputs, search_budget, max_dist, prepare)?;
         for (part, result) in pending.drain(..).zip(results) {
             let target = &mut tables[part.input_index];
             if part.keep == (0..result.len()) && target.is_empty() {
@@ -672,6 +771,7 @@ impl GpuMatchSearcher {
         inputs: &[&[u8]],
         search_budget: u32,
         max_dist: u32,
+        prepare: &PrepareInputs<'_>,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
         let mut tables = inputs
             .iter()
@@ -692,33 +792,15 @@ impl GpuMatchSearcher {
         let mut result_cursor = 0u64;
         let mut params_cursor = 0u64;
         let mut download_cursor = 0u64;
-        let mut prepared = Vec::with_capacity(inputs.len());
+        let mut prepared = prepare(
+            inputs,
+            search_budget,
+            max_dist,
+            limits.max_compute_workgroups_per_dimension,
+        )?;
 
-        for (input_index, input) in inputs.iter().copied().enumerate() {
-            let input_len = u32::try_from(input.len()).map_err(|_| {
-                GpuMatchError("GPU match search input exceeds u32::MAX bytes".into())
-            })?;
-            if input.is_empty() {
-                continue;
-            }
-
-            let dispatch = dispatch_grid(input_len, limits.max_compute_workgroups_per_dimension)?;
-            let predecessors = build_predecessors(input, max_dist)?;
-            let input_words = pack_words(input);
-            let mut item = PreparedGpuInput {
-                input_index,
-                input_len,
-                dispatch,
-                input_words,
-                predecessors,
-                params: [input_len, max_dist, MAX_MATCH, search_budget],
-                input_offset: 0,
-                predecessors_offset: 0,
-                result_offset: 0,
-                params_offset: 0,
-                download_offset: 0,
-            };
-
+        for item in &mut prepared {
+            let input_index = item.input_index;
             for (name, size) in [
                 ("input", item.input_size()),
                 ("predecessors", item.predecessors_size()),
@@ -752,7 +834,6 @@ impl GpuMatchSearcher {
             download_cursor = download_cursor
                 .checked_add(item.result_size())
                 .ok_or_else(|| GpuMatchError("GPU download buffer layout overflowed".into()))?;
-            prepared.push(item);
         }
 
         if prepared.is_empty() {
@@ -1171,9 +1252,30 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn pooled_preparation_preserves_order_and_contents() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = crate::BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("workers")?)?;
+        let inputs = [b"".as_slice(), b"a", b"abcabcabc", b"", b"abc", b"aaaaaaaa"];
+        let expected = prepare_serial(&inputs, 7, 64, 65535)?;
+        let actual = prepare_parallel(&inputs, 7, 64, 65535, &pool)?;
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert_eq!(a.input_index, b.input_index);
+            assert_eq!(a.input_len, b.input_len);
+            assert_eq!(a.dispatch, b.dispatch);
+            assert_eq!(a.input_words, b.input_words);
+            assert_eq!(a.predecessors, b.predecessors);
+            assert_eq!(a.params, b.params);
+        }
+        assert!(prepare_parallel(&[], 7, 64, 65535, &pool)?.is_empty());
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a Vulkan compute adapter"]
-    fn partitioned_search_preserves_full_history_and_lookahead() -> Result<(), GpuMatchError> {
+    fn partitioned_search_preserves_full_history_and_lookahead(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let searcher = GpuMatchSearcher::new(None)?;
         let actual_geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
         let mut mixed = b"abc0123456".repeat(210);
@@ -1194,7 +1296,31 @@ mod tests {
                 max_group_bytes: (part_size as u64 * 4).max(actual_geometry.alignment * 2),
                 alignment: actual_geometry.alignment,
             };
-            let actual = searcher.search_with_geometry(&inputs, budget, max_dist, geometry)?;
+            let actual = searcher.search_with_geometry(
+                &inputs,
+                budget,
+                max_dist,
+                geometry,
+                &prepare_serial,
+            )?;
+            #[cfg(feature = "parallel")]
+            {
+                let pool =
+                    crate::BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("workers")?)?;
+                let pooled = searcher.search_with_geometry(
+                    &inputs,
+                    budget,
+                    max_dist,
+                    geometry,
+                    &|inputs, budget, distance, groups| {
+                        prepare_parallel(inputs, budget, distance, groups, &pool)
+                    },
+                )?;
+                assert_eq!(pooled.len(), expected.len());
+                for (a, b) in pooled.iter().zip(&expected) {
+                    assert!(a.iter().eq(b.iter()));
+                }
+            }
             assert_eq!(actual.len(), inputs.len());
             for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
                 assert!(

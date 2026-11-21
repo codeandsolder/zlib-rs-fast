@@ -176,9 +176,9 @@ impl BatchCodec {
         jobs: &mut [BatchJob<'_>],
         config: InflateConfig,
     ) -> Vec<BatchDecompressResult> {
-        self.run_jobs(
+        self.run_items(
             jobs,
-            BatchDecompressResult {
+            || BatchDecompressResult {
                 read: 0,
                 written: 0,
                 code: ReturnCode::StreamError,
@@ -187,11 +187,11 @@ impl BatchCodec {
         )
     }
 
-    pub(crate) fn run_jobs<R: Copy + Send>(
+    pub(crate) fn run_items<T: Send, R: Send>(
         &self,
-        jobs: &mut [BatchJob<'_>],
-        initial: R,
-        run: impl Fn(usize, &mut BatchJob<'_>) -> R + Sync,
+        jobs: &mut [T],
+        initial: impl FnMut() -> R,
+        run: impl Fn(usize, &mut T) -> R + Sync,
     ) -> Vec<R> {
         if jobs.is_empty() {
             return Vec::new();
@@ -206,7 +206,7 @@ impl BatchCodec {
                     .collect()
             });
         }
-        let mut results = vec![initial; jobs.len()];
+        let mut results: Vec<R> = core::iter::repeat_with(initial).take(jobs.len()).collect();
         // Each task owns the independent input/output pair and its result slot.
         // Work stealing handles differences in stream length and complexity;
         // output order is independent of execution order.
@@ -243,9 +243,11 @@ mod tests {
                     scope.spawn(move || {
                         let mut output = [0u8; 1];
                         let mut jobs = [BatchJob::new(b"x", &mut output)];
-                        let results = codec.run_jobs(&mut jobs, false, |_, _| {
-                            codec.pool.current_thread_index().is_some()
-                        });
+                        let results = codec.run_items(
+                            &mut jobs,
+                            || false,
+                            |_, _| codec.pool.current_thread_index().is_some(),
+                        );
                         assert_eq!(results, [true]);
                     });
                 }
