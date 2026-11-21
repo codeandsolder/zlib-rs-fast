@@ -79,19 +79,15 @@ impl StandardHashCalc {
         let slice = &slice[..Ord::min(slice.len(), count + 3)];
 
         let w_mask = state.w_mask();
+        let head = state.head.as_mut_slice();
+        let prev = state.prev.as_mut_slice();
         for (i, w) in slice.windows(4).enumerate() {
-            // Add in the full address width first. A batch can cross the
-            // u16 boundary without overflowing an intermediate u16 value.
             let idx = hash_chain_position(string + i);
-
-            let val = Self::first_four_bytes(w);
-
-            let hm = Self::update_hash(0, val) as usize;
-
-            let head = state.head.as_slice()[hm];
-            if head != idx {
-                state.prev.as_mut_slice()[idx as usize & w_mask] = head;
-                state.head.as_mut_slice()[hm] = idx;
+            let hash = Self::update_hash(0, Self::first_four_bytes(w)) as usize;
+            let entry = &mut head[hash];
+            if *entry != idx {
+                prev[usize::from(idx) & w_mask] = *entry;
+                *entry = idx;
             }
         }
     }
@@ -136,21 +132,19 @@ impl RollHashCalc {
         let slice = &state.window.filled()[string + Self::HASH_CALC_OFFSET..][..count];
 
         let w_mask = state.w_mask();
+        let head = state.head.as_mut_slice();
+        let prev = state.prev.as_mut_slice();
+        let mut ins_h = state.ins_h;
         for (i, val) in slice.iter().copied().enumerate() {
-            // Add in the full address width first. A batch can cross the
-            // u16 boundary without overflowing an intermediate u16 value.
             let idx = hash_chain_position(string + i);
-
-            state.ins_h = Self::hash_calc(state.ins_h, u32::from(val));
-            state.ins_h &= Self::HASH_CALC_MASK;
-            let hm = state.ins_h as usize;
-
-            let head = state.head.as_slice()[hm];
-            if head != idx {
-                state.prev.as_mut_slice()[idx as usize & w_mask] = head;
-                state.head.as_mut_slice()[hm] = idx;
+            ins_h = Self::update_hash(ins_h, u32::from(val));
+            let entry = &mut head[ins_h as usize];
+            if *entry != idx {
+                prev[usize::from(idx) & w_mask] = *entry;
+                *entry = idx;
             }
         }
+        state.ins_h = ins_h;
     }
 }
 
@@ -170,6 +164,49 @@ mod tests {
         ] {
             assert_eq!(hash_chain_position(position), expected);
         }
+    }
+
+    #[test]
+    fn bulk_insert_matches_ordered_single_insertions() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{set_dictionary, DeflateConfig, DeflateStream};
+        // Include long collisions, alternating patterns and repeated runs.
+        let dictionary: Vec<_> = (0..4096u32)
+            .map(|index| {
+                if index % 127 < 64 {
+                    b'a'
+                } else {
+                    (index ^ (index >> 3)).to_le_bytes()[0]
+                }
+            })
+            .collect();
+        for level in [6, 9] {
+            let config = DeflateConfig::new(level);
+            let mut bulk = DeflateStream::new(config)?;
+            let mut scalar = DeflateStream::new(config)?;
+            for stream in [&mut bulk, &mut scalar] {
+                assert_eq!(set_dictionary(stream, &dictionary), crate::ReturnCode::Ok);
+            }
+            // Compare individual and bulk updates over the same populated
+            // table, including reinsertion of existing positions.
+            for (start, count) in [
+                (0, 0),
+                (0, 1),
+                (1, 7),
+                (63, 128),
+                (63, 128),
+                (511, 1000),
+                (4032, 60),
+            ] {
+                bulk.state.insert_string(start, count);
+                for position in start..start + count {
+                    scalar.state.quick_insert_string(position);
+                }
+                assert_eq!(bulk.state.head.as_slice(), scalar.state.head.as_slice());
+                assert_eq!(bulk.state.prev.as_slice(), scalar.state.prev.as_slice());
+                assert_eq!(bulk.state.ins_h, scalar.state.ins_h);
+            }
+        }
+        Ok(())
     }
 
     #[test]
