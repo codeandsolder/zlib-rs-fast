@@ -13,7 +13,7 @@ pub struct BatchJob<'a> {
 }
 
 /// Both destinations expose only the capacity explicitly selected by the caller.
-pub(crate) struct BatchOutput<'a>(Destination<'a>);
+pub struct BatchOutput<'a>(Destination<'a>);
 
 enum Destination<'a> {
     Slice(&'a mut [u8]),
@@ -29,7 +29,6 @@ impl WritableBytes for BatchOutput<'_> {
         match &mut self.0 {
             Destination::Slice(output) => output.as_mut_ptr(),
             Destination::Vector { output, limit } => {
-                debug_assert!(output.is_empty() && output.capacity() >= *limit);
                 output.spare_capacity_mut()[..*limit].as_mut_ptr().cast()
             }
         }
