@@ -2588,6 +2588,28 @@ fn fast_huffman_masks(state: &State) -> Option<(u16, u16)> {
     ))
 }
 
+/// Reserve additional complete fast iterations after checking a group boundary.
+#[inline]
+fn fast_iteration_quota<const COUNT_BUFFERED_INPUT: bool>(
+    reader: &BitReader<'_>,
+    left: usize,
+) -> Option<usize> {
+    // Logical whole bytes decrease by at most rounded-up bit consumption;
+    // raw input decreases by at most both refills' combined advancement.
+    // Reserve the entry minima in addition to every unchecked continuation.
+    let (remaining, bytes_per_iteration) = if COUNT_BUFFERED_INPUT {
+        (
+            reader.bytes_remaining_including_buffer(),
+            MAX_FAST_ITERATION_BYTES,
+        )
+    } else {
+        (reader.bytes_remaining(), MAX_FAST_ITERATION_RAW_BYTES)
+    };
+    let input = remaining.checked_sub(INFLATE_FAST_MIN_HAVE)?;
+    let output = left.checked_sub(INFLATE_FAST_MIN_LEFT)?;
+    Some((input / bytes_per_iteration).min(output / INFLATE_FAST_MIN_LEFT))
+}
+
 /// Fast literal/length/distance decoder.
 ///
 /// Callers enter only when at least `INFLATE_FAST_MIN_HAVE` bytes and
@@ -2726,26 +2748,10 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             continue;
         }
 
-        // At the group boundary, reserve enough input and output for the
-        // next iteration plus every subsequent unchecked continuation.
-        // Whole bytes (including the reservoir) decrease by at most the
-        // rounded-up bit consumption; the raw cursor advances by at most
-        // the total bytes moved by both refills. Every reserved continuation
-        // therefore still satisfies the ordinary fast-entry thresholds.
-        let remaining = if COUNT_BUFFERED_INPUT {
-            bit_reader.bytes_remaining_including_buffer()
-        } else {
-            bit_reader.bytes_remaining()
-        };
-        let left = output.remaining();
-        if remaining >= INFLATE_FAST_MIN_HAVE && left >= INFLATE_FAST_MIN_LEFT {
-            let bytes_per_iteration = if COUNT_BUFFERED_INPUT {
-                MAX_FAST_ITERATION_BYTES
-            } else {
-                MAX_FAST_ITERATION_RAW_BYTES
-            };
-            quota = ((remaining - INFLATE_FAST_MIN_HAVE) / bytes_per_iteration)
-                .min((left - INFLATE_FAST_MIN_LEFT) / INFLATE_FAST_MIN_LEFT);
+        if let Some(next) =
+            fast_iteration_quota::<COUNT_BUFFERED_INPUT>(&bit_reader, output.remaining())
+        {
+            quota = next;
             continue;
         }
 
