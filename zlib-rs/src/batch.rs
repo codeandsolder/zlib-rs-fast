@@ -255,8 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn serial_batch_decode_preserves_independent_results_and_canaries() {
-        run_decode_cases(decompress_slices_batch);
+    fn serial_batch_decode_preserves_independent_results_and_canaries(
+    ) -> Result<(), std::collections::TryReserveError> {
+        run_decode_cases(decompress_slices_batch)
     }
 
     #[cfg(feature = "parallel")]
@@ -268,7 +269,8 @@ mod tests {
             core::num::NonZeroUsize::new(4).ok_or("worker count")?,
         ] {
             let codec = BatchCodec::new(workers).map_err(|_| "worker pool")?;
-            run_decode_cases(|jobs, config| codec.decompress(jobs, config));
+            run_decode_cases(|jobs, config| codec.decompress(jobs, config))
+                .map_err(|_| "vector output reservation")?;
             assert!(codec
                 .decompress(&mut [], InflateConfig::default())
                 .is_empty());
@@ -290,16 +292,13 @@ mod tests {
         config: InflateConfig,
         expected: &[Vec<u8>],
         refs: &[BatchDecompressResult],
-    ) {
+    ) -> Result<(), std::collections::TryReserveError> {
         let mut vectors = vec![vec![0x79; 3]; inputs.len()];
-        let destinations = inputs
+        let mut jobs = inputs
             .iter()
             .zip(&mut vectors)
             .map(|(src, dst)| BatchJob::with_vec(src, dst, capacity))
-            .collect::<Result<Vec<_>, _>>();
-        let Ok(mut jobs) = destinations else {
-            panic!("vector destination reservation failed");
-        };
+            .collect::<Result<Vec<_>, _>>()?;
         // Repeated execution replaces the initialized extent rather than
         // appending or exposing the previous contents.
         for _ in 0..2 {
@@ -309,11 +308,12 @@ mod tests {
         for (vector, (reference, result)) in vectors.iter().zip(expected.iter().zip(refs)) {
             assert_eq!(vector, &reference[..result.written]);
         }
+        Ok(())
     }
 
     fn run_decode_cases(
         mut decode: impl FnMut(&mut [BatchJob<'_>], InflateConfig) -> Vec<BatchDecompressResult>,
-    ) {
+    ) -> Result<(), std::collections::TryReserveError> {
         let input = b"batch-decode/history-window/".repeat(8192);
         for wrapper in [-15, 15, 31] {
             let config = InflateConfig {
@@ -370,7 +370,7 @@ mod tests {
                 };
                 assert_eq!(results, refs);
                 assert_eq!(actual, expected);
-                verify_vector_decode(&mut decode, &inputs, capacity, config, &expected, &refs);
+                verify_vector_decode(&mut decode, &inputs, capacity, config, &expected, &refs)?;
                 if capacity >= input.len() {
                     for index in 0..2 {
                         assert_eq!(results[index].code, ReturnCode::Ok);
@@ -382,5 +382,6 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 }
