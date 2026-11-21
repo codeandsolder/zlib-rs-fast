@@ -2607,6 +2607,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
     };
 
     let mut bad = None;
+    let mut quota = 0usize;
 
     if bit_reader.bits_in_buffer() < 10 {
         // The entry precondition already guarantees 15 unread input bytes.
@@ -2709,16 +2710,25 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             break 'dolen;
         }
 
-        // For normal `inflate`, include the bits in the bit_reader buffer in the count of available bytes.
-        // Ordinary inflate considers retained bytes in the bit reservoir for
-        // its fast-loop threshold, while the callback decoder counts only the
-        // unread callback span. Specialize that input policy at compile time.
+        if quota != 0 {
+            quota -= 1;
+            continue;
+        }
+
+        // Each outer iteration emits at most two literals followed by
+        // one 258-byte match. It consumes at most 78 bits (10 bytes
+        // rounded up), or moves at most 14 raw input bytes in two refills.
+        // Reserve that worst-case budget for a group of iterations.
         let remaining = if COUNT_BUFFERED_INPUT {
             bit_reader.bytes_remaining_including_buffer()
         } else {
             bit_reader.bytes_remaining()
         };
-        if remaining >= INFLATE_FAST_MIN_HAVE && output.remaining() >= INFLATE_FAST_MIN_LEFT {
+        let left = output.remaining();
+        if remaining >= INFLATE_FAST_MIN_HAVE && left >= INFLATE_FAST_MIN_LEFT {
+            let bytes_per_iteration = if COUNT_BUFFERED_INPUT { 10 } else { 14 };
+            quota = ((remaining - INFLATE_FAST_MIN_HAVE) / bytes_per_iteration)
+                .min((left - INFLATE_FAST_MIN_LEFT) / INFLATE_FAST_MIN_LEFT);
             continue;
         }
 
