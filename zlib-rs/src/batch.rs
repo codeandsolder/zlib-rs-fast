@@ -166,7 +166,30 @@ mod tests {
     }
 
     #[test]
-    fn batch_decode_preserves_independent_results_and_canaries() -> Result<(), &'static str> {
+    fn serial_batch_decode_preserves_independent_results_and_canaries() {
+        run_decode_cases(decompress_slices_batch);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_batch_decode_preserves_independent_results_and_canaries() -> Result<(), &'static str>
+    {
+        for workers in [
+            core::num::NonZeroUsize::MIN,
+            core::num::NonZeroUsize::new(4).ok_or("worker count")?,
+        ] {
+            let codec = BatchCodec::new(workers).map_err(|_| "worker pool")?;
+            run_decode_cases(|jobs, config| codec.decompress(jobs, config));
+            assert!(codec
+                .decompress(&mut [], InflateConfig::default())
+                .is_empty());
+        }
+        Ok(())
+    }
+
+    fn run_decode_cases(
+        mut decode: impl FnMut(&mut [BatchJob<'_>], InflateConfig) -> Vec<BatchDecompressResult>,
+    ) {
         let input = b"batch-decode/history-window/".repeat(8192);
         for wrapper in [-15, 15, 31] {
             let config = InflateConfig {
@@ -196,12 +219,6 @@ mod tests {
                 corrupted.as_slice(),
                 &[],
             ];
-            #[cfg(feature = "parallel")]
-            let codecs = [
-                BatchCodec::new(core::num::NonZeroUsize::MIN).map_err(|_| "worker pool")?,
-                BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("worker count")?)
-                    .map_err(|_| "worker pool")?,
-            ];
             // Whole buffers, short and zero destinations, valid and failed jobs.
             for capacity in [0, 1, 23, input.len(), input.len() + 31] {
                 let mut expected = vec![vec![0xa5; capacity]; inputs.len()];
@@ -225,7 +242,7 @@ mod tests {
                         .zip(&mut actual)
                         .map(|(src, dst)| BatchJob::new(src, dst))
                         .collect::<Vec<_>>();
-                    decompress_slices_batch(&mut jobs, config)
+                    decode(&mut jobs, config)
                 };
                 assert_eq!(results, refs);
                 assert_eq!(actual, expected);
@@ -238,25 +255,7 @@ mod tests {
                         assert!(actual[index][input.len()..].iter().all(|&b| b == 0xa5));
                     }
                 }
-                #[cfg(feature = "parallel")]
-                for codec in &codecs {
-                    for output in &mut actual {
-                        output.fill(0xa5);
-                    }
-                    let results = {
-                        let mut jobs = inputs
-                            .iter()
-                            .zip(&mut actual)
-                            .map(|(src, dst)| BatchJob::new(src, dst))
-                            .collect::<Vec<_>>();
-                        codec.decompress(&mut jobs, config)
-                    };
-                    assert_eq!(results, refs);
-                    assert_eq!(actual, expected);
-                    assert!(codec.decompress(&mut [], config).is_empty());
-                }
             }
         }
-        Ok(())
     }
 }
