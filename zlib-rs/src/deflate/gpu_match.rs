@@ -1175,7 +1175,7 @@ mod tests {
         // All keys probe the same initial slot; exact identities and
         // replacement values remain distinct at maximum occupancy.
         let mut heads = SmallHeads::default();
-        for i in 0..128 {
+        for i in 0..128usize {
             for key in [i * 512, i * 512 + 1] {
                 let pos = u32::try_from(i).map_err(|e| GpuMatchError(e.to_string()))?;
                 assert_eq!(heads.replace(key, pos), NO_PREDECESSOR);
