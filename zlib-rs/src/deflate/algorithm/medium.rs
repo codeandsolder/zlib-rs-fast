@@ -81,6 +81,18 @@ impl MediumProducer {
     /// synchronously. The resumable path remains available to batch
     /// schedulers and external match sources.
     fn produce_local(&mut self, state: &mut State<'_>, allow_short_tail: bool) -> ProduceStatus {
+        if self.early_exit {
+            self.produce_local_inner::<true>(state, allow_short_tail)
+        } else {
+            self.produce_local_inner::<false>(state, allow_short_tail)
+        }
+    }
+
+    fn produce_local_inner<const EARLY: bool>(
+        &mut self,
+        state: &mut State<'_>,
+        allow_short_tail: bool,
+    ) -> ProduceStatus {
         debug_assert_eq!(self.phase, MediumPhase::Ready);
         debug_assert!(self.match_source.maintains_hash_chain());
         debug_assert!(self
@@ -96,12 +108,31 @@ impl MediumProducer {
                 return ProduceStatus::NeedInput;
             }
 
-            if !self.early_exit && next_match.match_length > 0 {
+            if !EARLY && next_match.match_length > 0 {
                 current_match = next_match;
                 next_match.match_length = 0;
             } else {
                 let hash_head = if state.lookahead >= WANT_MIN_MATCH {
-                    StandardHashCalc::quick_insert_string(state, state.strstart)
+                    let val = StandardHashCalc::first_four_bytes(
+                        &state.window.filled()[state.strstart..],
+                    );
+                    let head = StandardHashCalc::quick_insert_value(state, state.strstart, val);
+                    if EARLY && (head == 0 || state.recent_hash_distance(head).is_none()) {
+                        // A one-byte literal has no interior positions to
+                        // insert, and early mode never speculates a next match.
+                        // Reuse the byte already loaded for hashing.
+                        let block_ready = state.tally_lit(val.to_le_bytes()[0]);
+                        state.lookahead -= 1;
+                        state.strstart += 1;
+                        next_match.match_length = 0;
+                        if block_ready {
+                            self.next_match = next_match;
+                            self.save_next(state);
+                            return ProduceStatus::BlockReady(BlockContinuation::None);
+                        }
+                        continue;
+                    }
+                    head
                 } else {
                     0
                 };
@@ -132,53 +163,12 @@ impl MediumProducer {
 
             insert_match(state, current_match, self.match_source);
 
-            let current_len = usize::from(current_match.match_length);
-            let future_start = usize::from(current_match.strstart) + current_len;
-            let future_lookahead = state.lookahead.saturating_sub(current_len);
-            if !self.early_exit
-                && state.lookahead > MIN_LOOKAHEAD
-                && future_lookahead >= WANT_MIN_MATCH
-                && future_start < state.window_size - MIN_LOOKAHEAD
-            {
-                let current_lookahead = state.lookahead;
-                state.strstart = future_start;
-                state.lookahead = future_lookahead;
-                let hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
-
-                next_match.strstart = hash_chain_position(state.strstart);
-                next_match.orgstart = next_match.strstart;
-
-                if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
-                    let result = match MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
-                        .request(state)
-                    {
-                        Ok(request) => request.execute(),
-                        Err(error) => return ProduceStatus::MatchSearchError(error),
-                    };
-                    state.match_start = result.start;
-                    next_match.match_length = result.length;
-                    next_match.match_start = result.start;
-                    if next_match.match_start >= next_match.strstart
-                        || usize::from(next_match.match_length) < WANT_MIN_MATCH
-                    {
-                        next_match.match_length = 1;
-                    } else {
-                        fizzle_matches(
-                            state.window.filled(),
-                            state.max_dist(),
-                            &mut current_match,
-                            &mut next_match,
-                        );
-                    }
-                } else {
-                    next_match.match_start = 0;
-                    next_match.match_length = 1;
-                }
-
-                state.lookahead = current_lookahead;
-                state.strstart = usize::from(current_match.strstart);
-            } else {
+            if EARLY {
                 next_match.match_length = 0;
+            } else if let Err(error) =
+                Self::local_future_match(state, &mut current_match, &mut next_match)
+            {
+                return ProduceStatus::MatchSearchError(error);
             }
 
             let block_ready = emit_match(state, current_match);
@@ -190,6 +180,60 @@ impl MediumProducer {
                 return ProduceStatus::BlockReady(BlockContinuation::None);
             }
         }
+    }
+    /// Compute the speculative next match only for the lazy local policy.
+    #[inline]
+    fn local_future_match(
+        state: &mut State<'_>,
+        current_match: &mut Match,
+        next_match: &mut Match,
+    ) -> Result<(), MatchSearchError> {
+        let current_len = usize::from(current_match.match_length);
+        let future_start = usize::from(current_match.strstart) + current_len;
+        let future_lookahead = state.lookahead.saturating_sub(current_len);
+        if state.lookahead > MIN_LOOKAHEAD
+            && future_lookahead >= WANT_MIN_MATCH
+            && future_start < state.window_size - MIN_LOOKAHEAD
+        {
+            let current_lookahead = state.lookahead;
+            state.strstart = future_start;
+            state.lookahead = future_lookahead;
+            let hash_head = StandardHashCalc::quick_insert_string(state, state.strstart);
+
+            next_match.strstart = hash_chain_position(state.strstart);
+            next_match.orgstart = next_match.strstart;
+
+            if hash_head != 0 && state.recent_hash_distance(hash_head).is_some() {
+                let result = MatchSearchWork::new(hash_head, MatchSearchKind::Standard)
+                    .request(state)?
+                    .execute();
+                state.match_start = result.start;
+                next_match.match_length = result.length;
+                next_match.match_start = result.start;
+                if next_match.match_start >= next_match.strstart
+                    || usize::from(next_match.match_length) < WANT_MIN_MATCH
+                {
+                    next_match.match_length = 1;
+                } else {
+                    fizzle_matches(
+                        state.window.filled(),
+                        state.max_dist(),
+                        current_match,
+                        next_match,
+                    );
+                }
+            } else {
+                next_match.match_start = 0;
+                next_match.match_length = 1;
+            }
+
+            state.lookahead = current_lookahead;
+            state.strstart = usize::from(current_match.strstart);
+        } else {
+            next_match.match_length = 0;
+        }
+
+        Ok(())
     }
 }
 
