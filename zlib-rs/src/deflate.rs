@@ -593,7 +593,7 @@ impl<'a> DeflateStream<'a> {
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
     /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
-    #[must_use]
+    #[must_use = "The returned option indicates whether the stream has the requested state."]
     #[inline]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
         {
@@ -618,7 +618,7 @@ impl<'a> DeflateStream<'a> {
         unsafe { &mut *core::ptr::from_mut(self).cast::<z_stream>() }
     }
 
-    #[must_use]
+    #[must_use = "The counts describe pending compressed output."]
     pub fn pending(&self) -> (usize, u8) {
         (
             self.state.bit_writer.pending.len(),
@@ -627,7 +627,7 @@ impl<'a> DeflateStream<'a> {
     }
 
     /// Last number of used bits when going to a byte boundary.
-    #[must_use]
+    #[must_use = "The count is needed to track the bit stream."]
     pub fn bits_used(&self) -> u8 {
         self.state.bit_writer.bits_used
     }
@@ -779,7 +779,7 @@ impl quickcheck::Arbitrary for DeflateConfig {
 }
 
 impl DeflateConfig {
-    #[must_use]
+    #[must_use = "The returned configuration must be used to configure compression."]
     pub fn new(level: i32) -> Self {
         Self {
             level,
@@ -788,13 +788,13 @@ impl DeflateConfig {
     }
 
     /// Configure for the best compression (takes longer).
-    #[must_use]
+    #[must_use = "The returned configuration must be used to configure compression."]
     pub fn best_compression() -> Self {
         Self::new(crate::c_api::Z_BEST_COMPRESSION)
     }
 
     /// Configure for the fastest compression (compresses less well).
-    #[must_use]
+    #[must_use = "The returned configuration must be used to configure compression."]
     pub fn best_speed() -> Self {
         Self::new(crate::c_api::Z_BEST_SPEED)
     }
@@ -1515,10 +1515,10 @@ struct BitWriter<'a> {
     pub(crate) bits_used: u8,
 
     /// total bit length of compressed file (NOTE: zlib-ng uses a 32-bit integer here)
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     compressed_len: usize,
     /// bit length of compressed data sent (NOTE: zlib-ng uses a 32-bit integer here)
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     bits_sent: usize,
 }
 
@@ -1610,9 +1610,9 @@ impl<'a> BitWriter<'a> {
             bits_valid: 0,
             bits_used: 0,
 
-            #[cfg(feature = "ZLIB_DEBUG")]
+            #[cfg(feature = "zlib-debug")]
             compressed_len: 0,
-            #[cfg(feature = "ZLIB_DEBUG")]
+            #[cfg(feature = "zlib-debug")]
             bits_sent: 0,
         }
     }
@@ -1624,9 +1624,9 @@ impl<'a> BitWriter<'a> {
             bits_valid: self.bits_valid,
             bits_used: self.bits_used,
 
-            #[cfg(feature = "ZLIB_DEBUG")]
+            #[cfg(feature = "zlib-debug")]
             compressed_len: self.compressed_len,
-            #[cfg(feature = "ZLIB_DEBUG")]
+            #[cfg(feature = "zlib-debug")]
             bits_sent: self.bits_sent,
         }
     }
@@ -1656,28 +1656,28 @@ impl<'a> BitWriter<'a> {
         self.bit_buffer = 0;
         self.bits_valid = 0;
 
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         self.sent_bits_align();
     }
 
     // These counters do not exist in release builds. Keep their updates
     // feature-gated rather than exposing release-build no-op methods.
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     fn cmpr_bits_add(&mut self, len: usize) {
         self.compressed_len += len;
     }
 
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     fn cmpr_bits_align(&mut self) {
         self.compressed_len = self.compressed_len.next_multiple_of(8);
     }
 
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     fn sent_bits_add(&mut self, len: usize) {
         self.bits_sent += len;
     }
 
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     fn sent_bits_align(&mut self) {
         self.bits_sent = self.bits_sent.next_multiple_of(8);
     }
@@ -1694,7 +1694,7 @@ impl<'a> BitWriter<'a> {
         let total_bits = len + self.bits_valid;
 
         trace!(" l {:>2} v {:>4x} ", len, val);
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         self.sent_bits_add(usize::from(len));
 
         if total_bits < Self::BIT_BUF_SIZE {
@@ -1759,7 +1759,7 @@ impl<'a> BitWriter<'a> {
     pub(crate) fn emit_lit(&mut self, ltree: &[Value], c: u8) -> u16 {
         self.send_code(c as usize, ltree);
 
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         if let Some(c) = char::from_u32(c as u32) {
             if isgraph(c as u8) {
                 trace!(" '{}' ", c);
@@ -2328,7 +2328,7 @@ impl<'a> State<'a> {
         self.bit_writer.bits_valid = 0;
         self.bit_writer.bits_used = 0;
 
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         {
             self.bit_writer.compressed_len = 0;
             self.bit_writer.bits_sent = 0;
@@ -2459,12 +2459,12 @@ fn emit_stored_block_header(state: &mut State, stored_len: usize, is_last: bool)
     let length_fields = stored_block_length_fields(stored_len);
     state.bit_writer.emit_tree(BlockType::StoredBlock, is_last);
     state.bit_writer.emit_align();
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     state.bit_writer.cmpr_bits_align();
     state.bit_writer.pending.extend(&length_fields);
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     state.bit_writer.cmpr_bits_add(32);
-    #[cfg(feature = "ZLIB_DEBUG")]
+    #[cfg(feature = "zlib-debug")]
     state.bit_writer.sent_bits_add(32);
 }
 
@@ -2487,7 +2487,7 @@ pub fn zng_tr_stored_block(
             .bit_writer
             .pending
             .extend(&state.window.filled()[window_range]);
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         {
             let payload_bits = stored_len << 3;
             state.bit_writer.cmpr_bits_add(payload_bits);
@@ -2883,7 +2883,7 @@ fn gen_bitlen<const N: usize>(
 }
 
 /// Checks that symbol is a printing character (excluding space)
-#[cfg(feature = "ZLIB_DEBUG")]
+#[cfg(feature = "zlib-debug")]
 fn isgraph(c: u8) -> bool {
     (c > 0x20) && (c <= 0x7E)
 }
@@ -4060,7 +4060,7 @@ fn compress_into_stream<O: WritableBytes + ?Sized>(
 /// let (compressed, rc) = compress_slice(&mut buf, input, DeflateConfig::default());
 /// # }
 /// ```
-#[must_use]
+#[must_use = "The bound is needed to size the destination buffer."]
 pub const fn compress_bound(source_len: usize) -> usize {
     // div_ceil avoids the overflow in (source_len + 7) / 8; saturating additions
     // avoid understating bounds that cannot fit in usize.
@@ -4079,7 +4079,7 @@ pub const fn compress_bound(source_len: usize) -> usize {
 /// C callers already observe the original zlib-ng integer behavior at extreme
 /// lengths; the Rust-facing `compress_bound` instead supplies a true saturating
 /// upper bound. This function intentionally stays separate from that safe API.
-#[must_use]
+#[must_use = "The bound is needed to size the destination buffer."]
 pub const fn compress_bound_abi(source_len: usize) -> usize {
     compress_bound_help(source_len, ZLIB_WRAPLEN)
 }
@@ -4326,7 +4326,7 @@ const fn deflate_quick_overhead(x: usize) -> usize {
 /// every combination of windowBits and memLevel.  But even the conservative
 /// upper bound of about 14% expansion does not seem onerous for output buffer
 /// allocation.
-#[must_use]
+#[must_use = "The bound is needed to size the destination buffer."]
 pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
     // on windows, c_ulong is only a 32-bit integer
     // A c_ulong can be wider than usize on unusual ABIs. In that case
@@ -4406,7 +4406,7 @@ pub fn bound(stream: Option<&DeflateStream>, source_len: usize) -> usize {
 ///
 /// Raw caller-buffer handling belongs to the C ABI layer; the compression core exposes only a
 /// checked slice over its initialized window storage.
-#[must_use]
+#[must_use = "The returned bytes describe the current history."]
 pub fn dictionary<'stream>(stream: &'stream DeflateStream<'_>) -> &'stream [u8] {
     let state = &*stream.state;
     state
@@ -5893,7 +5893,7 @@ mod test {
             let fields = stored_block_length_fields(len);
             let pending = stream.state.bit_writer.pending.pending();
             assert_eq!(pending, &[&[1u8][..], &fields[..]].concat());
-            #[cfg(feature = "ZLIB_DEBUG")]
+            #[cfg(feature = "zlib-debug")]
             {
                 assert_eq!(stream.state.bit_writer.compressed_len, 32);
                 assert_eq!(stream.state.bit_writer.bits_sent, 40);
@@ -6067,7 +6067,7 @@ mod test {
             assert_eq!(&pending[3..5], &(!len).to_le_bytes()[..2]);
             assert_eq!(&pending[5..], source.as_slice());
 
-            #[cfg(feature = "ZLIB_DEBUG")]
+            #[cfg(feature = "zlib-debug")]
             {
                 assert_eq!(
                     stream.state.bit_writer.compressed_len,
@@ -9692,9 +9692,9 @@ mod test {
         const _: () = assert!(offset_of!(State, status) == 0);
         const _: () = assert!(offset_of!(State, _cache_line_0) == 64);
         const _: () = assert!(offset_of!(State, _cache_line_1) == 128);
-        #[cfg(not(feature = "ZLIB_DEBUG"))] // ZLIB_DEBUG adds 16 bytes
+        #[cfg(not(feature = "zlib-debug"))] // ZLIB_DEBUG adds 16 bytes
         const _: () = assert!(offset_of!(State, _cache_line_2) == 192);
-        #[cfg(not(feature = "ZLIB_DEBUG"))] // ZLIB_DEBUG adds 16 bytes
+        #[cfg(not(feature = "zlib-debug"))] // ZLIB_DEBUG adds 16 bytes
         const _: () = assert!(offset_of!(State, _cache_line_3) == 256);
     }
 }

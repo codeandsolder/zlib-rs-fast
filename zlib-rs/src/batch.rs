@@ -54,7 +54,7 @@ impl WritableBytes for BatchOutput<'_> {
 
 impl<'a> BatchJob<'a> {
     /// Write into a fixed initialized slice, retaining its untouched tail.
-    #[must_use]
+    #[must_use = "The returned batch job must be submitted to perform the work."]
     pub const fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
         Self {
             input,
@@ -200,7 +200,7 @@ impl BatchCodec {
     }
 
     /// Worker count owned by this codec.
-    #[must_use]
+    #[must_use = "The count describes the available workers."]
     pub fn workers(&self) -> usize {
         self.pool.current_num_threads()
     }
@@ -366,9 +366,7 @@ mod tests {
             let codec = BatchCodec::new(workers).map_err(|_| "worker pool")?;
             run_decode_cases(|jobs, config| codec.decompress(jobs, config))
                 .map_err(|_| "vector output reservation")?;
-            assert!(codec
-                .decompress(&mut [], InflateConfig::default())
-                .is_empty());
+            assert_eq!(codec.decompress(&mut [], InflateConfig::default()), []);
         }
         Ok(())
     }

@@ -323,11 +323,11 @@ enum StandardPhase {
 ///
 /// `OutputFull` returns this token unchanged so a persistent scheduler can resume the same drain
 /// before advancing token production again.
-#[must_use]
+#[must_use = "Pending output work must be consumed by the caller."]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PendingOutputWork;
 
-#[must_use]
+#[must_use = "The outcome determines whether pending output processing can proceed."]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingOutputOutcome {
     Ready,

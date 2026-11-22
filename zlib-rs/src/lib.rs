@@ -61,7 +61,7 @@ pub use inflate::decompress_slice;
 
 macro_rules! traceln {
     ($($arg:tt)*) => {
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         {
             eprintln!($($arg)*)
         }
@@ -71,7 +71,7 @@ pub(crate) use traceln;
 
 macro_rules! trace {
     ($($arg:tt)*) => {
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         {
             eprint!($($arg)*)
         }
@@ -254,13 +254,13 @@ impl ReturnCode {
         }
     }
 
-    #[must_use]
+    #[must_use = "The returned description communicates the error."]
     pub const fn error_message(self) -> *const core::ffi::c_char {
         let msg = self.error_message_str_with_null();
         msg.as_ptr().cast::<core::ffi::c_char>()
     }
 
-    #[must_use]
+    #[must_use = "The option reports whether the integer is a recognized return code."]
     pub const fn try_from_c_int(err: core::ffi::c_int) -> Option<Self> {
         match err {
             0 => Some(Self::Ok),

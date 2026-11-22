@@ -25,7 +25,7 @@ __internal-fuzz = ["arbitrary"]
 __internal-fuzz-disable-checksum = [] # disable checksum validation on inflate
 __internal-test = ["quickcheck"]
 __internal-api = [] # export internal symbols for use in `libz-rs-sys`.
-ZLIB_DEBUG = []
+zlib-debug = ["std"]
 
 
 [dependencies]

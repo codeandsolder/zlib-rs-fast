@@ -17,7 +17,7 @@ pub struct Window<'a> {
 }
 
 impl Window<'_> {
-    #[must_use]
+    #[must_use = "The raw parts must be retained to manage the window allocation."]
     pub const fn into_raw_parts(self) -> (*mut u8, usize) {
         let (ptr, len) = self.buf.into_raw_parts();
         (ptr.cast(), len)
@@ -45,12 +45,12 @@ impl Window<'_> {
         unsafe { Window::<'a>::from_raw_parts(storage.as_mut_ptr(), storage.len()) }
     }
 
-    #[must_use]
+    #[must_use = "The boolean reports whether the collection is empty."]
     pub const fn is_empty(&self) -> bool {
         self.size() == 0
     }
 
-    #[must_use]
+    #[must_use = "The size describes the window capacity."]
     pub const fn size(&self) -> usize {
         self.size
     }
@@ -74,18 +74,18 @@ impl Window<'_> {
     }
 
     /// Number of initialized logical history bytes, saturating at `size()`.
-    #[must_use]
+    #[must_use = "The count describes the available window history."]
     pub const fn have(&self) -> usize {
         self.have
     }
 
     /// Position where the next byte will be written
-    #[must_use]
+    #[must_use = "The returned index describes the next window write position."]
     pub const fn next(&self) -> usize {
         self.next
     }
 
-    #[must_use]
+    #[must_use = "The returned empty window must be retained to use it."]
     pub const fn empty() -> Self {
         Self {
             buf: WeakSliceMut::empty(),
@@ -105,7 +105,7 @@ impl Window<'_> {
     ///
     /// Panics if the logical history length exceeds storage or a partially filled
     /// window's write cursor differs from the initialized prefix length.
-    #[must_use]
+    #[must_use = "The borrowed bytes are the result of this accessor."]
     pub fn as_slice(&self) -> &[u8] {
         assert!(self.have <= self.size, "inflate history stays in-bounds");
         if self.have < self.size {
@@ -116,7 +116,7 @@ impl Window<'_> {
         unsafe { self.buf.as_slice()[..self.have].assume_init_ref() }
     }
 
-    #[must_use]
+    #[must_use = "The pointer is the result of this accessor."]
     pub const fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr().cast()
     }
@@ -125,7 +125,7 @@ impl Window<'_> {
     ///
     /// Before the circular window fills, all history is one initialized prefix. Once full, `next`
     /// points at the oldest byte, so the logical dictionary is the tail followed by the head.
-    #[must_use]
+    #[must_use = "Both returned segments describe the current history."]
     pub fn dictionary_segments(&self) -> (&[u8], &[u8]) {
         let initialized = self.as_slice();
         if self.have < self.size() {
@@ -193,7 +193,7 @@ impl Window<'_> {
     }
 
     #[cfg(test)]
-    #[must_use]
+    #[must_use = "A successful window allocation must be retained and eventually released."]
     pub fn new_in<'a>(
         alloc: &crate::inflate::Allocator<'a>,
         window_bits: usize,

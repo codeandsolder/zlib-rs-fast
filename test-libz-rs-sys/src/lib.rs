@@ -8,7 +8,7 @@
 ///
 /// The compile-time check fails if the stream structure cannot fit in
 /// the signed C integer field required by the initialization ABI.
-#[must_use]
+#[must_use = "The size is needed to validate the ABI version."]
 pub const fn abi_z_stream_size() -> core::ffi::c_int {
     // Evaluate the bound at compile time, even if callers invoke this
     // function from non-const test code.

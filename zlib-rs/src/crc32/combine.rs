@@ -1,17 +1,17 @@
 use super::braid::CRC32_LSB_POLY;
 
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub const fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     crc32_combine_op(crc1, crc2, crc32_combine_gen(len2))
 }
 
-#[must_use]
+#[must_use = "The returned polynomial operator is needed to combine checksums."]
 #[inline]
 pub const fn crc32_combine_gen(len2: u64) -> u32 {
     x2nmodp(len2, 3)
 }
 
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 #[inline]
 pub const fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
     multmodp(op, crc1) ^ crc2
