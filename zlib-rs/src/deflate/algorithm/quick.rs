@@ -10,6 +10,8 @@ use crate::{
     DeflateFlush,
 };
 
+const PENDING_WORD_BYTES: usize = State::BIT_BUF_SIZE.div_ceil(8) as usize;
+
 pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState {
     let last = flush == DeflateFlush::Finish;
 
@@ -48,7 +50,26 @@ pub fn deflate_quick(stream: &mut Compressor, flush: DeflateFlush) -> BlockState
             start_block(stream.state, last);
         }
 
-        emit_next(stream.state);
+        if stream.state.lookahead >= MIN_LOOKAHEAD {
+            // A token consumes at most STD_MAX_MATCH input bytes and emits at
+            // most one bit-buffer word. Reserve only tokens for which both
+            // full lookahead and the original pending-drain threshold hold.
+            let input_quota = (stream.state.lookahead - MIN_LOOKAHEAD) / STD_MAX_MATCH + 1;
+            let pending_quota = stream
+                .state
+                .bit_writer
+                .pending
+                .remaining()
+                .saturating_sub(1)
+                / PENDING_WORD_BYTES;
+            // Opening a block can consume pending capacity. As before, its
+            // first token is emitted before the next outer drain check.
+            for _ in 0..input_quota.min(pending_quota).max(1) {
+                emit_next::<true>(stream.state);
+            }
+        } else {
+            emit_next::<false>(stream.state);
+        }
     }
 
     stream.state.insert = Ord::min(stream.state.strstart, STD_MIN_MATCH - 1);
@@ -96,19 +117,23 @@ fn end_block(stream: &mut Compressor<'_, '_>, last: bool) -> Option<BlockState> 
 }
 
 #[inline]
-fn pending_needs_drain(state: &State<'_>) -> bool {
-    state.bit_writer.pending.remaining() <= usize::from(State::BIT_BUF_SIZE.div_ceil(8))
+const fn pending_needs_drain(state: &State<'_>) -> bool {
+    state.bit_writer.pending.remaining() <= PENDING_WORD_BYTES
 }
 
-fn emit_next(state: &mut State<'_>) {
-    if state.lookahead >= WANT_MIN_MATCH {
+fn emit_next<const FULL: bool>(state: &mut State<'_>) {
+    if FULL || state.lookahead >= WANT_MIN_MATCH {
         let str_val = StandardHashCalc::first_four_bytes(&state.window.filled()[state.strstart..]);
         let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, str_val);
 
         if let Some(distance) = state.recent_hash_distance(hash_head) {
             let match_start = &state.window.filled()[usize::from(hash_head)..];
             if str_val == StandardHashCalc::first_four_bytes(match_start) {
-                let max_len = state.lookahead.min(STD_MAX_MATCH);
+                let max_len = if FULL {
+                    STD_MAX_MATCH
+                } else {
+                    state.lookahead.min(STD_MAX_MATCH)
+                };
                 let match_len = WANT_MIN_MATCH
                     + crate::deflate::match_compare::common_prefix_len(
                         &state.window.filled()
