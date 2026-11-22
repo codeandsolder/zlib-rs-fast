@@ -343,6 +343,7 @@ use std::{boxed::Box, vec, vec::Vec};
 pub struct MisalignedAlloc {
     pub(super) remainder: usize,
     pub(super) modulus: usize,
+    pub(super) fill: u8,
     pub(super) allocations: usize,
     pub(super) frees: usize,
     pub(super) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
@@ -370,7 +371,7 @@ pub unsafe extern "C" fn misaligned_alloc_callback(
     else {
         return core::ptr::null_mut();
     };
-    let mut data = vec![0u8; length].into_boxed_slice();
+    let mut data = vec![ctx.fill; length].into_boxed_slice();
     let base = data.as_mut_ptr().addr();
     let delta = (ctx.remainder + ctx.modulus - base % ctx.modulus) % ctx.modulus;
     // SAFETY: the allocation reserves one full alignment unit beyond the requested
@@ -552,6 +553,7 @@ mod tests {
             let mut ctx = MisalignedAlloc {
                 remainder,
                 modulus,
+                fill: 0,
                 allocations: 0,
                 frees: 0,
                 buffers: Vec::new(),

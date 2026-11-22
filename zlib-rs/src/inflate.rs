@@ -4148,6 +4148,7 @@ mod tests {
             let mut context = MisalignedAlloc {
                 remainder,
                 modulus: ALLOCATION_BLOCK_BYTES,
+                fill: 0,
                 allocations: 0,
                 frees: 0,
                 buffers: Vec::new(),
@@ -4637,6 +4638,7 @@ mod tests {
             let mut ctx = MisalignedAlloc {
                 remainder,
                 modulus: ALLOCATION_BLOCK_BYTES,
+                fill: 0,
                 allocations: 0,
                 frees: 0,
                 buffers: Vec::new(),
