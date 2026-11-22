@@ -123,23 +123,52 @@ const fn pending_needs_drain(state: &State<'_>) -> bool {
 
 fn emit_next<const FULL: bool>(state: &mut State<'_>) {
     if FULL || state.lookahead >= WANT_MIN_MATCH {
-        let str_val = StandardHashCalc::first_four_bytes(&state.window.filled()[state.strstart..]);
+        let current = &state.window.filled()[state.strstart..];
+        // Full-lookahead runs can use one eight-byte probe for both hashing
+        // its low four bytes and comparing the common short matches. The
+        // terminal path still reads only the four bytes guaranteed available.
+        let probe = if FULL {
+            u64::from_le_bytes(current.as_chunks::<8>().0[0])
+        } else {
+            u64::from(StandardHashCalc::first_four_bytes(current))
+        };
+        let [a, b, c, d, ..] = probe.to_le_bytes();
+        let str_val = u32::from_le_bytes([a, b, c, d]);
         let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, str_val);
 
         if let Some(distance) = state.recent_hash_distance(hash_head) {
+            let current = &state.window.filled()[state.strstart..];
             let match_start = &state.window.filled()[usize::from(hash_head)..];
-            if str_val == StandardHashCalc::first_four_bytes(match_start) {
+            // A validated backward distance starts before the current position,
+            // so its eight-byte probe also fits in the initialized window.
+            let past_probe = if FULL {
+                u64::from_le_bytes(match_start.as_chunks::<8>().0[0])
+            } else {
+                u64::from(StandardHashCalc::first_four_bytes(match_start))
+            };
+            let different = probe ^ past_probe;
+            if different & u64::from(u32::MAX) == 0 {
                 let max_len = if FULL {
                     STD_MAX_MATCH
                 } else {
                     state.lookahead.min(STD_MAX_MATCH)
                 };
-                let match_len = WANT_MIN_MATCH
-                    + crate::deflate::match_compare::common_prefix_len(
-                        &state.window.filled()
-                            [state.strstart + WANT_MIN_MATCH..state.strstart + max_len],
-                        &match_start[WANT_MIN_MATCH..max_len],
-                    );
+                let match_len = if FULL {
+                    if different != 0 {
+                        different.trailing_zeros() as usize / 8
+                    } else {
+                        8 + crate::deflate::match_compare::common_prefix_len(
+                            &current[8..max_len],
+                            &match_start[8..max_len],
+                        )
+                    }
+                } else {
+                    WANT_MIN_MATCH
+                        + crate::deflate::match_compare::common_prefix_len(
+                            &current[WANT_MIN_MATCH..max_len],
+                            &match_start[WANT_MIN_MATCH..max_len],
+                        )
+                };
 
                 if match_len >= WANT_MIN_MATCH {
                     // The static writer accepts a host-width length code.
@@ -178,6 +207,54 @@ mod tests {
             StandardHashCalc::first_four_bytes(&[1, 2, 3, 4, 5]),
             0x0403_0201
         );
+    }
+
+    #[test]
+    fn quick_probe_preserves_match_length_and_terminal_bounds() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{end, reset, set_dictionary, DeflateConfig, DeflateStream};
+
+        let mut stream = DeflateStream::new(DeflateConfig::new(1))?;
+        // Include all first mismatches across the complete match limit,
+        // then exercise the short terminal path without padded lookahead.
+        for lookahead in [1, 2, 3, 4, 5, 6, 7, 8, MIN_LOOKAHEAD] {
+            let limit = lookahead.min(STD_MAX_MATCH);
+            for mismatch in 0..=limit {
+                assert_eq!(reset(&mut stream), crate::ReturnCode::Ok);
+                let start = MIN_LOOKAHEAD;
+                let mut bytes = [b'a'; 2 * MIN_LOOKAHEAD];
+                if mismatch < limit {
+                    bytes[start + mismatch] = b'b';
+                }
+                assert_eq!(
+                    set_dictionary(&mut stream, &bytes[..start + lookahead]),
+                    crate::ReturnCode::Ok
+                );
+                let state = &mut stream.state;
+                state.strstart = start;
+                state.lookahead = lookahead;
+                if lookahead >= WANT_MIN_MATCH {
+                    let probe = StandardHashCalc::first_four_bytes(&bytes[start..]);
+                    let hash = StandardHashCalc::update_hash(0, probe) as usize;
+                    // Make history index zero the candidate independent of
+                    // the dictionary insertion sequence.
+                    state.head.as_mut_slice()[hash] = 0;
+                }
+                if lookahead >= MIN_LOOKAHEAD {
+                    emit_next::<true>(state);
+                } else {
+                    emit_next::<false>(state);
+                }
+                let consumed = if mismatch >= WANT_MIN_MATCH {
+                    mismatch
+                } else {
+                    1
+                };
+                assert_eq!(state.strstart, start + consumed);
+                assert_eq!(state.lookahead, lookahead - consumed);
+            }
+        }
+        assert!(end(&mut stream).is_ok());
+        Ok(())
     }
 
     #[test]
