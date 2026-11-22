@@ -357,11 +357,10 @@ mod tests {
     }
 
     #[test]
-    fn reuse_handles_different_headers_and_partial_streams(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn reuse_handles_different_headers_and_partial_streams() -> Result<(), &'static str> {
         let input = b"decoder reuse: different wrapper windows and block modes/".repeat(128);
         let mut streams = Vec::new();
-        for window_bits in [9, 12, 15, 25, 31] {
+        for window_bits in [-9, -15, 9, 12, 15, 25, 31] {
             for level in [0, 1, 6, 9] {
                 let mut compressed = vec![0; compress_bound(input.len()) + 64];
                 let (encoded, code) = compress_slice(
@@ -396,53 +395,52 @@ mod tests {
                 .collect::<Vec<_>>();
             streams.push(bytes);
         }
-        for window_bits in [-15, 0, 15, 31, 32, 47, i32::MAX] {
+        for window_bits in [-15, 0, 15, 31, 32, 47] {
             let config = InflateConfig { window_bits };
-            let capacities = (0..streams.len())
-                .map(|i| [0, 1, 23, input.len(), input.len() + 31][i % 5])
-                .collect::<Vec<_>>();
-            let mut expected = capacities
-                .iter()
-                .map(|&cap| vec![0xa5; cap])
-                .collect::<Vec<_>>();
-            let references = streams
-                .iter()
-                .zip(&mut expected)
-                .map(|(src, dst)| {
-                    let (read, written, code) = uncompress2_into(dst.as_mut_slice(), src, config);
-                    BatchDecompressResult {
-                        read,
-                        written,
-                        code,
-                    }
-                })
-                .collect::<Vec<_>>();
-            let check = |run: &dyn Fn(&mut [BatchJob<'_>]) -> Vec<BatchDecompressResult>| -> Result<(), std::collections::TryReserveError> {
-                let mut slice_outputs = capacities.iter().map(|&cap| vec![0xa5; cap]).collect::<Vec<_>>();
-                let mut jobs = streams.iter().zip(&mut slice_outputs).map(|(src,dst)| BatchJob::new(src,dst)).collect::<Vec<_>>();
-                assert_eq!(run(&mut jobs), references);
-                drop(jobs);
-                assert_eq!(slice_outputs, expected);
-                let mut vectors = vec![vec![0x79; 3]; streams.len()];
-                let mut jobs = streams.iter().zip(&mut vectors).zip(&capacities)
-                    .map(|((src,dst),&cap)| BatchJob::with_vec(src,dst,cap)).collect::<Result<Vec<_>,_>>()?;
-                assert_eq!(run(&mut jobs), references);
-                drop(jobs);
-                for ((actual, expected), result) in vectors.iter().zip(&expected).zip(&references) {
-                    assert_eq!(actual, &expected[..result.written]);
+            // Drive the very same decoder through all streams in sequence,
+            // including bad headers and different inferred window sizes.
+            // The batch front-end slice and vector contracts are exercised
+            // independently by run_decode_cases.
+            let mut decoder = WholeDecoder::new(config).ok_or("valid decoder config")?;
+            for source in &streams {
+                for capacity in [0, 1, 23, input.len(), input.len() + 31] {
+                    let mut reference = vec![0xa5; capacity];
+                    let expected = uncompress2_into(reference.as_mut_slice(), source, config);
+                    let mut actual = vec![0xa5; capacity];
+                    assert_eq!(
+                        decoder.decode(actual.as_mut_slice(), source),
+                        expected,
+                        "wrapper={window_bits} capacity={capacity}"
+                    );
+                    assert_eq!(actual, reference);
                 }
-                Ok(())
-            };
-            check(&|jobs| decompress_slices_batch(jobs, config))?;
-            #[cfg(feature = "parallel")]
-            for workers in [
-                core::num::NonZeroUsize::MIN,
-                core::num::NonZeroUsize::new(4).ok_or("workers")?,
-            ] {
-                let codec = BatchCodec::new(workers)?;
-                check(&|jobs| codec.decompress(jobs, config))?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_batch_configuration_preserves_output_contract(
+    ) -> Result<(), std::collections::TryReserveError> {
+        let config = InflateConfig {
+            window_bits: i32::MAX,
+        };
+        let mut slice = [0xa5; 7];
+        let mut vector = vec![0x79; 3];
+        let mut jobs = [
+            BatchJob::new(b"invalid", &mut slice),
+            BatchJob::with_vec(b"invalid", &mut vector, 7)?,
+        ];
+        assert_eq!(
+            decompress_slices_batch(&mut jobs, config),
+            [BatchDecompressResult {
+                read: 0,
+                written: 0,
+                code: ReturnCode::StreamError
+            }; 2]
+        );
+        assert_eq!(slice, [0xa5; 7]);
+        assert!(vector.is_empty());
         Ok(())
     }
 
