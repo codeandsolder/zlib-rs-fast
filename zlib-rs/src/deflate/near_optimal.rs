@@ -423,10 +423,17 @@ impl FrontierTileScratch {
             .enumerate()
         {
             let position = tile_start + local;
-            if let Some(suffixes) = suffixes {
-                *rank = suffixes.rank_of(position);
-            }
+            *rank = suffixes.rank_of(position);
             *available = u16::try_from(STD_MAX_MATCH.min(input_len - position))
+                .unwrap_or_else(|_| unreachable!("DEFLATE maximum match length fits in u16"));
+        }
+    }
+
+    fn prepare_direct(&mut self, input_len: usize, tile_start: usize, len: usize) {
+        self.counts[..len].fill(0);
+        self.staged.clear();
+        for (local, available) in self.available[..len].iter_mut().enumerate() {
+            *available = u16::try_from(STD_MAX_MATCH.min(input_len - tile_start - local))
                 .unwrap_or_else(|_| unreachable!("DEFLATE maximum match length fits in u16"));
         }
     }
@@ -702,8 +709,8 @@ impl<'a> FrontierSource<'a> {
         let first_rank_code = self.first_rank_code;
         let first_query = query.start;
         let suffixes = match &self.traversal {
-            FrontierTraversal::Direct => None,
-            FrontierTraversal::Dense(suffixes) => Some(suffixes),
+            FrontierTraversal::Direct => return Ok(self.build_direct(query)),
+            FrontierTraversal::Dense(suffixes) => suffixes,
             FrontierTraversal::Grouped { sa, groups } => {
                 return Ok(group_local_frontier(
                     input,
@@ -720,7 +727,7 @@ impl<'a> FrontierSource<'a> {
             (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
                 .then(|| RankSet::new(input.len()))
         });
-        if let Some(suffixes) = suffixes {
+        if first_query != 0 {
             for (set, &(min, max)) in active.iter_mut().zip(ranges) {
                 if let Some(set) = set {
                     if let Some(end) = first_query.checked_sub(min) {
@@ -757,17 +764,15 @@ impl<'a> FrontierSource<'a> {
                 tile_len,
                 &mut scratch,
             );
-            if let Some(suffixes) = suffixes {
-                scan_rank_buckets(
-                    input,
-                    suffixes,
-                    ranges,
-                    &mut active,
-                    first_rank_code..last_rank_code,
-                    tile_start..tile_start + tile_len,
-                    &mut scratch,
-                );
-            }
+            scan_rank_buckets(
+                input,
+                suffixes,
+                ranges,
+                &mut active,
+                first_rank_code..last_rank_code,
+                tile_start..tile_start + tile_len,
+                &mut scratch,
+            );
             scan_direct_buckets(
                 input,
                 &ranges[last_rank_code..],
@@ -783,6 +788,26 @@ impl<'a> FrontierSource<'a> {
             offsets,
             entries,
         })
+    }
+    /// No suffix permutation or active sets are necessary when every
+    /// distance class is narrow. Preserve the same position-major staging
+    /// and exact direct-bucket tie rules as the dense traversal.
+    fn build_direct(&self, query: Range<usize>) -> MatchCandidates {
+        let mut offsets = Vec::with_capacity(query.len() + 1);
+        let mut entries = Vec::new();
+        let mut scratch = FrontierTileScratch::new();
+        offsets.push(0);
+        for tile_start in query.clone().step_by(FRONTIER_TILE_POSITIONS) {
+            let len = (query.end - tile_start).min(FRONTIER_TILE_POSITIONS);
+            scratch.prepare_direct(self.input.len(), tile_start, len);
+            scan_direct_buckets(self.input, &self.ranges, tile_start, len, &mut scratch);
+            scratch.scatter(len, &mut entries, &mut offsets);
+        }
+        MatchCandidates {
+            first_query: query.start,
+            offsets,
+            entries,
+        }
     }
 }
 
