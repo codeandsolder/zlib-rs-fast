@@ -458,6 +458,32 @@ fn direct_bucket_match(
     best
 }
 
+// The leading distance-code classes of width <= DIRECT_SCAN_MAX
+// end at distance 32. Later truncated classes can also be narrow;
+// only the leading contiguous group uses the single SIMD mask.
+const NEARBY_DISTANCE_MASK_BITS: usize = u32::BITS as usize;
+
+/// One lane for each of the preceding 32 positions. Compare the first
+/// three exact bytes together, so nonmatches need no suffix comparison.
+#[inline]
+fn direct_prefix_mask(input: &[u8], position: usize) -> u32 {
+    use core::simd::{cmp::SimdPartialEq, Simd};
+    let start = position - NEARBY_DISTANCE_MASK_BITS;
+    let query = &input[position..position + STD_MIN_MATCH];
+    let mut equal = Simd::<u8, NEARBY_DISTANCE_MASK_BITS>::from_slice(
+        &input[start..start + NEARBY_DISTANCE_MASK_BITS],
+    )
+    .simd_eq(Simd::splat(query[0]));
+    for (offset, &byte) in query.iter().enumerate().skip(1) {
+        equal &=
+            Simd::from_slice(&input[start + offset..start + offset + NEARBY_DISTANCE_MASK_BITS])
+                .simd_eq(Simd::splat(byte));
+    }
+    // Bit zero represents the nearest (distance-one) candidate.
+    let [a, b, c, d, _, _, _, _] = equal.to_bitmask().to_le_bytes();
+    u32::from_le_bytes([a, b, c, d]).reverse_bits()
+}
+
 fn scan_direct_buckets(
     input: &[u8],
     ranges: &[(usize, usize)],
@@ -465,12 +491,56 @@ fn scan_direct_buckets(
     tile_len: usize,
     scratch: &mut FrontierTileScratch,
 ) {
+    let max_direct = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
+    if max_direct == 0 {
+        return;
+    }
+    let leading =
+        max_direct <= NEARBY_DISTANCE_MASK_BITS && ranges.first().is_some_and(|r| r.0 == 1);
     for (local, &available) in scratch.available[..tile_len].iter().enumerate() {
         let available = usize::from(available);
         if available < STD_MIN_MATCH {
             continue;
         }
         let position = tile_start + local;
+        if leading && position >= NEARBY_DISTANCE_MASK_BITS {
+            let mut mask = direct_prefix_mask(input, position)
+                & (u32::MAX >> (NEARBY_DISTANCE_MASK_BITS - max_direct));
+            let mut code = None;
+            let mut best = MatchCandidate::NONE;
+            while mask != 0 {
+                let distance = mask.trailing_zeros() as usize + 1;
+                mask &= mask - 1;
+                let next_code = State::d_code(distance - 1);
+                if code != Some(next_code) {
+                    if best.length != 0 {
+                        stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
+                    }
+                    best = MatchCandidate::NONE;
+                    code = Some(next_code);
+                }
+                let candidate_position = position - distance;
+                let length = STD_MIN_MATCH
+                    + match_compare::common_prefix_len(
+                        &input[position + STD_MIN_MATCH..position + available],
+                        &input[candidate_position + STD_MIN_MATCH..candidate_position + available],
+                    );
+                best.consider(length, distance);
+                // The distance mask is visited nearest first, so once
+                // the full available prefix matches, no remaining member
+                // of this class can improve length or distance ties.
+                if length == available {
+                    let (_, maximum) = ranges[usize::from(next_code)];
+                    mask &= u32::MAX
+                        .checked_shl(u32::try_from(maximum).unwrap_or(32))
+                        .unwrap_or(0);
+                }
+            }
+            if best.length != 0 {
+                stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
+            }
+            continue;
+        }
         for &(min_distance, max_distance) in ranges {
             if min_distance == 0 {
                 continue;
@@ -1773,6 +1843,52 @@ mod tests {
         }
 
         Ok(MatchCandidates { offsets, entries })
+    }
+
+    #[test]
+    fn nearby_simd_mask_matches_every_scalar_candidate() {
+        let mut random = 0x92ad_7c51u32;
+        let mut low_entropy = [0u8; 289];
+        for value in &mut low_entropy {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            *value = random.to_le_bytes()[0] & 3;
+        }
+        let periodic = b"abcabcabdabc0123".repeat(33);
+        let constant = [b'a'; 288];
+        for input in [low_entropy.as_slice(), periodic.as_slice(), &constant] {
+            for position in NEARBY_DISTANCE_MASK_BITS..=input.len() - STD_MIN_MATCH {
+                let expected = (1..=NEARBY_DISTANCE_MASK_BITS).fold(0u32, |mask, distance| {
+                    let candidate = position - distance;
+                    if input[position..position + STD_MIN_MATCH]
+                        == input[candidate..candidate + STD_MIN_MATCH]
+                    {
+                        mask | (1 << (distance - 1))
+                    } else {
+                        mask
+                    }
+                });
+                assert_eq!(direct_prefix_mask(input, position), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_frontier_retains_exact_records_at_truncated_distance_boundaries(
+    ) -> Result<(), ReturnCode> {
+        let mut input = b"abcabcabdabc0123".repeat(69);
+        for position in (0..input.len()).step_by(53) {
+            input[position] = b'X';
+        }
+        for distance in (0..=40).chain([
+            127, 128, 129, 130, 131, 255, 256, 257, 258, 1023, 1024, 1025, 1028, 1032, 1033, 32768,
+        ]) {
+            let actual = build_match_candidates(&input, distance)?;
+            let expected = build_match_candidates_position_major(&input, distance)?;
+            assert_eq!(actual, expected, "distance={distance}");
+        }
+        Ok(())
     }
 
     #[test]
