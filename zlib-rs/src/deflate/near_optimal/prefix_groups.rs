@@ -235,12 +235,12 @@ fn scan_word_group(
             } else {
                 for &word in positions[begin..end].iter().rev() {
                     grouped_compare(input, position, word.position(), available, &mut best);
-                    if usize::from(best.length) == available {
+                    if usize::from(best.length()) == available {
                         break;
                     }
                 }
             }
-            debug_assert_ne!(best.length, 0);
+            debug_assert_ne!(best.length(), 0);
             out.entries.push(best);
             end = begin;
         }
@@ -323,7 +323,7 @@ impl ClassWindow {
                     available,
                     &mut best,
                 );
-                if usize::from(best.length) == available {
+                if usize::from(best.length()) == available {
                     break;
                 }
             }
@@ -365,17 +365,17 @@ fn scan_group_nearby(
             let other = record.position();
             let code = State::d_code(position - other - 1);
             if current != Some(code) {
-                if best.length != 0 {
+                if best.length() != 0 {
                     stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
                 }
                 best = MatchCandidate::NONE;
                 current = Some(code);
             }
-            if usize::from(best.length) != available {
+            if usize::from(best.length()) != available {
                 grouped_compare(source.input, position, other, available, &mut best);
             }
         }
-        if best.length != 0 {
+        if best.length() != 0 {
             stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
         }
     }
@@ -460,7 +460,7 @@ impl GroupScratch {
                         usize::from(scratch.available[local]),
                         range,
                     );
-                    if best.length != 0 {
+                    if best.length() != 0 {
                         stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
                     }
                 }

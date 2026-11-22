@@ -49,15 +49,43 @@ fn compact_match_distance(distance: usize) -> u16 {
 /// does not), so only the longest available match in that bucket can ever be useful to a parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchCandidate {
-    pub(crate) length: u16,
+    length_and_code: u16,
     pub(crate) distance: u16,
 }
 
 impl MatchCandidate {
     const NONE: Self = Self {
-        length: 0,
+        length_and_code: 0,
         distance: 0,
     };
+
+    const LENGTH_BITS: u32 = STD_MAX_MATCH.ilog2() + 1;
+    const LENGTH_MASK: u16 = (1 << Self::LENGTH_BITS) - 1;
+    // The nine length bits leave enough room for the five-bit distance
+    // alphabet. Preserve the full distance for exact traceback ties.
+    const CHECK_LAYOUT: () = assert!(Self::LENGTH_BITS + (D_CODES - 1).ilog2() < u16::BITS);
+
+    #[inline]
+    const fn length(self) -> u16 {
+        self.length_and_code & Self::LENGTH_MASK
+    }
+
+    #[inline]
+    fn code(self) -> usize {
+        usize::from(self.length_and_code >> Self::LENGTH_BITS)
+    }
+
+    #[inline]
+    fn matching(length: u16, distance: u16) -> Self {
+        let () = Self::CHECK_LAYOUT;
+        debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&usize::from(length)));
+        debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&usize::from(distance)));
+        Self {
+            length_and_code: length
+                | (u16::from(State::d_code(usize::from(distance) - 1)) << Self::LENGTH_BITS),
+            distance,
+        }
+    }
 
     /// Update the best match for one distance-code bucket. Both discovery
     /// strategies deliver byte positions as usize; they share the same compact
@@ -75,13 +103,13 @@ impl MatchCandidate {
             (1..=1usize << crate::MAX_WBITS).contains(&distance),
             "match exceeds DEFLATE distance limit"
         );
-        if length > usize::from(self.length)
-            || (length == usize::from(self.length) && distance < usize::from(self.distance))
+        if length > usize::from(self.length())
+            || (length == usize::from(self.length()) && distance < usize::from(self.distance))
         {
-            *self = Self {
-                length: compact_match_length(length),
-                distance: compact_match_distance(distance),
-            };
+            *self = Self::matching(
+                compact_match_length(length),
+                compact_match_distance(distance),
+            );
         }
     }
 }
@@ -507,7 +535,7 @@ fn scan_direct_buckets(
                 mask &= mask - 1;
                 let next_code = State::d_code(distance - 1);
                 if code != Some(next_code) {
-                    if best.length != 0 {
+                    if best.length() != 0 {
                         stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
                     }
                     best = MatchCandidate::NONE;
@@ -530,7 +558,7 @@ fn scan_direct_buckets(
                         .unwrap_or(0);
                 }
             }
-            if best.length != 0 {
+            if best.length() != 0 {
                 stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
             }
             continue;
@@ -540,7 +568,7 @@ fn scan_direct_buckets(
                 continue;
             }
             let best = direct_bucket_match(input, position, available, min_distance, max_distance);
-            if best.length != 0 {
+            if best.length() != 0 {
                 stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
             }
         }
@@ -596,7 +624,7 @@ fn scan_rank_buckets(
             if let Some(rank) = successor {
                 consider_rank(rank);
             }
-            if best.length != 0 {
+            if best.length() != 0 {
                 stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
             }
         }
@@ -1525,39 +1553,122 @@ pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: &TokenCost
     parse_range(input, candidates, 0..input.len(), costs)
 }
 
-/// Reuse a bounded cost horizon and block-sized traceback across cost-model
-/// passes. Every forward edge is at most one DEFLATE match long, so finalized
-/// costs can be discarded without losing any subsequent relaxation.
+/// A signed packed key compares cost first, then predecessor position.
+trait CostKey:
+    Copy
+    + Ord
+    + From<i32>
+    + Into<i64>
+    + core::ops::Add<Output = Self>
+    + core::ops::Sub<Output = Self>
+    + core::ops::BitAnd<Output = Self>
+    + core::ops::BitOr<Output = Self>
+{
+    const INF: Self;
+}
+
+impl CostKey for i32 {
+    const INF: Self = Self::MAX;
+}
+
+impl CostKey for i64 {
+    const INF: Self = Self::MAX;
+}
+
+enum CostBuffer {
+    Narrow(Vec<i32>),
+    Wide(Vec<i64>),
+}
+
+impl Default for CostBuffer {
+    fn default() -> Self {
+        Self::Narrow(Vec::new())
+    }
+}
+
+#[cfg(test)]
+impl CostBuffer {
+    fn len(&self) -> usize {
+        match self {
+            Self::Narrow(values) => values.len(),
+            Self::Wide(values) => values.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Narrow(values) => values.capacity(),
+            Self::Wide(values) => values.capacity(),
+        }
+    }
+}
+
+/// Reuse a bounded packed cost horizon and block-sized traceback. A
+/// predecessor is expressed relative to the current tile, with room for
+/// origins up to one maximum-match length before the tile boundary.
 #[derive(Default)]
 struct ParseScratch {
-    best_cost: Vec<u64>,
+    best_cost: CostBuffer,
     steps: Vec<u16>,
 }
 
 impl ParseScratch {
-    const INF: u64 = u64::MAX / 4;
-    // A power-of-two tile at least as large as the longest edge gives
-    // contiguous relaxation spans even at the final position of a tile.
     const COST_TILE: usize = (STD_MAX_MATCH + 1).next_power_of_two();
     const COST_CAPACITY: usize = Self::COST_TILE + STD_MAX_MATCH;
+    const ORIGIN_BITS: u32 = (Self::COST_CAPACITY - 1).ilog2() + 1;
+    const ORIGIN_MASK: i32 = (1 << Self::ORIGIN_BITS) - 1;
 
-    fn advance_cost_horizon(costs: &mut [u64]) {
-        let retained = costs.len() - Self::COST_TILE;
-        costs.copy_within(Self::COST_TILE.., 0);
-        costs[retained..].fill(Self::INF);
+    // With nonnegative edge costs, a shortest path crossing a position
+    // must have an origin at most MAX_MATCH behind it. A literal-only
+    // bridge from that origin bounds the cost difference between
+    // finalized positions within the horizon. A pending candidate can
+    // add at most one further match token price. This conservative bound
+    // is independent of absolute parse cost, even for arbitrarily long
+    // inputs supported by the u32 suffix index.
+    fn narrow_model(costs: &TokenCosts) -> bool {
+        const MAX_TOKEN: u64 = 2 * u16::MAX as u64 + 32 * COST_SCALE as u64;
+        let max_literal = u64::from(costs.literal.iter().copied().max().unwrap_or_default());
+        let bound = Self::COST_CAPACITY as u64 * max_literal + MAX_TOKEN;
+        bound < (i32::MAX >> Self::ORIGIN_BITS) as u64
     }
 
-    fn reset(&mut self, block_len: usize) {
+    fn record_traceback<K: CostKey>(costs: &[K], steps: &mut [u16]) {
+        let bias = u16::try_from(STD_MAX_MATCH).unwrap_or_else(|_| unreachable!());
+        for ((&key, step), endpoint) in costs.iter().zip(steps).zip(bias..) {
+            let origin: i64 = (key & K::from(Self::ORIGIN_MASK)).into();
+            // The mask bounds the packed origin to ten bits. Extract its
+            // low word without introducing a per-lane checked conversion.
+            let [low, high, ..] = origin.to_le_bytes();
+            // The winning predecessor is always within MAX_MATCH of the
+            // endpoint. Subtraction is in this tile's biased coordinates.
+            *step = endpoint - u16::from_le_bytes([low, high]);
+        }
+    }
+
+    fn advance_cost_horizon<K: CostKey>(costs: &mut [K]) -> i64 {
+        let delta = costs[Self::COST_TILE] & K::from(!Self::ORIGIN_MASK);
+        let shift =
+            delta + K::from(i32::try_from(Self::COST_TILE).unwrap_or_else(|_| unreachable!()));
+        let retained = costs.len() - Self::COST_TILE;
+        costs.copy_within(Self::COST_TILE.., 0);
+        for key in &mut costs[..retained] {
+            if *key != K::INF {
+                *key = *key - shift;
+            }
+        }
+        costs[retained..].fill(K::INF);
+        let delta: i64 = delta.into();
+        delta >> Self::ORIGIN_BITS
+    }
+
+    fn reset<K: CostKey>(costs: &mut Vec<K>, steps: &mut Vec<u16>, block_len: usize) {
         assert!(block_len < usize::MAX, "DP block has too many positions");
         let slots = block_len + 1;
-        // clear() retains each Vec's allocation; resize() then initializes
-        // every slot exactly once, including after a shorter previous parse.
-        self.best_cost.clear();
-        self.best_cost
-            .resize(slots.min(Self::COST_CAPACITY), Self::INF);
-        self.best_cost[0] = 0;
-        self.steps.clear();
-        self.steps.resize(slots, 0);
+        costs.clear();
+        costs.resize(slots.min(Self::COST_CAPACITY), K::INF);
+        costs[0] = K::from(i32::try_from(STD_MAX_MATCH).unwrap_or_else(|_| unreachable!()));
+        steps.clear();
+        steps.resize(slots, 0);
     }
 }
 
@@ -1583,43 +1694,72 @@ fn parse_range_with_scratch(
     costs: &TokenCosts,
     scratch: &mut ParseScratch,
 ) -> ParseResult {
-    const INF: u64 = ParseScratch::INF;
+    let narrow = ParseScratch::narrow_model(costs);
+    match (&scratch.best_cost, narrow) {
+        (CostBuffer::Narrow(_), false) => scratch.best_cost = CostBuffer::Wide(Vec::new()),
+        (CostBuffer::Wide(_), true) => scratch.best_cost = CostBuffer::Narrow(Vec::new()),
+        _ => (),
+    }
+    match &mut scratch.best_cost {
+        CostBuffer::Narrow(keys) => {
+            parse_range_with_keys(input, candidates, block, costs, keys, &mut scratch.steps)
+        }
+        CostBuffer::Wide(keys) => {
+            parse_range_with_keys(input, candidates, block, costs, keys, &mut scratch.steps)
+        }
+    }
+}
 
+fn parse_range_with_keys<K: CostKey>(
+    input: &[u8],
+    candidates: &MatchCandidates,
+    block: Range<usize>,
+    costs: &TokenCosts,
+    best_cost: &mut Vec<K>,
+    steps: &mut Vec<u16>,
+) -> ParseResult {
     assert_eq!(candidates.end(), input.len());
     assert!(candidates.first_query <= block.start);
     assert!(block.start <= block.end && block.end <= input.len());
 
     let block_len = block.len();
-    scratch.reset(block_len);
-    let (best_cost, steps) = (&mut scratch.best_cost, &mut scratch.steps);
+    ParseScratch::reset(best_cost, steps, block_len);
     let prices = LengthPrices::new(costs);
     // DEFLATE distance cost depends on the Huffman distance symbol, not the
     // numeric distance. Build 30 entries rather than allocating and filling
     // one entry per possible byte offset in the 32 KiB window.
     let distance_costs: [u32; D_CODES] =
         core::array::from_fn(|code| costs.distance_symbol_cost(code));
-    // The per-position bitmap identifies live distance slots and already
-    // records every length where the cheapest capable distance can change.
-    // Reset only these five words, not the values, at each new position.
-    let mut distance_cost_at_max = [0u32; STD_MAX_MATCH + 1];
+    let price_order = DistancePriceOrder::new(&distance_costs);
+    let mut absolute_base = 0i64;
     let mut cost_base = 0;
     for local_position in 0..block_len {
         if local_position - cost_base == ParseScratch::COST_TILE {
             // All earlier positions are finalized. Keep the outstanding
             // targets from their matches, never resetting a live cost.
-            ParseScratch::advance_cost_horizon(best_cost);
+            ParseScratch::record_traceback(
+                &best_cost[..ParseScratch::COST_TILE],
+                &mut steps[cost_base..local_position],
+            );
+            absolute_base += ParseScratch::advance_cost_horizon(best_cost);
             cost_base = local_position;
         }
         let cost_position = local_position - cost_base;
         let position = block.start + local_position;
-        let prefix_cost = best_cost[cost_position];
-        debug_assert_ne!(prefix_cost, INF);
+        let key = best_cost[cost_position];
+        debug_assert!(key != K::INF);
+        // The tile index plus its bias never exceeds ORIGIN_MASK.
+        let [low, high, ..] = (cost_position + STD_MAX_MATCH).to_le_bytes();
+        let origin = i32::from(u16::from_le_bytes([low, high]));
+        let prefix_key = (key & K::from(!ParseScratch::ORIGIN_MASK)) | K::from(origin);
 
         relax(
             &mut best_cost[cost_position + 1],
-            &mut steps[local_position + 1],
-            prefix_cost + u64::from(costs.literal_cost(input[position])),
-            1,
+            prefix_key
+                + K::from(
+                    (costs.literal_cost(input[position]).cast_signed())
+                        << ParseScratch::ORIGIN_BITS,
+                ),
         );
 
         let available = STD_MAX_MATCH.min(block.end - position);
@@ -1631,52 +1771,21 @@ fn parse_range_with_scratch(
         if alternatives.is_empty() {
             continue;
         }
-        let mut markers = [0u64; STD_MAX_MATCH / 64 + 1];
-        let mut longest_match = 0usize;
-        for candidate in alternatives {
-            let max_len = usize::from(candidate.length).min(available);
-            longest_match = longest_match.max(max_len);
-            let marker = 1u64 << (max_len % 64);
-            let word = &mut markers[max_len / 64];
-            let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
-            let cost = distance_costs[code];
-            let slot = &mut distance_cost_at_max[max_len];
-            if *word & marker == 0 || cost < *slot {
-                *slot = cost;
-                *word |= marker;
-            }
+        MatchRelaxation {
+            costs: &mut best_cost[cost_position..],
+            prices: &prices,
+            prefix_key,
         }
-
-        if longest_match < STD_MIN_MATCH {
-            continue;
-        }
-        if longest_match >= GROUPED_RELAX_MIN_LENGTH {
-            MatchRelaxation {
-                costs: &mut best_cost[cost_position..],
-                steps: &mut steps[local_position..],
-                prices: &prices,
-                prefix_cost,
-            }
-            .long_matches(markers, longest_match, &distance_cost_at_max);
-            continue;
-        }
-        let mut distance_cost = distance_cost_at_max[longest_match];
-        for length in (STD_MIN_MATCH..=longest_match).rev() {
-            if markers[0] & (1u64 << length) != 0 {
-                distance_cost = distance_cost.min(distance_cost_at_max[length]);
-            }
-            let token_cost = u64::from(prices.costs[length]) + u64::from(distance_cost);
-            relax(
-                &mut best_cost[cost_position + length],
-                &mut steps[local_position + length],
-                prefix_cost + token_cost,
-                compact_match_length(length),
-            );
-        }
+        .relax_candidates(alternatives, compact_match_length(available), &price_order);
     }
 
+    let key: i64 = best_cost[block_len - cost_base].into();
+    ParseScratch::record_traceback(
+        &best_cost[..=block_len - cost_base],
+        &mut steps[cost_base..=block_len],
+    );
     ParseResult {
-        cost_x16: best_cost[block_len - cost_base],
+        cost_x16: (absolute_base + (key >> ParseScratch::ORIGIN_BITS)).cast_unsigned(),
         tokens: reconstruct_tokens(steps, input, candidates, block, &distance_costs),
     }
 }
@@ -1711,12 +1820,12 @@ fn reconstruct_tokens(
             let best = candidates
                 .for_position(position)
                 .iter()
-                .filter(|candidate| usize::from(candidate.length) >= length)
+                .filter(|candidate| usize::from(candidate.length()) >= length)
                 .min_by_key(|candidate| {
-                    let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
+                    let code = candidate.code();
                     let cost = distance_costs[code];
                     debug_assert!(cost <= u32::MAX >> LENGTH_BITS);
-                    (cost << LENGTH_BITS) | u32::from(max_match - candidate.length.min(available))
+                    (cost << LENGTH_BITS) | u32::from(max_match - candidate.length().min(available))
                 })
                 .unwrap_or_else(|| unreachable!("winning match must have a capable distance"));
             ParseToken::matching(length, best.distance)
@@ -1732,104 +1841,117 @@ fn reconstruct_tokens(
 }
 
 struct LengthPrices {
-    costs: [u32; STD_MAX_MATCH + 1],
-    run_start: [usize; STD_MAX_MATCH + 1],
+    costs: [i32; STD_MAX_MATCH + 1],
 }
 
 impl LengthPrices {
     fn new(model: &TokenCosts) -> Self {
         let mut costs = [0; STD_MAX_MATCH + 1];
-        let mut run_start = [STD_MIN_MATCH; STD_MAX_MATCH + 1];
-        let mut first = STD_MIN_MATCH;
-        let mut previous = 0;
-        for length in STD_MIN_MATCH..=STD_MAX_MATCH {
-            let code = usize::from(trees_tbl::LENGTH_CODE[length - STD_MIN_MATCH]);
-            let cost = model.length_symbol_cost(code);
-            if cost != previous {
-                first = length;
-            }
-            costs[length] = cost;
-            run_start[length] = first;
-            previous = cost;
+        for (price, &code) in costs[STD_MIN_MATCH..]
+            .iter_mut()
+            .zip(&trees_tbl::LENGTH_CODE)
+        {
+            *price = model.length_symbol_cost(usize::from(code)).cast_signed()
+                << ParseScratch::ORIGIN_BITS;
         }
-        Self { costs, run_start }
+        Self { costs }
     }
 }
 
-// Short matches are cheaper to enumerate directly. Longer matches contain
-// many equal-price endpoints, which can be relaxed in contiguous spans.
-const GROUPED_RELAX_MIN_LENGTH: usize = 32;
-// The direct short-match traversal tests occupancy in the first word.
-const _: () = assert!(GROUPED_RELAX_MIN_LENGTH <= u64::BITS as usize);
-
-struct MatchRelaxation<'a> {
-    costs: &'a mut [u64],
-    steps: &'a mut [u16],
-    prices: &'a LengthPrices,
-    prefix_cost: u64,
+/// Map the DEFLATE distance alphabet into ascending distinct price
+/// classes once per parser pass. A cost model need not be monotone in
+/// distance code, and several codes may have identical prices.
+struct DistancePriceOrder {
+    rank_by_code: [usize; D_CODES],
+    price_by_rank: [u32; D_CODES],
 }
 
-impl MatchRelaxation<'_> {
-    fn long_matches(
+impl DistancePriceOrder {
+    fn new(distance_costs: &[u32; D_CODES]) -> Self {
+        let mut order: [usize; D_CODES] = core::array::from_fn(|code| code);
+        order.sort_unstable_by_key(|&code| distance_costs[code]);
+        let mut rank_by_code = [0usize; D_CODES];
+        let mut price_by_rank = [0u32; D_CODES];
+        let mut rank = 0;
+        for (index, code) in order.into_iter().enumerate() {
+            let price = distance_costs[code];
+            if index != 0 && price != price_by_rank[rank] {
+                rank += 1;
+            }
+            rank_by_code[code] = rank;
+            price_by_rank[rank] = price;
+        }
+        Self {
+            rank_by_code,
+            price_by_rank,
+        }
+    }
+}
+
+struct MatchRelaxation<'a, K> {
+    costs: &'a mut [K],
+    prices: &'a LengthPrices,
+    prefix_key: K,
+}
+
+impl<K: CostKey> MatchRelaxation<'_, K> {
+    /// For each distinct distance price, only its longest available
+    /// match matters. Visit prices cheapest first; an offer covering an
+    /// already-relaxed endpoint cannot improve it. This constructs the
+    /// exact cost envelope without scattering across 259 length slots.
+    /// Distance choice is still reconstructed from the full frontier,
+    /// retaining the original tie rules independently of price order.
+    #[inline]
+    fn relax_candidates(
         &mut self,
-        markers: [u64; STD_MAX_MATCH / 64 + 1],
-        longest_match: usize,
-        distance_cost_at_max: &[u32; STD_MAX_MATCH + 1],
+        alternatives: &[MatchCandidate],
+        available: u16,
+        order: &DistancePriceOrder,
     ) {
-        // Only lengths at which another distance becomes capable can
-        // change the chosen distance. A descending walk preserves the
-        // longer-maximum-first and strict improvement tie rules.
-        let mut best = distance_cost_at_max[longest_match];
-        let mut high = longest_match;
-        for (word, mut mask) in markers.into_iter().enumerate().rev() {
-            while mask != 0 {
-                let len = word * 64 + highest_bit(mask);
-                mask ^= 1 << (len % 64);
-                let candidate = distance_cost_at_max[len];
-                if candidate < best {
-                    self.span(len + 1..=high, best);
-                    best = candidate;
-                    high = len;
+        const _: () = assert!(D_CODES <= u32::BITS as usize);
+        let mut occupied = 0u32;
+        let mut maximum_by_rank = [0u16; D_CODES];
+        for candidate in alternatives {
+            let max_len = candidate.length().min(available);
+            let rank = order.rank_by_code[candidate.code()];
+            let slot = &mut maximum_by_rank[rank];
+            *slot = (*slot).max(max_len);
+            occupied |= 1 << rank;
+        }
+        let mut low = STD_MIN_MATCH;
+        while occupied != 0 {
+            let rank = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            let high = usize::from(maximum_by_rank[rank]);
+            if high >= low {
+                self.span(low..=high, order.price_by_rank[rank]);
+                if maximum_by_rank[rank] == available {
+                    break;
                 }
+                low = high + 1;
             }
         }
-        self.span(STD_MIN_MATCH..=high, best);
     }
 
     /// Each endpoint is unique for this starting position; traversal
     /// order inside a span cannot affect the DP tie-break.
     #[inline]
     fn span(&mut self, lengths: core::ops::RangeInclusive<usize>, distance_cost: u32) {
-        let low = *lengths.start();
-        let mut high = *lengths.end();
-        let prefix_cost = self.prefix_cost + u64::from(distance_cost);
-        loop {
-            let start = self.prices.run_start[high].max(low);
-            let cost = prefix_cost + u64::from(self.prices.costs[high]);
-            let first = compact_match_length(start);
-            for ((old, step), length) in self.costs[start..=high]
-                .iter_mut()
-                .zip(&mut self.steps[start..=high])
-                .zip(first..)
-            {
-                if cost < *old {
-                    *old = cost;
-                    *step = length;
-                }
-            }
-            if start == low {
-                break;
-            }
-            high = start - 1;
+        let prefix_key =
+            self.prefix_key + K::from((distance_cost.cast_signed()) << ParseScratch::ORIGIN_BITS);
+        for (old, &price) in self.costs[lengths.clone()]
+            .iter_mut()
+            .zip(&self.prices.costs[lengths])
+        {
+            *old = (*old).min(prefix_key + K::from(price));
         }
     }
 }
 
 #[inline]
-const fn relax(best_cost: &mut u64, step: &mut u16, cost: u64, length: u16) {
-    if cost < *best_cost {
-        *best_cost = cost;
-        *step = length;
+fn relax<K: CostKey>(best_cost: &mut K, key: K) {
+    if key < *best_cost {
+        *best_cost = key;
     }
 }
 
@@ -1911,7 +2033,7 @@ mod tests {
                     }
                 }
 
-                if best.length != 0 {
+                if best.length() != 0 {
                     entries.push(best);
                 }
             }
@@ -2166,18 +2288,9 @@ mod tests {
     fn traceback_recovers_distance_with_clipped_ties() {
         let input = [b'a'; 40];
         let entries = vec![
-            MatchCandidate {
-                length: 4,
-                distance: 1,
-            },
-            MatchCandidate {
-                length: 8,
-                distance: 2,
-            },
-            MatchCandidate {
-                length: 12,
-                distance: 3,
-            },
+            MatchCandidate::matching(4, 1),
+            MatchCandidate::matching(8, 2),
+            MatchCandidate::matching(12, 3),
         ];
         let mut offsets = vec![0; input.len() + 1];
         offsets[21..].fill(entries.len());
@@ -2267,31 +2380,42 @@ mod tests {
         assert_eq!(best, MatchCandidate::NONE);
 
         best.consider(STD_MIN_MATCH, 2);
-        assert_eq!(
-            best,
-            MatchCandidate {
-                length: 3,
-                distance: 2
-            }
-        );
+        assert_eq!(best, MatchCandidate::matching(3, 2));
         best.consider(STD_MIN_MATCH, 32_768);
         assert_eq!(best.distance, 2, "equal-length matches prefer the nearest");
         best.consider(STD_MIN_MATCH, 1);
         assert_eq!(best.distance, 1);
         best.consider(STD_MAX_MATCH, 32_768);
-        assert_eq!(
-            best,
-            MatchCandidate {
-                length: 258,
-                distance: 32_768,
-            }
-        );
+        assert_eq!(best, MatchCandidate::matching(258, 32_768));
         best.consider(STD_MAX_MATCH - 1, 1);
         assert_eq!(
             best.distance, 32_768,
             "a shorter match must not replace a longer one"
         );
         assert_eq!(core::mem::size_of::<MatchCandidate>(), 4);
+    }
+
+    #[test]
+    fn packed_frontier_record_preserves_length_distance_and_class() {
+        let min_len = compact_match_length(STD_MIN_MATCH);
+        let max_len = compact_match_length(STD_MAX_MATCH);
+        for length in [min_len, max_len] {
+            for distance in 1..=compact_match_distance(1usize << crate::MAX_WBITS) {
+                let entry = MatchCandidate::matching(length, distance);
+                assert_eq!(entry.length(), length);
+                assert_eq!(entry.distance, distance);
+                assert_eq!(
+                    entry.code(),
+                    usize::from(State::d_code(usize::from(distance) - 1))
+                );
+            }
+        }
+        for length in min_len..=max_len {
+            let entry = MatchCandidate::matching(length, 32768);
+            assert_eq!(entry.length(), length);
+            assert_eq!(entry.distance, 32768);
+            assert_eq!(entry.code(), D_CODES - 1);
+        }
     }
 
     #[test]
@@ -2324,7 +2448,7 @@ mod tests {
         let table = build_match_candidates(&input, 32_768)?;
         assert!(table.for_position(32_768).iter().any(|candidate| {
             usize::from(candidate.distance) == 32_768
-                && usize::from(candidate.length) == STD_MAX_MATCH
+                && usize::from(candidate.length()) == STD_MAX_MATCH
         }));
         Ok(())
     }
@@ -2347,7 +2471,7 @@ mod tests {
         assert!(table
             .for_position(32_769)
             .iter()
-            .all(|candidate| usize::from(candidate.length) < STD_MAX_MATCH));
+            .all(|candidate| usize::from(candidate.length()) < STD_MAX_MATCH));
         Ok(())
     }
 
@@ -2367,15 +2491,15 @@ mod tests {
             }
             let distance = position - candidate;
             let code = State::d_code(distance - 1) as usize;
-            if length > usize::from(best[code].length) {
-                best[code] = MatchCandidate {
-                    length: compact_match_length(length),
-                    distance: compact_match_distance(distance),
-                };
+            if length > usize::from(best[code].length()) {
+                best[code] = MatchCandidate::matching(
+                    compact_match_length(length),
+                    compact_match_distance(distance),
+                );
             }
         }
         best.into_iter()
-            .filter(|candidate| candidate.length != 0)
+            .filter(|candidate| candidate.length() != 0)
             .collect()
     }
 
@@ -2385,7 +2509,7 @@ mod tests {
             .map(|candidate| {
                 (
                     State::d_code(usize::from(candidate.distance) - 1),
-                    candidate.length,
+                    candidate.length(),
                 )
             })
             .collect()
@@ -2454,12 +2578,12 @@ mod tests {
                 let selected = candidates
                     .for_position(position)
                     .iter()
-                    .filter(|candidate| usize::from(candidate.length) >= len)
+                    .filter(|candidate| usize::from(candidate.length()) >= len)
                     .min_by_key(|candidate| {
                         let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
                         (
                             costs.distance_symbol_cost(code),
-                            core::cmp::Reverse(usize::from(candidate.length).min(available)),
+                            core::cmp::Reverse(usize::from(candidate.length()).min(available)),
                         )
                     });
                 if let Some(candidate) = selected {
@@ -2544,10 +2668,10 @@ mod tests {
                         .min(STD_MAX_MATCH)
                         .min(input.len() - position);
                     if length >= STD_MIN_MATCH {
-                        entries.push(MatchCandidate {
-                            length: compact_match_length(length),
-                            distance: compact_match_distance(distance),
-                        });
+                        entries.push(MatchCandidate::matching(
+                            compact_match_length(length),
+                            compact_match_distance(distance),
+                        ));
                     }
                 }
             }
@@ -2572,8 +2696,13 @@ mod tests {
             length: [u16::MAX; LENGTH_CODES],
             distance: [u16::MAX; D_CODES],
         };
+        assert!(ParseScratch::narrow_model(&tied));
+        assert!(ParseScratch::narrow_model(&nonmonotone));
+        assert!(!ParseScratch::narrow_model(&expensive));
         let mut scratch = ParseScratch::default();
-        for costs in [&tied, &nonmonotone, &expensive] {
+        let mut wide = Vec::<i64>::new();
+        let mut wide_steps = Vec::new();
+        for costs in [&tied, &nonmonotone, &expensive, &tied] {
             let tile = ParseScratch::COST_TILE;
             for block in [
                 0..input.len(),
@@ -2595,6 +2724,19 @@ mod tests {
                     &mut scratch,
                 );
                 assert_eq!(actual, expected, "range={block:?}");
+                // Both widths must implement the same ordering and exact cost.
+                assert_eq!(
+                    parse_range_with_keys(
+                        &input,
+                        &candidates,
+                        block.clone(),
+                        costs,
+                        &mut wide,
+                        &mut wide_steps,
+                    ),
+                    expected,
+                    "wide range={block:?}",
+                );
                 assert_eq!(
                     scratch.best_cost.len(),
                     (block.len() + 1).min(ParseScratch::COST_CAPACITY)
@@ -3441,7 +3583,7 @@ fn initial_statistical_costs(
         let best_length = candidates
             .for_position(position)
             .iter()
-            .map(|candidate| usize::from(candidate.length).min(available))
+            .map(|candidate| usize::from(candidate.length()).min(available))
             .max()
             .unwrap_or(0);
         if best_length >= min_match {

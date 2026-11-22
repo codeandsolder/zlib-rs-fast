@@ -31,7 +31,7 @@ fn crc32_braid(start: u32, buf: &[u8]) -> u32 {
 }
 
 #[must_use]
-pub fn get_crc_table() -> &'static [u32; 256] {
+pub const fn get_crc_table() -> &'static [u32; 256] {
     braid::get_crc_table()
 }
 
@@ -46,6 +46,7 @@ enum Crc32Backend {
     ArmCrc(u32),
     #[cfg(target_arch = "loongarch64")]
     LoongArchCrc(u32),
+    #[cfg(not(target_arch = "loongarch64"))]
     Scalar(u32),
 }
 #[cfg(feature = "__internal-test")]
@@ -125,13 +126,14 @@ impl Crc32Fold {
             Crc32Backend::LoongArchCrc(value) => {
                 *value = self::loongarch::crc32_loongarch64(*value, src);
             }
+            #[cfg(not(target_arch = "loongarch64"))]
             Crc32Backend::Scalar(value) => *value = braid::crc32_braid::<5>(*value, src),
         }
     }
+    #[cfg(target_arch = "x86_64")]
     #[must_use]
     pub fn finish(self) -> u32 {
-        #[cfg(target_arch = "x86_64")]
-        let result = match self.backend {
+        match self.backend {
             Crc32Backend::Pclmul {
                 accumulator,
                 pending_initial,
@@ -140,16 +142,20 @@ impl Crc32Fold {
                 unsafe { accumulator.finish() }
             }),
             Crc32Backend::Scalar(value) => value,
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let result = match self.backend {
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[must_use]
+    pub const fn finish(self) -> u32 {
+        match self.backend {
             #[cfg(target_arch = "aarch64")]
             Crc32Backend::ArmCrc(value) => value,
             #[cfg(target_arch = "loongarch64")]
             Crc32Backend::LoongArchCrc(value) => value,
+            #[cfg(not(target_arch = "loongarch64"))]
             Crc32Backend::Scalar(value) => value,
-        };
-        result
+        }
     }
 }
 

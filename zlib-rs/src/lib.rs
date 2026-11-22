@@ -2,10 +2,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![feature(portable_simd)]
 #![cfg_attr(target_arch = "x86_64", feature(uint_carryless_mul))]
-#![cfg_attr(
-    all(any(miri, feature = "lsx"), target_arch = "loongarch64"),
-    feature(stdarch_loongarch)
-)]
 
 #[cfg(any(test, feature = "rust-allocator", feature = "c-allocator"))]
 extern crate alloc;
@@ -82,27 +78,6 @@ macro_rules! trace {
     };
 }
 pub(crate) use trace;
-
-macro_rules! cfg_select {
-    ({ $($tt:tt)* }) => {{
-        $crate::cfg_select! { $($tt)* }
-    }};
-    (_ => { $($output:tt)* }) => {
-        $($output)*
-    };
-    (
-        $cfg:meta => $output:tt
-        $($( $rest:tt )+)?
-    ) => {
-        #[cfg($cfg)]
-        $crate::cfg_select! { _ => $output }
-        $(
-            #[cfg(not($cfg))]
-            $crate::cfg_select! { $($rest)+ }
-        )?
-    }
-}
-use cfg_select;
 
 /// Maximum size of the dynamic table.  The maximum number of code structures is
 /// 1924, which is the sum of 1332 for literal/length codes and 592 for distance
