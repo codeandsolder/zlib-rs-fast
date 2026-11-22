@@ -1518,12 +1518,10 @@ fn parse_range_with_scratch(
     // one entry per possible byte offset in the 32 KiB window.
     let distance_costs: [u32; D_CODES] =
         core::array::from_fn(|code| costs.distance_symbol_cost(code));
-    // One candidate can become newly capable at each maximum match length. Keep the sparse values
-    // in a generation-tagged table instead of clearing a 259-entry Option array at every input byte.
-    // Generation zero is never live, so the all-zero initial table needs no per-position clearing.
-    assert!(u32::try_from(block_len).is_ok());
+    // The per-position bitmap identifies live distance slots and already
+    // records every length where the cheapest capable distance can change.
+    // Reset only these five words, not the values, at each new position.
     let mut distance_cost_at_max = [DistanceAtMax {
-        generation: 0,
         cost: 0,
         distance: 0,
     }; STD_MAX_MATCH + 1];
@@ -1545,22 +1543,26 @@ fn parse_range_with_scratch(
             continue;
         }
 
-        let generation = u32::try_from(local_position + 1)
-            .unwrap_or_else(|_| unreachable!("the block-length limit was checked"));
         let alternatives = candidates.for_position(position);
+        if alternatives.is_empty() {
+            continue;
+        }
+        let mut markers = [0u64; STD_MAX_MATCH / 64 + 1];
         let mut longest_match = 0usize;
         for candidate in alternatives {
             let max_len = usize::from(candidate.length).min(available);
             longest_match = longest_match.max(max_len);
+            let marker = 1u64 << (max_len % 64);
+            let word = &mut markers[max_len / 64];
             let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
             let cost = distance_costs[code];
             let slot = &mut distance_cost_at_max[max_len];
-            if slot.generation != generation || cost < slot.cost {
+            if *word & marker == 0 || cost < slot.cost {
                 *slot = DistanceAtMax {
-                    generation,
                     cost,
                     distance: candidate.distance,
                 };
+                *word |= marker;
             }
         }
 
@@ -1574,19 +1576,13 @@ fn parse_range_with_scratch(
                 prices: &prices,
                 prefix_cost,
             }
-            .long_matches(
-                alternatives,
-                available,
-                longest_match,
-                &distance_cost_at_max,
-                generation,
-            );
+            .long_matches(markers, longest_match, &distance_cost_at_max);
             continue;
         }
         let mut cheapest_capable = None::<(u32, u16)>;
         for length in (STD_MIN_MATCH..=longest_match).rev() {
             let candidate = distance_cost_at_max[length];
-            if candidate.generation == generation
+            if markers[0] & (1u64 << length) != 0
                 && cheapest_capable.is_none_or(|(old, _)| candidate.cost < old)
             {
                 cheapest_capable = Some((candidate.cost, candidate.distance));
@@ -1636,7 +1632,6 @@ impl MatchCandidates {
 
 #[derive(Clone, Copy)]
 struct DistanceAtMax {
-    generation: u32,
     cost: u32,
     distance: u16,
 }
@@ -1669,6 +1664,8 @@ impl LengthPrices {
 // Short matches are cheaper to enumerate directly. Longer matches contain
 // many equal-price endpoints, which can be relaxed in contiguous spans.
 const GROUPED_RELAX_MIN_LENGTH: usize = 32;
+// The direct short-match traversal tests occupancy in the first word.
+const _: () = assert!(GROUPED_RELAX_MIN_LENGTH <= u64::BITS as usize);
 
 struct MatchRelaxation<'a> {
     costs: &'a mut [u64],
@@ -1680,20 +1677,13 @@ struct MatchRelaxation<'a> {
 impl MatchRelaxation<'_> {
     fn long_matches(
         &mut self,
-        alternatives: &[MatchCandidate],
-        available: usize,
+        markers: [u64; STD_MAX_MATCH / 64 + 1],
         longest_match: usize,
         distance_cost_at_max: &[DistanceAtMax; STD_MAX_MATCH + 1],
-        generation: u32,
     ) {
         // Only lengths at which another distance becomes capable can
         // change the chosen distance. A descending walk preserves the
         // longer-maximum-first and strict improvement tie rules.
-        let mut markers = [0u64; STD_MAX_MATCH / 64 + 1];
-        for candidate in alternatives {
-            let len = usize::from(candidate.length).min(available);
-            markers[len / 64] |= 1 << (len % 64);
-        }
         let mut best = distance_cost_at_max[longest_match];
         let mut high = longest_match;
         for (word, mut mask) in markers.into_iter().enumerate().rev() {
@@ -1701,7 +1691,6 @@ impl MatchRelaxation<'_> {
                 let len = word * 64 + highest_bit(mask);
                 mask ^= 1 << (len % 64);
                 let candidate = distance_cost_at_max[len];
-                debug_assert_eq!(candidate.generation, generation);
                 if candidate.cost < best.cost {
                     self.span(len + 1..=high, best);
                     best = candidate;
@@ -2428,6 +2417,61 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn sparse_length_occupancy_preserves_parse_across_word_boundaries() {
+        let input = [b'a'; 600];
+        let lengths = [3, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257, 258];
+        let mut offsets = vec![0];
+        let mut entries = Vec::new();
+        for position in 0..input.len() {
+            // Interleave empty positions with matches, including duplicate
+            // maximum lengths in different distance classes.
+            if position >= 16 && position % 5 != 0 {
+                let length = lengths[position % lengths.len()];
+                for (distance, adjustment) in [(1, 0), (2, 0), (8, 1), (16, 2)] {
+                    let length = (length + adjustment)
+                        .min(STD_MAX_MATCH)
+                        .min(input.len() - position);
+                    if length >= STD_MIN_MATCH {
+                        entries.push(MatchCandidate {
+                            length: compact_match_length(length),
+                            distance: compact_match_distance(distance),
+                        });
+                    }
+                }
+            }
+            offsets.push(entries.len());
+        }
+        let candidates = MatchCandidates { offsets, entries };
+        let mut tied = TokenCosts::fixed();
+        // Equal total distance cost, including extra bits. Preserve the
+        // existing first-candidate and longest-maximum tie ordering.
+        for (code, cost) in tied.distance.iter_mut().enumerate() {
+            *cost = (16 - u16::from(StaticTreeDesc::EXTRA_DBITS[code])) * COST_SCALE;
+        }
+        let mut nonmonotone = tied.clone();
+        nonmonotone.distance[0] = 200;
+        nonmonotone.distance[1] = 400;
+        let mut scratch = ParseScratch::default();
+        for costs in [&tied, &nonmonotone] {
+            for block in [0..input.len(), 18..330, 31..64, 96..353] {
+                let expected =
+                    exhaustive_parse_from_frontier(&input, &candidates, block.clone(), costs);
+                let actual = parse_range_with_scratch(
+                    &input,
+                    &candidates,
+                    block.clone(),
+                    costs,
+                    &mut scratch,
+                );
+                assert_eq!(actual, expected, "range={block:?}");
+                if block.start == 0 {
+                    assert_eq!(expand(&actual.tokens), input[block]);
+                }
+            }
+        }
     }
 
     #[test]
