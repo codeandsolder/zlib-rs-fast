@@ -19,7 +19,8 @@ use super::{
     CallCursors, State, Status,
 };
 use super::{
-    compress_into_stream, reset_impl, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode,
+    compress_into_stream, reset_impl, DeflateConfig, DeflateFlush, DeflateStream, HashHistoryReset,
+    ReturnCode,
 };
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
@@ -305,7 +306,10 @@ impl CpuEncoder {
         output: &mut crate::batch::BatchOutput<'_>,
     ) -> (usize, ReturnCode) {
         let stream = if let Some(stream) = self.stream.as_mut() {
-            let code = reset_impl(stream, Some(self.previous_input_len));
+            let code = reset_impl(
+                stream,
+                HashHistoryReset::Independent(self.previous_input_len),
+            );
             if code != ReturnCode::Ok {
                 self.stream = None;
                 return (0, code);
@@ -1314,7 +1318,10 @@ mod tests {
                                 );
                                 assert_eq!(&output[..expected.len()], expected);
                                 let stream = encoder.stream.as_mut().ok_or("owned stream")?;
-                                assert_eq!(reset_impl(stream, Some(len)), ReturnCode::Ok);
+                                assert_eq!(
+                                    reset_impl(stream, HashHistoryReset::Independent(len)),
+                                    ReturnCode::Ok
+                                );
                                 assert!(stream.state.head.as_slice().iter().all(|&head| head == 0));
                             }
                         }

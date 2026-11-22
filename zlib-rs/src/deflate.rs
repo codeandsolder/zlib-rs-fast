@@ -925,7 +925,7 @@ fn init_with_lit_bufsize(
         return ReturnCode::StreamError;
     };
 
-    reset(stream)
+    reset_impl(stream, HashHistoryReset::Fresh)
 }
 
 /// Return the bytes accumulated since the start of the current DEFLATE block.
@@ -1254,14 +1254,23 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
     }
 }
 
-pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
-    reset_impl(stream, None)
+/// The provenance of the hash history determines how it can be reset.
+#[derive(Clone, Copy)]
+enum HashHistoryReset {
+    /// Newly initialized typed storage already contains zero heads.
+    Fresh,
+    /// The public streaming state may contain arbitrary retained history.
+    Full,
+    /// Only a private fixed-config complete-stream batch owner may use
+    /// this mode; no dictionary, caller flush or parameter changes.
+    Independent(usize),
 }
 
-/// Only the private complete-stream batch owner supplies the full previous
-/// input length: no preset dictionary, caller-driven flushes, or parameter
-/// changes can have populated its history.
-fn reset_impl(stream: &mut DeflateStream, previous_input_len: Option<usize>) -> ReturnCode {
+pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
+    reset_impl(stream, HashHistoryReset::Full)
+}
+
+fn reset_impl(stream: &mut DeflateStream, history: HashHistoryReset) -> ReturnCode {
     // A damaged or stale state must fail before reset_keep mutates any
     // buffered output, checksums, or the live hash history.
     let Some(config) = level_config(stream.state.level) else {
@@ -1270,7 +1279,7 @@ fn reset_impl(stream: &mut DeflateStream, previous_input_len: Option<usize>) -> 
     let ret = reset_keep(stream);
 
     if ret == ReturnCode::Ok {
-        lm_init(&mut stream.state, config, previous_input_len);
+        lm_init(&mut stream.state, config, history);
     }
 
     ret
@@ -1312,8 +1321,8 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
-fn lm_init(state: &mut State, config: algorithm::LevelConfig, previous_input_len: Option<usize>) {
-    clear_hash_history(state, previous_input_len);
+fn lm_init(state: &mut State, config: algorithm::LevelConfig, history: HashHistoryReset) {
+    clear_hash_history(state, history);
     state.window_size = 2 * state.w_size;
     state.window.clear();
 
@@ -1336,19 +1345,22 @@ fn lm_init(state: &mut State, config: algorithm::LevelConfig, previous_input_len
 /// complete-stream batch job. With no window slide, all inserted probes
 /// remain in the initialized window. Clearing a superset of touched buckets
 /// is equivalent to clearing the whole head array.
-fn clear_hash_history(state: &mut State<'_>, previous_input_len: Option<usize>) {
+fn clear_hash_history(state: &mut State<'_>, history: HashHistoryReset) {
     const MAX_SPARSE_RESET_BYTES: usize = 512;
-    // Stored jobs may slide their window but never populate hash heads.
-    // The first allocation is initialized normally and the configuration
-    // stays fixed for the entire lifetime of the privately owned stream.
-    if previous_input_len.is_some() && state.level == 0 {
-        return;
-    }
-    if !previous_input_len
-        .is_some_and(|len| len <= MAX_SPARSE_RESET_BYTES && len < state.w_size + state.max_dist())
-    {
-        state.head.as_mut_slice().fill(0);
-        return;
+    match history {
+        HashHistoryReset::Fresh => {
+            debug_assert!(state.head.as_slice().iter().all(|&head| head == 0));
+            return;
+        }
+        // Stored jobs never populate hash heads. The fixed-config owner
+        // cannot switch to a compressed level.
+        HashHistoryReset::Independent(_) if state.level == 0 => return,
+        HashHistoryReset::Independent(len)
+            if len <= MAX_SPARSE_RESET_BYTES && len < state.w_size + state.max_dist() => {}
+        HashHistoryReset::Full | HashHistoryReset::Independent(_) => {
+            state.head.as_mut_slice().fill(0);
+            return;
+        }
     }
     let window = state.window.filled();
     let head = state.head.as_mut_slice();
@@ -6734,6 +6746,7 @@ mod test {
             let mut ctx = MisalignedAlloc {
                 remainder,
                 modulus: ALLOCATION_BLOCK_BYTES,
+                fill: 0xa5,
                 allocations: 0,
                 frees: 0,
                 buffers: Vec::new(),
@@ -6760,6 +6773,8 @@ mod test {
             assert_eq!(source.state.window.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
             assert_eq!(source.state.prev.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
             assert_eq!(source.state.head.as_ptr().addr() % DEFLATE_ALLOC_ALIGN, 0);
+            assert!(source.state.prev.as_slice().iter().all(|&entry| entry == 0));
+            assert!(source.state.head.as_slice().iter().all(|&entry| entry == 0));
             source.state.prev.as_mut_slice()[0] = 0x1234;
             source.state.head.as_mut_slice()[0] = 0x4321;
             source.state.bit_writer.pending.extend(&[11, 22, 33]);
