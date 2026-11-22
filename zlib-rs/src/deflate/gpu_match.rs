@@ -332,7 +332,23 @@ impl GpuWorkspace {
 }
 
 type PrepareInputs<'a> =
-    dyn Fn(&[&[u8]], u32, u32, u32) -> Result<Vec<Option<PreparedGpuInput>>, GpuMatchError> + 'a;
+    dyn Fn(&[&[u8]], u32, u32, u32) -> Result<Vec<PreparedSearch>, GpuMatchError> + 'a;
+
+const MAX_LOCAL_INPUT_BYTES: usize = 8192;
+
+enum PreparedSearch {
+    Local(GpuMatchTable),
+    Gpu(PreparedGpuInput),
+}
+
+impl PreparedSearch {
+    const fn gpu(&self) -> Option<&PreparedGpuInput> {
+        match self {
+            Self::Local(_) => None,
+            Self::Gpu(item) => Some(item),
+        }
+    }
+}
 
 fn prepare_input(
     input_index: usize,
@@ -340,25 +356,39 @@ fn prepare_input(
     search_budget: u32,
     max_dist: u32,
     max_workgroups: u32,
-) -> Result<Option<PreparedGpuInput>, GpuMatchError> {
+    forced_layout: Option<InputLayout>,
+) -> Result<PreparedSearch, GpuMatchError> {
     let input_len = u32::try_from(input.len())
         .map_err(|_| GpuMatchError("GPU match search input exceeds u32::MAX bytes".into()))?;
     // No match can start before position one and still have three bytes
     // available in an input shorter than four bytes.
     if input.len() < 4 || max_dist == 1 {
-        return Ok(None);
+        return Ok(PreparedSearch::Local(GpuMatchTable {
+            entries: vec![0; input.len()],
+        }));
     }
 
     let predecessors = build_predecessors(input, max_dist)?;
     // A zero chain contains no eligible candidate at any position.
     // Such an input needs neither a GPU dispatch nor a packed input copy.
     if predecessors.iter().all(|&word| word == 0) {
-        return Ok(None);
+        return Ok(PreparedSearch::Local(GpuMatchTable {
+            entries: vec![0; input.len()],
+        }));
+    }
+    let input_layout = forced_layout
+        .unwrap_or_else(|| InputLayout::select(input, &predecessors, search_budget, max_dist));
+    if forced_layout.is_none()
+        && input_layout == InputLayout::Packed
+        && input.len() <= MAX_LOCAL_INPUT_BYTES
+    {
+        if let Some(matches) = resolve_bounded(input, &predecessors, search_budget, max_dist) {
+            return Ok(PreparedSearch::Local(matches));
+        }
     }
     let dispatch = dispatch_grid(input_len, max_workgroups)?;
-    let input_layout = InputLayout::select(input, &predecessors, search_budget, max_dist);
     let input_words = input_layout.pack(input);
-    Ok(Some(PreparedGpuInput {
+    Ok(PreparedSearch::Gpu(PreparedGpuInput {
         input_index,
         input_len,
         dispatch,
@@ -379,11 +409,13 @@ fn prepare_serial(
     search_budget: u32,
     max_dist: u32,
     max_workgroups: u32,
-) -> Result<Vec<Option<PreparedGpuInput>>, GpuMatchError> {
+) -> Result<Vec<PreparedSearch>, GpuMatchError> {
     inputs
         .iter()
         .enumerate()
-        .map(|(index, input)| prepare_input(index, input, search_budget, max_dist, max_workgroups))
+        .map(|(index, input)| {
+            prepare_input(index, input, search_budget, max_dist, max_workgroups, None)
+        })
         .collect()
 }
 
@@ -394,12 +426,12 @@ fn prepare_parallel(
     max_dist: u32,
     max_workgroups: u32,
     pool: &crate::BatchCodec,
-) -> Result<Vec<Option<PreparedGpuInput>>, GpuMatchError> {
+) -> Result<Vec<PreparedSearch>, GpuMatchError> {
     let mut inputs = inputs.to_vec();
     pool.run_items(
         &mut inputs,
-        || Ok(None),
-        |index, input| prepare_input(index, input, search_budget, max_dist, max_workgroups),
+        || Ok(PreparedSearch::Local(GpuMatchTable::default())),
+        |index, input| prepare_input(index, input, search_budget, max_dist, max_workgroups, None),
     )
     .into_iter()
     .collect()
@@ -827,13 +859,13 @@ impl GpuMatchSearcher {
             max_dist,
             limits.max_compute_workgroups_per_dimension,
         )?;
-
         for (input_index, item) in prepared.iter_mut().enumerate() {
-            let Some(item) = item else {
-                tables[input_index]
-                    .entries
-                    .resize(inputs[input_index].len(), 0);
-                continue;
+            let item = match item {
+                PreparedSearch::Local(table) => {
+                    tables[input_index] = core::mem::take(table);
+                    continue;
+                }
+                PreparedSearch::Gpu(item) => item,
             };
             debug_assert_eq!(input_index, item.input_index);
             for (name, size) in [
@@ -898,7 +930,7 @@ impl GpuMatchSearcher {
             .download
             .ensure_capacity(&self.device, download_cursor, max_buffer_size)?;
 
-        for item in prepared.iter().flatten() {
+        for item in prepared.iter().filter_map(PreparedSearch::gpu) {
             self.queue.write_buffer(
                 &workspace.input.buffer,
                 item.input_offset,
@@ -924,7 +956,7 @@ impl GpuMatchSearcher {
 
         let packed_layout = self.packed_pipeline.get_bind_group_layout(0);
         let aligned_layout = self.aligned_pipeline.get_bind_group_layout(0);
-        for item in prepared.iter().flatten() {
+        for item in prepared.iter().filter_map(PreparedSearch::gpu) {
             let (pipeline, layout) = match item.input_layout {
                 InputLayout::Packed => (&self.packed_pipeline, &packed_layout),
                 InputLayout::Aligned => (&self.aligned_pipeline, &aligned_layout),
@@ -1009,7 +1041,7 @@ impl GpuMatchSearcher {
             .buffer
             .slice(0..download_cursor)
             .get_mapped_range();
-        for item in prepared.iter().flatten() {
+        for item in prepared.iter().filter_map(PreparedSearch::gpu) {
             let start = item.download_offset as usize;
             let end = start + item.result_size() as usize;
             let entries = mapped[start..end]
@@ -1150,6 +1182,61 @@ impl InputLayout {
             }
         }
     }
+}
+
+/// Resolve the same nearest-first, budgeted search as the shader. Return
+/// None when the bounded local effort would be exceeded; a caller can then
+/// dispatch the original unmodified index on the GPU.
+fn resolve_bounded(
+    input: &[u8],
+    predecessors: &[u32],
+    budget: u32,
+    max_dist: u32,
+) -> Option<GpuMatchTable> {
+    let mut work_left = input.len().saturating_mul(16).saturating_add(256);
+    let mut entries = vec![0; input.len()];
+    for (position, entry) in entries
+        .iter_mut()
+        .enumerate()
+        .take(input.len().saturating_sub(2))
+    {
+        let mut distance = predecessor_distance(predecessors, position);
+        if distance == 0 {
+            continue;
+        }
+        let max_len = (input.len() - position).min(MAX_MATCH as usize);
+        let min_start = position.saturating_sub(max_dist as usize - 1);
+        let query = &input[position..position + max_len];
+        let mut cursor = position;
+        let mut best_len = 0;
+        let mut best_distance = 0;
+        for _ in 0..budget {
+            if distance == 0 || best_len == max_len {
+                break;
+            }
+            cursor -= distance;
+            if cursor < min_start {
+                break;
+            }
+            distance = predecessor_distance(predecessors, cursor);
+            work_left = work_left.checked_sub(1)?;
+            if best_len >= 3 && query[best_len] != input[cursor + best_len] {
+                continue;
+            }
+            let candidate = &input[cursor..cursor + max_len];
+            if query[..3] != candidate[..3] {
+                continue;
+            }
+            let len = 3 + super::match_compare::common_prefix_len(&query[3..], &candidate[3..]);
+            work_left = work_left.checked_sub(len / 32)?;
+            if len > best_len {
+                best_len = len;
+                best_distance = position - cursor;
+            }
+        }
+        *entry = (u32::try_from(best_distance).ok()? << 16) | u32::try_from(best_len).ok()?;
+    }
+    Some(GpuMatchTable { entries })
 }
 
 fn pack_words(input: &[u8]) -> Vec<u32> {
@@ -1444,49 +1531,20 @@ mod tests {
                     max_dist,
                     geometry,
                     &|inputs, budget, distance, groups| {
-                        let mut prepared = prepare_serial(inputs, budget, distance, groups)?;
-                        for (input, item) in inputs.iter().zip(&mut prepared) {
-                            if let Some(item) = item {
-                                item.input_layout = layout;
-                                item.input_words = layout.pack(input);
-                            }
-                        }
-                        Ok(prepared)
+                        inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(index, input)| {
+                                prepare_input(index, input, budget, distance, groups, Some(layout))
+                            })
+                            .collect()
                     },
                 )?;
                 assert_eq!(tables.len(), inputs.len());
                 for (input, table) in inputs.iter().zip(tables) {
                     assert_eq!(table.len(), input.len());
                     for (position, actual) in table.iter().enumerate() {
-                        let mut expected = GpuMatch::default();
-                        let max_len = (input.len() - position).min(MAX_MATCH as usize);
-                        if max_len >= 3 {
-                            let hash = hash3(&input[position..position + 3]);
-                            let first = if position >= max_dist as usize {
-                                position - max_dist as usize + 1
-                            } else {
-                                0
-                            };
-                            for candidate in (first..position)
-                                .rev()
-                                .filter(|&candidate| {
-                                    hash3(&input[candidate..candidate + 3]) == hash
-                                })
-                                .take(budget as usize)
-                            {
-                                let len = input[position..position + max_len]
-                                    .iter()
-                                    .zip(&input[candidate..candidate + max_len])
-                                    .take_while(|(left, right)| left == right)
-                                    .count();
-                                if len >= 3 && len > expected.length as usize {
-                                    expected = GpuMatch {
-                                        length: len as u32,
-                                        start: candidate as u32,
-                                    };
-                                }
-                            }
-                        }
+                        let expected = oracle_match(input, position, max_dist, budget)?;
                         assert_eq!(
                             actual, expected,
                             "max_dist={max_dist}, budget={budget}, position={position}"
@@ -1559,14 +1617,114 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn preparation_omits_only_empty_candidate_chains() -> Result<(), GpuMatchError> {
-        for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
-            assert!(prepare_input(0, input, 1, DEFAULT_MAX_DIST, 65535)?.is_none());
+    fn oracle_match(
+        input: &[u8],
+        pos: usize,
+        max_dist: u32,
+        budget: u32,
+    ) -> Result<GpuMatch, GpuMatchError> {
+        let mut best = GpuMatch::default();
+        let len = (input.len() - pos).min(MAX_MATCH as usize);
+        if len < 3 {
+            return Ok(best);
         }
-        assert!(prepare_input(0, b"aaaaaaaa", 1, 1, 65535)?.is_none());
-        assert!(prepare_input(0, b"aaaaaaaa", 1, 2, 65535)?.is_some());
-        assert!(prepare_input(0, b"abcabc", 1, DEFAULT_MAX_DIST, 65535)?.is_some());
+        let hash = hash3(&input[pos..pos + 3]);
+        let minimum = pos.saturating_sub(max_dist as usize - 1);
+        for start in (minimum..pos)
+            .rev()
+            .filter(|&start| hash3(&input[start..start + 3]) == hash)
+            .take(budget as usize)
+        {
+            let n = input[pos..pos + len]
+                .iter()
+                .zip(&input[start..start + len])
+                .take_while(|(a, b)| a == b)
+                .count();
+            if n >= 3 && n > best.length as usize {
+                best = GpuMatch {
+                    length: u32::try_from(n).map_err(|e| GpuMatchError(e.to_string()))?,
+                    start: u32::try_from(start).map_err(|e| GpuMatchError(e.to_string()))?,
+                };
+            }
+        }
+        Ok(best)
+    }
+
+    #[test]
+    fn bounded_local_resolution_matches_nearest_first_oracle() -> Result<(), GpuMatchError> {
+        let mut seed = 0x87c4_238bu32;
+        let random = (0..513)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let patterned = b"abc0123abcXYZabc".repeat(33);
+        let mut completed = 0;
+        for bytes in [&random[..], &patterned[..]] {
+            for len in [3, 4, 5, 15, 31, 63, 128, 255, 512] {
+                let input = &bytes[..len];
+                for max_dist in [1, 2, 8, 64, DEFAULT_MAX_DIST] {
+                    let pred = build_predecessors(input, max_dist)?;
+                    for budget in [1, 2, 8, 64, 512] {
+                        let Some(table) = resolve_bounded(input, &pred, budget, max_dist) else {
+                            continue;
+                        };
+                        completed += 1;
+                        for (pos, actual) in table.iter().enumerate() {
+                            let expected = oracle_match(input, pos, max_dist, budget)?;
+                            assert_eq!(
+                                actual, expected,
+                                "pos={pos} budget={budget} max_dist={max_dist}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(completed > 300);
+        // An expensive search must decline without publishing partial results.
+        let repeated = (0u8..=255)
+            .flat_map(|i| [b'a', b'a', b'a', i])
+            .cycle()
+            .take(8192)
+            .collect::<Vec<_>>();
+        let pred = build_predecessors(&repeated, DEFAULT_MAX_DIST)?;
+        assert!(resolve_bounded(&repeated, &pred, 512, DEFAULT_MAX_DIST).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_handles_local_results_and_forced_gpu() -> Result<(), GpuMatchError> {
+        for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
+            let PreparedSearch::Local(table) =
+                prepare_input(0, input, 1, DEFAULT_MAX_DIST, 65535, None)?
+            else {
+                return Err(GpuMatchError("empty candidate chain dispatched".into()));
+            };
+            assert_eq!(table.entries, vec![0; input.len()]);
+        }
+        assert!(matches!(
+            prepare_input(0, b"aaaaaaaa", 1, 1, 65535, None)?,
+            PreparedSearch::Local(_)
+        ));
+        assert!(matches!(
+            prepare_input(0, b"aaaaaaaa", 1, 2, 65535, Some(InputLayout::Packed))?,
+            PreparedSearch::Gpu(_)
+        ));
+        assert!(matches!(
+            prepare_input(
+                0,
+                b"abcabc",
+                1,
+                DEFAULT_MAX_DIST,
+                65535,
+                Some(InputLayout::Packed)
+            )?,
+            PreparedSearch::Gpu(_)
+        ));
         Ok(())
     }
 
@@ -1601,14 +1759,27 @@ mod tests {
     #[test]
     fn pooled_preparation_preserves_order_and_contents() -> Result<(), Box<dyn std::error::Error>> {
         let pool = crate::BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("workers")?)?;
-        let inputs = [b"".as_slice(), b"a", b"abcabcabc", b"", b"abc", b"aaaaaaaa"];
+        let long = b"abc".repeat(MAX_LOCAL_INPUT_BYTES / 3 + 1);
+        let inputs = [
+            b"".as_slice(),
+            b"a",
+            b"abcabcabc",
+            b"",
+            b"abc",
+            b"aaaaaaaa",
+            &long,
+        ];
         let expected = prepare_serial(&inputs, 7, 64, 65535)?;
         let actual = prepare_parallel(&inputs, 7, 64, 65535, &pool)?;
         assert_eq!(actual.len(), expected.len());
         for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
-            let (Some(a), Some(b)) = (a, b.as_ref()) else {
-                assert!(a.is_none() && b.is_none());
-                continue;
+            let (a, b) = match (a, b) {
+                (PreparedSearch::Local(a), PreparedSearch::Local(b)) => {
+                    assert_eq!(a.entries, b.entries);
+                    continue;
+                }
+                (PreparedSearch::Gpu(a), PreparedSearch::Gpu(b)) => (a, b),
+                _ => return Err("different preparation policy".into()),
             };
             assert_eq!(a.input_index, index);
             assert_eq!(a.input_index, b.input_index);
