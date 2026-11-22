@@ -140,10 +140,9 @@ fn decode_profile(
                 return Err("slice output or untouched tail differs from reference".into());
             }
             println!(
-                "decode-slice: {} compressed bytes -> {} bytes, {} iterations, {elapsed:?}",
+                "decode-slice: {} compressed bytes -> {} bytes, {iterations} iterations, {elapsed:?}",
                 stream.len(),
                 expected.len(),
-                iterations
             );
         }
         Destination::Vector => {
@@ -156,10 +155,9 @@ fn decode_profile(
                 return Err("vector output differs from reference".into());
             }
             println!(
-                "decode-vector: {} compressed bytes -> {} bytes, {} iterations, {elapsed:?}",
+                "decode-vector: {} compressed bytes -> {} bytes, {iterations} iterations, {elapsed:?}",
                 stream.len(),
                 expected.len(),
-                iterations
             );
         }
     }
