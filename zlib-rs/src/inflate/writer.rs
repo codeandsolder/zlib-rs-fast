@@ -770,11 +770,13 @@ mod test {
         }
     }
 
-    fn check_discarding_tail<const WIDTH: usize>() {
+    fn check_fast_copy<const WIDTH: usize>(discard_tail: bool) {
+        // Exercise every match length with initialized history, unused
+        // capacity, and an allocation guard beyond the allowed destination.
         let prefix: [u8; 64] = core::array::from_fn(|i| u8::try_from(i + 1).unwrap_or(0));
         for distance in 1..=prefix.len() {
             for length in 0..=258 {
-                for slack in [0, 1, WIDTH - 1, WIDTH, WIDTH + 1] {
+                for slack in [0, 1, 7, WIDTH - 1, WIDTH, WIDTH + 1] {
                     let capacity = prefix.len() + length + slack;
                     let mut storage = vec![MaybeUninit::<u8>::uninit(); capacity + 32];
                     for (slot, byte) in storage.iter_mut().zip(prefix) {
@@ -783,6 +785,12 @@ mod test {
                     for slot in &mut storage[capacity..] {
                         slot.write(0xa5);
                     }
+                    if !discard_tail {
+                        for slot in &mut storage[prefix.len() + length..capacity] {
+                            slot.write(0x5a);
+                        }
+                    }
+
                     let mut expected = prefix.to_vec();
                     for _ in 0..length {
                         expected.push(expected[expected.len() - distance]);
@@ -792,17 +800,34 @@ mod test {
                             buf: WeakSliceMut::from_mut_slice(&mut storage[..capacity]),
                             filled: prefix.len(),
                         };
-                        writer.copy_match_discarding_tail::<WIDTH>(distance, length);
-                        assert_eq!(writer.filled(), expected);
-                        // A subsequent back-reference must see the logical
-                        // prefix, not speculative bytes from the earlier copy.
-                        for _ in 0..slack {
-                            expected.push(expected[expected.len() - distance]);
+                        if discard_tail {
+                            writer.copy_match_discarding_tail::<WIDTH>(distance, length);
+                        } else {
+                            writer.copy_match_fast(distance, length);
                         }
-                        if slack != 0 {
-                            writer.copy_match_discarding_tail::<WIDTH>(distance, slack);
+                        assert_eq!(writer.len(), expected.len());
+                        assert_eq!(
+                            writer.filled(),
+                            expected,
+                            "distance {distance}, length {length}, slack {slack}"
+                        );
+                        if discard_tail {
+                            // A subsequent match must use the logical prefix,
+                            // not speculative bytes beyond the earlier match.
+                            for _ in 0..slack {
+                                expected.push(expected[expected.len() - distance]);
+                            }
+                            if slack != 0 {
+                                writer.copy_match_discarding_tail::<WIDTH>(distance, slack);
+                            }
+                            assert_eq!(writer.filled(), expected);
                         }
-                        assert_eq!(writer.filled(), expected);
+                    }
+                    if !discard_tail {
+                        for slot in &storage[prefix.len() + length..capacity] {
+                            // SAFETY: the exact-copy slack canaries were initialized above.
+                            assert_eq!(unsafe { slot.assume_init() }, 0x5a);
+                        }
                     }
                     for slot in &storage[capacity..] {
                         // SAFETY: guard bytes were initialized above.
@@ -816,86 +841,15 @@ mod test {
     #[test]
     #[cfg_attr(miri, ignore = "exhaustive discarded-tail copy matrix")]
     fn discarded_tail_copy_preserves_logical_prefix_and_capacity() {
-        check_discarding_tail::<8>();
-        check_discarding_tail::<16>();
-        check_discarding_tail::<32>();
+        check_fast_copy::<8>(true);
+        check_fast_copy::<16>(true);
+        check_fast_copy::<32>(true);
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "exhaustive copy-length and slack matrix")]
     fn fast_copy_match_preserves_logical_bytes_and_allocation_canaries() {
-        // Include a genuinely uninitialized output tail, unaligned lengths,
-        // every RFC 1951 match length, and both vector and boundary paths.
-        let prefix: [u8; 64] = core::array::from_fn(|i| u8::try_from(i + 1).unwrap_or(0));
-        for distance in 1..=prefix.len() {
-            for length in 0..=258 {
-                for slack in [
-                    0,
-                    1,
-                    7,
-                    MATCH_COPY_WIDTH - 1,
-                    MATCH_COPY_WIDTH,
-                    MATCH_COPY_WIDTH + 1,
-                ] {
-                    let capacity = prefix.len() + length + slack;
-                    let mut storage = vec![MaybeUninit::<u8>::uninit(); capacity + 32];
-                    for (slot, byte) in storage.iter_mut().zip(prefix) {
-                        slot.write(byte);
-                    }
-                    for slot in &mut storage[capacity..] {
-                        slot.write(0xa5);
-                    }
-                    for slot in &mut storage[prefix.len() + length..capacity] {
-                        slot.write(0x5a);
-                    }
-
-                    let mut expected = prefix.to_vec();
-                    for _ in 0..length {
-                        let source = expected.len() - distance;
-                        expected.push(expected[source]);
-                    }
-
-                    {
-                        let mut writer = Writer {
-                            buf: WeakSliceMut::from_mut_slice(&mut storage[..capacity]),
-                            filled: prefix.len(),
-                        };
-                        writer.copy_match_fast(distance, length);
-                        assert_eq!(writer.len(), expected.len());
-                        assert_eq!(
-                            writer.filled(),
-                            expected,
-                            "distance {distance}, length {length}, slack {slack}"
-                        );
-                    }
-                    for (i, slot) in storage[prefix.len() + length..capacity].iter().enumerate() {
-                        // SAFETY: slack canaries were initialized above.
-                        assert_eq!(
-                            {
-                                // SAFETY: slack canaries were
-                                // initialized before the tested copy.
-                                unsafe { slot.assume_init() }
-                            },
-                            0x5a,
-                            "unexpected write after logical output at {i}, distance {distance}, length {length}, slack {slack}"
-                        );
-                    }
-                    for (i, slot) in storage[capacity..].iter().enumerate() {
-                        // SAFETY: the allocation canaries were initialized above
-                        // and the copy routine must not write beyond capacity.
-                        assert_eq!(
-                            {
-                                // SAFETY: allocation guard canaries were
-                                // initialized before the tested copy.
-                                unsafe { slot.assume_init() }
-                            },
-                            0xa5,
-                            "out-of-bounds write at {i}, distance {distance}, length {length}, slack {slack}"
-                        );
-                    }
-                }
-            }
-        }
+        check_fast_copy::<MATCH_COPY_WIDTH>(false);
     }
 
     #[test]
