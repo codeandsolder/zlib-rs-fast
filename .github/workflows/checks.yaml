@@ -105,7 +105,6 @@ jobs:
           - target: "loongarch64-unknown-linux-gnu"
             os: ubuntu-26.04
             codecov: false
-            flags: "--features=lsx"
             packages: gcc-loongarch64-linux-gnu g++-loongarch64-linux-gnu qemu-user qemu-user-binfmt
 
           - target: "wasm32-wasip1"
