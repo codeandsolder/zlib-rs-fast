@@ -81,6 +81,35 @@ impl InflateError {
     }
 }
 
+// Both owned streams expose the same progress and error contract.
+macro_rules! stream_accessors {
+    () => {
+        /// The number of input bytes consumed so far.
+        #[must_use = "The count describes the input consumed by the stream."]
+        pub const fn total_in(&self) -> u64 {
+            self.total_in
+        }
+
+        /// The number of output bytes produced so far.
+        #[must_use = "The count describes the output produced by the stream."]
+        pub const fn total_out(&self) -> u64 {
+            self.total_out
+        }
+
+        /// The error message if the previous operation failed.
+        #[must_use = "The returned description communicates the error."]
+        pub fn error_message(&self) -> Option<&'static str> {
+            if self.inner.msg.is_null() {
+                None
+            } else {
+                // SAFETY: the inner stream only points msg at a static,
+                // NUL-terminated zlib error literal while it is live.
+                unsafe { core::ffi::CStr::from_ptr(self.inner.msg).to_str() }.ok()
+            }
+        }
+    };
+}
+
 /// The state that is used to decompress an input.
 pub struct Inflate {
     inner: crate::inflate::InflateStream<'static>,
@@ -89,29 +118,7 @@ pub struct Inflate {
 }
 
 impl Inflate {
-    /// The amount of bytes consumed from the input so far.
-    #[must_use = "The count describes the input consumed by the stream."]
-    pub const fn total_in(&self) -> u64 {
-        self.total_in
-    }
-
-    /// The amount of decompressed bytes that have been written to the output thus far.
-    #[must_use = "The count describes the output produced by the stream."]
-    pub const fn total_out(&self) -> u64 {
-        self.total_out
-    }
-
-    /// The error message if the previous operation failed.
-    #[must_use = "The returned description communicates the error."]
-    pub fn error_message(&self) -> Option<&'static str> {
-        if self.inner.msg.is_null() {
-            None
-        } else {
-            // SAFETY: the inner stream only points msg at a static,
-            // NUL-terminated zlib error literal while it is live.
-            unsafe { core::ffi::CStr::from_ptr(self.inner.msg).to_str() }.ok()
-        }
-    }
+    stream_accessors!();
 
     /// Create a new instance. This function allocates, and so it is recommended to re-use this
     /// state when possible, using [`Inflate::reset`] as needed.
@@ -341,29 +348,7 @@ pub struct Deflate {
 }
 
 impl Deflate {
-    /// The number of bytes that were read from the input.
-    #[must_use = "The count describes the input consumed by the stream."]
-    pub const fn total_in(&self) -> u64 {
-        self.total_in
-    }
-
-    /// The number of compressed bytes that were written to the output.
-    #[must_use = "The count describes the output produced by the stream."]
-    pub const fn total_out(&self) -> u64 {
-        self.total_out
-    }
-
-    /// The error message if the previous operation failed.
-    #[must_use = "The returned description communicates the error."]
-    pub fn error_message(&self) -> Option<&'static str> {
-        if self.inner.msg.is_null() {
-            None
-        } else {
-            // SAFETY: the inner stream only points msg at a static,
-            // NUL-terminated zlib error literal while it is live.
-            unsafe { core::ffi::CStr::from_ptr(self.inner.msg).to_str() }.ok()
-        }
-    }
+    stream_accessors!();
 
     /// Create a new instance - this allocates so should be done with care.
     ///

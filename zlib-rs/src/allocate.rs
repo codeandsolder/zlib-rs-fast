@@ -337,7 +337,7 @@ impl Allocator<'_> {
 /// Reusable test-only C allocator simulating every raw pointer residue.
 /// The per-stream context avoids global callbacks and cross-test contention.
 #[cfg(test)]
-use std::{boxed::Box, vec, vec::Vec};
+use std::{vec, vec::Vec};
 
 #[cfg(test)]
 pub struct MisalignedAlloc {
@@ -346,7 +346,7 @@ pub struct MisalignedAlloc {
     pub(super) fill: u8,
     pub(super) allocations: usize,
     pub(super) frees: usize,
-    pub(super) buffers: Vec<(*mut core::ffi::c_void, Box<[u8]>)>,
+    pub(super) buffers: Vec<(*mut core::ffi::c_void, Vec<u8>)>,
 }
 
 /// # Safety
@@ -371,7 +371,10 @@ pub unsafe extern "C" fn misaligned_alloc_callback(
     else {
         return core::ptr::null_mut();
     };
-    let mut data = vec![ctx.fill; length].into_boxed_slice();
+    // Vec owns the allocation through a raw pointer. Moving the vector
+    // into the callback's ownership table does not retag its buffer as
+    // moving a uniquely owning Box would.
+    let mut data = vec![ctx.fill; length];
     let base = data.as_mut_ptr().addr();
     let delta = (ctx.remainder + ctx.modulus - base % ctx.modulus) % ctx.modulus;
     // SAFETY: the allocation reserves one full alignment unit beyond the requested

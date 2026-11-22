@@ -366,9 +366,7 @@ mod tests {
             let codec = BatchCodec::new(workers).map_err(|_| "worker pool")?;
             run_decode_cases(|jobs, config| codec.decompress(jobs, config))
                 .map_err(|_| "vector output reservation")?;
-            assert!(codec
-                .decompress(&mut [], InflateConfig::default())
-                .is_empty());
+            assert_eq!(codec.decompress(&mut [], InflateConfig::default()), []);
         }
         Ok(())
     }

@@ -164,145 +164,188 @@ pub type z_off64_t = i64;
 #[cfg(all(windows, target_env = "gnu"))]
 pub type z_off64_t = z_off_t;
 
-/// Calculates the [crc32](https://en.wikipedia.org/wiki/Computation_of_cyclic_redundancy_checks#CRC-32_algorithm) checksum
-/// of a sequence of bytes.
-///
-/// When the pointer argument is `NULL`, the initial checksum value is returned.
-///
-/// # Safety
-///
-/// The caller must guarantee that either:
-///
-/// - `buf` is `NULL`
-/// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::crc32_z;
-///
-/// unsafe {
-///     assert_eq!(crc32_z(0, core::ptr::null(), 0), 0);
-///     assert_eq!(crc32_z(1, core::ptr::null(), 32), 0);
-///
-///     let input = [1,2,3];
-///     assert_eq!(crc32_z(0, input.as_ptr(), input.len() as _), 1438416925);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_z))]
-#[must_use = "The checksum is the result of this computation."]
-pub unsafe extern "C" fn crc32_z(crc: c_ulong, buf: *const Bytef, len: size_t) -> c_ulong {
-    // SAFETY: The public checksum contract guarantees a readable span for non-null buf; the helper checks null before creating the slice.
-    let Some(buf) = (unsafe { slice_from_raw_parts(buf, len) }) else {
-        return 0;
+fn combine_crc(crc1: c_ulong, crc2: c_ulong, len2: impl Into<i64>) -> c_ulong {
+    c_ulong::from(zlib_rs::crc32::crc32_combine(
+        checksum_word(crc1),
+        checksum_word(crc2),
+        crc_combine_length(len2),
+    ))
+}
+
+fn combine_crc_operator(len2: impl Into<i64>) -> c_ulong {
+    let len2 = len2.into();
+    debug_assert!(len2 >= 0, "`len2` must be non-negative");
+    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
+}
+
+fn combine_adler(adler1: c_ulong, adler2: c_ulong, len2: impl Into<i64>) -> c_ulong {
+    // A negative length returns an invalid checksum for diagnosis.
+    u64::try_from(len2.into()).map_or(0xFFFF_FFFF, |len2| {
+        c_ulong::from(zlib_rs::adler32::adler32_combine(
+            checksum_word(adler1),
+            checksum_word(adler2),
+            len2,
+        ))
+    })
+}
+
+// Both checksum algorithms share the C buffer and length contract.
+macro_rules! checksum_exports {
+    (
+        $(#[$wide_doc:meta])* $wide:ident,
+        $(#[$narrow_doc:meta])* $narrow:ident,
+        $checksum:path, $initial:expr,
+        $(#[$combine_doc:meta])* $combine:ident,
+        $(#[$combine64_doc:meta])* $combine64:ident,
+        $combine_impl:path
+    ) => {
+        $(#[$wide_doc])*
+        #[cfg_attr(feature = "export-symbols", export_name = prefix!($wide))]
+        #[must_use = "The checksum is the result of this computation."]
+        pub unsafe extern "C" fn $wide(checksum: c_ulong, buf: *const Bytef, len: size_t) -> c_ulong {
+            // SAFETY: the caller guarantees a readable span for a non-null
+            // buffer; the slice helper checks null before constructing it.
+            let Some(buf) = (unsafe { slice_from_raw_parts(buf, len) }) else {
+                return $initial;
+            };
+            c_ulong::from($checksum(checksum_word(checksum), buf))
+        }
+
+        $(#[$narrow_doc])*
+        #[cfg_attr(feature = "export-symbols", export_name = prefix!($narrow))]
+        #[must_use = "The checksum is the result of this computation."]
+        pub unsafe extern "C" fn $narrow(checksum: c_ulong, buf: *const Bytef, len: uInt) -> c_ulong {
+            // SAFETY: the caller's buffer contract is forwarded unchanged.
+            unsafe { $wide(checksum, buf, len as size_t) }
+        }
+
+        $(#[$combine_doc])*
+        #[cfg_attr(feature = "export-symbols", export_name = prefix!($combine))]
+        #[must_use = "The checksum is the result of this computation."]
+        pub extern "C" fn $combine(first: c_ulong, second: c_ulong, length: z_off_t) -> c_ulong {
+            $combine_impl(first, second, length)
+        }
+
+        $(#[$combine64_doc])*
+        #[cfg_attr(feature = "export-symbols", export_name = prefix!($combine64))]
+        #[must_use = "The checksum is the result of this computation."]
+        pub extern "C" fn $combine64(first: c_ulong, second: c_ulong, length: z_off64_t) -> c_ulong {
+            $combine_impl(first, second, length)
+        }
     };
-    c_ulong::from(zlib_rs::crc32::crc32(checksum_word(crc), buf))
 }
 
-/// Calculates the [crc32](https://en.wikipedia.org/wiki/Computation_of_cyclic_redundancy_checks#CRC-32_algorithm) checksum
-/// of a sequence of bytes.
-///
-/// When the pointer argument is `NULL`, the initial checksum value is returned.
-///
-/// # Safety
-///
-/// The caller must guarantee that either:
-///
-/// - `buf` is `NULL`
-/// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::crc32;
-///
-/// unsafe {
-///     assert_eq!(crc32(0, core::ptr::null(), 0), 0);
-///     assert_eq!(crc32(1, core::ptr::null(), 32), 0);
-///
-///     let input = [1,2,3];
-///     assert_eq!(crc32(0, input.as_ptr(), input.len() as _), 1438416925);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32))]
-#[must_use = "The checksum is the result of this computation."]
-pub unsafe extern "C" fn crc32(crc: c_ulong, buf: *const Bytef, len: uInt) -> c_ulong {
-    // SAFETY: this thin wrapper forwards the caller-provided readable buffer span unchanged under the same documented checksum contract.
-    unsafe { crc32_z(crc, buf, len as size_t) }
-}
-
-/// Combines the checksum of two slices into one.
-///
-/// The combined value is equivalent to calculating the checksum of the whole input.
-///
-/// This function can be used when input arrives in chunks, or when different threads
-/// calculate the checksum of different sections of the input.
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::{crc32, crc32_combine};
-///
-/// let input = [1, 2, 3, 4, 5, 6, 7, 8];
-/// let lo = &input[..4];
-/// let hi = &input[4..];
-///
-/// unsafe {
-///     let full = crc32(0, input.as_ptr(), input.len() as _);
-///
-///     let crc1 = crc32(0, lo.as_ptr(), lo.len() as _);
-///     let crc2 = crc32(0, hi.as_ptr(), hi.len() as _);
-///
-///     let combined = crc32_combine(crc1, crc2, hi.len() as _);
-///
-///     assert_eq!(full, combined);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine))]
-#[must_use = "The checksum is the result of this computation."]
-pub extern "C" fn crc32_combine(crc1: c_ulong, crc2: c_ulong, len2: z_off_t) -> c_ulong {
-    c_ulong::from(zlib_rs::crc32::crc32_combine(
-        checksum_word(crc1),
-        checksum_word(crc2),
-        crc_combine_length(len2),
-    ))
-}
-
-/// Combines the checksum of two slices into one.
-///
-/// The combined value is equivalent to calculating the checksum of the whole input.
-///
-/// This function can be used when input arrives in chunks, or when different threads
-/// calculate the checksum of different sections of the input.
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::{crc32, crc32_combine64};
-///
-/// let input = [1, 2, 3, 4, 5, 6, 7, 8];
-/// let lo = &input[..4];
-/// let hi = &input[4..];
-///
-/// unsafe {
-///     let full = crc32(0, input.as_ptr(), input.len() as _);
-///
-///     let crc1 = crc32(0, lo.as_ptr(), lo.len() as _);
-///     let crc2 = crc32(0, hi.as_ptr(), hi.len() as _);
-///
-///     let combined = crc32_combine64(crc1, crc2, hi.len() as _);
-///
-///     assert_eq!(full, combined);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine64))]
-#[must_use = "The checksum is the result of this computation."]
-pub extern "C" fn crc32_combine64(crc1: c_ulong, crc2: c_ulong, len2: z_off64_t) -> c_ulong {
-    c_ulong::from(zlib_rs::crc32::crc32_combine(
-        checksum_word(crc1),
-        checksum_word(crc2),
-        crc_combine_length(len2),
-    ))
+checksum_exports! {
+    /// Calculates the [crc32](https://en.wikipedia.org/wiki/Computation_of_cyclic_redundancy_checks#CRC-32_algorithm) checksum
+    /// of a sequence of bytes.
+    ///
+    /// When the pointer argument is `NULL`, the initial checksum value is returned.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that either:
+    ///
+    /// - `buf` is `NULL`
+    /// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::crc32_z;
+    ///
+    /// unsafe {
+    ///     assert_eq!(crc32_z(0, core::ptr::null(), 0), 0);
+    ///     assert_eq!(crc32_z(1, core::ptr::null(), 32), 0);
+    ///
+    ///     let input = [1,2,3];
+    ///     assert_eq!(crc32_z(0, input.as_ptr(), input.len() as _), 1438416925);
+    /// }
+    /// ```
+    crc32_z,
+    /// Calculates the [crc32](https://en.wikipedia.org/wiki/Computation_of_cyclic_redundancy_checks#CRC-32_algorithm) checksum
+    /// of a sequence of bytes.
+    ///
+    /// When the pointer argument is `NULL`, the initial checksum value is returned.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that either:
+    ///
+    /// - `buf` is `NULL`
+    /// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::crc32;
+    ///
+    /// unsafe {
+    ///     assert_eq!(crc32(0, core::ptr::null(), 0), 0);
+    ///     assert_eq!(crc32(1, core::ptr::null(), 32), 0);
+    ///
+    ///     let input = [1,2,3];
+    ///     assert_eq!(crc32(0, input.as_ptr(), input.len() as _), 1438416925);
+    /// }
+    /// ```
+    crc32,
+    zlib_rs::crc32::crc32, 0,
+    /// Combines the checksum of two slices into one.
+    ///
+    /// The combined value is equivalent to calculating the checksum of the whole input.
+    ///
+    /// This function can be used when input arrives in chunks, or when different threads
+    /// calculate the checksum of different sections of the input.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::{crc32, crc32_combine};
+    ///
+    /// let input = [1, 2, 3, 4, 5, 6, 7, 8];
+    /// let lo = &input[..4];
+    /// let hi = &input[4..];
+    ///
+    /// unsafe {
+    ///     let full = crc32(0, input.as_ptr(), input.len() as _);
+    ///
+    ///     let crc1 = crc32(0, lo.as_ptr(), lo.len() as _);
+    ///     let crc2 = crc32(0, hi.as_ptr(), hi.len() as _);
+    ///
+    ///     let combined = crc32_combine(crc1, crc2, hi.len() as _);
+    ///
+    ///     assert_eq!(full, combined);
+    /// }
+    /// ```
+    crc32_combine,
+    /// Combines the checksum of two slices into one.
+    ///
+    /// The combined value is equivalent to calculating the checksum of the whole input.
+    ///
+    /// This function can be used when input arrives in chunks, or when different threads
+    /// calculate the checksum of different sections of the input.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::{crc32, crc32_combine64};
+    ///
+    /// let input = [1, 2, 3, 4, 5, 6, 7, 8];
+    /// let lo = &input[..4];
+    /// let hi = &input[4..];
+    ///
+    /// unsafe {
+    ///     let full = crc32(0, input.as_ptr(), input.len() as _);
+    ///
+    ///     let crc1 = crc32(0, lo.as_ptr(), lo.len() as _);
+    ///     let crc2 = crc32(0, hi.as_ptr(), hi.len() as _);
+    ///
+    ///     let combined = crc32_combine64(crc1, crc2, hi.len() as _);
+    ///
+    ///     assert_eq!(full, combined);
+    /// }
+    /// ```
+    crc32_combine64,
+    combine_crc
 }
 
 /// The CRC table used by the crc32 checksum algorithm.
@@ -317,8 +360,7 @@ pub extern "C" fn get_crc_table() -> *const [u32; 256] {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine_gen64))]
 #[must_use = "The returned polynomial operator is needed to combine checksums."]
 pub extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> c_ulong {
-    debug_assert!(len2 >= 0, "`len2` must be non-negative");
-    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
+    combine_crc_operator(len2)
 }
 
 /// Return the operator corresponding to length `len2`, to be used with
@@ -326,8 +368,7 @@ pub extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> c_ulong {
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine_gen))]
 #[must_use = "The returned polynomial operator is needed to combine checksums."]
 pub extern "C" fn crc32_combine_gen(len2: z_off_t) -> c_ulong {
-    debug_assert!(len2 >= 0, "`len2` must be non-negative");
-    c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
+    combine_crc_operator(len2)
 }
 
 /// Give the same result as [`crc32_combine`], using `op` in place of `len2`.
@@ -344,151 +385,117 @@ pub extern "C" fn crc32_combine_op(crc1: c_ulong, crc2: c_ulong, op: c_ulong) ->
     ))
 }
 
-/// Calculates the [adler32](https://en.wikipedia.org/wiki/Adler-32) checksum
-/// of a sequence of bytes.
-///
-/// When the pointer argument is `NULL`, the initial checksum value is returned.
-///
-/// # Safety
-///
-/// The caller must guarantee that either:
-///
-/// - `buf` is `NULL`
-/// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::adler32_z;
-///
-/// unsafe {
-///     assert_eq!(adler32_z(0, core::ptr::null(), 0), 1);
-///     assert_eq!(adler32_z(1, core::ptr::null(), 32), 1);
-///
-///     let input = [1,2,3];
-///     assert_eq!(adler32_z(0, input.as_ptr(), input.len() as _), 655366);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_z))]
-#[must_use = "The checksum is the result of this computation."]
-pub unsafe extern "C" fn adler32_z(adler: c_ulong, buf: *const Bytef, len: size_t) -> c_ulong {
-    // SAFETY: The public Adler-32 contract guarantees a readable span for non-null buf; the helper checks null before creating the slice.
-    let Some(buf) = (unsafe { slice_from_raw_parts(buf, len) }) else {
-        return 1;
-    };
-    c_ulong::from(zlib_rs::adler32::adler32(checksum_word(adler), buf))
-}
-
-/// Calculates the [adler32](https://en.wikipedia.org/wiki/Adler-32) checksum
-/// of a sequence of bytes.
-///
-/// When the pointer argument is `NULL`, the initial checksum value is returned.
-///
-/// # Safety
-///
-/// The caller must guarantee that either:
-///
-/// - `buf` is `NULL`
-/// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::adler32;
-///
-/// unsafe {
-///     assert_eq!(adler32(0, core::ptr::null(), 0), 1);
-///     assert_eq!(adler32(1, core::ptr::null(), 32), 1);
-///
-///     let input = [1,2,3];
-///     assert_eq!(adler32(0, input.as_ptr(), input.len() as _), 655366);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32))]
-#[must_use = "The checksum is the result of this computation."]
-pub unsafe extern "C" fn adler32(adler: c_ulong, buf: *const Bytef, len: uInt) -> c_ulong {
-    // SAFETY: this thin wrapper forwards the caller-provided readable buffer span unchanged under the same documented checksum contract.
-    unsafe { adler32_z(adler, buf, len as size_t) }
-}
-
-/// Combines the checksum of two slices into one.
-///
-/// The combined value is equivalent to calculating the checksum of the whole input.
-///
-/// This function can be used when input arrives in chunks, or when different threads
-/// calculate the checksum of different sections of the input.
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::{adler32, adler32_combine};
-///
-/// let input = [1, 2, 3, 4, 5, 6, 7, 8];
-/// let lo = &input[..4];
-/// let hi = &input[4..];
-///
-/// unsafe {
-///     let full = adler32(1, input.as_ptr(), input.len() as _);
-///
-///     let adler1 = adler32(1, lo.as_ptr(), lo.len() as _);
-///     let adler2 = adler32(1, hi.as_ptr(), hi.len() as _);
-///
-///     let combined = adler32_combine(adler1, adler2, hi.len() as _);
-///
-///     assert_eq!(full, combined);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_combine))]
-#[must_use = "The checksum is the result of this computation."]
-pub extern "C" fn adler32_combine(adler1: c_ulong, adler2: c_ulong, len2: z_off_t) -> c_ulong {
-    // A negative length returns an invalid checksum for diagnosis.
-    u64::try_from(len2).map_or(0xFFFF_FFFF, |len2| {
-        c_ulong::from(zlib_rs::adler32::adler32_combine(
-            checksum_word(adler1),
-            checksum_word(adler2),
-            len2,
-        ))
-    })
-}
-
-/// Combines the checksum of two slices into one.
-///
-/// The combined value is equivalent to calculating the checksum of the whole input.
-///
-/// This function can be used when input arrives in chunks, or when different threads
-/// calculate the checksum of different sections of the input.
-///
-/// # Example
-///
-/// ```
-/// use libz_rs_sys::{adler32, adler32_combine64};
-///
-/// let input = [1, 2, 3, 4, 5, 6, 7, 8];
-/// let lo = &input[..4];
-/// let hi = &input[4..];
-///
-/// unsafe {
-///     let full = adler32(1, input.as_ptr(), input.len() as _);
-///
-///     let adler1 = adler32(1, lo.as_ptr(), lo.len() as _);
-///     let adler2 = adler32(1, hi.as_ptr(), hi.len() as _);
-///
-///     let combined = adler32_combine64(adler1, adler2, hi.len() as _);
-///
-///     assert_eq!(full, combined);
-/// }
-/// ```
-#[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_combine64))]
-#[must_use = "The checksum is the result of this computation."]
-pub extern "C" fn adler32_combine64(adler1: c_ulong, adler2: c_ulong, len2: z_off64_t) -> c_ulong {
-    // A negative length returns an invalid checksum for diagnosis.
-    u64::try_from(len2).map_or(0xFFFF_FFFF, |len2| {
-        c_ulong::from(zlib_rs::adler32::adler32_combine(
-            checksum_word(adler1),
-            checksum_word(adler2),
-            len2,
-        ))
-    })
+checksum_exports! {
+    /// Calculates the [adler32](https://en.wikipedia.org/wiki/Adler-32) checksum
+    /// of a sequence of bytes.
+    ///
+    /// When the pointer argument is `NULL`, the initial checksum value is returned.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that either:
+    ///
+    /// - `buf` is `NULL`
+    /// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::adler32_z;
+    ///
+    /// unsafe {
+    ///     assert_eq!(adler32_z(0, core::ptr::null(), 0), 1);
+    ///     assert_eq!(adler32_z(1, core::ptr::null(), 32), 1);
+    ///
+    ///     let input = [1,2,3];
+    ///     assert_eq!(adler32_z(0, input.as_ptr(), input.len() as _), 655366);
+    /// }
+    /// ```
+    adler32_z,
+    /// Calculates the [adler32](https://en.wikipedia.org/wiki/Adler-32) checksum
+    /// of a sequence of bytes.
+    ///
+    /// When the pointer argument is `NULL`, the initial checksum value is returned.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that either:
+    ///
+    /// - `buf` is `NULL`
+    /// - `buf` and `len` satisfy the requirements of [`core::slice::from_raw_parts`]
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::adler32;
+    ///
+    /// unsafe {
+    ///     assert_eq!(adler32(0, core::ptr::null(), 0), 1);
+    ///     assert_eq!(adler32(1, core::ptr::null(), 32), 1);
+    ///
+    ///     let input = [1,2,3];
+    ///     assert_eq!(adler32(0, input.as_ptr(), input.len() as _), 655366);
+    /// }
+    /// ```
+    adler32,
+    zlib_rs::adler32::adler32, 1,
+    /// Combines the checksum of two slices into one.
+    ///
+    /// The combined value is equivalent to calculating the checksum of the whole input.
+    ///
+    /// This function can be used when input arrives in chunks, or when different threads
+    /// calculate the checksum of different sections of the input.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::{adler32, adler32_combine};
+    ///
+    /// let input = [1, 2, 3, 4, 5, 6, 7, 8];
+    /// let lo = &input[..4];
+    /// let hi = &input[4..];
+    ///
+    /// unsafe {
+    ///     let full = adler32(1, input.as_ptr(), input.len() as _);
+    ///
+    ///     let adler1 = adler32(1, lo.as_ptr(), lo.len() as _);
+    ///     let adler2 = adler32(1, hi.as_ptr(), hi.len() as _);
+    ///
+    ///     let combined = adler32_combine(adler1, adler2, hi.len() as _);
+    ///
+    ///     assert_eq!(full, combined);
+    /// }
+    /// ```
+    adler32_combine,
+    /// Combines the checksum of two slices into one.
+    ///
+    /// The combined value is equivalent to calculating the checksum of the whole input.
+    ///
+    /// This function can be used when input arrives in chunks, or when different threads
+    /// calculate the checksum of different sections of the input.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use libz_rs_sys::{adler32, adler32_combine64};
+    ///
+    /// let input = [1, 2, 3, 4, 5, 6, 7, 8];
+    /// let lo = &input[..4];
+    /// let hi = &input[4..];
+    ///
+    /// unsafe {
+    ///     let full = adler32(1, input.as_ptr(), input.len() as _);
+    ///
+    ///     let adler1 = adler32(1, lo.as_ptr(), lo.len() as _);
+    ///     let adler2 = adler32(1, hi.as_ptr(), hi.len() as _);
+    ///
+    ///     let combined = adler32_combine64(adler1, adler2, hi.len() as _);
+    ///
+    ///     assert_eq!(full, combined);
+    /// }
+    /// ```
+    adler32_combine64,
+    combine_adler
 }
 
 /// Like [`uncompress`] but takes a `usize` instead.

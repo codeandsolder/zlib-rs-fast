@@ -33,7 +33,7 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
     with:
       validation-tier: routine
-      rust-toolchain: nightly-2026-11-20
+      rust-toolchain: nightly-2026-11-19
       rustflags: ""
       command: |
         cargo test --locked --workspace --lib --features gz,gpu,parallel,near-optimal
