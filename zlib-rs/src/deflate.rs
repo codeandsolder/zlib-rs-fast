@@ -8545,6 +8545,7 @@ mod test {
         }
 
         let configurations = [
+            (1, Strategy::Default),
             (2, Strategy::Default),
             (6, Strategy::Default),
             (9, Strategy::Default),
