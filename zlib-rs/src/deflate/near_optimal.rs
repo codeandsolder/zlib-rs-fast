@@ -1822,7 +1822,7 @@ impl MatchRelaxation<'_> {
 }
 
 #[inline]
-fn relax(best_cost: &mut u64, step: &mut u16, cost: u64, length: u16) {
+const fn relax(best_cost: &mut u64, step: &mut u16, cost: u64, length: u16) {
     if cost < *best_cost {
         *best_cost = cost;
         *step = length;
