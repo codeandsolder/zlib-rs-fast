@@ -308,7 +308,7 @@ pub extern "C" fn crc32_combine64(crc1: c_ulong, crc2: c_ulong, len2: z_off64_t)
 /// The CRC table used by the crc32 checksum algorithm.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(get_crc_table))]
 #[must_use]
-pub extern "C" fn get_crc_table() -> *const [u32; 256] {
+pub const extern "C" fn get_crc_table() -> *const [u32; 256] {
     zlib_rs::crc32::get_crc_table()
 }
 
