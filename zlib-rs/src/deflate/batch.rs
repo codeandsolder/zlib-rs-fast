@@ -300,22 +300,19 @@ impl CpuEncoder {
         input: &[u8],
         output: &mut crate::batch::BatchOutput<'_>,
     ) -> (usize, ReturnCode) {
-        let stream = match self.stream.as_mut() {
-            Some(stream) => {
-                let code = reset(stream);
-                if code != ReturnCode::Ok {
-                    self.stream = None;
-                    return (0, code);
-                }
-                stream
+        let stream = if let Some(stream) = self.stream.as_mut() {
+            let code = reset(stream);
+            if code != ReturnCode::Ok {
+                self.stream = None;
+                return (0, code);
             }
-            None => {
-                let stream = match DeflateStream::new(self.config) {
-                    Ok(stream) => stream,
-                    Err(code) => return (0, code),
-                };
-                self.stream.insert(stream)
-            }
+            stream
+        } else {
+            let stream = match DeflateStream::new(self.config) {
+                Ok(stream) => stream,
+                Err(code) => return (0, code),
+            };
+            self.stream.insert(stream)
         };
         compress_into_stream(stream, output, input, DeflateFlush::Finish)
     }
@@ -1287,8 +1284,8 @@ mod tests {
                 for window_bits in [-15, 15, 31] {
                     let config = DeflateConfig {
                         level,
-                        strategy,
                         window_bits,
+                        strategy,
                         ..DeflateConfig::default()
                     };
                     let references = inputs
@@ -1318,20 +1315,22 @@ mod tests {
                         assert_eq!(&output[..bytes.len()], bytes);
                         assert!(output[bytes.len()..].iter().all(|&b| b == 0xa5));
                     }
-                    #[cfg(feature = "parallel")]
-                    for pool in &pools {
+                    let check_vectors = |run: &dyn Fn(&mut [BatchJob<'_>]) -> Vec<BatchCompressResult>| -> Result<(), std::collections::TryReserveError> {
                         let mut vectors = caps.map(Vec::with_capacity);
-                        let mut jobs = inputs
-                            .iter()
-                            .zip(&mut vectors)
-                            .zip(caps)
+                        let mut jobs = inputs.iter().zip(&mut vectors).zip(caps)
                             .map(|((input, output), cap)| BatchJob::with_vec(input, output, cap))
                             .collect::<Result<Vec<_>, _>>()?;
-                        assert_eq!(pool.compress(&mut jobs, config), results);
+                        assert_eq!(run(&mut jobs), results);
                         drop(jobs);
                         for (output, (bytes, _)) in vectors.iter().zip(&references) {
                             assert_eq!(output, bytes);
                         }
+                        Ok(())
+                    };
+                    check_vectors(&|jobs| compress_slices_batch(jobs, config))?;
+                    #[cfg(feature = "parallel")]
+                    for pool in &pools {
+                        check_vectors(&|jobs| pool.compress(jobs, config))?;
                     }
                 }
             }
