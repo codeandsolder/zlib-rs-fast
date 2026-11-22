@@ -408,7 +408,13 @@ impl FrontierTileScratch {
         }
     }
 
-    fn prepare(&mut self, suffixes: &SuffixRanks, input_len: usize, tile_start: usize, len: usize) {
+    fn prepare(
+        &mut self,
+        suffixes: Option<&SuffixRanks>,
+        input_len: usize,
+        tile_start: usize,
+        len: usize,
+    ) {
         self.counts[..len].fill(0);
         self.staged.clear();
         for (local, (rank, available)) in self.ranks[..len]
@@ -417,7 +423,9 @@ impl FrontierTileScratch {
             .enumerate()
         {
             let position = tile_start + local;
-            *rank = suffixes.rank_of(position);
+            if let Some(suffixes) = suffixes {
+                *rank = suffixes.rank_of(position);
+            }
             *available = u16::try_from(STD_MAX_MATCH.min(input_len - position))
                 .unwrap_or_else(|_| unreachable!("DEFLATE maximum match length fits in u16"));
         }
@@ -654,7 +662,7 @@ struct FrontierSource<'a> {
     max_distance: usize,
     ranges: [(usize, usize); D_CODES],
     first_rank_code: usize,
-    suffixes: SuffixRanks,
+    traversal: FrontierTraversal,
 }
 
 impl<'a> FrontierSource<'a> {
@@ -667,13 +675,18 @@ impl<'a> FrontierSource<'a> {
             .iter()
             .position(|&(min, max)| min != 0 && max - min + 1 > DIRECT_SCAN_MAX)
             .unwrap_or(D_CODES);
-        let suffixes = SuffixRanks::new(input, first_rank_code < D_CODES)?;
+        let traversal = if first_rank_code == D_CODES {
+            checked_suffix_input_len(input.len())?;
+            FrontierTraversal::Direct
+        } else {
+            FrontierTraversal::from_input(input, true)?
+        };
         Ok(Self {
             input,
             max_distance,
             ranges,
             first_rank_code,
-            suffixes,
+            traversal,
         })
     }
 
@@ -685,26 +698,29 @@ impl<'a> FrontierSource<'a> {
             return Err(ReturnCode::StreamError);
         }
         let input = self.input;
-        let suffixes = &self.suffixes;
         let ranges = &self.ranges;
         let first_rank_code = self.first_rank_code;
         let first_query = query.start;
-        if let Some(groups) = &suffixes.prefix_groups {
-            return Ok(group_local_frontier(
-                input,
-                suffixes,
-                groups,
-                ranges,
-                self.max_distance,
-                query,
-            ));
-        }
+        let suffixes = match &self.traversal {
+            FrontierTraversal::Direct => None,
+            FrontierTraversal::Dense(suffixes) => Some(suffixes),
+            FrontierTraversal::Grouped { sa, groups } => {
+                return Ok(group_local_frontier(
+                    input,
+                    sa,
+                    groups,
+                    ranges,
+                    self.max_distance,
+                    query,
+                ));
+            }
+        };
         let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
             let (min_distance, max_distance) = ranges[code];
             (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
                 .then(|| RankSet::new(input.len()))
         });
-        if first_query != 0 {
+        if let Some(suffixes) = suffixes {
             for (set, &(min, max)) in active.iter_mut().zip(ranges) {
                 if let Some(set) = set {
                     if let Some(end) = first_query.checked_sub(min) {
@@ -741,15 +757,17 @@ impl<'a> FrontierSource<'a> {
                 tile_len,
                 &mut scratch,
             );
-            scan_rank_buckets(
-                input,
-                suffixes,
-                ranges,
-                &mut active,
-                first_rank_code..last_rank_code,
-                tile_start..tile_start + tile_len,
-                &mut scratch,
-            );
+            if let Some(suffixes) = suffixes {
+                scan_rank_buckets(
+                    input,
+                    suffixes,
+                    ranges,
+                    &mut active,
+                    first_rank_code..last_rank_code,
+                    tile_start..tile_start + tile_len,
+                    &mut scratch,
+                );
+            }
             scan_direct_buckets(
                 input,
                 &ranges[last_rank_code..],
@@ -1132,7 +1150,15 @@ const fn suffix_index(value: u32) -> usize {
 struct SuffixRanks {
     sa: Vec<u32>,
     rank: Vec<u32>,
-    prefix_groups: Option<PrefixGroups>,
+}
+
+/// Each traversal retains only its own index representation. Narrow-only
+/// searches need neither suffix order nor inverse ranks. Grouped searches
+/// read contiguous suffix intervals and never need the dense inverse map.
+enum FrontierTraversal {
+    Direct,
+    Dense(SuffixRanks),
+    Grouped { sa: Vec<u32>, groups: PrefixGroups },
 }
 
 /// The packed suffix permutation and counting-sort offsets require indices
@@ -1152,14 +1178,23 @@ impl SuffixRanks {
         suffix_index(self.sa[suffix_rank])
     }
 
-    fn new(input: &[u8], collect_groups: bool) -> Result<Self, ReturnCode> {
+    #[cfg(test)]
+    fn new(input: &[u8]) -> Result<Self, ReturnCode> {
+        match FrontierTraversal::from_input(input, false)? {
+            FrontierTraversal::Dense(ranks) => Ok(ranks),
+            _ => unreachable!("dense order requested"),
+        }
+    }
+}
+
+impl FrontierTraversal {
+    fn from_input(input: &[u8], collect_groups: bool) -> Result<Self, ReturnCode> {
         let length = checked_suffix_input_len(input.len())?;
         if input.is_empty() {
-            return Ok(Self {
+            return Ok(Self::Dense(SuffixRanks {
                 sa: Vec::new(),
                 rank: Vec::new(),
-                prefix_groups: None,
-            });
+            }));
         }
 
         let mut sa = (0..length).collect::<Vec<_>>();
@@ -1232,17 +1267,17 @@ impl SuffixRanks {
             core::mem::swap(&mut sa, &mut scratch);
         }
 
+        if let Some(groups) = prefix_groups {
+            // Grouped queries never use the inverse permutation.
+            return Ok(Self::Grouped { sa, groups });
+        }
         // The doubling ranks are 1-based equivalence classes. The parser wants direct indices into
         // `sa`, so materialize the exact inverse suffix-array permutation once.
         for (suffix_rank, &position) in (0..length).zip(&sa) {
             rank[suffix_index(position)] = suffix_rank;
         }
 
-        Ok(Self {
-            sa,
-            rank,
-            prefix_groups,
-        })
+        Ok(Self::Dense(SuffixRanks { sa, rank }))
     }
 }
 
@@ -1859,7 +1894,7 @@ mod tests {
             return Err(ReturnCode::StreamError);
         }
         // Candidate offsets remain usize because there may be D_CODES entries per byte.
-        let suffixes = SuffixRanks::new(input, false)?;
+        let suffixes = SuffixRanks::new(input)?;
         let ranges = distance_code_ranges(max_distance);
         let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
             let (min_distance, max_distance) = ranges[code];
@@ -2077,7 +2112,7 @@ mod tests {
             *byte = state.to_le_bytes()[4] & 0x1f;
         }
 
-        let suffixes = SuffixRanks::new(&input, false)?;
+        let suffixes = SuffixRanks::new(&input)?;
         for rank in 0..input.len() {
             let position = suffixes.position_at(rank);
             assert_eq!(suffixes.rank_of(position), rank);
@@ -2100,7 +2135,7 @@ mod tests {
                         byte
                     })
                     .collect::<Vec<_>>();
-                let suffixes = SuffixRanks::new(&input, false)?;
+                let suffixes = SuffixRanks::new(&input)?;
                 let mut expected = (0..u32::try_from(len).map_err(|_| ReturnCode::StreamError)?)
                     .collect::<Vec<_>>();
                 expected.sort_unstable_by(|&left, &right| {
@@ -2145,7 +2180,7 @@ mod tests {
                     })
                     .collect();
 
-                let suffixes = SuffixRanks::new(&input, false)?;
+                let suffixes = SuffixRanks::new(&input)?;
                 assert_eq!(suffixes.sa.len(), length);
                 assert_eq!(suffixes.rank.len(), length);
                 for rank in 0..length {
@@ -2759,14 +2794,17 @@ mod tests {
             }
         }
         input.extend_from_slice(&atom);
-        let suffixes = SuffixRanks::new(&input, true)?;
-        let Some(prefix_groups) = &suffixes.prefix_groups else {
+        let traversal = FrontierTraversal::from_input(&input, true)?;
+        let FrontierTraversal::Grouped {
+            sa,
+            groups: prefix_groups,
+        } = &traversal
+        else {
             return Err(ReturnCode::StreamError);
         };
         for (marker, &count) in (0u8..).zip(&groups) {
             let prefix = [0xf5, 0xe4, marker];
-            let actual = suffixes
-                .sa
+            let actual = sa
                 .iter()
                 .filter(|&&pos| {
                     input[suffix_index(pos)..].get(..STD_MIN_MATCH) == Some(prefix.as_slice())
@@ -2778,14 +2816,8 @@ mod tests {
             0usize, 31, 32, 33, 39, 40, 41, 63, 64, 65, 127, 129, 257, 1025, 32768,
         ] {
             let ranges = distance_code_ranges(distance);
-            let actual = group_local_frontier(
-                &input,
-                &suffixes,
-                prefix_groups,
-                &ranges,
-                distance,
-                0..input.len(),
-            );
+            let actual =
+                group_local_frontier(&input, sa, prefix_groups, &ranges, distance, 0..input.len());
             assert_eq!(
                 actual,
                 build_match_candidates_position_major(&input, distance)?,

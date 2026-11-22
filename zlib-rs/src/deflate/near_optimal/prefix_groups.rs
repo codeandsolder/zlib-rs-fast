@@ -10,8 +10,8 @@ use core::ops::Range;
 
 use super::{
     compact_match_length, highest_bit, match_compare, stage_candidate, suffix_index,
-    FrontierTileScratch, MatchCandidate, MatchCandidates, RankSet, State, SuffixRanks,
-    DIRECT_SCAN_MAX, D_CODES, FRONTIER_TILE_POSITIONS, STD_MAX_MATCH, STD_MIN_MATCH,
+    FrontierTileScratch, MatchCandidate, MatchCandidates, RankSet, State, DIRECT_SCAN_MAX, D_CODES,
+    FRONTIER_TILE_POSITIONS, STD_MAX_MATCH, STD_MIN_MATCH,
 };
 
 // A short rank interval is cheaper to enumerate than to maintain a
@@ -547,7 +547,7 @@ impl PrefixGroups {
 #[inline(never)]
 pub(super) fn group_local_frontier(
     input: &[u8],
-    suffixes: &SuffixRanks,
+    sa: &[u32],
     groups: &PrefixGroups,
     ranges: &[(usize, usize); D_CODES],
     max_distance: usize,
@@ -569,7 +569,7 @@ pub(super) fn group_local_frontier(
     let mut output = GroupOutput::new(&query_range);
     let mut scratch = GroupScratch::new();
     for interval in &groups.intervals {
-        let group = &suffixes.sa[interval.clone()];
+        let group = &sa[interval.clone()];
         match group.len() {
             n if n <= SMALL_GROUP_DIRECT => {
                 scan_small_group(input, group, wide, max_distance, &query_range, &mut output);
