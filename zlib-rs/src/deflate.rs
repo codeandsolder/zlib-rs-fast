@@ -1255,6 +1255,13 @@ pub fn end<'a>(stream: &'a mut DeflateStream) -> Result<&'a mut z_stream, &'a mu
 }
 
 pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
+    reset_impl(stream, None)
+}
+
+/// Only the private complete-stream batch owner supplies the full previous
+/// input length: no preset dictionary, caller-driven flushes, or parameter
+/// changes can have populated its history.
+fn reset_impl(stream: &mut DeflateStream, previous_input_len: Option<usize>) -> ReturnCode {
     // A damaged or stale state must fail before reset_keep mutates any
     // buffered output, checksums, or the live hash history.
     let Some(config) = level_config(stream.state.level) else {
@@ -1263,7 +1270,7 @@ pub fn reset(stream: &mut DeflateStream) -> ReturnCode {
     let ret = reset_keep(stream);
 
     if ret == ReturnCode::Ok {
-        lm_init(&mut stream.state, config);
+        lm_init(&mut stream.state, config, previous_input_len);
     }
 
     ret
@@ -1305,12 +1312,10 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
-fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
+fn lm_init(state: &mut State, config: algorithm::LevelConfig, previous_input_len: Option<usize>) {
+    clear_hash_history(state, previous_input_len);
     state.window_size = 2 * state.w_size;
     state.window.clear();
-
-    // zlib uses CLEAR_HASH here
-    state.head.as_mut_slice().fill(0);
 
     // Hashes are a property of the live history representation, not a tunable
     // search budget. Choose the representation only while the history is empty.
@@ -1325,6 +1330,49 @@ fn lm_init(state: &mut State, config: algorithm::LevelConfig) {
     state.match_available = false;
     state.match_start = 0;
     state.ins_h = 0;
+}
+
+/// Reconstruct every bucket that could have been populated by a short
+/// complete-stream batch job. With no window slide, all inserted probes
+/// remain in the initialized window. Clearing a superset of touched buckets
+/// is equivalent to clearing the whole head array.
+fn clear_hash_history(state: &mut State<'_>, previous_input_len: Option<usize>) {
+    const MAX_SPARSE_RESET_BYTES: usize = 512;
+    // Stored jobs may slide their window but never populate hash heads.
+    // The first allocation is initialized normally and the configuration
+    // stays fixed for the entire lifetime of the privately owned stream.
+    if previous_input_len.is_some() && state.level == 0 {
+        return;
+    }
+    if !previous_input_len
+        .is_some_and(|len| len <= MAX_SPARSE_RESET_BYTES && len < state.w_size + state.max_dist())
+    {
+        state.head.as_mut_slice().fill(0);
+        return;
+    }
+    let window = state.window.filled();
+    let head = state.head.as_mut_slice();
+    match state.hash_calc_variant {
+        HashCalcVariant::Standard => {
+            for bytes in window.windows(4) {
+                let value = hash_calc::StandardHashCalc::first_four_bytes(bytes);
+                let hash = hash_calc::StandardHashCalc::update_hash(0, value) as usize;
+                head[hash] = 0;
+            }
+        }
+        HashCalcVariant::Roll => {
+            // The 15-bit recurrence shifts by five each byte, so three
+            // bytes determine a rolling bucket regardless of older bytes.
+            for bytes in window.windows(3) {
+                let prefix =
+                    hash_calc::RollHashCalc::update_hash(u32::from(bytes[0]), u32::from(bytes[1]));
+                let hash =
+                    hash_calc::RollHashCalc::update_hash(prefix, u32::from(bytes[2])) as usize;
+                head[hash] = 0;
+            }
+        }
+    }
+    debug_assert!(head.iter().all(|&entry| entry == 0));
 }
 
 const fn lm_set_level(state: &mut State, level: i8, config: algorithm::LevelConfig) {

@@ -18,7 +18,9 @@ use super::{
     longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
     CallCursors, State, Status,
 };
-use super::{compress_into_stream, reset, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode};
+use super::{
+    compress_into_stream, reset_impl, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode,
+};
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
 #[cfg(any(feature = "gpu", test))]
@@ -274,6 +276,7 @@ fn compress_external_job(
 struct CpuEncoder {
     config: DeflateConfig,
     stream: Option<DeflateStream<'static>>,
+    previous_input_len: usize,
 }
 
 impl CpuEncoder {
@@ -281,6 +284,7 @@ impl CpuEncoder {
         Self {
             config,
             stream: None,
+            previous_input_len: 0,
         }
     }
 
@@ -301,7 +305,7 @@ impl CpuEncoder {
         output: &mut crate::batch::BatchOutput<'_>,
     ) -> (usize, ReturnCode) {
         let stream = if let Some(stream) = self.stream.as_mut() {
-            let code = reset(stream);
+            let code = reset_impl(stream, Some(self.previous_input_len));
             if code != ReturnCode::Ok {
                 self.stream = None;
                 return (0, code);
@@ -314,6 +318,7 @@ impl CpuEncoder {
             };
             self.stream.insert(stream)
         };
+        self.previous_input_len = input.len();
         compress_into_stream(stream, output, input, DeflateFlush::Finish)
     }
 }
@@ -1256,6 +1261,65 @@ mod tests {
                 assert_eq!(vector.as_ptr(), original);
                 assert_eq!(vector, reference);
                 assert_eq!(&slice[..reference.len()], reference);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_batch_reset_clears_every_hash_bucket() -> Result<(), Box<dyn std::error::Error>> {
+        let mut seed = 0x4d89_8b27u32;
+        let random = (0..1025)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let repeated = b"abc0123456789a".repeat(80);
+        for level in 0..=9 {
+            for strategy in [
+                Strategy::Default,
+                Strategy::Filtered,
+                Strategy::Fixed,
+                Strategy::Rle,
+                Strategy::HuffmanOnly,
+            ] {
+                for window_bits in [-9, 9, 15, 31] {
+                    let config = DeflateConfig {
+                        level,
+                        window_bits,
+                        mem_level: 1,
+                        strategy,
+                        ..DeflateConfig::default()
+                    };
+                    let mut encoder = CpuEncoder::new(config);
+                    for bytes in [random.as_slice(), repeated.as_slice()] {
+                        for len in [
+                            0, 1, 2, 3, 4, 5, 7, 15, 31, 63, 127, 255, 511, 512, 513, 1024,
+                        ] {
+                            for cap in [0, 1, 11, compress_bound(len) + 64] {
+                                let input = &bytes[..len];
+                                let (expected, code) = independent(input, config, cap);
+                                let mut output = vec![0xa5; cap];
+                                let result =
+                                    encoder.compress(&mut BatchJob::new(input, &mut output));
+                                assert_eq!(
+                                    result,
+                                    BatchCompressResult {
+                                        written: expected.len(),
+                                        code
+                                    }
+                                );
+                                assert_eq!(&output[..expected.len()], expected);
+                                let stream = encoder.stream.as_mut().ok_or("owned stream")?;
+                                assert_eq!(reset_impl(stream, Some(len)), ReturnCode::Ok);
+                                assert!(stream.state.head.as_slice().iter().all(|&head| head == 0));
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
