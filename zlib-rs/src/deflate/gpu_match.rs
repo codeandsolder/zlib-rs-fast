@@ -37,11 +37,13 @@ struct Params {
 @group(0) @binding(3) var<uniform> params: Params;
 
 fn load_byte(index: u32) -> u32 {
+    if aligned_input { return input_words[index] & 0xffu; }
     let word = input_words[index >> 2u];
     return (word >> ((index & 3u) * 8u)) & 0xffu;
 }
 
 fn load_u32(index: u32) -> u32 {
+    if aligned_input { return input_words[index]; }
     let word_index = index >> 2u;
     let shift = (index & 3u) * 8u;
     let low = input_words[word_index] >> shift;
@@ -122,6 +124,7 @@ fn search(
 
     var best_len = 0u;
     var best_distance = 0u;
+    var best_probe = probe;
     var visited = 0u;
 
     // The predecessor index walks the same hash bucket newest to oldest.
@@ -136,8 +139,12 @@ fn search(
         distance = predecessor_distance(cursor);
         visited += 1u;
 
-        if best_len >= 3u && load_byte(position + best_len) != load_byte(candidate + best_len) {
-            continue;
+        if best_len >= 3u {
+            if aligned_input {
+                if best_probe != load_u32(candidate + best_len - 3u) { continue; }
+            } else if load_byte(position + best_len) != load_byte(candidate + best_len) {
+                continue;
+            }
         }
 
         let length = common_length(position, candidate, max_len, probe);
@@ -146,6 +153,11 @@ fn search(
         if length >= 3u && length > best_len {
             best_len = length;
             best_distance = position - candidate;
+            // A three-byte best match uses the existing first-word probe.
+            // Complete matches never read a following byte.
+            if aligned_input && best_len > 3u && best_len < max_len {
+                best_probe = load_u32(position + best_len - 3u);
+            }
         }
     }
 
@@ -344,11 +356,13 @@ fn prepare_input(
         return Ok(None);
     }
     let dispatch = dispatch_grid(input_len, max_workgroups)?;
-    let input_words = pack_words(input);
+    let input_layout = InputLayout::select(input, &predecessors, search_budget, max_dist);
+    let input_words = input_layout.pack(input);
     Ok(Some(PreparedGpuInput {
         input_index,
         input_len,
         dispatch,
+        input_layout,
         input_words,
         predecessors,
         params: [input_len, max_dist, MAX_MATCH, search_budget],
@@ -395,6 +409,7 @@ struct PreparedGpuInput {
     input_index: usize,
     input_len: u32,
     dispatch: (u32, u32),
+    input_layout: InputLayout,
     input_words: Vec<u32>,
     predecessors: Vec<u32>,
     params: [u32; 4],
@@ -547,7 +562,8 @@ struct SearchPart<'a> {
 pub struct GpuMatchSearcher {
     device: Device,
     queue: Queue,
-    pipeline: ComputePipeline,
+    packed_pipeline: ComputePipeline,
+    aligned_pipeline: ComputePipeline,
     adapter_name: String,
     workspace: Mutex<GpuWorkspace>,
 }
@@ -570,24 +586,33 @@ impl GpuMatchSearcher {
         }))
         .map_err(|error| GpuMatchError(format!("failed to create GPU device: {error}")))?;
 
-        let module = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("zlib whole-input match search"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("whole-input match search"),
-            layout: None,
-            module: &module,
-            entry_point: Some("search"),
-            compilation_options: PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let create_pipeline = |aligned: bool| {
+            // Generate a constant-specialized module, rather than leaving
+            // per-candidate layout branches or driver override resolution.
+            let module = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("zlib whole-input match search"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!("const aligned_input: bool = {aligned};\n{SHADER}").into(),
+                ),
+            });
+            device.create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("whole-input match search"),
+                layout: None,
+                module: &module,
+                entry_point: Some("search"),
+                compilation_options: PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let packed_pipeline = create_pipeline(false);
+        let aligned_pipeline = create_pipeline(true);
 
         let workspace = Mutex::new(GpuWorkspace::new(&device));
         Ok(Self {
             device,
             queue,
-            pipeline,
+            packed_pipeline,
+            aligned_pipeline,
             adapter_name,
             workspace,
         })
@@ -891,17 +916,22 @@ impl GpuMatchSearcher {
             );
         }
 
-        let layout = self.pipeline.get_bind_group_layout(0);
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("whole-input match batch command encoder"),
             });
 
+        let packed_layout = self.packed_pipeline.get_bind_group_layout(0);
+        let aligned_layout = self.aligned_pipeline.get_bind_group_layout(0);
         for item in prepared.iter().flatten() {
+            let (pipeline, layout) = match item.input_layout {
+                InputLayout::Packed => (&self.packed_pipeline, &packed_layout),
+                InputLayout::Aligned => (&self.aligned_pipeline, &aligned_layout),
+            };
             let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
                 label: Some("whole-input packed match buffers"),
-                layout: &layout,
+                layout,
                 entries: &[
                     BindGroupEntry {
                         binding: 0,
@@ -943,7 +973,7 @@ impl GpuMatchSearcher {
                     label: Some("whole-input match search"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipeline);
+                pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(item.dispatch.0, item.dispatch.1, 1);
             }
@@ -1029,6 +1059,96 @@ const fn device_type_rank(device_type: DeviceType) -> u8 {
         DeviceType::VirtualGpu => 3,
         DeviceType::Cpu => 2,
         DeviceType::Other => 1,
+    }
+}
+
+/// Choose a compact byte-packed layout for cheap searches, and one
+/// overlapping word per byte when enough history traversal is expected
+/// to amortize the additional input upload. Both produce identical tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputLayout {
+    Packed,
+    Aligned,
+}
+
+impl InputLayout {
+    // Bound the classifier independently of input length and search budget.
+    const SAMPLES: usize = 64;
+    const MAX_SAMPLE_VISITS: usize = 16;
+    const MIN_MEAN_VISITS: usize = 8;
+    const MIN_EXPANDED_BYTES: usize = 16 * 1024;
+
+    fn select(input: &[u8], predecessors: &[u32], budget: u32, max_dist: u32) -> Self {
+        if input.len() < Self::MIN_EXPANDED_BYTES || budget < Self::MIN_MEAN_VISITS as u32 {
+            return Self::Packed;
+        }
+        // Stratified samples with a different phase in each stratum avoid
+        // synchronizing the sample positions with a periodic input.
+        let stride = (input.len() - 2) / Self::SAMPLES;
+        let visits = (0..Self::SAMPLES)
+            .map(|sample| {
+                let phase = (sample * 37) % Self::SAMPLES;
+                let offset = (stride / Self::SAMPLES) * phase;
+                let position = sample * stride + offset;
+                Self::sample_visits(input, predecessors, position, budget, max_dist)
+            })
+            .sum::<usize>();
+        if visits >= Self::SAMPLES * Self::MIN_MEAN_VISITS {
+            Self::Aligned
+        } else {
+            Self::Packed
+        }
+    }
+
+    fn sample_visits(
+        input: &[u8],
+        predecessors: &[u32],
+        position: usize,
+        budget: u32,
+        max_dist: u32,
+    ) -> usize {
+        let minimum = position.saturating_sub(max_dist as usize - 1);
+        let length = (input.len() - position).min(MAX_MATCH as usize);
+        let max_visits = (budget as usize).min(Self::MAX_SAMPLE_VISITS);
+        let mut cursor = position;
+        for visited in 0..max_visits {
+            let distance = predecessor_distance(predecessors, cursor);
+            if distance == 0 {
+                return visited;
+            }
+            cursor -= distance;
+            if cursor < minimum {
+                return visited;
+            }
+            // A complete match ends the shader search immediately, even
+            // when the remaining chain contains thousands of predecessors.
+            if input[position..position + length] == input[cursor..cursor + length] {
+                return visited + 1;
+            }
+        }
+        max_visits
+    }
+
+    fn pack(self, input: &[u8]) -> Vec<u32> {
+        match self {
+            Self::Packed => pack_words(input),
+            Self::Aligned => {
+                let mut words = Vec::with_capacity(input.len());
+                words.extend(
+                    input
+                        .windows(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+                // Only byte comparisons can use the final three positions.
+                words.extend(
+                    input[input.len().saturating_sub(3)..]
+                        .iter()
+                        .copied()
+                        .map(u32::from),
+                );
+                words
+            }
+        }
     }
 }
 
@@ -1128,7 +1248,6 @@ fn build_predecessor_words(
     predecessors
 }
 
-#[cfg(test)]
 fn predecessor_distance(words: &[u32], position: usize) -> usize {
     ((words[position / 2] >> ((position & 1) * 16)) & 0xffff) as usize
 }
@@ -1141,6 +1260,58 @@ fn hash3(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_layout_uses_bounded_search_samples() -> Result<(), GpuMatchError> {
+        let mut seed = 0x4265_7391u32;
+        let random = (0..65536)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let periodic = b"abc01234567".repeat(6000);
+        // Many same-bucket candidates but no full match: different fourth
+        // bytes recur, followed by independent random data.
+        let deep = random
+            .chunks(1)
+            .flat_map(|tail| {
+                b"abcdefghijklmno"
+                    .iter()
+                    .copied()
+                    .chain(tail.iter().copied())
+            })
+            .collect::<Vec<_>>();
+        for (input, expected) in [
+            (random.as_slice(), InputLayout::Packed),
+            (periodic.as_slice(), InputLayout::Packed),
+            (deep.as_slice(), InputLayout::Aligned),
+        ] {
+            let pred = build_predecessors(input, DEFAULT_MAX_DIST)?;
+            assert_eq!(
+                InputLayout::select(input, &pred, 512, DEFAULT_MAX_DIST),
+                expected
+            );
+            assert_eq!(
+                InputLayout::select(input, &pred, 1, DEFAULT_MAX_DIST),
+                InputLayout::Packed
+            );
+        }
+        for len in 0..=12 {
+            let input = &random[..len];
+            let words = InputLayout::Aligned.pack(input);
+            assert_eq!(words.len(), len);
+            for (position, word) in words.iter().enumerate() {
+                assert_eq!(word.to_le_bytes()[0], input[position]);
+                if position + 4 <= len {
+                    assert_eq!(word.to_le_bytes(), input[position..position + 4]);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn compact_heads_preserve_dense_chain_semantics() -> Result<(), GpuMatchError> {
@@ -1265,42 +1436,62 @@ mod tests {
         let repetitive = b"abc".repeat(100);
         let inputs = [b"".as_slice(), b"a", b"ab", b"abc", &mixed, &repetitive];
         for (max_dist, budget) in [(1, 1), (8, 7), (64, 1), (64, 31), (DEFAULT_MAX_DIST, 64)] {
-            let tables = searcher.search_batch_with_max_dist(&inputs, budget, max_dist)?;
-            assert_eq!(tables.len(), inputs.len());
-            for (input, table) in inputs.iter().zip(tables) {
-                assert_eq!(table.len(), input.len());
-                for (position, actual) in table.iter().enumerate() {
-                    let mut expected = GpuMatch::default();
-                    let max_len = (input.len() - position).min(MAX_MATCH as usize);
-                    if max_len >= 3 {
-                        let hash = hash3(&input[position..position + 3]);
-                        let first = if position >= max_dist as usize {
-                            position - max_dist as usize + 1
-                        } else {
-                            0
-                        };
-                        for candidate in (first..position)
-                            .rev()
-                            .filter(|&candidate| hash3(&input[candidate..candidate + 3]) == hash)
-                            .take(budget as usize)
-                        {
-                            let len = input[position..position + max_len]
-                                .iter()
-                                .zip(&input[candidate..candidate + max_len])
-                                .take_while(|(left, right)| left == right)
-                                .count();
-                            if len >= 3 && len > expected.length as usize {
-                                expected = GpuMatch {
-                                    length: len as u32,
-                                    start: candidate as u32,
-                                };
+            let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+            for layout in [InputLayout::Packed, InputLayout::Aligned] {
+                let tables = searcher.search_with_geometry(
+                    &inputs,
+                    budget,
+                    max_dist,
+                    geometry,
+                    &|inputs, budget, distance, groups| {
+                        let mut prepared = prepare_serial(inputs, budget, distance, groups)?;
+                        for (input, item) in inputs.iter().zip(&mut prepared) {
+                            if let Some(item) = item {
+                                item.input_layout = layout;
+                                item.input_words = layout.pack(input);
                             }
                         }
+                        Ok(prepared)
+                    },
+                )?;
+                assert_eq!(tables.len(), inputs.len());
+                for (input, table) in inputs.iter().zip(tables) {
+                    assert_eq!(table.len(), input.len());
+                    for (position, actual) in table.iter().enumerate() {
+                        let mut expected = GpuMatch::default();
+                        let max_len = (input.len() - position).min(MAX_MATCH as usize);
+                        if max_len >= 3 {
+                            let hash = hash3(&input[position..position + 3]);
+                            let first = if position >= max_dist as usize {
+                                position - max_dist as usize + 1
+                            } else {
+                                0
+                            };
+                            for candidate in (first..position)
+                                .rev()
+                                .filter(|&candidate| {
+                                    hash3(&input[candidate..candidate + 3]) == hash
+                                })
+                                .take(budget as usize)
+                            {
+                                let len = input[position..position + max_len]
+                                    .iter()
+                                    .zip(&input[candidate..candidate + max_len])
+                                    .take_while(|(left, right)| left == right)
+                                    .count();
+                                if len >= 3 && len > expected.length as usize {
+                                    expected = GpuMatch {
+                                        length: len as u32,
+                                        start: candidate as u32,
+                                    };
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "max_dist={max_dist}, budget={budget}, position={position}"
+                        );
                     }
-                    assert_eq!(
-                        actual, expected,
-                        "max_dist={max_dist}, budget={budget}, position={position}"
-                    );
                 }
             }
         }
@@ -1423,6 +1614,7 @@ mod tests {
             assert_eq!(a.input_index, b.input_index);
             assert_eq!(a.input_len, b.input_len);
             assert_eq!(a.dispatch, b.dispatch);
+            assert_eq!(a.input_layout, b.input_layout);
             assert_eq!(a.input_words, b.input_words);
             assert_eq!(a.predecessors, b.predecessors);
             assert_eq!(a.params, b.params);
