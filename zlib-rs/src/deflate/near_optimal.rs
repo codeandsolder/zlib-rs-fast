@@ -1692,6 +1692,11 @@ fn reconstruct_tokens(
     block: Range<usize>,
     distance_costs: &[u32; D_CODES],
 ) -> Vec<ParseToken> {
+    // The inverse maximum length fits in the low field. A distance
+    // symbol cost is a u16 model price plus at most 13 DEFLATE extra
+    // bits at COST_SCALE, so the complete unsigned ordering key fits u32.
+    const LENGTH_BITS: u32 = STD_MAX_MATCH.ilog2() + 1;
+    let max_match = compact_match_length(STD_MAX_MATCH);
     let mut tokens = Vec::new();
     let mut cursor = block.len();
     while cursor != 0 {
@@ -1702,17 +1707,16 @@ fn reconstruct_tokens(
         let token = if length == 1 {
             ParseToken::Literal(input[position])
         } else {
-            let available = STD_MAX_MATCH.min(block.end - position);
+            let available = compact_match_length(STD_MAX_MATCH.min(block.end - position));
             let best = candidates
                 .for_position(position)
                 .iter()
                 .filter(|candidate| usize::from(candidate.length) >= length)
                 .min_by_key(|candidate| {
                     let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
-                    (
-                        distance_costs[code],
-                        core::cmp::Reverse(usize::from(candidate.length).min(available)),
-                    )
+                    let cost = distance_costs[code];
+                    debug_assert!(cost <= u32::MAX >> LENGTH_BITS);
+                    (cost << LENGTH_BITS) | u32::from(max_match - candidate.length.min(available))
                 })
                 .unwrap_or_else(|| unreachable!("winning match must have a capable distance"));
             ParseToken::matching(length, best.distance)
@@ -2563,8 +2567,13 @@ mod tests {
         let mut nonmonotone = tied.clone();
         nonmonotone.distance[0] = 200;
         nonmonotone.distance[1] = 400;
+        let expensive = TokenCosts {
+            literal: [u16::MAX; 256],
+            length: [u16::MAX; LENGTH_CODES],
+            distance: [u16::MAX; D_CODES],
+        };
         let mut scratch = ParseScratch::default();
-        for costs in [&tied, &nonmonotone] {
+        for costs in [&tied, &nonmonotone, &expensive] {
             let tile = ParseScratch::COST_TILE;
             for block in [
                 0..input.len(),
