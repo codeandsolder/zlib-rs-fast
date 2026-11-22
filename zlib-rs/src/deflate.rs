@@ -1279,6 +1279,7 @@ pub fn reset_keep(stream: &mut DeflateStream) -> ReturnCode {
     state.data_type = crate::c_api::Z_UNKNOWN;
 
     state.bit_writer.pending.reset_keep();
+    state.block_open = 0;
 
     // can be made negative by deflate(..., Z_FINISH);
     state.wrap = state.wrap.abs();
@@ -3926,13 +3927,23 @@ fn compress_into<O: WritableBytes + ?Sized>(
     config: DeflateConfig,
     final_flush: DeflateFlush,
 ) -> (usize, ReturnCode) {
-    let output_len = output.len();
-    // This helper owns its compressor. Using the typed constructor ensures
-    // all exit paths release its state instead of requiring raw ABI cleanup.
+    // Own and release the compressor on every independent one-shot call.
     let mut stream = match DeflateStream::new(config) {
         Ok(stream) => stream,
         Err(code) => return (0, code),
     };
+    compress_into_stream(&mut stream, output, input, final_flush)
+}
+
+/// Drive one complete independent input with an already initialized/reset
+/// stream. The stream retains its allocation, but never the caller buffers.
+fn compress_into_stream<O: WritableBytes + ?Sized>(
+    stream: &mut DeflateStream<'_>,
+    output: &mut O,
+    input: &[u8],
+    final_flush: DeflateFlush,
+) -> (usize, ReturnCode) {
+    let output_len = output.len();
     stream.next_in = input.as_ptr().cast_mut();
     stream.avail_in = 0; // let SliceBudget issue the first chunk
     stream.next_out = output.byte_ptr();
@@ -3950,7 +3961,7 @@ fn compress_into<O: WritableBytes + ?Sized>(
         } else {
             final_flush
         };
-        let err = deflate(&mut stream, flush);
+        let err = deflate(stream, flush);
 
         match err {
             ReturnCode::Ok => {}
@@ -3962,7 +3973,11 @@ fn compress_into<O: WritableBytes + ?Sized>(
     // The public zlib total_out counter may wrap on 64-bit Windows (32-bit c_ulong).
     // Recover the exact Rust-slice length from caller output budgets instead.
     let produced = output_budget.processed(stream.avail_out);
-    drop(stream);
+    // A reused stream must not retain pointers into either caller buffer.
+    stream.next_in = core::ptr::null_mut();
+    stream.next_out = core::ptr::null_mut();
+    stream.avail_in = 0;
+    stream.avail_out = 0;
 
     (produced, return_code)
 }

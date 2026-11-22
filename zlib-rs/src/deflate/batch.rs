@@ -16,9 +16,9 @@ use super::{
     },
     deflate,
     longest_match::{MatchSearchError, MatchSearchResult, MatchSearchWork},
-    CallCursors, DeflateFlush, DeflateStream, State, Status,
+    CallCursors, State, Status,
 };
-use super::{compress_into, DeflateConfig, ReturnCode};
+use super::{compress_into_stream, reset, DeflateConfig, DeflateFlush, DeflateStream, ReturnCode};
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
 #[cfg(any(feature = "gpu", test))]
@@ -57,13 +57,14 @@ impl BatchCodec {
         jobs: &mut [BatchJob<'_>],
         config: DeflateConfig,
     ) -> Vec<BatchCompressResult> {
-        self.run_items(
+        self.run_with_state(
             jobs,
             || BatchCompressResult {
                 written: 0,
                 code: ReturnCode::StreamError,
             },
-            |_, job| compress_cpu_job(job, config),
+            || CpuEncoder::new(config),
+            |encoder, _, job| encoder.compress(job),
         )
     }
 
@@ -268,14 +269,52 @@ fn compress_external_job(
     }
 }
 
-fn compress_cpu_job(job: &mut BatchJob<'_>, config: DeflateConfig) -> BatchCompressResult {
-    // SAFETY: compress_into reports only initialized bytes within its
-    // destination capacity and retains no reference after returning.
-    unsafe {
-        job.write(|input, output| {
-            let (written, code) = compress_into(output, input, config, crate::DeflateFlush::Finish);
-            (written, BatchCompressResult { written, code })
-        })
+/// One exclusively owned allocation reused only within this batch worker.
+/// A reset after either success or output exhaustion starts a new stream.
+struct CpuEncoder {
+    config: DeflateConfig,
+    stream: Option<DeflateStream<'static>>,
+}
+
+impl CpuEncoder {
+    const fn new(config: DeflateConfig) -> Self {
+        Self {
+            config,
+            stream: None,
+        }
+    }
+
+    fn compress(&mut self, job: &mut BatchJob<'_>) -> BatchCompressResult {
+        // SAFETY: compress_into_stream reports exactly the initialized
+        // prefix, and clears the borrowed buffer pointers before returning.
+        unsafe {
+            job.write(|input, output| {
+                let (written, code) = self.encode(input, output);
+                (written, BatchCompressResult { written, code })
+            })
+        }
+    }
+
+    fn encode(
+        &mut self,
+        input: &[u8],
+        output: &mut crate::batch::BatchOutput<'_>,
+    ) -> (usize, ReturnCode) {
+        let stream = if let Some(stream) = self.stream.as_mut() {
+            let code = reset(stream);
+            if code != ReturnCode::Ok {
+                self.stream = None;
+                return (0, code);
+            }
+            stream
+        } else {
+            let stream = match DeflateStream::new(self.config) {
+                Ok(stream) => stream,
+                Err(code) => return (0, code),
+            };
+            self.stream.insert(stream)
+        };
+        compress_into_stream(stream, output, input, DeflateFlush::Finish)
     }
 }
 
@@ -283,9 +322,8 @@ fn compress_synchronously(
     jobs: &mut [BatchJob<'_>],
     config: DeflateConfig,
 ) -> Vec<BatchCompressResult> {
-    jobs.iter_mut()
-        .map(|job| compress_cpu_job(job, config))
-        .collect()
+    let mut encoder = CpuEncoder::new(config);
+    jobs.iter_mut().map(|job| encoder.compress(job)).collect()
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -1218,6 +1256,83 @@ mod tests {
                 assert_eq!(vector.as_ptr(), original);
                 assert_eq!(vector, reference);
                 assert_eq!(&slice[..reference.len()], reference);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reused_compressor_preserves_independent_streams_after_partial_output(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let big = b"quick-reset-state/".repeat(5000);
+        let small = b"independent-neighbor";
+        let inputs: [&[u8]; 8] = [&big, small, b"", &big, small, &big, b"", small];
+        let caps = [7, 256, 0, compress_bound(big.len()), 1, 19, 64, 256];
+        #[cfg(feature = "parallel")]
+        let pools = [
+            BatchCodec::new(core::num::NonZeroUsize::MIN)?,
+            BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("workers")?)?,
+        ];
+        for level in 0..=9 {
+            for strategy in [
+                Strategy::Default,
+                Strategy::Filtered,
+                Strategy::Fixed,
+                Strategy::Rle,
+                Strategy::HuffmanOnly,
+            ] {
+                for window_bits in [-15, 15, 31] {
+                    let config = DeflateConfig {
+                        level,
+                        window_bits,
+                        strategy,
+                        ..DeflateConfig::default()
+                    };
+                    let references = inputs
+                        .iter()
+                        .zip(caps)
+                        .map(|(input, cap)| independent(input, config, cap))
+                        .collect::<Vec<_>>();
+                    let mut outputs = caps.map(|cap| vec![0xa5; cap]);
+                    let mut jobs = inputs
+                        .iter()
+                        .zip(&mut outputs)
+                        .map(|(input, output)| BatchJob::new(input, output))
+                        .collect::<Vec<_>>();
+                    let results = compress_slices_batch(&mut jobs, config);
+                    for (result, (bytes, code)) in results.iter().zip(&references) {
+                        assert_eq!(
+                            *result,
+                            BatchCompressResult {
+                                written: bytes.len(),
+                                code: *code
+                            },
+                            "level {level} strategy {strategy:?} window {window_bits}"
+                        );
+                    }
+                    drop(jobs);
+                    for (output, (bytes, _)) in outputs.iter().zip(&references) {
+                        assert_eq!(&output[..bytes.len()], bytes);
+                        assert!(output[bytes.len()..].iter().all(|&b| b == 0xa5));
+                    }
+                    let check_vectors = |run: &dyn Fn(&mut [BatchJob<'_>]) -> Vec<BatchCompressResult>| -> Result<(), std::collections::TryReserveError> {
+                        let mut vectors = caps.map(Vec::with_capacity);
+                        let mut jobs = inputs.iter().zip(&mut vectors).zip(caps)
+                            .map(|((input, output), cap)| BatchJob::with_vec(input, output, cap))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        assert_eq!(run(&mut jobs), results);
+                        drop(jobs);
+                        for (output, (bytes, _)) in vectors.iter().zip(&references) {
+                            assert_eq!(output, bytes);
+                        }
+                        Ok(())
+                    };
+                    check_vectors(&|jobs| compress_slices_batch(jobs, config))?;
+                    #[cfg(feature = "parallel")]
+                    for pool in &pools {
+                        check_vectors(&|jobs| pool.compress(jobs, config))?;
+                    }
+                }
             }
         }
         Ok(())
