@@ -93,12 +93,17 @@ impl StandardHashCalc {
     }
 }
 
+const ROLL_HASH_BITS: u32 = 15;
+
+/// Number of distinct buckets addressed by the three-byte rolling hash.
+pub(super) const ROLL_HASH_SIZE: usize = 1 << ROLL_HASH_BITS;
+
 pub struct RollHashCalc;
 
 impl RollHashCalc {
     const HASH_CALC_OFFSET: usize = STD_MIN_MATCH - 1;
 
-    const HASH_CALC_MASK: u32 = (1 << 15) - 1;
+    const HASH_CALC_MASK: u32 = (1 << ROLL_HASH_BITS) - 1;
 
     const fn hash_calc(h: u32, val: u32) -> u32 {
         const HASH_SLIDE: u32 = 5;
