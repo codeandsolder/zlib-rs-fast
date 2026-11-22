@@ -1557,8 +1557,9 @@ pub fn parse_block(input: &[u8], candidates: &MatchCandidates, costs: &TokenCost
     parse_range(input, candidates, 0..input.len(), costs)
 }
 
-/// Reuse the block-sized dynamic-programming arrays across cost-model passes;
-/// each completed parse still owns its token output independently.
+/// Reuse a bounded cost horizon and block-sized traceback across cost-model
+/// passes. Every forward edge is at most one DEFLATE match long, so finalized
+/// costs can be discarded without losing any subsequent relaxation.
 #[derive(Default)]
 struct ParseScratch {
     best_cost: Vec<u64>,
@@ -1567,6 +1568,16 @@ struct ParseScratch {
 
 impl ParseScratch {
     const INF: u64 = u64::MAX / 4;
+    // A power-of-two tile at least as large as the longest edge gives
+    // contiguous relaxation spans even at the final position of a tile.
+    const COST_TILE: usize = (STD_MAX_MATCH + 1).next_power_of_two();
+    const COST_CAPACITY: usize = Self::COST_TILE + STD_MAX_MATCH;
+
+    fn advance_cost_horizon(costs: &mut [u64]) {
+        let retained = costs.len() - Self::COST_TILE;
+        costs.copy_within(Self::COST_TILE.., 0);
+        costs[retained..].fill(Self::INF);
+    }
 
     fn reset(&mut self, block_len: usize) {
         assert!(block_len < usize::MAX, "DP block has too many positions");
@@ -1574,7 +1585,8 @@ impl ParseScratch {
         // clear() retains each Vec's allocation; resize() then initializes
         // every slot exactly once, including after a shorter previous parse.
         self.best_cost.clear();
-        self.best_cost.resize(slots, Self::INF);
+        self.best_cost
+            .resize(slots.min(Self::COST_CAPACITY), Self::INF);
         self.best_cost[0] = 0;
         self.steps.clear();
         self.steps.resize(slots, ParseStep(0));
@@ -1625,15 +1637,22 @@ fn parse_range_with_scratch(
         cost: 0,
         distance: 0,
     }; STD_MAX_MATCH + 1];
+    let mut cost_base = 0;
     for local_position in 0..block_len {
+        if local_position - cost_base == ParseScratch::COST_TILE {
+            // All earlier positions are finalized. Keep the outstanding
+            // targets from their matches, never resetting a live cost.
+            ParseScratch::advance_cost_horizon(best_cost);
+            cost_base = local_position;
+        }
+        let cost_position = local_position - cost_base;
         let position = block.start + local_position;
-        let prefix_cost = best_cost[local_position];
+        let prefix_cost = best_cost[cost_position];
         debug_assert_ne!(prefix_cost, INF);
 
         relax(
-            best_cost.as_mut_slice(),
-            steps.as_mut_slice(),
-            local_position + 1,
+            &mut best_cost[cost_position + 1],
+            &mut steps[local_position + 1],
             prefix_cost + u64::from(costs.literal_cost(input[position])),
             ParseToken::Literal(input[position]),
         );
@@ -1671,7 +1690,7 @@ fn parse_range_with_scratch(
         }
         if longest_match >= GROUPED_RELAX_MIN_LENGTH {
             MatchRelaxation {
-                costs: &mut best_cost[local_position..],
+                costs: &mut best_cost[cost_position..],
                 steps: &mut steps[local_position..],
                 prices: &prices,
                 prefix_cost,
@@ -1692,9 +1711,8 @@ fn parse_range_with_scratch(
             };
             let token_cost = u64::from(prices.costs[length]) + u64::from(distance_cost);
             relax(
-                best_cost.as_mut_slice(),
-                steps.as_mut_slice(),
-                local_position + length,
+                &mut best_cost[cost_position + length],
+                &mut steps[local_position + length],
                 prefix_cost + token_cost,
                 ParseToken::matching(length, distance),
             );
@@ -1702,7 +1720,7 @@ fn parse_range_with_scratch(
     }
 
     ParseResult {
-        cost_x16: best_cost[block_len],
+        cost_x16: best_cost[block_len - cost_base],
         tokens: reconstruct_tokens(steps, block_len),
     }
 }
@@ -1827,16 +1845,10 @@ impl MatchRelaxation<'_> {
 }
 
 #[inline]
-fn relax(
-    best_cost: &mut [u64],
-    steps: &mut [ParseStep],
-    endpoint: usize,
-    cost: u64,
-    token: ParseToken,
-) {
-    if cost < best_cost[endpoint] {
-        best_cost[endpoint] = cost;
-        steps[endpoint] = ParseStep::new(token);
+fn relax(best_cost: &mut u64, step: &mut ParseStep, cost: u64, token: ParseToken) {
+    if cost < *best_cost {
+        *best_cost = cost;
+        *step = ParseStep::new(token);
     }
 }
 
@@ -2519,7 +2531,7 @@ mod tests {
 
     #[test]
     fn sparse_length_occupancy_preserves_parse_across_word_boundaries() {
-        let input = [b'a'; 600];
+        let input = vec![b'a'; 3 * ParseScratch::COST_TILE + STD_MAX_MATCH];
         let lengths = [3, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257, 258];
         let mut offsets = vec![0];
         let mut entries = Vec::new();
@@ -2558,7 +2570,17 @@ mod tests {
         nonmonotone.distance[1] = 400;
         let mut scratch = ParseScratch::default();
         for costs in [&tied, &nonmonotone] {
-            for block in [0..input.len(), 18..330, 31..64, 96..353] {
+            let tile = ParseScratch::COST_TILE;
+            for block in [
+                0..input.len(),
+                0..tile,
+                0..tile + 1,
+                17..17 + tile + STD_MAX_MATCH - 1,
+                17..17 + tile + STD_MAX_MATCH,
+                31..64,
+                96..353,
+                18..330,
+            ] {
                 let expected =
                     exhaustive_parse_from_frontier(&input, &candidates, block.clone(), costs);
                 let actual = parse_range_with_scratch(
@@ -2569,6 +2591,11 @@ mod tests {
                     &mut scratch,
                 );
                 assert_eq!(actual, expected, "range={block:?}");
+                assert_eq!(
+                    scratch.best_cost.len(),
+                    (block.len() + 1).min(ParseScratch::COST_CAPACITY)
+                );
+                assert_eq!(scratch.steps.len(), block.len() + 1);
                 if block.start == 0 {
                     assert_eq!(expand(&actual.tokens), input[block]);
                 }
@@ -2993,7 +3020,10 @@ mod tests {
             let actual =
                 parse_range_with_scratch(input, &candidates, range.clone(), costs, &mut scratch);
             assert_eq!(actual, expected, "range={range:?}");
-            assert_eq!(scratch.best_cost.len(), range.len() + 1);
+            assert_eq!(
+                scratch.best_cost.len(),
+                (range.len() + 1).min(ParseScratch::COST_CAPACITY)
+            );
             assert_eq!(scratch.steps.len(), range.len() + 1);
             if let Some((cost_capacity, step_capacity)) = capacity {
                 assert_eq!(scratch.best_cost.capacity(), cost_capacity);
