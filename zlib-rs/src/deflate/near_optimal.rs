@@ -6,6 +6,9 @@ use core::ops::Range;
 
 use crate::ReturnCode;
 
+mod prefix_groups;
+use prefix_groups::try_group_local_frontier;
+
 use super::{
     match_compare, trees_tbl, State, StaticTreeDesc, D_CODES, LENGTH_CODES, L_CODES, STD_MAX_MATCH,
     STD_MIN_MATCH,
@@ -632,6 +635,11 @@ pub fn build_match_candidates(
             min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX
         })
         .unwrap_or(D_CODES);
+    if first_rank_code < D_CODES {
+        if let Some(frontier) = try_group_local_frontier(input, &suffixes, &ranges, max_distance) {
+            return Ok(frontier);
+        }
+    }
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
         (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
@@ -2550,6 +2558,60 @@ mod tests {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_local_frontier_matches_exact_records_across_group_sizes() -> Result<(), ReturnCode> {
+        // Exercise all three local scanners, their transition boundaries,
+        // and the final truncated direct class. Use a broad-alphabet
+        // region to make the local strategy profitable regardless of the
+        // denser groups, with separated runs crossing multiple tiles.
+        let groups = [2usize, 15, 16, 17, 63, 64, 65, 511, 512, 513];
+        let mut input = Vec::new();
+        let mut seed = 0x93c5_112a_cab8_4621u64;
+        for _ in 0..8_192 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            input.push(seed.to_le_bytes()[0] & 0x7f);
+        }
+        let atom = input.clone();
+        for (marker, &count) in (0u8..).zip(&groups) {
+            for index in 0..count {
+                input.extend_from_slice(&[0xf5, 0xe4, marker, index.to_le_bytes()[0] & 0x7f]);
+                if index == count / 2 {
+                    input.extend_from_slice(&atom[..257]);
+                }
+            }
+        }
+        input.extend_from_slice(&atom);
+        let suffixes = SuffixRanks::new(&input)?;
+        for (marker, &count) in (0u8..).zip(&groups) {
+            let prefix = [0xf5, 0xe4, marker];
+            let actual = suffixes
+                .sa
+                .iter()
+                .filter(|&&pos| {
+                    input[suffix_index(pos)..].get(..STD_MIN_MATCH) == Some(prefix.as_slice())
+                })
+                .count();
+            assert_eq!(actual, count, "group marker={marker}");
+        }
+        for distance in [
+            0usize, 31, 32, 33, 39, 40, 41, 63, 64, 65, 127, 129, 257, 1025, 32768,
+        ] {
+            let ranges = distance_code_ranges(distance);
+            let Some(actual) = try_group_local_frontier(&input, &suffixes, &ranges, distance)
+            else {
+                return Err(ReturnCode::StreamError);
+            };
+            assert_eq!(
+                actual,
+                build_match_candidates_position_major(&input, distance)?,
+                "distance={distance}"
+            );
         }
         Ok(())
     }
