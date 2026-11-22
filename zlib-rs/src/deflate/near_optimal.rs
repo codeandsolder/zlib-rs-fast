@@ -1014,41 +1014,57 @@ impl SuffixRanks {
             .map(|&byte| u32::from(byte) + 1)
             .collect::<Vec<_>>();
         let mut next_rank = vec![0u32; input.len()];
-        let mut max_rank = rank.iter().copied().max().unwrap_or(0);
+        let max_rank = rank.iter().copied().max().unwrap_or(0);
         let mut counts = vec![0u32; input.len().max(256) + 1];
         let mut span = 1usize;
+        counting_sort_suffixes(&sa, &mut scratch, max_rank, &mut counts, |position| {
+            suffix_second_rank(&rank, position, span)
+        });
+        counting_sort_suffixes(&scratch, &mut sa, max_rank, &mut counts, |position| {
+            rank[suffix_index(position)]
+        });
 
         loop {
-            // Prefix-doubling ranks are dense integers after the first round. Sort the pair
-            // (rank[pos], rank[pos + span]) with two stable counting passes instead of doing a
-            // comparison sort of all suffixes at every doubling step.
-            counting_sort_suffixes(&sa, &mut scratch, max_rank, &mut counts, |position| {
-                suffix_second_rank(&rank, position, span)
-            });
-            counting_sort_suffixes(&scratch, &mut sa, max_rank, &mut counts, |position| {
-                rank[suffix_index(position)]
-            });
-
             let mut class = 1u32;
+            counts[1] = 0;
             next_rank[suffix_index(sa[0])] = class;
-            for pair in sa.windows(2) {
-                let left = pair[0];
-                let right = pair[1];
-                if rank[suffix_index(left)] != rank[suffix_index(right)]
-                    || suffix_second_rank(&rank, left, span)
-                        != suffix_second_rank(&rank, right, span)
-                {
+            let mut previous_pair = (
+                rank[suffix_index(sa[0])],
+                suffix_second_rank(&rank, sa[0], span),
+            );
+            for (suffix_rank, &position) in (1..length).zip(&sa[1..]) {
+                let pair = (
+                    rank[suffix_index(position)],
+                    suffix_second_rank(&rank, position, span),
+                );
+                if pair != previous_pair {
                     class += 1;
+                    counts[suffix_index(class)] = suffix_rank;
                 }
-                next_rank[suffix_index(right)] = class;
+                next_rank[suffix_index(position)] = class;
+                previous_pair = pair;
             }
 
             core::mem::swap(&mut rank, &mut next_rank);
             if class == length {
                 break;
             }
-            max_rank = class;
             span = span.checked_mul(2).ok_or(ReturnCode::StreamError)?;
+
+            // Each equivalence class occupies a contiguous range of the
+            // previous SA. Reclassification already recorded its first slot,
+            // so no histogram or prefix sum is needed in this round.
+            let shift =
+                u32::try_from(span.min(input.len())).map_err(|_| ReturnCode::StreamError)?;
+            for position in (length - shift..length).chain(
+                sa.iter()
+                    .filter_map(|&position| position.checked_sub(shift)),
+            ) {
+                let key = suffix_index(rank[suffix_index(position)]);
+                scratch[suffix_index(counts[key])] = position;
+                counts[key] += 1;
+            }
+            core::mem::swap(&mut sa, &mut scratch);
         }
 
         // The doubling ranks are 1-based equivalence classes. The parser wants direct indices into
@@ -1746,6 +1762,33 @@ mod tests {
         }
         for pair in suffixes.sa.windows(2) {
             assert!(input[suffix_index(pair[0])..] < input[suffix_index(pair[1])..]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shifted_suffix_order_matches_exhaustive_small_alphabets() -> Result<(), ReturnCode> {
+        for len in 0..=8usize {
+            let combinations = 3usize.pow(u32::try_from(len).map_err(|_| ReturnCode::StreamError)?);
+            for mut value in 0..combinations {
+                let input = (0..len)
+                    .map(|_| {
+                        let byte = b'a' + u8::try_from(value % 3).unwrap_or_default();
+                        value /= 3;
+                        byte
+                    })
+                    .collect::<Vec<_>>();
+                let suffixes = SuffixRanks::new(&input)?;
+                let mut expected = (0..u32::try_from(len).map_err(|_| ReturnCode::StreamError)?)
+                    .collect::<Vec<_>>();
+                expected.sort_unstable_by(|&left, &right| {
+                    input[suffix_index(left)..].cmp(&input[suffix_index(right)..])
+                });
+                assert_eq!(suffixes.sa, expected, "input={input:?}");
+                for (rank, &position) in expected.iter().enumerate() {
+                    assert_eq!(suffixes.rank_of(suffix_index(position)), rank);
+                }
+            }
         }
         Ok(())
     }
