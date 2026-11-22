@@ -86,32 +86,55 @@ impl MatchCandidate {
     }
 }
 
-/// Sparse whole-input candidate table in CSR form.
+/// Exact candidate records for a contiguous range of query positions.
 ///
-/// `offsets[position]..offsets[position + 1]` indexes the alternatives for one input byte. Entries
-/// are ordered by distance code, and there is at most one entry for each of DEFLATE's 30 distance
-/// symbols. This boundary is rich enough for arbitrary Huffman cost models without forcing ordinary
-/// Fast/Medium/Slow parsing to consume more than its current single-best projection.
+/// The suffix-order input includes the history before this range, but only
+/// queried positions own CSR records. Offsets are relative to the first query,
+/// and each record list is ordered by DEFLATE distance code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchCandidates {
     // CSR offsets count candidate *entries*, not input bytes. A position may
     // contribute up to D_CODES entries, so an input fitting in a u32 index can
     // still produce more than u32::MAX entries. Keep the offsets in the same
     // index domain as the backing Vec instead of silently wrapping them.
+    first_query: usize,
     offsets: Vec<usize>,
     entries: Vec<MatchCandidate>,
 }
 
 impl MatchCandidates {
     pub(crate) fn for_position(&self, position: usize) -> &[MatchCandidate] {
-        let start = self.offsets[position];
-        let end = self.offsets[position + 1];
+        let index = position - self.first_query;
+        let start = self.offsets[index];
+        let end = self.offsets[index + 1];
         &self.entries[start..end]
     }
 
     #[cfg(test)]
     const fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+        self.offsets.len() - 1
+    }
+
+    const fn end(&self) -> usize {
+        self.first_query + self.offsets.len() - 1
+    }
+
+    /// Extend the query coverage to the left without discovering the
+    /// already-computed suffix records again. Both tables use exactly the
+    /// same input context and suffix order.
+    fn prepend(&mut self, mut prefix: Self) {
+        assert_eq!(prefix.end(), self.first_query);
+        let added = prefix.entries.len();
+        self.entries.append(&mut prefix.entries);
+        self.entries.rotate_right(added);
+        for index in &mut self.offsets {
+            *index += added;
+        }
+        let positions = prefix.offsets.len() - 1;
+        prefix.offsets.truncate(positions);
+        self.offsets.append(&mut prefix.offsets);
+        self.offsets.rotate_right(positions);
+        self.first_query = prefix.first_query;
     }
 }
 
@@ -612,89 +635,137 @@ fn scan_rank_buckets(
     }
 }
 
-/// Build the exact useful-match frontier for a complete input.
-///
-/// Suffix-array ranks make this exact without walking every equal-prefix predecessor. For each DEFLATE
-/// distance symbol, a sliding ordered set contains exactly the suffix ranks currently inside that
-/// symbol's distance interval. The lexicographic predecessor or successor of the current suffix
-/// maximizes LCP over that set, so two probes recover the longest match for the whole distance class.
-/// Retaining that one maximum per class is lossless for arbitrary DEFLATE Huffman code lengths.
-pub fn build_match_candidates(
+/// Whole-input helper for the exact frontier oracle and parser fixtures.
+#[cfg(test)]
+fn build_match_candidates(
     input: &[u8],
     max_distance: usize,
 ) -> Result<MatchCandidates, ReturnCode> {
-    // Reject invalid history as an API error, not a process-wide panic.
-    if max_distance > 1usize << crate::MAX_WBITS {
-        return Err(ReturnCode::StreamError);
-    }
-    let ranges = distance_code_ranges(max_distance);
-    let first_rank_code = ranges
-        .iter()
-        .position(|&(min_distance, max_distance)| {
-            min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX
-        })
-        .unwrap_or(D_CODES);
-    let suffixes = SuffixRanks::new(input, first_rank_code < D_CODES)?;
-    if let Some(groups) = &suffixes.prefix_groups {
-        return Ok(group_local_frontier(
+    FrontierSource::new(input, max_distance)?.build(0..input.len())
+}
+
+/// Immutable suffix order and distance geometry for one input context.
+/// Build only the query ranges a parser needs. A preceding history byte
+/// remains an eligible match source even when no record is built for it.
+/// Holding the input borrow here prevents a suffix order from being reused
+/// with another byte slice.
+struct FrontierSource<'a> {
+    input: &'a [u8],
+    max_distance: usize,
+    ranges: [(usize, usize); D_CODES],
+    first_rank_code: usize,
+    suffixes: SuffixRanks,
+}
+
+impl<'a> FrontierSource<'a> {
+    fn new(input: &'a [u8], max_distance: usize) -> Result<Self, ReturnCode> {
+        if max_distance > 1usize << crate::MAX_WBITS {
+            return Err(ReturnCode::StreamError);
+        }
+        let ranges = distance_code_ranges(max_distance);
+        let first_rank_code = ranges
+            .iter()
+            .position(|&(min, max)| min != 0 && max - min + 1 > DIRECT_SCAN_MAX)
+            .unwrap_or(D_CODES);
+        let suffixes = SuffixRanks::new(input, first_rank_code < D_CODES)?;
+        Ok(Self {
             input,
-            &suffixes,
-            groups,
-            &ranges,
             max_distance,
-        ));
+            ranges,
+            first_rank_code,
+            suffixes,
+        })
     }
-    let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
-        let (min_distance, max_distance) = ranges[code];
-        (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
-            .then(|| RankSet::new(input.len()))
-    });
-    let last_rank_code = active
-        .iter()
-        .rposition(Option::is_some)
-        .map_or(first_rank_code, |code| code + 1);
 
-    let mut offsets = Vec::with_capacity(input.len() + 1);
-    let mut entries = Vec::new();
-    let mut scratch = FrontierTileScratch::new();
-    offsets.push(0);
+    /// In each wide distance interval, the predecessor/successor in
+    /// suffix order recover the longest match for that entire code.
+    /// Preserve the complete ordered record sequence for any query range.
+    fn build(&self, query: Range<usize>) -> Result<MatchCandidates, ReturnCode> {
+        if query.start > query.end || query.end > self.input.len() {
+            return Err(ReturnCode::StreamError);
+        }
+        let input = self.input;
+        let suffixes = &self.suffixes;
+        let ranges = &self.ranges;
+        let first_rank_code = self.first_rank_code;
+        let first_query = query.start;
+        if let Some(groups) = &suffixes.prefix_groups {
+            return Ok(group_local_frontier(
+                input,
+                suffixes,
+                groups,
+                ranges,
+                self.max_distance,
+                query,
+            ));
+        }
+        let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
+            let (min_distance, max_distance) = ranges[code];
+            (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
+                .then(|| RankSet::new(input.len()))
+        });
+        if first_query != 0 {
+            for (set, &(min, max)) in active.iter_mut().zip(ranges) {
+                if let Some(set) = set {
+                    if let Some(end) = first_query.checked_sub(min) {
+                        for position in first_query.saturating_sub(max + 1)..end {
+                            set.insert(suffixes.rank_of(position));
+                        }
+                    }
+                }
+            }
+        }
+        let last_rank_code = active
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(first_rank_code, |code| code + 1);
 
-    for tile_start in (0..input.len()).step_by(FRONTIER_TILE_POSITIONS) {
-        let tile_len = tile_start
-            .saturating_add(FRONTIER_TILE_POSITIONS)
-            .min(input.len())
-            - tile_start;
-        scratch.prepare(&suffixes, input.len(), tile_start, tile_len);
+        let mut offsets = Vec::with_capacity(query.len() + 1);
+        let mut entries = Vec::new();
+        let mut scratch = FrontierTileScratch::new();
+        offsets.push(0);
 
-        // Short classes are position-major. Wide classes are class-major
-        // for locality. A truncated final short class must be emitted last.
-        scan_direct_buckets(
-            input,
-            &ranges[..first_rank_code],
-            tile_start,
-            tile_len,
-            &mut scratch,
-        );
-        scan_rank_buckets(
-            input,
-            &suffixes,
-            &ranges,
-            &mut active,
-            first_rank_code..last_rank_code,
-            tile_start..tile_start + tile_len,
-            &mut scratch,
-        );
-        scan_direct_buckets(
-            input,
-            &ranges[last_rank_code..],
-            tile_start,
-            tile_len,
-            &mut scratch,
-        );
-        scratch.scatter(tile_len, &mut entries, &mut offsets);
+        for tile_start in query.clone().step_by(FRONTIER_TILE_POSITIONS) {
+            let tile_len = tile_start
+                .saturating_add(FRONTIER_TILE_POSITIONS)
+                .min(query.end)
+                - tile_start;
+            scratch.prepare(suffixes, input.len(), tile_start, tile_len);
+
+            // Short classes are position-major. Wide classes are class-major
+            // for locality. A truncated final short class must be emitted last.
+            scan_direct_buckets(
+                input,
+                &ranges[..first_rank_code],
+                tile_start,
+                tile_len,
+                &mut scratch,
+            );
+            scan_rank_buckets(
+                input,
+                suffixes,
+                ranges,
+                &mut active,
+                first_rank_code..last_rank_code,
+                tile_start..tile_start + tile_len,
+                &mut scratch,
+            );
+            scan_direct_buckets(
+                input,
+                &ranges[last_rank_code..],
+                tile_start,
+                tile_len,
+                &mut scratch,
+            );
+            scratch.scatter(tile_len, &mut entries, &mut offsets);
+        }
+        debug_assert_eq!(offsets.last().copied(), Some(entries.len()));
+        Ok(MatchCandidates {
+            first_query,
+            offsets,
+            entries,
+        })
     }
-    debug_assert_eq!(offsets.last().copied(), Some(entries.len()));
-    Ok(MatchCandidates { offsets, entries })
 }
 
 /// Dense ordered set over suffix ranks. Each level is a bitset whose set bits identify non-empty
@@ -1534,7 +1605,8 @@ fn parse_range_with_scratch(
 ) -> ParseResult {
     const INF: u64 = ParseScratch::INF;
 
-    assert_eq!(candidates.len_for_parse(), input.len());
+    assert_eq!(candidates.end(), input.len());
+    assert!(candidates.first_query <= block.start);
     assert!(block.start <= block.end && block.end <= input.len());
 
     let block_len = block.len();
@@ -1650,12 +1722,6 @@ fn reconstruct_tokens(steps: &[ParseStep], block_len: usize) -> Vec<ParseToken> 
         block_len
     );
     tokens
-}
-
-impl MatchCandidates {
-    const fn len_for_parse(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1859,7 +1925,11 @@ mod tests {
             offsets.push(entries.len());
         }
 
-        Ok(MatchCandidates { offsets, entries })
+        Ok(MatchCandidates {
+            first_query: 0,
+            offsets,
+            entries,
+        })
     }
 
     #[test]
@@ -2472,7 +2542,11 @@ mod tests {
             }
             offsets.push(entries.len());
         }
-        let candidates = MatchCandidates { offsets, entries };
+        let candidates = MatchCandidates {
+            first_query: 0,
+            offsets,
+            entries,
+        };
         let mut tied = TokenCosts::fixed();
         // Equal total distance cost, including extra bits. Preserve the
         // existing first-candidate and longest-maximum tie ordering.
@@ -2583,6 +2657,84 @@ mod tests {
     }
 
     #[test]
+    fn query_ranges_and_lazy_prefix_preserve_every_candidate() -> Result<(), ReturnCode> {
+        // Dense repeated text plus a broad-alphabet context containing
+        // small, word-sized and multi-tile exact prefix groups.
+        let dense = b"abracadabra0123456789".repeat(513);
+        let mut seed = 0x93c5_112a_cab8_4621u64;
+        let mut sparse = Vec::new();
+        for _ in 0..3_500 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            sparse.push(seed.to_le_bytes()[0] & 0x7f);
+        }
+        for (marker, count) in [(0xf0, 16usize), (0xf1, 64), (0xf2, 65), (0xf3, 513)] {
+            for i in 0..count {
+                sparse.extend_from_slice(&[0xff, 0xfe, marker, i.to_le_bytes()[0] & 0x7f]);
+            }
+        }
+        let copy = sparse[..3500].to_vec();
+        sparse.extend_from_slice(&copy);
+        for input in [&dense[..], &sparse[..], &[], b"a", b"ab", b"abc"] {
+            for distance in [0, 1, 31, 32, 33, 40, 41, 65, 129, 1025, 32768] {
+                let source = FrontierSource::new(input, distance)?;
+                let full = build_match_candidates_position_major(input, distance)?;
+                let n = input.len();
+                let points = [
+                    0,
+                    1.min(n),
+                    31.min(n),
+                    511.min(n),
+                    512.min(n),
+                    513.min(n),
+                    n / 2,
+                    n.saturating_sub(2),
+                    n,
+                ];
+                for (i, &start) in points.iter().enumerate() {
+                    let end = points[i..]
+                        .iter()
+                        .copied()
+                        .find(|&p| p > start)
+                        .unwrap_or(n);
+                    let partial = source.build(start..end)?;
+                    assert_eq!(partial.first_query, start);
+                    assert_eq!(partial.end(), end);
+                    for position in start..end {
+                        assert_eq!(
+                            partial.for_position(position),
+                            full.for_position(position),
+                            "distance={distance} query={start}..{end} position={position}"
+                        );
+                    }
+                }
+                // Reconstruct a complete CSR from arbitrarily aligned
+                // adjacent query ranges, including empty prefixes.
+                let first = n / 3;
+                let second = n * 2 / 3;
+                let mut suffix = source.build(second..n)?;
+                suffix.prepend(source.build(first..second)?);
+                suffix.prepend(source.build(0..first)?);
+                assert_eq!(suffix, full, "distance={distance}, bytes={n}");
+                assert_eq!(source.build(n..n)?.offsets, [0]);
+                assert!(matches!(
+                    source.build(n..n + 1),
+                    Err(ReturnCode::StreamError)
+                ));
+                assert!(matches!(
+                    source.build(core::ops::Range {
+                        start: n + 1,
+                        end: n
+                    }),
+                    Err(ReturnCode::StreamError)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn group_local_frontier_matches_exact_records_across_group_sizes() -> Result<(), ReturnCode> {
         // Exercise all three local scanners, their transition boundaries,
         // and the final truncated direct class. Use a broad-alphabet
@@ -2626,7 +2778,14 @@ mod tests {
             0usize, 31, 32, 33, 39, 40, 41, 63, 64, 65, 127, 129, 257, 1025, 32768,
         ] {
             let ranges = distance_code_ranges(distance);
-            let actual = group_local_frontier(&input, &suffixes, prefix_groups, &ranges, distance);
+            let actual = group_local_frontier(
+                &input,
+                &suffixes,
+                prefix_groups,
+                &ranges,
+                distance,
+                0..input.len(),
+            );
             assert_eq!(
                 actual,
                 build_match_candidates_position_major(&input, distance)?,
@@ -3040,11 +3199,12 @@ impl PlannedBlock {
     }
 }
 
-pub struct PlannedBlockSource {
+pub struct PlannedBlockSource<'a> {
     pub(crate) block: PlannedBlock,
     model: ParseModel,
     context_start: usize,
-    context_end: usize,
+    context: &'a [u8],
+    source: Option<FrontierSource<'a>>,
     candidates: MatchCandidates,
 }
 
@@ -3070,7 +3230,7 @@ impl PreviousParse {
     }
 }
 
-impl PlannedBlockSource {
+impl PlannedBlockSource<'_> {
     pub(crate) fn into_parts(self) -> (PlannedBlock, ParseModel) {
         (self.block, self.model)
     }
@@ -3080,17 +3240,19 @@ impl PlannedBlockSource {
         Ok(())
     }
 
-    /// Re-run only the minimum-cost parser after a boundary change. The exact match frontier built
-    /// for the original right-hand block already covers up to `max_distance` bytes of preceding
-    /// history, so most leftward shifts and every rightward shift need no new match discovery.
+    /// Re-run the parser after a boundary change. A rightward shift needs
+    /// no match discovery. For a leftward shift inside the original
+    /// context, extend only the missing query prefix using its retained
+    /// suffix order. Do not reinterpret a different history context.
     pub(crate) fn reparse_with_existing_candidates(
         &mut self,
         state: &mut super::State<'_>,
-        input: &[u8],
         optimization_passes: usize,
         previous_model: Option<&ParseModel>,
     ) -> Result<bool, ReturnCode> {
-        if self.block.range.start < self.context_start || self.block.range.end != self.context_end {
+        if self.block.range.start < self.context_start
+            || self.block.range.end != self.context_start + self.context.len()
+        {
             self.refresh_model(state)?;
             return Ok(false);
         }
@@ -3100,8 +3262,15 @@ impl PlannedBlockSource {
             return Ok(false);
         }
 
-        let context = &input[self.context_start..self.context_end];
+        let context = self.context;
         let local_range = (self.block.range.start - self.context_start)..context.len();
+        if local_range.start < self.candidates.first_query {
+            let Some(source) = &self.source else {
+                return Err(ReturnCode::StreamError);
+            };
+            let prefix = source.build(local_range.start..self.candidates.first_query)?;
+            self.candidates.prepend(prefix);
+        }
         // The original block is one of the possible winners. Learn its costs
         // now so the final model can be retained without rebuilding the same
         // Huffman trees after the optimization loop.
@@ -3984,14 +4153,14 @@ pub fn optimize_token_partition(
 
 /// Parse one splitter range into a production-ready token block. A caller only needs to retain two
 /// adjacent blocks at a time to optimize their shared Huffman boundary.
-pub fn parse_planned_block_source(
+pub fn parse_planned_block_source<'a>(
     state: &mut super::State<'_>,
-    input: &[u8],
+    input: &'a [u8],
     range: Range<usize>,
     max_distance: usize,
     optimization_passes: usize,
     previous_model: Option<&ParseModel>,
-) -> Result<PlannedBlockSource, ReturnCode> {
+) -> Result<PlannedBlockSource<'a>, ReturnCode> {
     // This API accepts a caller-provided range, not merely the trusted
     // output of the built-in splitter. Reject invalid bounds before slicing
     // or updating any compression model.
@@ -3999,10 +4168,13 @@ pub fn parse_planned_block_source(
         return Err(ReturnCode::StreamError);
     }
     let history_start = range.start.saturating_sub(max_distance);
-    let context_end = range.end;
-    let context = &input[history_start..context_end];
+    let context = &input[history_start..range.end];
     let local_range = (range.start - history_start)..context.len();
-    let candidates = build_match_candidates(context, max_distance)?;
+    let source = FrontierSource::new(context, max_distance)?;
+    let candidates = source.build(local_range.clone())?;
+    // Only a later boundary shift toward the history could need the
+    // suffix order again. Release it for the first block or fixed parse.
+    let source = (optimization_passes > 0 && local_range.start != 0).then_some(source);
     let (parsed, model) = optimized_parse_range(
         state,
         context,
@@ -4020,7 +4192,8 @@ pub fn parse_planned_block_source(
         block,
         model,
         context_start: history_start,
-        context_end,
+        context,
+        source,
         candidates,
     })
 }
@@ -4287,8 +4460,7 @@ mod boundary_tests {
                 parse_planned_block_source(state, &input, 4_000..13_000, 32_768, passes, None)?;
             let previous = model_from_tokens(state, &block.block.tokens)?;
             for prior in [None, Some(&previous)] {
-                let _changed =
-                    block.reparse_with_existing_candidates(state, &input, passes, prior)?;
+                let _changed = block.reparse_with_existing_candidates(state, passes, prior)?;
                 let independently_scored = model_from_tokens(state, &block.block.tokens)?;
                 assert_eq!(
                     block.model,
@@ -4297,6 +4469,61 @@ mod boundary_tests {
                     prior.is_some()
                 );
                 assert_eq!(block.block.token_input_len(), block.block.range.len());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_reparse_extends_only_the_missing_history_queries() -> Result<(), ReturnCode> {
+        let input = (0..18_000usize)
+            .map(|i| b"xyzabc123"[i % 9])
+            .collect::<Vec<_>>();
+        let mut stream = super::super::DeflateStream::new(super::super::DeflateConfig::new(9))?;
+        let state = &mut *stream.state;
+        for passes in [1, 3] {
+            let mut block =
+                parse_planned_block_source(state, &input, 8_000..16_000, 4096, passes, None)?;
+            let original_start = block.candidates.first_query;
+            let context = block.context;
+            let full = build_match_candidates(context, 4096)?;
+            assert_eq!(original_start, 4096);
+            let original = block.candidates.clone();
+            // Move the boundary left by a sequence of valid literals.
+            let shift = 513;
+            let mut tokens = input[8000 - shift..8000]
+                .iter()
+                .copied()
+                .map(ParseToken::Literal)
+                .collect::<Vec<_>>();
+            tokens.append(&mut block.block.tokens);
+            block.block.tokens = tokens;
+            block.block.range.start -= shift;
+            let mut reference = PlannedBlockSource {
+                block: block.block.clone(),
+                model: block.model.clone(),
+                context_start: block.context_start,
+                context,
+                source: None,
+                candidates: full.clone(),
+            };
+            let actual = block.reparse_with_existing_candidates(state, passes, None)?;
+            let expected = reference.reparse_with_existing_candidates(state, passes, None)?;
+            assert_eq!(actual, expected);
+            assert_eq!(block.block.tokens, reference.block.tokens);
+            assert_eq!(block.model, reference.model);
+            assert_eq!(block.candidates.first_query, original_start - shift);
+            for position in original_start - shift..context.len() {
+                assert_eq!(
+                    block.candidates.for_position(position),
+                    full.for_position(position)
+                );
+                if position >= original_start {
+                    assert_eq!(
+                        block.candidates.for_position(position),
+                        original.for_position(position)
+                    );
+                }
             }
         }
         Ok(())
