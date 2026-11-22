@@ -191,7 +191,7 @@ pub struct GpuMatchTable {
 
 impl GpuMatchTable {
     #[inline]
-    #[must_use]
+    #[must_use = "The option reports the match at the requested position."]
     pub fn get(&self, absolute_position: usize) -> Option<GpuMatch> {
         let position = u32::try_from(absolute_position).ok()?;
         self.entries
@@ -207,17 +207,17 @@ impl GpuMatchTable {
         Some((u16::from_le_bytes([a, b]), u16::from_le_bytes([c, d])))
     }
 
-    #[must_use]
+    #[must_use = "The count describes the number of matches."]
     pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
-    #[must_use]
+    #[must_use = "The boolean reports whether the collection is empty."]
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    #[must_use]
+    #[must_use = "Iterators are lazy and must be consumed to visit matches."]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = GpuMatch> + '_ {
         (0..u32::MAX)
             .zip(self.entries.iter().copied())

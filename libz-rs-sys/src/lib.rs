@@ -190,7 +190,7 @@ pub type z_off64_t = z_off_t;
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_z))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub unsafe extern "C" fn crc32_z(crc: c_ulong, buf: *const Bytef, len: size_t) -> c_ulong {
     // SAFETY: The public checksum contract guarantees a readable span for non-null buf; the helper checks null before creating the slice.
     let Some(buf) = (unsafe { slice_from_raw_parts(buf, len) }) else {
@@ -225,7 +225,7 @@ pub unsafe extern "C" fn crc32_z(crc: c_ulong, buf: *const Bytef, len: size_t) -
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub unsafe extern "C" fn crc32(crc: c_ulong, buf: *const Bytef, len: uInt) -> c_ulong {
     // SAFETY: this thin wrapper forwards the caller-provided readable buffer span unchanged under the same documented checksum contract.
     unsafe { crc32_z(crc, buf, len as size_t) }
@@ -259,7 +259,7 @@ pub unsafe extern "C" fn crc32(crc: c_ulong, buf: *const Bytef, len: uInt) -> c_
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub extern "C" fn crc32_combine(crc1: c_ulong, crc2: c_ulong, len2: z_off_t) -> c_ulong {
     c_ulong::from(zlib_rs::crc32::crc32_combine(
         checksum_word(crc1),
@@ -296,7 +296,7 @@ pub extern "C" fn crc32_combine(crc1: c_ulong, crc2: c_ulong, len2: z_off_t) -> 
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine64))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub extern "C" fn crc32_combine64(crc1: c_ulong, crc2: c_ulong, len2: z_off64_t) -> c_ulong {
     c_ulong::from(zlib_rs::crc32::crc32_combine(
         checksum_word(crc1),
@@ -307,7 +307,7 @@ pub extern "C" fn crc32_combine64(crc1: c_ulong, crc2: c_ulong, len2: z_off64_t)
 
 /// The CRC table used by the crc32 checksum algorithm.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(get_crc_table))]
-#[must_use]
+#[must_use = "The returned table is the result of this accessor."]
 pub extern "C" fn get_crc_table() -> *const [u32; 256] {
     zlib_rs::crc32::get_crc_table()
 }
@@ -315,7 +315,7 @@ pub extern "C" fn get_crc_table() -> *const [u32; 256] {
 /// Return the operator corresponding to length `len2`, to be used with
 /// [`crc32_combine_op`]. `len2` must be non-negative.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine_gen64))]
-#[must_use]
+#[must_use = "The returned polynomial operator is needed to combine checksums."]
 pub extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> c_ulong {
     debug_assert!(len2 >= 0, "`len2` must be non-negative");
     c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
@@ -324,7 +324,7 @@ pub extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> c_ulong {
 /// Return the operator corresponding to length `len2`, to be used with
 /// [`crc32_combine_op`]. `len2` must be non-negative.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine_gen))]
-#[must_use]
+#[must_use = "The returned polynomial operator is needed to combine checksums."]
 pub extern "C" fn crc32_combine_gen(len2: z_off_t) -> c_ulong {
     debug_assert!(len2 >= 0, "`len2` must be non-negative");
     c_ulong::from(zlib_rs::crc32::crc32_combine_gen(crc_combine_length(len2)))
@@ -335,7 +335,7 @@ pub extern "C" fn crc32_combine_gen(len2: z_off_t) -> c_ulong {
 /// `op` is generated from `len2` by [`crc32_combine_gen`].
 /// This will be faster than [`crc32_combine`] if the generated `op` is used more than once.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(crc32_combine_op))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub extern "C" fn crc32_combine_op(crc1: c_ulong, crc2: c_ulong, op: c_ulong) -> c_ulong {
     c_ulong::from(zlib_rs::crc32::crc32_combine_op(
         checksum_word(crc1),
@@ -370,7 +370,7 @@ pub extern "C" fn crc32_combine_op(crc1: c_ulong, crc2: c_ulong, op: c_ulong) ->
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_z))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub unsafe extern "C" fn adler32_z(adler: c_ulong, buf: *const Bytef, len: size_t) -> c_ulong {
     // SAFETY: The public Adler-32 contract guarantees a readable span for non-null buf; the helper checks null before creating the slice.
     let Some(buf) = (unsafe { slice_from_raw_parts(buf, len) }) else {
@@ -405,7 +405,7 @@ pub unsafe extern "C" fn adler32_z(adler: c_ulong, buf: *const Bytef, len: size_
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub unsafe extern "C" fn adler32(adler: c_ulong, buf: *const Bytef, len: uInt) -> c_ulong {
     // SAFETY: this thin wrapper forwards the caller-provided readable buffer span unchanged under the same documented checksum contract.
     unsafe { adler32_z(adler, buf, len as size_t) }
@@ -439,7 +439,7 @@ pub unsafe extern "C" fn adler32(adler: c_ulong, buf: *const Bytef, len: uInt) -
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_combine))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub extern "C" fn adler32_combine(adler1: c_ulong, adler2: c_ulong, len2: z_off_t) -> c_ulong {
     // A negative length returns an invalid checksum for diagnosis.
     u64::try_from(len2).map_or(0xFFFF_FFFF, |len2| {
@@ -479,7 +479,7 @@ pub extern "C" fn adler32_combine(adler1: c_ulong, adler2: c_ulong, len2: z_off_
 /// }
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(adler32_combine64))]
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub extern "C" fn adler32_combine64(adler1: c_ulong, adler2: c_ulong, len2: z_off64_t) -> c_ulong {
     // A negative length returns an invalid checksum for diagnosis.
     u64::try_from(len2).map_or(0xFFFF_FFFF, |len2| {
@@ -964,7 +964,7 @@ pub unsafe extern "C" fn inflateCopy(dest: *mut z_stream, source: *const z_strea
 ///     - `strm` is `NULL`
 ///     - `strm` satisfies the requirements of `&mut *strm` and was initialized with [`inflateInit_`] or similar
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(inflateMark))]
-#[must_use]
+#[must_use = "The returned mark describes the current inflate position."]
 pub unsafe extern "C" fn inflateMark(strm: *const z_stream) -> c_long {
     // SAFETY: the `inflateMark` FFI contract requires any non-null stream pointer to reference a live, initialized stream of the matching kind; the converter handles null.
     let Some(stream) = (unsafe { InflateStream::from_stream_ref(strm) }) else {
@@ -1728,7 +1728,7 @@ pub unsafe extern "C" fn compress2(
 ///
 /// Can be used before a [`compress`] or [`compress2`] call to allocate the destination buffer.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(compressBound_z))]
-#[must_use]
+#[must_use = "The bound is needed to size the destination buffer."]
 pub const extern "C" fn compressBound_z(sourceLen: usize) -> usize {
     zlib_rs::deflate::compress_bound_abi(sourceLen)
 }
@@ -1737,7 +1737,7 @@ pub const extern "C" fn compressBound_z(sourceLen: usize) -> usize {
 ///
 /// Can be used before a [`compress`] or [`compress2`] call to allocate the destination buffer.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(compressBound))]
-#[must_use]
+#[must_use = "The bound is needed to size the destination buffer."]
 pub const extern "C" fn compressBound(sourceLen: c_ulong) -> c_ulong {
     zlib_rs::deflate::compress_bound_abi(c_ulong_to_usize_wrapping(sourceLen)) as c_ulong
 }
@@ -2316,7 +2316,7 @@ pub unsafe extern "C" fn deflateTune(
 /// assert_eq!(cstr(zError(1234)), b"");
 /// ```
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(zError))]
-#[must_use]
+#[must_use = "The returned string describes the specified status."]
 pub const extern "C" fn zError(err: c_int) -> *const c_char {
     match ReturnCode::try_from_c_int(err) {
         Some(return_code) => return_code.error_message(),
@@ -2360,7 +2360,7 @@ unsafe fn is_version_compatible(version: *const c_char, stream_size: i32) -> boo
 /// - The first component is the version of stock zlib that this release is compatible with
 /// - The final component is the zlib-rs version used to build this release.
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(zlibVersion))]
-#[must_use]
+#[must_use = "The returned string identifies the library version."]
 pub const extern "C" fn zlibVersion() -> *const c_char {
     LIBZ_RS_SYS_VERSION.as_ptr().cast::<c_char>()
 }
@@ -2424,7 +2424,7 @@ pub const extern "C" fn zlibVersion() -> *const c_char {
 ///
 /// The remaining bits `27..=31` are 0 (reserved).
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(zlibCompileFlags))]
-#[must_use]
+#[must_use = "The returned flags describe the library build."]
 pub const extern "C" fn zlibCompileFlags() -> c_ulong {
     const fn encode_size<T>() -> c_ulong {
         match core::mem::size_of::<T>() {

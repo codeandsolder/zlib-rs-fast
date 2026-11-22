@@ -283,12 +283,12 @@ impl Allocator<'_> {
         ptr
     }
 
-    #[must_use]
+    #[must_use = "A successful allocation must be retained and eventually freed."]
     pub fn allocate_raw<T>(&self) -> Option<NonNull<T>> {
         NonNull::new(self.allocate_layout(Layout::new::<T>()).cast())
     }
 
-    #[must_use]
+    #[must_use = "A successful allocation must be retained and eventually freed."]
     pub fn allocate_slice_raw<T>(&self, len: usize) -> Option<NonNull<T>> {
         NonNull::new(self.allocate_layout(Layout::array::<T>(len).ok()?).cast())
     }

@@ -16,7 +16,7 @@ mod vpclmulqdq;
 
 pub use combine::{crc32_combine, crc32_combine_gen, crc32_combine_op};
 
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub fn crc32(start: u32, buf: &[u8]) -> u32 {
     /* For lens < 64, crc32_braid method is faster. The CRC32 instruction for
      * these short lengths might also prove to be effective */
@@ -33,7 +33,7 @@ fn crc32_braid(start: u32, buf: &[u8]) -> u32 {
     braid::crc32_braid::<5>(start, buf)
 }
 
-#[must_use]
+#[must_use = "The returned table is the result of this accessor."]
 pub fn get_crc_table() -> &'static [u32; 256] {
     braid::get_crc_table()
 }
@@ -67,11 +67,11 @@ impl Default for Crc32Fold {
     }
 }
 impl Crc32Fold {
-    #[must_use]
+    #[must_use = "The accumulator must be retained to update the checksum."]
     pub fn new() -> Self {
         Self::new_with_initial(CRC32_INITIAL_VALUE)
     }
-    #[must_use]
+    #[must_use = "The accumulator must be retained to update the checksum."]
     pub fn new_with_initial(initial: u32) -> Self {
         #[cfg(target_arch = "x86_64")]
         let backend = if crate::cpu_features::is_enabled_pclmulqdq() {
@@ -131,7 +131,7 @@ impl Crc32Fold {
             Crc32Backend::Scalar(value) => *value = braid::crc32_braid::<5>(*value, src),
         }
     }
-    #[must_use]
+    #[must_use = "The final checksum is the result of finishing the accumulator."]
     pub fn finish(self) -> u32 {
         #[cfg(target_arch = "x86_64")]
         let result = match self.backend {

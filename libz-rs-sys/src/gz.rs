@@ -826,7 +826,7 @@ impl Source {
 ///
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen64))]
-#[must_use]
+#[must_use = "The returned handle must be checked and closed after use."]
 pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> gzFile {
     if path.is_null() {
         return ptr::null_mut();
@@ -860,7 +860,7 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 ///
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzopen))]
-#[must_use]
+#[must_use = "The returned handle must be checked and closed after use."]
 pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzFile {
     if path.is_null() {
         return ptr::null_mut();
@@ -900,7 +900,7 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
 ///
 /// [`gzfree`]: crate::z_stream
 #[cfg_attr(feature = "export-symbols", export_name = prefix!(gzdopen))]
-#[must_use]
+#[must_use = "The returned handle must be checked and closed after use."]
 pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
     if mode.is_null() {
         return ptr::null_mut();

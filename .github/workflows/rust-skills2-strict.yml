@@ -16,4 +16,12 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@3119e52afb16c956bd072363d1f64f0fd916afbb # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@1c04118f00c0d43a4a22e67645b2ff40f30975bb # main
+    with:
+      rust-toolchain: nightly-2026-11-20
+
+  strict-rust-optional:
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@1c04118f00c0d43a4a22e67645b2ff40f30975bb # main
+    with:
+      rust-toolchain: nightly-2026-11-20
+      cargo-args: --locked --workspace --all-targets --features gz,gpu,parallel,near-optimal,__internal-api
