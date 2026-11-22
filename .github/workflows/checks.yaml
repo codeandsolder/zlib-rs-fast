@@ -770,7 +770,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Test avx512 crc32 implementation
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -j4 -p zlib-rs --target ${{ matrix.target }} --features=vpclmulqdq crc32::"
+        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -j4 -p zlib-rs --target ${{ matrix.target }} crc32::"
         env:
           RUSTFLAGS: "-Ctarget-feature=+vpclmulqdq,+avx512f"
 

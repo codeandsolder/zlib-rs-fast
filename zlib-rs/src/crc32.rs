@@ -10,9 +10,6 @@ mod combine;
 mod loongarch;
 #[cfg(target_arch = "x86_64")]
 mod pclmulqdq;
-#[cfg(target_arch = "x86_64")]
-#[cfg(feature = "vpclmulqdq")]
-mod vpclmulqdq;
 
 pub use combine::{crc32_combine, crc32_combine_gen, crc32_combine_op};
 
