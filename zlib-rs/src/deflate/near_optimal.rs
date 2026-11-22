@@ -1519,6 +1519,13 @@ fn parse_range_with_scratch(
         }
     }
 
+    ParseResult {
+        cost_x16: best_cost[block_len],
+        tokens: reconstruct_tokens(steps, block_len),
+    }
+}
+
+fn reconstruct_tokens(steps: &[ParseStep], block_len: usize) -> Vec<ParseToken> {
     let mut tokens = Vec::new();
     let mut cursor = block_len;
     while cursor != 0 {
@@ -1532,10 +1539,7 @@ fn parse_range_with_scratch(
         tokens.iter().map(|token| token.input_len()).sum::<usize>(),
         block_len
     );
-    ParseResult {
-        cost_x16: best_cost[block_len],
-        tokens,
-    }
+    tokens
 }
 
 impl MatchCandidates {
