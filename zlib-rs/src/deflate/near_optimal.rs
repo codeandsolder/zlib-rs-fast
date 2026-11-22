@@ -454,6 +454,11 @@ fn direct_bucket_match(
             &input[candidate_position..candidate_position + available],
         );
         best.consider(length, distance);
+        // Distances are visited from nearest to farthest. A full-length
+        // match cannot be improved in either length or tie-breaking.
+        if length == available {
+            break;
+        }
     }
     best
 }
@@ -1773,6 +1778,42 @@ mod tests {
         }
 
         Ok(MatchCandidates { offsets, entries })
+    }
+
+    #[test]
+    fn direct_bucket_full_match_exit_preserves_exact_nearest_tie() {
+        let mut mixed = b"0123456789abcdef".repeat(64);
+        for position in (0..mixed.len()).step_by(57) {
+            mixed[position] = b'X';
+        }
+        let inputs = [vec![b'a'; 1024], b"abcde".repeat(211), mixed];
+        for input in &inputs {
+            for position in (1..input.len() - 2).step_by(17) {
+                for cap in [3, 4, 7, 31, 64, 127, 257, STD_MAX_MATCH] {
+                    let available = cap.min(input.len() - position);
+                    for minimum in [1, 2, 3, 5, 9, 17, 25, 64, 127, 257] {
+                        for width in 1..=DIRECT_SCAN_MAX {
+                            let maximum = minimum + width - 1;
+                            let mut expected = MatchCandidate::NONE;
+                            for distance in minimum..=maximum.min(position) {
+                                let candidate = position - distance;
+                                let len = input[position..position + available]
+                                    .iter()
+                                    .zip(&input[candidate..candidate + available])
+                                    .position(|(left, right)| left != right)
+                                    .unwrap_or(available);
+                                expected.consider(len, distance);
+                            }
+                            assert_eq!(
+                                direct_bucket_match(input, position, available, minimum, maximum),
+                                expected,
+                                "position={position}, available={available}, range={minimum}..={maximum}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
