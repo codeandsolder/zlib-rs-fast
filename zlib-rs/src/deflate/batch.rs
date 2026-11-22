@@ -1320,7 +1320,7 @@ mod tests {
                     }
                     #[cfg(feature = "parallel")]
                     for pool in &pools {
-                        let mut vectors = caps.map(|cap| Vec::with_capacity(cap));
+                        let mut vectors = caps.map(Vec::with_capacity);
                         let mut jobs = inputs
                             .iter()
                             .zip(&mut vectors)
