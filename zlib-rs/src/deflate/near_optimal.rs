@@ -484,141 +484,8 @@ fn direct_prefix_mask(input: &[u8], position: usize) -> u32 {
     u32::from_le_bytes([a, b, c, d]).reverse_bits()
 }
 
-const DENSE_PREFIX_GROUP: u8 = u8::MAX;
-const SMALL_PREFIX_GROUP_LIMIT: usize = 16;
-const _: () = assert!(SMALL_PREFIX_GROUP_LIMIT <= 16 && D_CODES <= u32::BITS as usize);
-
-/// Every useful DEFLATE match starts with the same three bytes. Equal
-/// triples form contiguous suffix-array intervals. A singleton cannot
-/// match any other suffix; small intervals need no ordered-set updates.
-fn prefix_groups(input: &[u8], suffixes: &SuffixRanks) -> (Vec<u8>, usize) {
-    let mut groups = vec![DENSE_PREFIX_GROUP; input.len()];
-    let mut start = 0;
-    let mut sparse = 0;
-    while start < input.len() {
-        let pos = suffixes.position_at(start);
-        let Some(prefix) = input[pos..].get(..STD_MIN_MATCH) else {
-            groups[pos] = 0;
-            sparse += 1;
-            start += 1;
-            continue;
-        };
-        let mut end = start + 1;
-        while end < input.len() {
-            let pos = suffixes.position_at(end);
-            if input[pos..].get(..STD_MIN_MATCH) != Some(prefix) {
-                break;
-            }
-            end += 1;
-        }
-        if end - start <= SMALL_PREFIX_GROUP_LIMIT {
-            sparse += end - start;
-            for rank in start..end {
-                let lower = u8::try_from(rank - start).unwrap_or_else(|_| {
-                    unreachable!("small prefix group offset fits in four bits")
-                });
-                let upper = u8::try_from(end - rank - 1).unwrap_or_else(|_| {
-                    unreachable!("small prefix group offset fits in four bits")
-                });
-                groups[suffixes.position_at(rank)] = lower | (upper << 4);
-            }
-        }
-        start = end;
-    }
-    (groups, sparse)
-}
-
-struct FrontierSource<'a> {
-    input: &'a [u8],
-    suffixes: &'a SuffixRanks,
-    ranges: &'a [(usize, usize); D_CODES],
-    rank_codes: Range<usize>,
-}
-
-/// Small groups can find the same predecessor/successor within each
-/// wide distance class directly. Nearby direct classes retain their
-/// original exhaustive length/distance tie rule.
-fn scan_small_prefix_groups(
-    source: &FrontierSource<'_>,
-    groups: &[u8],
-    tile: Range<usize>,
-    scratch: &mut FrontierTileScratch,
-) {
-    let FrontierSource {
-        input,
-        suffixes,
-        ranges,
-        rank_codes,
-    } = source;
-    let tile_start = tile.start;
-    let tile_len = tile.len();
-    for (local, (&rank, &available)) in scratch.ranks[..tile_len]
-        .iter()
-        .zip(&scratch.available[..tile_len])
-        .enumerate()
-    {
-        let position = tile_start + local;
-        let group = groups[position];
-        if group == DENSE_PREFIX_GROUP || group == 0 || usize::from(available) < STD_MIN_MATCH {
-            continue;
-        }
-        let available = usize::from(available);
-        let first = rank - usize::from(group & 15);
-        let last = rank + usize::from(group >> 4);
-        let mut best = [MatchCandidate::NONE; D_CODES];
-        let mut occupied = 0u32;
-        let mut consider_side = |start: usize, count: usize, reverse: bool| {
-            let mut seen = 0u32;
-            for index in 0..count {
-                let other_rank = if reverse {
-                    start - index
-                } else {
-                    start + index
-                };
-                let other = suffixes.position_at(other_rank);
-                if other >= position {
-                    continue;
-                }
-                let distance = position - other;
-                if distance > 1usize << crate::MAX_WBITS {
-                    continue;
-                }
-                let code = usize::from(State::d_code(distance - 1));
-                let (minimum, maximum) = ranges[code];
-                if minimum == 0 || distance > maximum {
-                    continue;
-                }
-                let marker = 1u32 << code;
-                if rank_codes.contains(&code) {
-                    if seen & marker != 0 {
-                        continue;
-                    }
-                    seen |= marker;
-                }
-                let length = STD_MIN_MATCH
-                    + match_compare::common_prefix_len(
-                        &input[position + STD_MIN_MATCH..position + available],
-                        &input[other + STD_MIN_MATCH..other + available],
-                    );
-                best[code].consider(length, distance);
-                occupied |= marker;
-            }
-        };
-        if first < rank {
-            consider_side(rank - 1, rank - first, true);
-        }
-        consider_side(rank + 1, last - rank, false);
-        while occupied != 0 {
-            let code = occupied.trailing_zeros() as usize;
-            occupied &= occupied - 1;
-            stage_candidate(local, best[code], &mut scratch.counts, &mut scratch.staged);
-        }
-    }
-}
-
-fn scan_direct_buckets<const PARTITIONED: bool>(
+fn scan_direct_buckets(
     input: &[u8],
-    groups: &[u8],
     ranges: &[(usize, usize)],
     tile_start: usize,
     tile_len: usize,
@@ -631,9 +498,6 @@ fn scan_direct_buckets<const PARTITIONED: bool>(
     let leading =
         max_direct <= NEARBY_DISTANCE_MASK_BITS && ranges.first().is_some_and(|r| r.0 == 1);
     for (local, &available) in scratch.available[..tile_len].iter().enumerate() {
-        if PARTITIONED && groups[tile_start + local] != DENSE_PREFIX_GROUP {
-            continue;
-        }
         let available = usize::from(available);
         if available < STD_MIN_MATCH {
             continue;
@@ -689,37 +553,6 @@ fn scan_direct_buckets<const PARTITIONED: bool>(
     }
 }
 
-#[inline]
-fn best_rank_match(
-    input: &[u8],
-    suffixes: &SuffixRanks,
-    active: &RankSet,
-    position: usize,
-    available: usize,
-    rank: usize,
-    distance_range: Range<usize>,
-) -> MatchCandidate {
-    let mut best = MatchCandidate::NONE;
-    let (predecessor, successor) = active.neighbors(rank);
-    let mut consider_rank = |neighbor| {
-        let other = suffixes.position_at(neighbor);
-        debug_assert!(other < position);
-        debug_assert!(distance_range.contains(&(position - other)));
-        let length = match_compare::common_prefix_len(
-            &input[position..position + available],
-            &input[other..other + available],
-        );
-        best.consider(length, position - other);
-    };
-    if let Some(neighbor) = predecessor {
-        consider_rank(neighbor);
-    }
-    if let Some(neighbor) = successor {
-        consider_rank(neighbor);
-    }
-    best
-}
-
 fn scan_rank_buckets(
     input: &[u8],
     suffixes: &SuffixRanks,
@@ -767,6 +600,203 @@ fn scan_rank_buckets(
     }
 }
 
+const DENSE_PREFIX_GROUP: u8 = u8::MAX;
+const SMALL_PREFIX_GROUP_LIMIT: usize = 16;
+const _: () = assert!(SMALL_PREFIX_GROUP_LIMIT <= 16 && D_CODES <= u32::BITS as usize);
+
+/// Three-byte prefixes are contiguous in the four-byte equivalence
+/// classes. One representative per class suffices to recover the exact
+/// prefix intervals, and their rank boundaries survive later refinement.
+struct SmallPrefixGroups {
+    by_rank: Vec<u8>,
+    sparse: usize,
+}
+
+impl SmallPrefixGroups {
+    fn singleton(length: usize) -> Self {
+        Self {
+            by_rank: vec![0; length],
+            sparse: length,
+        }
+    }
+
+    fn from_classes(input: &[u8], sa: &[u32], starts: &[u32]) -> Option<Self> {
+        let length = input.len();
+        // Every small three-byte class comprises exclusively small
+        // four-byte classes. This upper bound cheaply rejects dense data.
+        let ends = starts
+            .iter()
+            .copied()
+            .skip(1)
+            .map(suffix_index)
+            .chain(core::iter::once(length));
+        let upper = starts
+            .iter()
+            .copied()
+            .map(suffix_index)
+            .zip(ends)
+            .filter(|&(start, end)| end - start <= SMALL_PREFIX_GROUP_LIMIT)
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+        if upper <= length / 2 {
+            return None;
+        }
+        let mut by_rank = vec![DENSE_PREFIX_GROUP; length];
+        let mut sparse = 0;
+        let mut group_start = 0;
+        let mut prefix = input[suffix_index(sa[0])..].get(..STD_MIN_MATCH);
+        for &start in &starts[1..] {
+            let start = suffix_index(start);
+            let current = input[suffix_index(sa[start])..].get(..STD_MIN_MATCH);
+            if current != prefix {
+                sparse += Self::record_group(&mut by_rank[group_start..start]);
+                group_start = start;
+                prefix = current;
+            }
+        }
+        sparse += Self::record_group(&mut by_rank[group_start..]);
+        (sparse > length / 2).then_some(Self { by_rank, sparse })
+    }
+
+    fn record_group(group: &mut [u8]) -> usize {
+        let length = group.len();
+        if length > SMALL_PREFIX_GROUP_LIMIT {
+            return 0;
+        }
+        for (i, slot) in group.iter_mut().enumerate() {
+            let lower = u8::try_from(i).unwrap_or_else(|_| unreachable!("bounded prefix class"));
+            let upper = u8::try_from(length - i - 1)
+                .unwrap_or_else(|_| unreachable!("bounded prefix class"));
+            *slot = lower | upper << 4;
+        }
+        length
+    }
+}
+
+struct FrontierSource<'a> {
+    input: &'a [u8],
+    suffixes: &'a SuffixRanks,
+    ranges: &'a [(usize, usize); D_CODES],
+    rank_codes: Range<usize>,
+}
+
+/// Small groups find the same predecessor/successor within each wide
+/// distance class and exhaust the narrow classes for their nearest-distance
+/// tie rule. Mask these positions so the dense traversal cannot repeat them.
+fn scan_small_prefix_groups(
+    source: &FrontierSource<'_>,
+    groups: &[u8],
+    tile: Range<usize>,
+    scratch: &mut FrontierTileScratch,
+) {
+    let FrontierSource {
+        input,
+        suffixes,
+        ranges,
+        rank_codes,
+    } = source;
+    let tile_start = tile.start;
+    let tile_len = tile.len();
+    for (local, (&rank, available)) in scratch.ranks[..tile_len]
+        .iter()
+        .zip(&mut scratch.available[..tile_len])
+        .enumerate()
+    {
+        let position = tile_start + local;
+        let group = groups[rank];
+        if group == DENSE_PREFIX_GROUP {
+            continue;
+        }
+        // Sparse positions are handled across every distance class here.
+        // Mark them unavailable for the subsequent dense-only traversal.
+        let available = usize::from(core::mem::replace(available, 0));
+        if group == 0 || available < STD_MIN_MATCH {
+            continue;
+        }
+        let first = rank - usize::from(group & 15);
+        let last = rank + usize::from(group >> 4);
+        let mut best = [MatchCandidate::NONE; D_CODES];
+        let mut occupied = 0u32;
+        let mut consider_side = |start: usize, count: usize, reverse: bool| {
+            let mut seen = 0u32;
+            for index in 0..count {
+                let other_rank = if reverse {
+                    start - index
+                } else {
+                    start + index
+                };
+                let other = suffixes.position_at(other_rank);
+                if other >= position {
+                    continue;
+                }
+                let distance = position - other;
+                if distance > 1usize << crate::MAX_WBITS {
+                    continue;
+                }
+                let code = usize::from(State::d_code(distance - 1));
+                let (minimum, maximum) = ranges[code];
+                if minimum == 0 || distance > maximum {
+                    continue;
+                }
+                let marker = 1u32 << code;
+                if rank_codes.contains(&code) {
+                    if seen & marker != 0 {
+                        continue;
+                    }
+                    seen |= marker;
+                }
+                let length = STD_MIN_MATCH
+                    + match_compare::common_prefix_len(
+                        &input[position + STD_MIN_MATCH..position + available],
+                        &input[other + STD_MIN_MATCH..other + available],
+                    );
+                best[code].consider(length, distance);
+                occupied |= marker;
+            }
+        };
+        if first < rank {
+            consider_side(rank - 1, rank - first, true);
+        }
+        consider_side(rank + 1, last - rank, false);
+        while occupied != 0 {
+            let code = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            stage_candidate(local, best[code], &mut scratch.counts, &mut scratch.staged);
+        }
+    }
+}
+
+#[inline]
+fn best_rank_match(
+    input: &[u8],
+    suffixes: &SuffixRanks,
+    active: &RankSet,
+    position: usize,
+    available: usize,
+    rank: usize,
+    distance_range: Range<usize>,
+) -> MatchCandidate {
+    let mut best = MatchCandidate::NONE;
+    let (predecessor, successor) = active.neighbors(rank);
+    let mut consider_rank = |neighbor| {
+        let other = suffixes.position_at(neighbor);
+        debug_assert!(other < position);
+        debug_assert!(distance_range.contains(&(position - other)));
+        let length = match_compare::common_prefix_len(
+            &input[position..position + available],
+            &input[other..other + available],
+        );
+        best.consider(length, position - other);
+    };
+    if let Some(neighbor) = predecessor {
+        consider_rank(neighbor);
+    }
+    if let Some(neighbor) = successor {
+        consider_rank(neighbor);
+    }
+    best
+}
+
 /// Ordered positions of dense-group suffixes. Maintain a rank set only
 /// at actual dense query positions, not at ignored sparse positions.
 /// Each distance class walks monotone insertion/removal cursors.
@@ -778,11 +808,12 @@ struct DensePositions {
 }
 
 impl DensePositions {
-    fn new(groups: &[u8]) -> Self {
-        let positions = groups
+    fn new(groups: &[u8], suffixes: &SuffixRanks) -> Self {
+        let positions = suffixes
+            .rank
             .iter()
             .enumerate()
-            .filter(|(_, g)| **g == DENSE_PREFIX_GROUP)
+            .filter(|(_, rank)| groups[suffix_index(**rank)] == DENSE_PREFIX_GROUP)
             .map(|(position, _)| {
                 u32::try_from(position)
                     .unwrap_or_else(|_| unreachable!("suffix rank construction bounds positions"))
@@ -863,6 +894,53 @@ impl DensePositions {
     }
 }
 
+/// Sparse and dense queries are disjoint by exact three-byte prefix.
+/// The dense path keeps the original narrow-class scanner and only
+/// advances wide-class rank windows at dense query positions.
+#[inline(never)]
+fn try_sparse_frontier(source: &FrontierSource<'_>) -> Option<MatchCandidates> {
+    let FrontierSource {
+        input,
+        suffixes,
+        ranges,
+        rank_codes,
+    } = source;
+    if rank_codes.is_empty() {
+        return None;
+    }
+    let groups = suffixes.small_prefix_groups.as_ref()?;
+    let sparse = groups.sparse;
+    let groups = &groups.by_rank;
+    let all_small = sparse == input.len();
+    if all_small && groups.iter().all(|&group| group == 0) {
+        return Some(MatchCandidates {
+            offsets: vec![0; input.len() + 1],
+            entries: Vec::new(),
+        });
+    }
+    let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
+        (!all_small && rank_codes.contains(&code)).then(|| RankSet::new(input.len()))
+    });
+    let mut dense = (!all_small).then(|| DensePositions::new(groups, suffixes));
+    let mut offsets = Vec::with_capacity(input.len() + 1);
+    let mut entries = Vec::new();
+    let mut scratch = FrontierTileScratch::new();
+    offsets.push(0);
+    for start in (0..input.len()).step_by(FRONTIER_TILE_POSITIONS) {
+        let len = FRONTIER_TILE_POSITIONS.min(input.len() - start);
+        let tile = start..start + len;
+        scratch.prepare(suffixes, input.len(), start, len);
+        scan_small_prefix_groups(source, groups, tile.clone(), &mut scratch);
+        if let Some(dense) = &mut dense {
+            scan_direct_buckets(input, &ranges[..rank_codes.start], start, len, &mut scratch);
+            dense.scan(source, &mut active, tile, &mut scratch);
+            scan_direct_buckets(input, &ranges[rank_codes.end..], start, len, &mut scratch);
+        }
+        scratch.scatter(len, &mut entries, &mut offsets);
+    }
+    Some(MatchCandidates { offsets, entries })
+}
+
 /// Build the exact useful-match frontier for a complete input.
 ///
 /// Suffix-array ranks make this exact without walking every equal-prefix predecessor. For each DEFLATE
@@ -878,7 +956,6 @@ pub fn build_match_candidates(
     if max_distance > 1usize << crate::MAX_WBITS {
         return Err(ReturnCode::StreamError);
     }
-    let suffixes = SuffixRanks::new(input)?;
     let ranges = distance_code_ranges(max_distance);
     let first_rank_code = ranges
         .iter()
@@ -886,35 +963,35 @@ pub fn build_match_candidates(
             min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX
         })
         .unwrap_or(D_CODES);
-    let last_rank_code = ranges
-        .iter()
-        .rposition(|&(min, max)| min != 0 && max - min + 1 > DIRECT_SCAN_MAX)
-        .map_or(first_rank_code, |code| code + 1);
-    let (groups, sparse) = if first_rank_code < last_rank_code {
-        prefix_groups(input, &suffixes)
-    } else {
-        (Vec::new(), 0)
-    };
-    // Small groups are an optimization, not a different match policy.
-    // Avoid adding eligibility checks to the dense-only traversal when
-    // the small prefix intervals are too rare to repay those checks.
-    let partitioned = sparse > input.len() / 4;
-    let all_small = partitioned && sparse == input.len();
-    let source = FrontierSource {
-        input,
-        suffixes: &suffixes,
-        ranges: &ranges,
-        rank_codes: first_rank_code..last_rank_code,
-    };
+    let suffixes = SuffixRanks::new(input, first_rank_code < D_CODES)?;
+    if first_rank_code < D_CODES {
+        let last_rank_code = ranges
+            .iter()
+            .rposition(|&(min, max)| min != 0 && max - min + 1 > DIRECT_SCAN_MAX)
+            .map_or(first_rank_code, |code| code + 1);
+        let source = FrontierSource {
+            input,
+            suffixes: &suffixes,
+            ranges: &ranges,
+            rank_codes: first_rank_code..last_rank_code,
+        };
+        if let Some(frontier) = try_sparse_frontier(&source) {
+            return Ok(frontier);
+        }
+    }
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
-        (!all_small && (first_rank_code..last_rank_code).contains(&code))
+        let (min_distance, max_distance) = ranges[code];
+        (min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX)
             .then(|| RankSet::new(input.len()))
     });
+    let last_rank_code = active
+        .iter()
+        .rposition(Option::is_some)
+        .map_or(first_rank_code, |code| code + 1);
 
     let mut offsets = Vec::with_capacity(input.len() + 1);
     let mut entries = Vec::new();
     let mut scratch = FrontierTileScratch::new();
-    let mut dense_positions = (partitioned && !all_small).then(|| DensePositions::new(&groups));
     offsets.push(0);
 
     for tile_start in (0..input.len()).step_by(FRONTIER_TILE_POSITIONS) {
@@ -924,58 +1001,31 @@ pub fn build_match_candidates(
             - tile_start;
         scratch.prepare(&suffixes, input.len(), tile_start, tile_len);
 
-        let tile = tile_start..tile_start + tile_len;
-        if partitioned {
-            scan_small_prefix_groups(&source, &groups, tile.clone(), &mut scratch);
-        }
-        if !all_small {
-            if let Some(dense) = &mut dense_positions {
-                scan_direct_buckets::<true>(
-                    input,
-                    &groups,
-                    &ranges[..first_rank_code],
-                    tile_start,
-                    tile_len,
-                    &mut scratch,
-                );
-                dense.scan(&source, &mut active, tile.clone(), &mut scratch);
-                scan_direct_buckets::<true>(
-                    input,
-                    &groups,
-                    &ranges[last_rank_code..],
-                    tile_start,
-                    tile_len,
-                    &mut scratch,
-                );
-            } else {
-                // Unpartitioned tiles retain the direct/rank scan ordering.
-                scan_direct_buckets::<false>(
-                    input,
-                    &[],
-                    &ranges[..first_rank_code],
-                    tile_start,
-                    tile_len,
-                    &mut scratch,
-                );
-                scan_rank_buckets(
-                    input,
-                    &suffixes,
-                    &ranges,
-                    &mut active,
-                    source.rank_codes.clone(),
-                    tile,
-                    &mut scratch,
-                );
-                scan_direct_buckets::<false>(
-                    input,
-                    &[],
-                    &ranges[last_rank_code..],
-                    tile_start,
-                    tile_len,
-                    &mut scratch,
-                );
-            }
-        }
+        // Short classes are position-major. Wide classes are class-major
+        // for locality. A truncated final short class must be emitted last.
+        scan_direct_buckets(
+            input,
+            &ranges[..first_rank_code],
+            tile_start,
+            tile_len,
+            &mut scratch,
+        );
+        scan_rank_buckets(
+            input,
+            &suffixes,
+            &ranges,
+            &mut active,
+            first_rank_code..last_rank_code,
+            tile_start..tile_start + tile_len,
+            &mut scratch,
+        );
+        scan_direct_buckets(
+            input,
+            &ranges[last_rank_code..],
+            tile_start,
+            tile_len,
+            &mut scratch,
+        );
         scratch.scatter(tile_len, &mut entries, &mut offsets);
     }
     debug_assert_eq!(offsets.last().copied(), Some(entries.len()));
@@ -1346,6 +1396,7 @@ const fn suffix_index(value: u32) -> usize {
 struct SuffixRanks {
     sa: Vec<u32>,
     rank: Vec<u32>,
+    small_prefix_groups: Option<SmallPrefixGroups>,
 }
 
 /// The packed suffix permutation and counting-sort offsets require indices
@@ -1365,12 +1416,13 @@ impl SuffixRanks {
         suffix_index(self.sa[suffix_rank])
     }
 
-    fn new(input: &[u8]) -> Result<Self, ReturnCode> {
+    fn new(input: &[u8], collect_prefix_groups: bool) -> Result<Self, ReturnCode> {
         let length = checked_suffix_input_len(input.len())?;
         if input.is_empty() {
             return Ok(Self {
                 sa: Vec::new(),
                 rank: Vec::new(),
+                small_prefix_groups: None,
             });
         }
 
@@ -1384,6 +1436,7 @@ impl SuffixRanks {
         let max_rank = rank.iter().copied().max().unwrap_or(0);
         let mut counts = vec![0u32; input.len().max(256) + 1];
         let mut span = 1usize;
+        let mut small_prefix_groups = None;
         counting_sort_suffixes(&sa, &mut scratch, max_rank, &mut counts, |position| {
             suffix_second_rank(&rank, position, span)
         });
@@ -1412,6 +1465,12 @@ impl SuffixRanks {
                 previous_pair = pair;
             }
 
+            if collect_prefix_groups && span == 1 && class == length {
+                small_prefix_groups = Some(SmallPrefixGroups::singleton(input.len()));
+            } else if collect_prefix_groups && span == 2 {
+                small_prefix_groups =
+                    SmallPrefixGroups::from_classes(input, &sa, &counts[1..=suffix_index(class)]);
+            }
             core::mem::swap(&mut rank, &mut next_rank);
             if class == length {
                 break;
@@ -1440,7 +1499,11 @@ impl SuffixRanks {
             rank[suffix_index(position)] = suffix_rank;
         }
 
-        Ok(Self { sa, rank })
+        Ok(Self {
+            sa,
+            rank,
+            small_prefix_groups,
+        })
     }
 }
 
@@ -2062,7 +2125,7 @@ mod tests {
             return Err(ReturnCode::StreamError);
         }
         // Candidate offsets remain usize because there may be D_CODES entries per byte.
-        let suffixes = SuffixRanks::new(input)?;
+        let suffixes = SuffixRanks::new(input, false)?;
         let ranges = distance_code_ranges(max_distance);
         let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
             let (min_distance, max_distance) = ranges[code];
@@ -2276,7 +2339,7 @@ mod tests {
             *byte = state.to_le_bytes()[4] & 0x1f;
         }
 
-        let suffixes = SuffixRanks::new(&input)?;
+        let suffixes = SuffixRanks::new(&input, false)?;
         for rank in 0..input.len() {
             let position = suffixes.position_at(rank);
             assert_eq!(suffixes.rank_of(position), rank);
@@ -2299,7 +2362,7 @@ mod tests {
                         byte
                     })
                     .collect::<Vec<_>>();
-                let suffixes = SuffixRanks::new(&input)?;
+                let suffixes = SuffixRanks::new(&input, false)?;
                 let mut expected = (0..u32::try_from(len).map_err(|_| ReturnCode::StreamError)?)
                     .collect::<Vec<_>>();
                 expected.sort_unstable_by(|&left, &right| {
@@ -2344,7 +2407,7 @@ mod tests {
                     })
                     .collect();
 
-                let suffixes = SuffixRanks::new(&input)?;
+                let suffixes = SuffixRanks::new(&input, false)?;
                 assert_eq!(suffixes.sa.len(), length);
                 assert_eq!(suffixes.rank.len(), length);
                 for rank in 0..length {
@@ -2853,9 +2916,6 @@ mod tests {
 
     #[test]
     fn sparse_prefix_partition_preserves_complete_frontier() -> Result<(), ReturnCode> {
-        // Mix genuinely sparse groups with dense groups separated by more than
-        // one tile and long gaps in the dense-position window. Repeating a
-        // random atom forces the small-group path to emit matches too.
         let mut seed = 0x8f6e_37a1_4c92_d5b7u64;
         let atom: Vec<u8> = (0..521)
             .map(|_| {
@@ -2863,15 +2923,41 @@ mod tests {
                 seed.to_le_bytes()[4]
             })
             .collect();
+        // Dense windows separated by more than one tile, with sparse
+        // matching groups between them. Vary the fourth byte to exercise
+        // coalescing four-byte classes into one exact three-byte interval.
         let mut mixed = vec![b'a'; 67];
         mixed.extend_from_slice(&atom);
         mixed.extend_from_slice(&[b'a'; 89]);
         mixed.extend_from_slice(&atom);
         mixed.extend_from_slice(&[b'a'; 65]);
+        for i in 0..17u8 {
+            mixed.extend_from_slice(&[b'P', b'Q', b'R', i]);
+            if i < 16 {
+                mixed.extend_from_slice(&[b'X', b'Y', b'Z', i]);
+            }
+        }
         for input in [atom.as_slice(), mixed.as_slice()] {
-            let ranks = SuffixRanks::new(input)?;
-            let (_, sparse) = prefix_groups(input, &ranks);
-            assert!(sparse > input.len() / 4);
+            let suffixes = SuffixRanks::new(input, true)?;
+            let Some(groups) = &suffixes.small_prefix_groups else {
+                return Err(ReturnCode::StreamError);
+            };
+            assert!(groups.sparse > input.len() / 2);
+            for position in 0..input.len() - 2 {
+                let rank = suffixes.rank_of(position);
+                let prefix = &input[position..position + STD_MIN_MATCH];
+                let equal =
+                    |r| input[suffixes.position_at(r)..].get(..STD_MIN_MATCH) == Some(prefix);
+                let lower = (0..rank).rev().take_while(|&r| equal(r)).count();
+                let upper = (rank + 1..input.len()).take_while(|&r| equal(r)).count();
+                let marker = groups.by_rank[rank];
+                if lower + upper + 1 > SMALL_PREFIX_GROUP_LIMIT {
+                    assert_eq!(marker, DENSE_PREFIX_GROUP);
+                } else {
+                    assert_eq!(usize::from(marker & 15), lower);
+                    assert_eq!(usize::from(marker >> 4), upper);
+                }
+            }
             for distance in [
                 0, 31, 32, 33, 39, 40, 41, 63, 64, 65, 127, 129, 521, 529, 1025, 32768,
             ] {
