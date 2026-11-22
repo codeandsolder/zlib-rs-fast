@@ -8,6 +8,13 @@ use core::mem::MaybeUninit;
 pub trait WritableBytes {
     fn byte_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
+
+    /// True only when the operation owns all writable storage and commits
+    /// just its reported prefix, discarding the contents of the remaining
+    /// capacity. Caller-provided slices must retain their untouched tail.
+    fn discards_tail(&self) -> bool {
+        false
+    }
 }
 
 impl WritableBytes for [u8] {

@@ -432,6 +432,37 @@ impl<'a> Writer<'a> {
         self.filled = current + length;
     }
 
+    /// Copy a match into a destination whose unused capacity will be
+    /// discarded. Short disjoint references can use one full-width load
+    /// and store, avoiding the exact-copy size dispatch. The logical
+    /// initialized prefix grows only by length; no later match may read
+    /// beyond that prefix as history.
+    #[inline]
+    pub(super) fn copy_match_discarding_tail<const WIDTH: usize>(
+        &mut self,
+        distance: usize,
+        length: usize,
+    ) {
+        if length <= WIDTH
+            && distance >= WIDTH
+            && distance <= self.filled
+            && self.remaining() >= WIDTH
+        {
+            let current = self.filled;
+            let start = current - distance;
+            // SAFETY: the distance proves the entire WIDTH-byte source is
+            // in the initialized prefix and disjoint from the destination.
+            // The remaining-capacity check proves the full store is valid.
+            // The caller owns the discarded tail and publishes only length.
+            unsafe {
+                Self::copy_disjoint_chunk::<WIDTH>(self.buf.as_mut_ptr(), start, current);
+            }
+            self.filled = current + length;
+        } else {
+            self.copy_match_fast(distance, length);
+        }
+    }
+
     /// Copy initialized bytes from another position in this same backing allocation.
     ///
     /// # Safety
@@ -737,6 +768,57 @@ mod test {
                 );
             }
         }
+    }
+
+    fn check_discarding_tail<const WIDTH: usize>() {
+        let prefix: [u8; 64] = core::array::from_fn(|i| u8::try_from(i + 1).unwrap_or(0));
+        for distance in 1..=prefix.len() {
+            for length in 0..=258 {
+                for slack in [0, 1, WIDTH - 1, WIDTH, WIDTH + 1] {
+                    let capacity = prefix.len() + length + slack;
+                    let mut storage = vec![MaybeUninit::<u8>::uninit(); capacity + 32];
+                    for (slot, byte) in storage.iter_mut().zip(prefix) {
+                        slot.write(byte);
+                    }
+                    for slot in &mut storage[capacity..] {
+                        slot.write(0xa5);
+                    }
+                    let mut expected = prefix.to_vec();
+                    for _ in 0..length {
+                        expected.push(expected[expected.len() - distance]);
+                    }
+                    {
+                        let mut writer = Writer {
+                            buf: WeakSliceMut::from_mut_slice(&mut storage[..capacity]),
+                            filled: prefix.len(),
+                        };
+                        writer.copy_match_discarding_tail::<WIDTH>(distance, length);
+                        assert_eq!(writer.filled(), expected);
+                        // A subsequent back-reference must see the logical
+                        // prefix, not speculative bytes from the earlier copy.
+                        for _ in 0..slack {
+                            expected.push(expected[expected.len() - distance]);
+                        }
+                        if slack != 0 {
+                            writer.copy_match_discarding_tail::<WIDTH>(distance, slack);
+                        }
+                        assert_eq!(writer.filled(), expected);
+                    }
+                    for slot in &storage[capacity..] {
+                        // SAFETY: guard bytes were initialized above.
+                        assert_eq!(unsafe { slot.assume_init() }, 0xa5);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "exhaustive discarded-tail copy matrix")]
+    fn discarded_tail_copy_preserves_logical_prefix_and_capacity() {
+        check_discarding_tail::<8>();
+        check_discarding_tail::<16>();
+        check_discarding_tail::<32>();
     }
 
     #[test]

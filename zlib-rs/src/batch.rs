@@ -45,6 +45,11 @@ impl WritableBytes for BatchOutput<'_> {
             Destination::Vector { limit, .. } => *limit,
         }
     }
+
+    #[inline]
+    fn discards_tail(&self) -> bool {
+        matches!(self.0, Destination::Vector { .. })
+    }
 }
 
 impl<'a> BatchJob<'a> {
