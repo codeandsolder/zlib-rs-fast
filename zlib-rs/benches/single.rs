@@ -4,6 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "shared/file_profile.rs"]
+mod file_profile;
+
 #[path = "shared/measurement.rs"]
 mod measurement;
 
@@ -41,8 +44,12 @@ struct Stats {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "--profile-file") {
+        return file_profile::run(&args[2..]);
+    }
     if args.len() == 2 && args[1] == "--self-test" {
         self_test()?;
+        file_profile::self_test()?;
         println!("single-stream benchmark invariants passed");
         return Ok(());
     }
