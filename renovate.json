@@ -6,14 +6,5 @@
   "separateMajorMinor": false,
   "separateMultipleMajor": false,
   "prConcurrentLimit": 3,
-  "rebaseWhen": "conflicted",
-  "packageRules": [
-    {
-      "description": "The portable-SIMD project pins Rust 1.99 nightly intentionally; toolchain upgrades require an explicit compiler/matrix compatibility review.",
-      "matchManagers": [
-        "rust-toolchain"
-      ],
-      "enabled": false
-    }
-  ]
+  "rebaseWhen": "conflicted"
 }

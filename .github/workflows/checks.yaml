@@ -3,9 +3,6 @@ name: checks
 permissions:
   contents: read
 
-env:
-  RUST_TOOLCHAIN: nightly-2026-11-19
-
 on: # zizmor: ignore[cache-poisoning] not actually used for releases
   push:
     branches:
@@ -32,10 +29,9 @@ concurrency:
 jobs:
   routine-linux:
     name: Routine Linux Rust validation
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
       validation-tier: routine
-      rust-toolchain: nightly-2026-11-19
       rust-components: rustfmt
       rustflags: ""
       command: |
@@ -45,10 +41,9 @@ jobs:
 
   miri-focused:
     name: Miri allocation and inflate history
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
       validation-tier: routine
-      rust-toolchain: nightly-2026-11-19
       rust-components: miri
       rustflags: ""
       command: |
@@ -146,16 +141,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
           targets: "${{ matrix.target }}"
 
       - name: Activate native ARM64 MSVC environment
@@ -231,7 +229,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   clippy:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: Clippy
@@ -250,16 +248,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
           components: clippy, rustfmt
           targets: ${{matrix.target}}
       - name: Run rustfmt and clippy
@@ -282,7 +283,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   fuzz:
     name: Smoke-test fuzzing targets
     runs-on: ubuntu-latest
@@ -296,16 +297,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Install cargo fuzz
         run: cargo install cargo-fuzz
       - name: Smoke-test fuzz targets
@@ -322,7 +326,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   fuzz-aarch64:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: Smoke-test fuzzing targets
@@ -338,16 +342,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Install cargo fuzz
         run: cargo install cargo-fuzz
       - name: Smoke-test fuzz targets
@@ -364,7 +371,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   fuzz-code-coverage:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/') }}
     name: Fuzz with code coverage
@@ -385,16 +392,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
           components: llvm-tools-preview
       - name: Install cargo fuzz
         run: cargo install cargo-fuzz
@@ -431,7 +441,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   link-c-dynamic-library:
     name: vanilla dynamic library
     strategy:
@@ -446,16 +456,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
           targets: ${{matrix.target}}
       - name: "cdylib: default settings"
         working-directory: libz-rs-sys-cdylib
@@ -511,8 +524,8 @@ jobs:
           LD_LIBRARY_PATH: "target/${{matrix.target}}/release"
         working-directory: libz-rs-sys-cdylib
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN"
-          cargo +${RUST_TOOLCHAIN} build --release --target ${{matrix.target}} --no-default-features --features=gz,gzprintf,c-allocator
+          rustup toolchain install "${{ steps.compiler.outputs.channel }}"
+          cargo +${{ steps.compiler.outputs.channel }} build --release --target ${{matrix.target}} --no-default-features --features=gz,gzprintf,c-allocator
           cc -o example example.c target/${{matrix.target}}/release/libz_rs.so
           ./example
           valgrind --track-origins=yes --error-exitcode=1 ./example
@@ -528,7 +541,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   symbol-versioning:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: Symbol versioning
@@ -544,16 +557,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }} # for c-variadic functions
+          toolchain: ${{ steps.compiler.outputs.channel }} # for c-variadic functions
           targets: ${{matrix.target}}
 
       - name: Install apt packages
@@ -575,7 +591,7 @@ jobs:
       - name: Build libz_rs.versioned.so
         working-directory: libz-rs-sys-cdylib
         run: |
-          cargo +${RUST_TOOLCHAIN} build --release --target ${{matrix.target}} --features=gz,gzprintf
+          cargo +${{ steps.compiler.outputs.channel }} build --release --target ${{matrix.target}} --features=gz,gzprintf
 
           cc -shared \
             -Wl,--gc-sections \
@@ -604,7 +620,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   cargo-c-dynamic-library:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: cargo-c dynamic library
@@ -620,16 +636,19 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.compiler.outputs.channel }}
           targets: ${{matrix.target}}
       - name: Install cargo-c
         env:
@@ -653,7 +672,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   miri-zlib-rs:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: "Miri (zlib-rs)"
@@ -670,17 +689,20 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install Miri
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --component miri
-          rustup target add --toolchain "$RUST_TOOLCHAIN" ${{ matrix.target }}
-          cargo +${RUST_TOOLCHAIN} miri setup
+          rustup toolchain install "${{ steps.compiler.outputs.channel }}" --component miri
+          rustup target add --toolchain "${{ steps.compiler.outputs.channel }}" ${{ matrix.target }}
+          cargo +${{ steps.compiler.outputs.channel }} miri setup
       - name: Install gcc
         if: ${{ contains(matrix.target, 'windows') }}
         run: |
@@ -691,11 +713,11 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Test with miri
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -p zlib-rs --target ${{ matrix.target }}"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri nextest run -p zlib-rs --target ${{ matrix.target }}"
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   miri-libz-rs-sys:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: "Miri (libz-rs-sys)"
@@ -712,17 +734,20 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install Miri
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --component miri
-          rustup target add --toolchain "$RUST_TOOLCHAIN" ${{ matrix.target }}
-          cargo +${RUST_TOOLCHAIN} miri setup
+          rustup toolchain install "${{ steps.compiler.outputs.channel }}" --component miri
+          rustup target add --toolchain "${{ steps.compiler.outputs.channel }}" ${{ matrix.target }}
+          cargo +${{ steps.compiler.outputs.channel }} miri setup
       - name: Install gcc
         if: ${{ contains(matrix.target, 'windows') }}
         run: |
@@ -733,23 +758,23 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Test public C api with NULL arguments
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -p test-libz-rs-sys --target ${{ matrix.target }} null::"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri nextest run -p test-libz-rs-sys --target ${{ matrix.target }} null::"
         env:
           RUSTFLAGS: "-Ctarget-feature=+avx2,+bmi2,+bmi1"
       - name: Test gz internals with miri
         working-directory: libz-rs-sys
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -p libz-rs-sys --target ${{ matrix.target }} --features=gz gz::"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri nextest run -p libz-rs-sys --target ${{ matrix.target }} --features=gz gz::"
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation"
       - name: Test gz api with miri
         if: ${{ contains(matrix.target, 'linux') }}
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -p test-libz-rs-sys --target ${{ matrix.target }} gz::"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri nextest run -p test-libz-rs-sys --target ${{ matrix.target }} gz::"
         env:
           MIRIFLAGS: "-Zmiri-no-short-fd-operations -Zmiri-disable-isolation"
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   miri-vpclmulqdq:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: "Miri VPCLMULQDQ"
@@ -765,29 +790,32 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install Miri
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --component miri
-          rustup target add --toolchain "$RUST_TOOLCHAIN" ${{ matrix.target }}
-          cargo +${RUST_TOOLCHAIN} miri setup
+          rustup toolchain install "${{ steps.compiler.outputs.channel }}" --component miri
+          rustup target add --toolchain "${{ steps.compiler.outputs.channel }}" ${{ matrix.target }}
+          cargo +${{ steps.compiler.outputs.channel }} miri setup
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
       - name: Test avx512 crc32 implementation
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -j4 -p zlib-rs --target ${{ matrix.target }} crc32::"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri nextest run -j4 -p zlib-rs --target ${{ matrix.target }} crc32::"
         env:
           RUSTFLAGS: "-Ctarget-feature=+vpclmulqdq,+avx512f"
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   miri-simd:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     name: "Miri SIMD"
@@ -807,16 +835,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: Install Miri
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --component miri
-          cargo +${RUST_TOOLCHAIN} miri setup
+          rustup toolchain install "${{ steps.compiler.outputs.channel }}" --component miri
+          cargo +${{ steps.compiler.outputs.channel }} miri setup
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
@@ -824,18 +855,18 @@ jobs:
           tool: cargo-nextest
       - name: Test aarch64 with `+neon,+crc`
         if: ${{ contains(matrix.target, 'aarch64') }}
-        run: "cargo +${RUST_TOOLCHAIN} miri test  --target ${{ matrix.target }} -- crc32 adler32 compare256"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri test  --target ${{ matrix.target }} -- crc32 adler32 compare256"
         env:
           RUSTFLAGS: "-Ctarget-feature=+crc"
       - name: Test loongarch64
         if: ${{ contains(matrix.target, 'loongarch64') }}
         # FIXME: the -p zlib-rs is needed because github's ubuntu
         # does not have loongarch64 gcc for building our C dependencies.
-        run: "cargo +${RUST_TOOLCHAIN} miri test  --target ${{ matrix.target }} -p zlib-rs -- crc32 adler32 compare256"
+        run: "cargo +${{ steps.compiler.outputs.channel }} miri test  --target ${{ matrix.target }} -p zlib-rs -- crc32 adler32 compare256"
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
   run-flate2-test-suite:
     name: run flate2 test suite
     strategy:
@@ -850,10 +881,13 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           persist-credentials: false
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
           rustflags: ""
 
       - name: run
@@ -862,8 +896,8 @@ jobs:
           git clone https://github.com/rust-lang/flate2-rs.git
           cd flate2-rs
           sed -i '/^libz-rs-sys =/c\libz-rs-sys = { path = "../zlib-rs/libz-rs-sys", optional = true, default-features = false, features = ["std", "rust-allocator"] }' Cargo.toml
-          cargo test --no-default-features --features="zlib-rs"
+          cargo +${{ steps.compiler.outputs.channel }} test --no-default-features --features="zlib-rs"
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
