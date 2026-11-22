@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 use crate::deflate::{
-    hash_calc::{HashCalcVariant, RollHashCalc},
+    hash_calc::{HashCalcVariant, RollHashCalc, ROLL_HASH_SIZE},
     Pos, State, STD_MAX_MATCH, STD_MIN_MATCH,
 };
 
 const EARLY_EXIT_TRIGGER_LEVEL: i8 = 5;
+const MAX_WINDOW_SIZE: usize = 1 << crate::MAX_WBITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SearchCursor {
@@ -241,9 +242,9 @@ fn execute_standard(
     params: MatchSearchParams,
 ) -> MatchSearchResult {
     if params.lookahead >= STD_MAX_MATCH {
-        longest_match_help::<false, true>(resources, params)
+        longest_match_help::<false, true, 0>(resources, params)
     } else {
-        longest_match_help::<false, false>(resources, params)
+        longest_match_help::<false, false, 0>(resources, params)
     }
 }
 
@@ -252,10 +253,13 @@ fn execute_slow(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
 ) -> MatchSearchResult {
+    if params.wmask == MAX_WINDOW_SIZE - 1 && params.lookahead >= STD_MAX_MATCH {
+        return longest_match_help::<true, true, MAX_WINDOW_SIZE>(resources, params);
+    }
     if params.lookahead >= STD_MAX_MATCH {
-        longest_match_help::<true, true>(resources, params)
+        longest_match_help::<true, true, 0>(resources, params)
     } else {
-        longest_match_help::<true, false>(resources, params)
+        longest_match_help::<true, false, 0>(resources, params)
     }
 }
 
@@ -275,10 +279,23 @@ pub fn execute_match_search_batch(
     clippy::too_many_lines,
     reason = "keep the shared chain walk and its full/short lookahead specializations together"
 )]
-fn longest_match_help<const SLOW: bool, const FULL: bool>(
+fn longest_match_help<const SLOW: bool, const FULL: bool, const RING: usize>(
     resources: MatchSearchResources<'_>,
     params: MatchSearchParams,
 ) -> MatchSearchResult {
+    // For the full-size rolling window, make the exact table extents
+    // visible to LLVM. The fixed mask then proves every chain index valid.
+    // All smaller windows and short lookahead keep the dynamic path.
+    let resources = if RING != 0 {
+        MatchSearchResources {
+            prev: &resources.prev[..RING],
+            head: &resources.head[..ROLL_HASH_SIZE],
+            ..resources
+        }
+    } else {
+        resources
+    };
+    let wmask = if RING != 0 { RING - 1 } else { params.wmask };
     let scan = &resources.initialized[params.strstart..];
     let limit_base = params.strstart.saturating_sub(params.max_dist);
 
@@ -346,10 +363,10 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
         };
         let len = match probe {
             CandidateProbe::Reject => {
-                let Some(next) = next_in_chain(
+                let Some(next) = next_in_chain::<RING>(
                     cursor,
                     resources.prev,
-                    params.wmask,
+                    wmask,
                     limit_base,
                     &mut chain_remaining,
                 ) else {
@@ -380,14 +397,9 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
             }
 
             if SLOW && len > STD_MIN_MATCH && candidate_start + len < params.strstart {
-                let Some(next) = next_slow_cursor(
-                    resources,
-                    scan,
-                    candidate_pos,
-                    len,
-                    limit_base,
-                    params.wmask,
-                ) else {
+                let Some(next) =
+                    next_slow_cursor(resources, scan, candidate_pos, len, limit_base, wmask)
+                else {
                     return break_matching(params, best_len, match_start);
                 };
                 cursor = next;
@@ -397,10 +409,10 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
             break;
         }
 
-        let Some(next) = next_in_chain(
+        let Some(next) = next_in_chain::<RING>(
             cursor,
             resources.prev,
-            params.wmask,
+            wmask,
             limit_base,
             &mut chain_remaining,
         ) else {
@@ -412,6 +424,7 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
     MatchSearchResult::new(best_len, match_start)
 }
 
+#[inline]
 fn initial_slow_cursor(
     resources: MatchSearchResources<'_>,
     scan: &[u8],
@@ -441,6 +454,7 @@ fn initial_slow_cursor(
     (usize::from(cursor.hash_pos) > limit_base + cursor.offset).then_some(cursor)
 }
 
+#[inline]
 fn next_slow_cursor(
     resources: MatchSearchResources<'_>,
     scan: &[u8],
@@ -485,7 +499,8 @@ fn next_slow_cursor(
     Some(next)
 }
 
-fn next_in_chain(
+#[inline]
+fn next_in_chain<const RING: usize>(
     cursor: SearchCursor,
     prev: &[Pos],
     wmask: usize,
@@ -497,7 +512,11 @@ fn next_in_chain(
         return None;
     }
 
-    let hash_pos = prev[usize::from(cursor.hash_pos) & wmask];
+    let hash_pos = if RING != 0 {
+        prev[..RING][usize::from(cursor.hash_pos) & (RING - 1)]
+    } else {
+        prev[usize::from(cursor.hash_pos) & wmask]
+    };
     (usize::from(hash_pos) > limit_base + cursor.offset)
         .then_some(SearchCursor { hash_pos, ..cursor })
 }
@@ -909,6 +928,66 @@ mod tests {
                         "width={width} best_len={best_len} mismatch={mismatch}"
                     );
                     candidate[mismatch] = b'a';
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_rolling_tables_match_dynamic_chain_search() {
+        let mut random = 0x3812_5b7d_8fed_1a03u64;
+        let mut next_random = || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        let mut window = vec![0u8; 2 * MAX_WINDOW_SIZE];
+        let mut prev = vec![0; MAX_WINDOW_SIZE];
+        let mut head = vec![0; super::super::HASH_SIZE];
+        // Include arbitrary bytes, repeated patterns, ring wrap, varying
+        // chain budget, ties, shifted offsets, and the full valid lookahead.
+        for pattern in [0, 3, 17, 255] {
+            for byte in &mut window {
+                *byte = next_random().to_le_bytes()[0] & pattern;
+            }
+            for value in prev.iter_mut().chain(&mut head) {
+                let bytes = next_random().to_le_bytes();
+                *value = u16::from_le_bytes([bytes[0], bytes[1]]);
+            }
+            let resources = MatchSearchResources {
+                initialized: &window,
+                prev: &prev,
+                head: &head,
+            };
+            for strstart in [
+                512,
+                MAX_WINDOW_SIZE - 1,
+                MAX_WINDOW_SIZE,
+                MAX_WINDOW_SIZE + 1,
+                2 * MAX_WINDOW_SIZE - STD_MAX_MATCH,
+            ] {
+                for prev_length in [2, 3, 7, 8, 17, 64, 257] {
+                    for max_chain_length in [1, 4, 32, 4096] {
+                        let params = MatchSearchParams {
+                            cur_match: u16::try_from(strstart - 1).unwrap_or_default(),
+                            strstart,
+                            lookahead: STD_MAX_MATCH,
+                            wmask: MAX_WINDOW_SIZE - 1,
+                            max_dist: MAX_WINDOW_SIZE - crate::deflate::MIN_LOOKAHEAD,
+                            prev_length,
+                            match_start: 0,
+                            max_chain_length,
+                            good_match: 32,
+                            nice_match: 258,
+                            level: 9,
+                            kind: MatchSearchKind::RollingOffset,
+                        };
+                        assert_eq!(
+                            execute_slow(resources, params),
+                            longest_match_help::<true, true, 0>(resources, params),
+                        );
+                    }
                 }
             }
         }
