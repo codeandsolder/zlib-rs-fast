@@ -30,7 +30,7 @@ concurrency:
 jobs:
   optional-codecs:
     name: GPU, parallel and near-optimal
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
       validation-tier: routine
       rustflags: ""
