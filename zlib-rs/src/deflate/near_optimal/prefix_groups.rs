@@ -91,13 +91,16 @@ fn grouped_compare(
 
 struct GroupOutput {
     entries: Vec<MatchCandidate>,
+    first_query: usize,
     starts: Vec<usize>,
     counts: Vec<u8>,
 }
 impl GroupOutput {
-    fn new(length: usize) -> Self {
+    fn new(query: &Range<usize>) -> Self {
+        let length = query.len();
         Self {
             entries: Vec::new(),
+            first_query: query.start,
             starts: vec![0; length + 1],
             counts: vec![0; length],
         }
@@ -112,7 +115,11 @@ impl GroupOutput {
         }
         let last = offsets.len() - 1;
         offsets[last] = entries.len();
-        MatchCandidates { offsets, entries }
+        MatchCandidates {
+            first_query: self.first_query,
+            offsets,
+            entries,
+        }
     }
 }
 
@@ -124,10 +131,14 @@ fn scan_small_group(
     group: &[u32],
     wide: u32,
     max_distance: usize,
+    query_range: &Range<usize>,
     out: &mut GroupOutput,
 ) {
     for (rank, &query) in group.iter().enumerate() {
         let position = suffix_index(query);
+        if !query_range.contains(&position) {
+            continue;
+        }
         let available = STD_MAX_MATCH.min(input.len() - position);
         let mut best = [MatchCandidate::NONE; D_CODES];
         let mut occupied = 0u32;
@@ -158,8 +169,8 @@ fn scan_small_group(
             side(rank - 1, rank, true);
         }
         side(rank + 1, group.len() - rank - 1, false);
-        out.starts[position] = out.entries.len();
-        out.counts[position] = candidate_count(occupied.count_ones() as usize);
+        out.starts[position - out.first_query] = out.entries.len();
+        out.counts[position - out.first_query] = candidate_count(occupied.count_ones() as usize);
         while occupied != 0 {
             let code = occupied.trailing_zeros() as usize;
             occupied &= occupied - 1;
@@ -176,6 +187,7 @@ fn scan_word_group(
     group: &[u32],
     ranges: &[(usize, usize); D_CODES],
     max_distance: usize,
+    query_range: &Range<usize>,
     out: &mut GroupOutput,
 ) {
     let mut packed = [Occurrence::default(); WORD_GROUP_SIZE];
@@ -190,9 +202,12 @@ fn scan_word_group(
     }
     for (i, &query) in positions.iter().enumerate() {
         let position = query.position();
+        if !query_range.contains(&position) {
+            continue;
+        }
         let rank = query.rank();
         let available = STD_MAX_MATCH.min(input.len() - position);
-        out.starts[position] = out.entries.len();
+        out.starts[position - out.first_query] = out.entries.len();
         let mut end = i;
         while end != 0 {
             let other = positions[end - 1].position();
@@ -229,7 +244,8 @@ fn scan_word_group(
             out.entries.push(best);
             end = begin;
         }
-        out.counts[position] = candidate_count(out.entries.len() - out.starts[position]);
+        out.counts[position - out.first_query] =
+            candidate_count(out.entries.len() - out.starts[position - out.first_query]);
     }
 }
 
@@ -384,6 +400,7 @@ impl GroupScratch {
         input: &[u8],
         group: &[u32],
         ranges: &[(usize, usize); D_CODES],
+        query_range: &Range<usize>,
         out: &mut GroupOutput,
     ) {
         self.positions.clear();
@@ -407,7 +424,16 @@ impl GroupScratch {
             .unwrap_or(0);
         let mut near_start = 0;
         let scratch = &mut self.tile;
-        for (tile_index, tile) in source.positions.chunks(FRONTIER_TILE_POSITIONS).enumerate() {
+        let query_start = source
+            .positions
+            .partition_point(|record| record.position() < query_range.start);
+        let query_end = source
+            .positions
+            .partition_point(|record| record.position() < query_range.end);
+        for (tile_index, tile) in source.positions[query_start..query_end]
+            .chunks(FRONTIER_TILE_POSITIONS)
+            .enumerate()
+        {
             let len = tile.len();
             scratch.counts[..len].fill(0);
             scratch.staged.clear();
@@ -415,7 +441,7 @@ impl GroupScratch {
                 *available =
                     compact_match_length(STD_MAX_MATCH.min(input.len() - record.position()));
             }
-            let start = tile_index * FRONTIER_TILE_POSITIONS;
+            let start = query_start + tile_index * FRONTIER_TILE_POSITIONS;
             scan_group_nearby(
                 &source,
                 start..start + len,
@@ -444,8 +470,9 @@ impl GroupScratch {
             scratch.scatter(len, &mut out.entries, &mut self.offsets);
             for (local, record) in tile.iter().enumerate() {
                 let position = record.position();
-                out.starts[position] = self.offsets[local];
-                out.counts[position] = candidate_count(usize::from(scratch.counts[local]));
+                out.starts[position - out.first_query] = self.offsets[local];
+                out.counts[position - out.first_query] =
+                    candidate_count(usize::from(scratch.counts[local]));
             }
         }
     }
@@ -524,10 +551,12 @@ pub(super) fn group_local_frontier(
     groups: &PrefixGroups,
     ranges: &[(usize, usize); D_CODES],
     max_distance: usize,
+    query_range: Range<usize>,
 ) -> MatchCandidates {
     if groups.intervals.is_empty() {
         return MatchCandidates {
-            offsets: vec![0; input.len() + 1],
+            first_query: query_range.start,
+            offsets: vec![0; query_range.len() + 1],
             entries: Vec::new(),
         };
     }
@@ -537,18 +566,25 @@ pub(super) fn group_local_frontier(
             wide |= 1 << code;
         }
     }
-    let mut output = GroupOutput::new(input.len());
+    let mut output = GroupOutput::new(&query_range);
     let mut scratch = GroupScratch::new();
     for interval in &groups.intervals {
         let group = &suffixes.sa[interval.clone()];
         match group.len() {
             n if n <= SMALL_GROUP_DIRECT => {
-                scan_small_group(input, group, wide, max_distance, &mut output);
+                scan_small_group(input, group, wide, max_distance, &query_range, &mut output);
             }
             n if n <= WORD_GROUP_SIZE => {
-                scan_word_group(input, group, ranges, max_distance, &mut output);
+                scan_word_group(
+                    input,
+                    group,
+                    ranges,
+                    max_distance,
+                    &query_range,
+                    &mut output,
+                );
             }
-            _ => scratch.scan_large(input, group, ranges, &mut output),
+            _ => scratch.scan_large(input, group, ranges, &query_range, &mut output),
         }
     }
     output.finish()

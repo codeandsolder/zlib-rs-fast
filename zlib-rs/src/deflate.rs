@@ -3820,8 +3820,7 @@ fn encode_near_optimal_with_state(
         match near_optimal::optimize_token_partition(state, current_block, &mut next.block)? {
             near_optimal::BoundaryOptimization::Merged(merged) => {
                 next.block = merged;
-                let _ =
-                    next.reparse_with_existing_candidates(state, input, optimization_passes, None)?;
+                let _ = next.reparse_with_existing_candidates(state, optimization_passes, None)?;
                 current = next.into_parts();
                 continue;
             }
@@ -3829,7 +3828,6 @@ fn encode_near_optimal_with_state(
                 *current_model = near_optimal::model_from_tokens(state, &current_block.tokens)?;
                 let _ = next.reparse_with_existing_candidates(
                     state,
-                    input,
                     optimization_passes,
                     Some(current_model),
                 )?;
