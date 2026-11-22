@@ -182,7 +182,7 @@ pub fn deflate_stored(stream: &mut Compressor, flush: DeflateFlush) -> BlockStat
         let _ = drain_pending_output(stream.state, stream.output);
 
         // Update debugging counts for the data about to be copied.
-        #[cfg(feature = "ZLIB_DEBUG")]
+        #[cfg(feature = "zlib-debug")]
         {
             stream.state.bit_writer.cmpr_bits_add(len << 3);
             stream.state.bit_writer.sent_bits_add(len << 3);

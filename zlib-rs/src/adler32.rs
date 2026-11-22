@@ -10,7 +10,7 @@ mod weighted;
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 const AVX2_MIN_INPUT: usize = 1024;
 
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub fn adler32(start_checksum: u32, data: &[u8]) -> u32 {
     // Use architecture-width portable SIMD for large updates and retain
     // the existing short-input kernel for incremental updates.
@@ -39,7 +39,7 @@ pub(crate) fn adler32_for_deflate(start_checksum: u32, data: &[u8]) -> u32 {
     simd::adler32(start_checksum, data)
 }
 
-#[must_use]
+#[must_use = "The checksum is the result of this computation."]
 pub fn adler32_combine(adler1: u32, adler2: u32, len2: u64) -> u32 {
     const BASE: u64 = self::BASE as u64;
 

@@ -258,7 +258,7 @@ impl<'a> InflateStream<'a> {
     /// If non-null, the stream pointer must be valid, initialized for inflate,
     /// and remain alive for the returned lifetime. There must be no concurrent
     /// exclusive access to the returned stream view.
-    #[must_use]
+    #[must_use = "The returned option indicates whether the stream has the requested state."]
     pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
         // SAFETY: the caller's validity and lifetime contract is passed
         // unchanged to the kind-checking regular-inflate constructor.
@@ -3158,7 +3158,7 @@ impl State<'_> {
     }
 }
 
-#[must_use]
+#[must_use = "The count describes the current decode table."]
 pub fn codes_used(stream: &InflateStream) -> usize {
     stream.state.next
 }
@@ -3379,7 +3379,7 @@ pub unsafe fn sync(stream: &mut InflateStream) -> ReturnCode {
   block. When decompressing, PPP checks that at the end of input packet,
   inflate is waiting for these length bytes.
 */
-#[must_use]
+#[must_use = "The boolean reports whether the decoder is at a synchronization point."]
 pub fn sync_point(stream: &InflateStream) -> bool {
     matches!(stream.state.mode, Mode::Stored) && stream.state.bit_buffer.bits_in_buffer() == 0
 }
@@ -3439,7 +3439,7 @@ pub fn validate(stream: &mut InflateStream, check: bool) -> ReturnCode {
     ReturnCode::Ok
 }
 
-#[must_use]
+#[must_use = "The returned mark describes the current inflate position."]
 pub fn mark(stream: &InflateStream) -> c_long {
     // inflateMark inspects only the initialized state machine. The caller may
     // legitimately detach or replace input/output buffers between inflate calls.
@@ -3556,7 +3556,7 @@ pub unsafe fn get_header(
 ///
 /// Raw caller-buffer handling belongs to the C ABI layer; the inflate core exposes only checked
 /// slices over the initialized circular window.
-#[must_use]
+#[must_use = "The returned bytes describe the current history."]
 pub fn dictionary<'stream>(stream: &'stream InflateStream<'_>) -> (&'stream [u8], &'stream [u8]) {
     stream.state.window.dictionary_segments()
 }

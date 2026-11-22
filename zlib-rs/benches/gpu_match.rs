@@ -82,22 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("batch byte count overflow")?;
     let matches = steady.iter().filter(|item| item.length >= 3).count();
     let matched_bytes: u64 = steady.iter().map(|item| u64::from(item.length)).sum();
+    let input_size = input.len();
+    let adapter = searcher.adapter_name();
+    let scalar_percent = percentage(scalar_len, total_input);
+    let compressed_percent = percentage(compressed_len, total_input);
     println!(
-        "validated batch {} x {} {:?} bytes at budget {} on {}: {} matches/input, {} total matched bytes/input; level {} scalar {} bytes ({}%) in {:?}; GPU-fed {} bytes ({}%) in {:?}",
-        batch,
-        input.len(),
-        corpus,
-        search_budget,
-        searcher.adapter_name(),
-        matches,
-        matched_bytes,
-        level,
-        scalar_len,
-        percentage(scalar_len, total_input),
-        scalar_elapsed,
-        compressed_len,
-        percentage(compressed_len, total_input),
-        compression_elapsed,
+        "validated batch {batch} x {input_size} {corpus:?} bytes at budget {search_budget} on {adapter}: {matches} matches/input, {matched_bytes} total matched bytes/input; level {level} scalar {scalar_len} bytes ({scalar_percent}%) in {scalar_elapsed:?}; GPU-fed {compressed_len} bytes ({compressed_percent}%) in {compression_elapsed:?}"
     );
     black_box((steady, scalar_len, compressed_len));
     Ok(())
@@ -307,8 +297,7 @@ fn make_input(corpus: Corpus, len: usize) -> Vec<u8> {
             let mut row = 0u64;
             while out.len() < len {
                 let line = format!(
-                    "{{\"row\":{},\"sensor\":{},\"value\":{},\"status\":\"{}\"}}\n",
-                    row,
+                    "{{\"row\":{row},\"sensor\":{},\"value\":{},\"status\":\"{}\"}}\n",
                     row % 37,
                     (row.wrapping_mul(2_654_435_761) >> 11) % 100_000,
                     if row.is_multiple_of(11) { "warn" } else { "ok" }

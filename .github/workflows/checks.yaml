@@ -4,7 +4,7 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: nightly-2026-08-01
+  RUST_TOOLCHAIN: nightly-2026-11-19
 
 on: # zizmor: ignore[cache-poisoning] not actually used for releases
   push:
@@ -35,13 +35,25 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
     with:
       validation-tier: routine
-      rust-toolchain: nightly-2026-08-01
+      rust-toolchain: nightly-2026-11-19
       rust-components: rustfmt
       rustflags: ""
       command: |
         cargo fmt --all --check
         cargo test --locked --workspace --lib --features gz
         cargo check --locked --workspace --all-targets --features gz
+
+  miri-focused:
+    name: Miri allocation and inflate history
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    with:
+      validation-tier: routine
+      rust-toolchain: nightly-2026-11-19
+      rust-components: miri
+      rustflags: ""
+      command: |
+        cargo miri test --locked -p zlib-rs --lib --features __internal-api allocate::tests
+        cargo miri test --locked -p zlib-rs --lib --features __internal-api inflate::window::test
 
   build:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
@@ -105,7 +117,6 @@ jobs:
           - target: "loongarch64-unknown-linux-gnu"
             os: ubuntu-26.04
             codecov: false
-            flags: "--features=lsx"
             packages: gcc-loongarch64-linux-gnu g++-loongarch64-linux-gnu qemu-user qemu-user-binfmt
 
           - target: "wasm32-wasip1"
@@ -770,7 +781,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Test avx512 crc32 implementation
-        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -j4 -p zlib-rs --target ${{ matrix.target }} --features=vpclmulqdq crc32::"
+        run: "cargo +${RUST_TOOLCHAIN} miri nextest run -j4 -p zlib-rs --target ${{ matrix.target }} crc32::"
         env:
           RUSTFLAGS: "-Ctarget-feature=+vpclmulqdq,+avx512f"
 

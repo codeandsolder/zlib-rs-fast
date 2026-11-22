@@ -1,373 +1,497 @@
-use core::arch::x86_64::{
-    __m128i, _mm_and_si128, _mm_clmulepi64_si128, _mm_extract_epi32, _mm_load_si128,
-    _mm_loadu_si128, _mm_or_si128, _mm_shuffle_epi8, _mm_slli_si128, _mm_srli_si128, _mm_xor_si128,
-};
+//! Polynomial folding over 128-bit CRC states, using native polynomial
+//! arithmetic and portable SIMD. Target features select the available
+//! hardware width; all loads, arithmetic and permutations are safe Rust.
 
-use crate::CRC32_INITIAL_VALUE;
+use core::simd::{simd_swizzle, Simd, ToBytes};
 
-#[derive(Debug)]
-#[repr(C, align(16))]
-struct Align16<T>(T);
+type Polynomial = Simd<u8, 16>;
+type Polynomial256 = Simd<u8, 32>;
+type Polynomial512 = Simd<u8, 64>;
 
-#[cfg(target_arch = "x86_64")]
-const fn reg(input: [u32; 4]) -> __m128i {
-    // SAFETY: any valid [u32; 4] represents a valid __m128i
-    unsafe { core::mem::transmute(input) }
+const ZERO: Polynomial = Polynomial::splat(0);
+// A reflected polynomial power has an extra low zero bit in the
+// carry-less multiplication representation.
+const fn reflected_power(bits: u64) -> u64 {
+    (super::combine::x2nmodp(bits, 0) as u64) << 1
 }
 
-/// # Safety
-///
-/// The methods of this struct should only be used on `x86_64` systems that support the `pclmulqdq`
-/// instruction, and SSE2 and SSE4.1 instruction sets.
-#[derive(Debug, Clone, Copy)]
-#[cfg(target_arch = "x86_64")]
-pub struct Accumulator {
-    pub(super) fold: [__m128i; 4],
+// Advance one 128-bit word by the given number of words.
+const fn folding_factors(words: u64) -> Polynomial {
+    polynomial(
+        reflected_power(128 * words - 32),
+        reflected_power(128 * words + 32),
+    )
 }
 
-#[cfg(target_arch = "x86_64")]
-impl Accumulator {
-    const XMM_FOLD4: __m128i = reg([
-        0xc6e4_1596u32,
-        0x0000_0001u32,
-        0x5444_2bd4u32,
-        0x0000_0001u32,
-    ]);
+const FOLD_1: Polynomial = folding_factors(1);
+const FOLD_4: Polynomial = folding_factors(4);
+const FOLD_8: Polynomial = folding_factors(8);
+const FOLD_16: Polynomial = folding_factors(16);
+const REDUCTION_FACTORS: Polynomial = polynomial(reflected_power(96), reflected_power(64));
+// Reflected Barrett reciprocal and the reflected generator polynomial.
+const BARRETT: Polynomial = polynomial(0x1_f701_1640, reflected_power(32));
+// Paired Zen 5 measurements favor XMM below 1 KiB and wide folding from 1 KiB.
+const WIDE_MIN_BYTES: usize = 1024;
 
-    pub const fn new() -> Self {
-        let xmm_crc0 = reg([0x9db4_2487, 0, 0, 0]);
-        let xmm_zero = reg([0, 0, 0, 0]);
+const fn polynomial(low: u64, high: u64) -> Polynomial {
+    let mut bytes = [0; 16];
+    let (low_bytes, high_bytes) = bytes.split_at_mut(8);
+    low_bytes.copy_from_slice(&low.to_le_bytes());
+    high_bytes.copy_from_slice(&high.to_le_bytes());
+    Polynomial::from_array(bytes)
+}
 
-        Self {
-            fold: [xmm_crc0, xmm_zero, xmm_zero, xmm_zero],
-        }
+const fn consecutive_indices<const N: usize>() -> [usize; N] {
+    let mut indices = [0; N];
+    let mut index = 0;
+    while index < N {
+        indices[index] = index;
+        index += 1;
     }
+    indices
+}
 
-    /// # Safety
-    ///
-    /// The caller must have verified PCLMULQDQ and SSE4.1 support on this CPU.
-    pub unsafe fn fold(&mut self, src: &[u8], start: u32) {
-        // SAFETY: the caller guarantees the required CPU instructions.
-        unsafe { self.fold_help(src, start) }
-    }
+#[inline]
+fn pair(first: Polynomial, second: Polynomial) -> Polynomial256 {
+    simd_swizzle!(first, second, consecutive_indices::<32>())
+}
 
-    /// # Safety
-    ///
-    /// The caller must have verified PCLMULQDQ and SSE4.1 support on this CPU.
-    #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn finish(self) -> u32 {
-        const CRC_MASK1: __m128i = reg([
-            0xFFFF_FFFFu32,
-            0xFFFF_FFFFu32,
-            0x0000_0000u32,
-            0x0000_0000u32,
-        ]);
+#[inline]
+fn quad(
+    first: Polynomial,
+    second: Polynomial,
+    third: Polynomial,
+    fourth: Polynomial,
+) -> Polynomial512 {
+    simd_swizzle!(
+        pair(first, second),
+        pair(third, fourth),
+        consecutive_indices::<64>()
+    )
+}
 
-        const CRC_MASK2: __m128i = reg([
-            0x0000_0000u32,
-            0xFFFF_FFFFu32,
-            0xFFFF_FFFFu32,
-            0xFFFF_FFFFu32,
-        ]);
+#[inline]
+fn multiply<const LEFT: usize, const RIGHT: usize>(
+    left: Polynomial,
+    right: Polynomial,
+) -> Polynomial {
+    let left = Simd::<u64, 2>::from_le_bytes(left).to_array();
+    let right = Simd::<u64, 2>::from_le_bytes(right).to_array();
+    Polynomial::from_array(
+        left[LEFT]
+            .widening_carryless_mul(right[RIGHT])
+            .to_le_bytes(),
+    )
+}
 
-        const RK1_RK2: __m128i = reg([
-            0xccaa_009e,
-            0x0000_0000, /* rk1 */
-            0x7519_97d0,
-            0x0000_0001, /* rk2 */
-        ]);
+// Express each half in legal u64 SIMD lanes. Widening directly to u128
+// lanes prevents LLVM from combining the independent products. Keeping
+// both halves separate allows the backend to select full-width CLMUL.
+#[inline]
+fn products<const N: usize>(
+    left: Simd<u64, N>,
+    right: Simd<u64, N>,
+) -> (Simd<u64, N>, Simd<u64, N>) {
+    let left = left.to_array();
+    let right = right.to_array();
+    let low = Simd::from_array(core::array::from_fn(|i| left[i].carryless_mul(right[i])));
+    let high = Simd::from_array(core::array::from_fn(|i| {
+        (left[i].widening_carryless_mul(right[i]) >> 64) as u64
+    }));
+    (low, high)
+}
 
-        const RK5_RK6: __m128i = reg([
-            0xccaa_009e,
-            0x0000_0000, /* rk5 */
-            0x63cd_6124,
-            0x0000_0001, /* rk6 */
-        ]);
+#[inline]
+fn fold128(value: Polynomial, factors: Polynomial) -> Polynomial {
+    let value = Simd::<u64, 2>::from_le_bytes(value);
+    let factors = simd_swizzle!(Simd::<u64, 2>::from_le_bytes(factors), [1, 0]);
+    let (low, high) = products(value, factors);
+    (simd_swizzle!(low, high, [0, 2]) ^ simd_swizzle!(low, high, [1, 3])).to_le_bytes()
+}
 
-        const RK7_RK8: __m128i = reg([
-            0xf701_1640,
-            0x0000_0001, /* rk7 */
-            0xdb71_0640,
-            0x0000_0001, /* rk8 */
-        ]);
+#[inline]
+fn fold256(value: Polynomial256, factors: Polynomial256) -> Polynomial256 {
+    let value = Simd::<u64, 4>::from_le_bytes(value);
+    let factors = simd_swizzle!(Simd::<u64, 4>::from_le_bytes(factors), [1, 0, 3, 2]);
+    let (lo, hi) = products(value, factors);
+    let (sl, sh) = products(
+        simd_swizzle!(value, [1, 0, 3, 2]),
+        simd_swizzle!(factors, [1, 0, 3, 2]),
+    );
+    (simd_swizzle!(lo, hi, [0, 4, 2, 6]) ^ simd_swizzle!(sl, sh, [0, 4, 2, 6])).to_le_bytes()
+}
 
-        let [mut xmm_crc0, mut xmm_crc1, mut xmm_crc2, mut xmm_crc3] = self.fold;
+#[inline]
+fn fold512(value: Polynomial512, factors: Polynomial512) -> Polynomial512 {
+    let value = Simd::<u64, 8>::from_le_bytes(value);
+    let factors = simd_swizzle!(
+        Simd::<u64, 8>::from_le_bytes(factors),
+        [1, 0, 3, 2, 5, 4, 7, 6]
+    );
+    let (lo, hi) = products(value, factors);
+    let (sl, sh) = products(
+        simd_swizzle!(value, [1, 0, 3, 2, 5, 4, 7, 6]),
+        simd_swizzle!(factors, [1, 0, 3, 2, 5, 4, 7, 6]),
+    );
+    (simd_swizzle!(lo, hi, [0, 8, 2, 10, 4, 12, 6, 14])
+        ^ simd_swizzle!(sl, sh, [0, 8, 2, 10, 4, 12, 6, 14]))
+    .to_le_bytes()
+}
 
-        /*
-         * k1
-         */
-        let mut crc_fold = RK1_RK2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Width {
+    Narrow,
+    NarrowAvx,
+    Wide256,
+    Wide512,
+}
 
-        let x_tmp0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x10);
-        xmm_crc0 = _mm_clmulepi64_si128(xmm_crc0, crc_fold, 0x01);
-        xmm_crc1 = _mm_xor_si128(xmm_crc1, x_tmp0);
-        xmm_crc1 = _mm_xor_si128(xmm_crc1, xmm_crc0);
-
-        let x_tmp1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x10);
-        xmm_crc1 = _mm_clmulepi64_si128(xmm_crc1, crc_fold, 0x01);
-        xmm_crc2 = _mm_xor_si128(xmm_crc2, x_tmp1);
-        xmm_crc2 = _mm_xor_si128(xmm_crc2, xmm_crc1);
-
-        let x_tmp2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x10);
-        xmm_crc2 = _mm_clmulepi64_si128(xmm_crc2, crc_fold, 0x01);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, x_tmp2);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-
-        /*
-         * k5
-         */
-        crc_fold = RK5_RK6;
-
-        xmm_crc0 = xmm_crc3;
-        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
-        xmm_crc0 = _mm_srli_si128(xmm_crc0, 8);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
-
-        xmm_crc0 = xmm_crc3;
-        xmm_crc3 = _mm_slli_si128(xmm_crc3, 4);
-        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
-        xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK2);
-
-        /*
-         * k7
-         */
-        xmm_crc1 = xmm_crc3;
-        xmm_crc2 = xmm_crc3;
-        crc_fold = RK7_RK8;
-
-        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-        xmm_crc3 = _mm_and_si128(xmm_crc3, CRC_MASK1);
-
-        xmm_crc2 = xmm_crc3;
-        xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, crc_fold, 0x10);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc2);
-        xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc1);
-
-        !_mm_extract_epi32(xmm_crc3, 2).cast_unsigned()
-    }
-
-    unsafe fn fold_step<const N: usize>(&mut self) {
-        debug_assert!(
-            (1..=4).contains(&N),
-            "fold_step accepts only one to four vectors"
-        );
-        self.fold = core::array::from_fn(|i| match self.fold.get(i + N) {
-            Some(v) => *v,
-            None => {
-                // SAFETY: fold_step is reached only under the PCLMULQDQ feature guard.
-                unsafe { Self::step(self.fold[(i + N) - 4]) }
+impl Width {
+    fn supported(self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            match self {
+                Self::Narrow => crate::cpu_features::is_enabled_pclmulqdq(),
+                Self::NarrowAvx => std::is_x86_feature_detected!("avx"),
+                Self::Wide256 => {
+                    std::is_x86_feature_detected!("vpclmulqdq")
+                        && std::is_x86_feature_detected!("avx2")
+                }
+                Self::Wide512 => {
+                    std::is_x86_feature_detected!("vpclmulqdq")
+                        && std::is_x86_feature_detected!("avx512f")
+                }
             }
-        });
-    }
-
-    #[expect(
-        clippy::inline_always,
-        reason = "the PCLMUL reduction kernel is fused into its hot-loop caller"
-    )]
-    #[inline(always)]
-    unsafe fn step(input: __m128i) -> __m128i {
-        // SAFETY: the caller ensures PCLMULQDQ is available before invoking this kernel.
-        unsafe {
-            _mm_xor_si128(
-                _mm_clmulepi64_si128(input, Self::XMM_FOLD4, 0x01),
-                _mm_clmulepi64_si128(input, Self::XMM_FOLD4, 0x10),
-            )
         }
-    }
-
-    unsafe fn partial_fold(&mut self, xmm_crc_part: __m128i, len: usize) {
-        const PSHUFB_SHF_TABLE: [__m128i; 15] = [
-            reg([0x8483_8281, 0x8887_8685, 0x8c8b_8a89, 0x008f_8e8d]), /* shl 15 (16 - 1)/shr1 */
-            reg([0x8584_8382, 0x8988_8786, 0x8d8c_8b8a, 0x0100_8f8e]), /* shl 14 (16 - 3)/shr2 */
-            reg([0x8685_8483, 0x8a89_8887, 0x8e8d_8c8b, 0x0201_008f]), /* shl 13 (16 - 4)/shr3 */
-            reg([0x8786_8584, 0x8b8a_8988, 0x8f8e_8d8c, 0x0302_0100]), /* shl 12 (16 - 4)/shr4 */
-            reg([0x8887_8685, 0x8c8b_8a89, 0x008f_8e8d, 0x0403_0201]), /* shl 11 (16 - 5)/shr5 */
-            reg([0x8988_8786, 0x8d8c_8b8a, 0x0100_8f8e, 0x0504_0302]), /* shl 10 (16 - 6)/shr6 */
-            reg([0x8a89_8887, 0x8e8d_8c8b, 0x0201_008f, 0x0605_0403]), /* shl  9 (16 - 7)/shr7 */
-            reg([0x8b8a_8988, 0x8f8e_8d8c, 0x0302_0100, 0x0706_0504]), /* shl  8 (16 - 8)/shr8 */
-            reg([0x8c8b_8a89, 0x008f_8e8d, 0x0403_0201, 0x0807_0605]), /* shl  7 (16 - 9)/shr9 */
-            reg([0x8d8c_8b8a, 0x0100_8f8e, 0x0504_0302, 0x0908_0706]), /* shl  6 (16 -10)/shr10*/
-            reg([0x8e8d_8c8b, 0x0201_008f, 0x0605_0403, 0x0a09_0807]), /* shl  5 (16 -11)/shr11*/
-            reg([0x8f8e_8d8c, 0x0302_0100, 0x0706_0504, 0x0b0a_0908]), /* shl  4 (16 -12)/shr12*/
-            reg([0x008f_8e8d, 0x0403_0201, 0x0807_0605, 0x0c0b_0a09]), /* shl  3 (16 -13)/shr13*/
-            reg([0x0100_8f8e, 0x0504_0302, 0x0908_0706, 0x0d0c_0b0a]), /* shl  2 (16 -14)/shr14*/
-            reg([0x0201_008f, 0x0605_0403, 0x0a09_0807, 0x0e0d_0c0b]), /* shl  1 (16 -15)/shr15*/
-        ];
-
-        debug_assert!(
-            (1..=15).contains(&len),
-            "partial fold must contain 1..=15 bytes"
-        );
-        // SAFETY: the CPU feature guard includes SSSE3/SSE4.1 and PCLMULQDQ;
-        // the shuffle mask index is valid because len is in 1..=15.
-        unsafe {
-            let shift_left_mask = PSHUFB_SHF_TABLE[len - 1];
-            let shift_right_mask = _mm_xor_si128(shift_left_mask, reg([0x8080_8080u32; 4]));
-
-            let xmm_a0 = Self::step(_mm_shuffle_epi8(self.fold[0], shift_left_mask));
-
-            self.fold[0] = _mm_shuffle_epi8(self.fold[0], shift_right_mask);
-            let xmm_tmp1 = _mm_shuffle_epi8(self.fold[1], shift_left_mask);
-            self.fold[0] = _mm_or_si128(self.fold[0], xmm_tmp1);
-
-            self.fold[1] = _mm_shuffle_epi8(self.fold[1], shift_right_mask);
-            let xmm_tmp2 = _mm_shuffle_epi8(self.fold[2], shift_left_mask);
-            self.fold[1] = _mm_or_si128(self.fold[1], xmm_tmp2);
-
-            self.fold[2] = _mm_shuffle_epi8(self.fold[2], shift_right_mask);
-            let xmm_tmp3 = _mm_shuffle_epi8(self.fold[3], shift_left_mask);
-            self.fold[2] = _mm_or_si128(self.fold[2], xmm_tmp3);
-
-            self.fold[3] = _mm_shuffle_epi8(self.fold[3], shift_right_mask);
-            let xmm_crc_part = _mm_shuffle_epi8(xmm_crc_part, shift_left_mask);
-            self.fold[3] = _mm_or_si128(self.fold[3], xmm_crc_part);
-
-            // zlib-ng uses casts and a floating-point xor instruction here. There is a theory that
-            // this breaks dependency chains on some CPUs and gives better throughput. Other sources
-            // claim that casting between integer and float has a cost and should be avoided. We can't
-            // measure the difference, and choose the shorter code.
-            self.fold[3] = _mm_xor_si128(self.fold[3], xmm_a0);
-        }
-    }
-
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "progress receives 16-byte-aligned input and uses an aligned SIMD load"
-    )]
-    unsafe fn progress<const N: usize>(&mut self, src: &mut &[u8], init_crc: &mut u32) {
-        let (chunks, _) = src.as_chunks::<16>();
-        debug_assert!(chunks.len() >= N);
-        debug_assert_eq!(src.as_ptr().align_offset(16), 0);
-        let mut input: [_; N] = core::array::from_fn(|i| {
-            // SAFETY: fold_help aligns src to 16 bytes before progress, and the
-            // caller supplies at least N whole vectors. Each chunk stays aligned.
-            unsafe { _mm_load_si128(chunks[i].as_ptr().cast::<__m128i>()) }
-        });
-
-        *src = &src[N * 16..];
-
-        if *init_crc != CRC32_INITIAL_VALUE {
-            let xmm_initial = reg([*init_crc, 0, 0, 0]);
-            // SAFETY: this kernel is reached only through the SSE2-capable x86_64 path.
-            input[0] = unsafe { _mm_xor_si128(input[0], xmm_initial) };
-            *init_crc = CRC32_INITIAL_VALUE;
-        }
-
-        // SAFETY: the caller already checked PCLMULQDQ and N is in 1..=4.
-        unsafe { self.fold_step::<N>() };
-
-        for (fold, value) in self.fold[(4 - N)..].iter_mut().zip(input) {
-            // SAFETY: the x86_64 path supports SSE2.
-            *fold = unsafe { _mm_xor_si128(*fold, value) };
-        }
-    }
-
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the SIMD load instructions validate alignment where required or explicitly support unaligned input"
-    )]
-    #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
-    unsafe fn fold_help(&mut self, mut src: &[u8], mut init_crc: u32) {
-        let mut xmm_crc_part = reg([0; 4]);
-        let mut partial_buf = Align16([0u8; 16]);
-
-        // Technically the CRC functions don't even call this for input < 64, but a bare minimum of 31
-        // bytes of input is needed for the aligning load that occurs. If there's an initial CRC, to
-        // carry it forward through the folded CRC there must be 16 - src % 16 + 16 bytes available,
-        // which by definition can be up to 15 bytes + one full vector load.
-        let first = init_crc != CRC32_INITIAL_VALUE;
-        assert!(src.len() >= 31 || !first);
-
-        // Due to how alignment and loads work out, the 31 minimum is too tight. We use a simpler
-        // algorithm for small input anyway, so be stricter here to prevent accidental future UB.
-        assert!(src.len() >= 64 || !first);
-
-        if src.len() < 16 {
-            if src.is_empty() {
-                return;
+        #[cfg(not(feature = "std"))]
+        {
+            match self {
+                Self::Narrow => cfg!(target_feature = "pclmulqdq"),
+                Self::NarrowAvx => cfg!(target_feature = "avx"),
+                Self::Wide256 => cfg!(all(target_feature = "vpclmulqdq", target_feature = "avx2")),
+                Self::Wide512 => cfg!(all(
+                    target_feature = "vpclmulqdq",
+                    target_feature = "avx512f"
+                )),
             }
+        }
+    }
 
-            partial_buf.0[..src.len()].copy_from_slice(src);
-            // SAFETY: Align16 guarantees a 16-byte-aligned stack buffer and all
-            // 16 bytes are initialized (with zero padding beyond src.len()).
-            xmm_crc_part = unsafe { _mm_load_si128(partial_buf.0.as_ptr().cast::<__m128i>()) };
+    fn detect() -> Self {
+        if Self::Wide512.supported() {
+            Self::Wide512
+        } else if Self::Wide256.supported() {
+            Self::Wide256
+        } else if Self::NarrowAvx.supported() {
+            Self::NarrowAvx
         } else {
-            // SAFETY: [u8; 16] can safely transmute into __m128i.
-            let (before, _, _) = unsafe { src.align_to::<__m128i>() };
+            Self::Narrow
+        }
+    }
+}
 
-            if !before.is_empty() {
-                // SAFETY: src has at least 16 initialized bytes here; loadu
-                // explicitly permits the unaligned prefix before align_to.
-                xmm_crc_part = unsafe { _mm_loadu_si128(src.as_ptr().cast::<__m128i>()) };
-                let is_initial = init_crc == CRC32_INITIAL_VALUE;
+/// Four successive 128-bit folding states. All backends share this persistent
+/// representation, allowing free changes of processing width at chunk boundaries.
+#[derive(Debug, Clone, Copy)]
+pub struct Accumulator {
+    fold: [Polynomial; 4],
+    width: Width,
+}
 
-                if !is_initial {
-                    let xmm_initial = reg([init_crc, 0, 0, 0]);
-                    xmm_crc_part = _mm_xor_si128(xmm_crc_part, xmm_initial);
-                    init_crc = CRC32_INITIAL_VALUE;
-                }
+impl Accumulator {
+    pub fn new() -> Self {
+        Self {
+            fold: [polynomial(0x9db4_2487, 0), ZERO, ZERO, ZERO],
+            width: Width::detect(),
+        }
+    }
 
-                if before.len() < 4 && !is_initial {
-                    let xmm_t0 = xmm_crc_part;
-                    // SAFETY: the non-default initial CRC requires at least
-                    // 64 input bytes, so reading 16 bytes at offset 16 is in-bounds.
-                    // loadu imposes no alignment precondition.
-                    xmm_crc_part =
-                        unsafe { _mm_loadu_si128(src.as_ptr().add(16).cast::<__m128i>()) };
+    /// Fold one input fragment. A non-default initial CRC is supplied only with
+    /// the first fragment of at least 64 bytes; the outer CRC API handles short
+    /// seeded fragments through its scalar backend.
+    #[target_feature(enable = "pclmulqdq")]
+    pub fn fold(&mut self, mut input: &[u8], start: u32) {
+        debug_assert!(start == 0 || input.len() >= 64);
+        if start != 0 {
+            let Some((first, remaining)) = input.split_first_chunk::<16>() else {
+                unreachable!("non-default CRC seed requires at least 64 input bytes");
+            };
+            self.fold_word(Polynomial::from_array(*first) ^ polynomial(u64::from(start), 0));
+            input = remaining;
+        }
 
-                    // SAFETY: this method's CPU feature guard covers PCLMULQDQ.
-                    unsafe { self.fold_step::<1>() };
-
-                    self.fold[3] = _mm_xor_si128(self.fold[3], xmm_t0);
-                    src = &src[16..];
-                }
-
-                // SAFETY: the unaligned prefix is in 1..=15, and the CPU
-                // feature guard covers the shuffle and carry-less multiply.
-                unsafe { self.partial_fold(xmm_crc_part, before.len()) };
-                src = &src[before.len()..];
+        let (blocks, remainder) = input.as_chunks::<64>();
+        match self.width {
+            Width::Wide512 if input.len() >= WIDE_MIN_BYTES => {
+                // SAFETY: width is chosen once by runtime (or compile-time)
+                // feature detection for VPCLMULQDQ and AVX-512F.
+                unsafe { self.blocks512(blocks) };
             }
-
-            #[cfg(feature = "vpclmulqdq")]
-            #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-            if src.len() >= 256 {
-                // SAFETY: the conditional compilation enforces VPCLMULQDQ
-                // and AVX-512F; the 256-byte minimum covers all vector loads.
-                unsafe { self.fold_16_vpclmulqdq(&mut src, &mut init_crc) };
+            Width::Wide256 if input.len() >= WIDE_MIN_BYTES => {
+                // SAFETY: width is chosen once by runtime (or compile-time)
+                // feature detection for VPCLMULQDQ and AVX2.
+                unsafe { self.blocks256(blocks) };
             }
-
-            while src.len() >= 64 {
-                // SAFETY: src was advanced to a 16-byte boundary and contains
-                // four complete vectors; PCLMULQDQ is enabled for this method.
-                unsafe { self.progress::<4>(&mut src, &mut init_crc) };
-            }
-
-            if src.len() >= 48 {
-                // SAFETY: src is aligned and contains at least three vectors.
-                unsafe { self.progress::<3>(&mut src, &mut init_crc) };
-            } else if src.len() >= 32 {
-                // SAFETY: src is aligned and contains at least two vectors.
-                unsafe { self.progress::<2>(&mut src, &mut init_crc) };
-            } else if src.len() >= 16 {
-                // SAFETY: src is aligned and contains at least one full vector.
-                unsafe { self.progress::<1>(&mut src, &mut init_crc) };
+            Width::Narrow => self.blocks128(blocks),
+            Width::NarrowAvx | Width::Wide256 | Width::Wide512 => {
+                // SAFETY: every selected width here supports AVX.
+                unsafe { self.blocks128_avx(blocks) };
             }
         }
 
-        if !src.is_empty() {
-            debug_assert!(src.len() < 16);
-            // SAFETY: src is a disjoint live input slice shorter than 16 bytes;
-            // xmm_crc_part is 16 writable initialized bytes, and the feature guard
-            // covers partial_fold. Its length precondition is 1..=15.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    (&raw mut xmm_crc_part).cast::<u8>(),
-                    src.len(),
-                );
-                self.partial_fold(xmm_crc_part, src.len());
+        let (words, tail) = remainder.as_chunks::<16>();
+        for word in words {
+            self.fold_word(Polynomial::from_array(*word));
+        }
+        if !tail.is_empty() {
+            self.partial(tail);
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq")]
+    fn fold_word(&mut self, word: Polynomial) {
+        let [a, b, c, d] = self.fold;
+        self.fold = [b, c, d, fold128(a, FOLD_4) ^ word];
+    }
+
+    /// Shift the entire four-word polynomial reservoir by a nonempty partial
+    /// word (1..15 bytes). Ordinary integer shifts express the cross-word
+    /// operation without ISA-specific byte permutations or speculative loads.
+    #[target_feature(enable = "pclmulqdq")]
+    fn partial(&mut self, tail: &[u8]) {
+        debug_assert!((1..16).contains(&tail.len()));
+        let mut padded = [0; 16];
+        padded[..tail.len()].copy_from_slice(tail);
+        let right_shift = tail.len() * 8;
+        let left_shift = 128 - right_shift;
+        let [a, b, c, d] = self.fold.map(|value| u128::from_le_bytes(value.to_array()));
+        let input = u128::from_le_bytes(padded);
+        self.fold = [
+            Polynomial::from_array(((a >> right_shift) | (b << left_shift)).to_le_bytes()),
+            Polynomial::from_array(((b >> right_shift) | (c << left_shift)).to_le_bytes()),
+            Polynomial::from_array(((c >> right_shift) | (d << left_shift)).to_le_bytes()),
+            Polynomial::from_array(((d >> right_shift) | (input << left_shift)).to_le_bytes())
+                ^ fold128(
+                    Polynomial::from_array((a << left_shift).to_le_bytes()),
+                    FOLD_4,
+                ),
+        ];
+    }
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq")]
+    fn blocks128(&mut self, blocks: &[[u8; 64]]) {
+        let [mut a, mut b, mut c, mut d] = self.fold;
+        for block in blocks {
+            a = fold128(a, FOLD_4) ^ Polynomial::from_slice(block);
+            b = fold128(b, FOLD_4) ^ Polynomial::from_slice(&block[16..]);
+            c = fold128(c, FOLD_4) ^ Polynomial::from_slice(&block[32..]);
+            d = fold128(d, FOLD_4) ^ Polynomial::from_slice(&block[48..]);
+        }
+        self.fold = [a, b, c, d];
+    }
+
+    // Reuse the narrow loop with nondestructive AVX encodings when available.
+    #[target_feature(enable = "pclmulqdq,avx")]
+    fn blocks128_avx(&mut self, blocks: &[[u8; 64]]) {
+        self.blocks128(blocks);
+    }
+
+    // Four independent 256-bit accumulators hide the multiplication latency.
+    #[target_feature(enable = "vpclmulqdq,avx2")]
+    fn blocks256(&mut self, blocks: &[[u8; 64]]) {
+        let [a, b, c, d] = self.fold;
+        let mut a = pair(a, b);
+        let mut b = pair(c, d);
+        let k4 = pair(FOLD_4, FOLD_4);
+        let k8 = pair(FOLD_8, FOLD_8);
+        let (groups, tail) = blocks.as_chunks::<2>();
+        if let Some(([first, second], remaining)) = groups.split_first() {
+            a = fold256(a, k4) ^ Polynomial256::from_slice(first);
+            b = fold256(b, k4) ^ Polynomial256::from_slice(&first[32..]);
+            let mut c = Polynomial256::from_slice(second);
+            let mut d = Polynomial256::from_slice(&second[32..]);
+            for [first, second] in remaining {
+                a = fold256(a, k8) ^ Polynomial256::from_slice(first);
+                b = fold256(b, k8) ^ Polynomial256::from_slice(&first[32..]);
+                c = fold256(c, k8) ^ Polynomial256::from_slice(second);
+                d = fold256(d, k8) ^ Polynomial256::from_slice(&second[32..]);
+            }
+            a = fold256(a, k4) ^ c;
+            b = fold256(b, k4) ^ d;
+        }
+        for block in tail {
+            a = fold256(a, k4) ^ Polynomial256::from_slice(block);
+            b = fold256(b, k4) ^ Polynomial256::from_slice(&block[32..]);
+        }
+        self.fold = [
+            a.extract::<0, 16>(),
+            a.extract::<16, 16>(),
+            b.extract::<0, 16>(),
+            b.extract::<16, 16>(),
+        ];
+    }
+
+    // Widen to sixteen independent 128-bit lanes for sustained throughput,
+    // then reduce to the common four-word persistent representation.
+    #[target_feature(enable = "vpclmulqdq,avx512f")]
+    fn blocks512(&mut self, blocks: &[[u8; 64]]) {
+        let [first, second, third, fourth] = self.fold;
+        let mut state = quad(first, second, third, fourth);
+        let factors4 = quad(FOLD_4, FOLD_4, FOLD_4, FOLD_4);
+        let factors16 = quad(FOLD_16, FOLD_16, FOLD_16, FOLD_16);
+        let (groups, tail) = blocks.as_chunks::<4>();
+        if let Some((first, remaining)) = groups.split_first() {
+            let [word0, word1, word2, word3] = first.map(Polynomial512::from_array);
+            let mut a = fold512(state, factors4) ^ word0;
+            let mut b = word1;
+            let mut c = word2;
+            let mut d = word3;
+            for block in remaining {
+                let [word0, word1, word2, word3] = block.map(Polynomial512::from_array);
+                a = fold512(a, factors16) ^ word0;
+                b = fold512(b, factors16) ^ word1;
+                c = fold512(c, factors16) ^ word2;
+                d = fold512(d, factors16) ^ word3;
+            }
+            b ^= fold512(a, factors4);
+            c ^= fold512(b, factors4);
+            d ^= fold512(c, factors4);
+            state = d;
+        }
+        for block in tail {
+            state = fold512(state, factors4) ^ Polynomial512::from_array(*block);
+        }
+        self.fold = [
+            state.extract::<0, 16>(),
+            state.extract::<16, 16>(),
+            state.extract::<32, 16>(),
+            state.extract::<48, 16>(),
+        ];
+    }
+
+    /// Reduce the four-word reservoir to the final reflected CRC-32 using
+    /// the same polynomial folds and Barrett reduction as the original kernel.
+    #[target_feature(enable = "pclmulqdq")]
+    pub fn finish(self) -> u32 {
+        let [a, b, c, d] = self.fold;
+        let b = b ^ fold128(a, FOLD_1);
+        let c = c ^ fold128(b, FOLD_1);
+        let d = d ^ fold128(c, FOLD_1);
+
+        let factors = REDUCTION_FACTORS;
+        let upper = simd_swizzle!(
+            d,
+            ZERO,
+            [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+        );
+        let reduced = multiply::<0, 0>(d, factors) ^ upper;
+        let shifted = simd_swizzle!(
+            reduced,
+            ZERO,
+            [16, 17, 18, 19, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
+        let reduced = (reduced ^ multiply::<0, 1>(shifted, factors))
+            & polynomial(0xffff_ffff_0000_0000, u64::MAX);
+
+        let barrett = BARRETT;
+        let quotient = (multiply::<0, 0>(reduced, barrett) ^ reduced) & polynomial(u64::MAX, 0);
+        let result = reduced ^ quotient ^ multiply::<0, 1>(quotient, barrett);
+        !Simd::<u32, 4>::from_le_bytes(result)[2]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LENGTHS: [usize; 28] = [
+        0, 1, 2, 7, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513,
+        1023, 1024, 1025, 1087, 1088, 4095, 4096,
+    ];
+
+    #[test]
+    fn supported_widths_match_reference_at_boundaries_and_offsets() {
+        if !Width::Narrow.supported() {
+            return;
+        }
+        let input: Vec<u8> = (0usize..8192)
+            .map(|index| index.to_le_bytes()[0].wrapping_mul(137) ^ (index >> 8).to_le_bytes()[0])
+            .collect();
+        for width in [
+            Width::Narrow,
+            Width::NarrowAvx,
+            Width::Wide256,
+            Width::Wide512,
+        ] {
+            if !width.supported() {
+                continue;
+            }
+            for offset in 0..32 {
+                for length in LENGTHS {
+                    for start in [0, 1, 0x1234_5678, u32::MAX] {
+                        if start != 0 && length < 64 {
+                            continue;
+                        }
+                        let bytes = &input[offset..offset + length];
+                        let mut reference = crc32fast::Hasher::new_with_initial(start);
+                        reference.update(bytes);
+                        let mut accumulator = Accumulator {
+                            width,
+                            ..Accumulator::new()
+                        };
+                        // SAFETY: the baseline and requested wide features were verified.
+                        let actual = unsafe {
+                            accumulator.fold(bytes, start);
+                            accumulator.finish()
+                        };
+                        assert_eq!(
+                            actual,
+                            reference.finalize(),
+                            "{width:?}, {offset}, {length}, {start}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supported_widths_preserve_fragmented_crc_state() {
+        if !Width::Narrow.supported() {
+            return;
+        }
+        let input: Vec<u8> = (0usize..131_071)
+            .map(|index| index.to_le_bytes()[0].wrapping_mul(173) ^ (index >> 8).to_le_bytes()[0])
+            .collect();
+        let start = 0x1234_5678;
+        let mut reference = crc32fast::Hasher::new_with_initial(start);
+        reference.update(&input);
+        let expected = reference.finalize();
+        for width in [
+            Width::Narrow,
+            Width::NarrowAvx,
+            Width::Wide256,
+            Width::Wide512,
+        ] {
+            if !width.supported() {
+                continue;
+            }
+            for chunk_size in [1, 7, 15, 16, 17, 63, 64, 65, 255, 256, 511, 1024, 4096] {
+                let mut accumulator = Accumulator {
+                    width,
+                    ..Accumulator::new()
+                };
+                // SAFETY: the width and narrow CPU feature were checked above.
+                let actual = unsafe {
+                    accumulator.fold(&input[..64], start);
+                    for chunk in input[64..].chunks(chunk_size) {
+                        accumulator.fold(chunk, 0);
+                    }
+                    accumulator.finish()
+                };
+                assert_eq!(actual, expected, "{width:?}, chunk={chunk_size}");
             }
         }
     }

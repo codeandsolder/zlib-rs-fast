@@ -16,6 +16,8 @@ on:
     paths: *codec_paths
   schedule:
     - cron: '30 4 * * *'
+  merge_group:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -31,9 +33,7 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
     with:
       validation-tier: routine
-      rust-toolchain: nightly-2026-08-01
-      rust-components: clippy
+      rust-toolchain: nightly-2026-11-19
       rustflags: ""
       command: |
-        cargo clippy --locked -p zlib-rs --all-targets --features gpu,parallel,near-optimal,__internal-api -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
         cargo test --locked --workspace --lib --features gz,gpu,parallel,near-optimal
