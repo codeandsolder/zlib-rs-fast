@@ -408,13 +408,7 @@ impl FrontierTileScratch {
         }
     }
 
-    fn prepare(
-        &mut self,
-        suffixes: Option<&SuffixRanks>,
-        input_len: usize,
-        tile_start: usize,
-        len: usize,
-    ) {
+    fn prepare(&mut self, suffixes: &SuffixRanks, input_len: usize, tile_start: usize, len: usize) {
         self.counts[..len].fill(0);
         self.staged.clear();
         for (local, (rank, available)) in self.ranks[..len]
