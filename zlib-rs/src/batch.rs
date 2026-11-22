@@ -187,6 +187,52 @@ impl BatchCodec {
         )
     }
 
+    /// Stateful workers own their allocation locally, including non-Send
+    /// state. Claim jobs dynamically from a short-lived shared iterator;
+    /// only the disjoint job/result references leave the critical section.
+    pub(crate) fn run_with_state<T: Send, R: Send, S>(
+        &self,
+        jobs: &mut [T],
+        initial: impl FnMut() -> R,
+        make: impl Fn() -> S + Sync,
+        run: impl Fn(&mut S, usize, &mut T) -> R + Sync,
+    ) -> Vec<R> {
+        let workers = self.workers().min(jobs.len());
+        if workers == 0 {
+            return Vec::new();
+        }
+        if workers == 1 {
+            return self.pool.install(|| {
+                let mut state = make();
+                jobs.iter_mut()
+                    .enumerate()
+                    .map(|(index, job)| run(&mut state, index, job))
+                    .collect()
+            });
+        }
+        let mut results: Vec<R> = core::iter::repeat_with(initial).take(jobs.len()).collect();
+        let queue = std::sync::Mutex::new(jobs.iter_mut().zip(&mut results).enumerate());
+        self.pool.scope(|scope| {
+            for _ in 0..workers {
+                let (queue, make, run) = (&queue, &make, &run);
+                scope.spawn(move |_| {
+                    let mut state = make();
+                    loop {
+                        let next = queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .next();
+                        let Some((index, (job, result))) = next else {
+                            break;
+                        };
+                        *result = run(&mut state, index, job);
+                    }
+                });
+            }
+        });
+        results
+    }
+
     pub(crate) fn run_items<T: Send, R: Send>(
         &self,
         jobs: &mut [T],
