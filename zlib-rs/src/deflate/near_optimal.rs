@@ -49,15 +49,43 @@ fn compact_match_distance(distance: usize) -> u16 {
 /// does not), so only the longest available match in that bucket can ever be useful to a parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchCandidate {
-    pub(crate) length: u16,
+    length_and_code: u16,
     pub(crate) distance: u16,
 }
 
 impl MatchCandidate {
     const NONE: Self = Self {
-        length: 0,
+        length_and_code: 0,
         distance: 0,
     };
+
+    const LENGTH_BITS: u32 = STD_MAX_MATCH.ilog2() + 1;
+    const LENGTH_MASK: u16 = (1 << Self::LENGTH_BITS) - 1;
+    // The nine length bits leave enough room for the five-bit distance
+    // alphabet. Preserve the full distance for exact traceback ties.
+    const CHECK_LAYOUT: () = assert!(Self::LENGTH_BITS + (D_CODES - 1).ilog2() < u16::BITS);
+
+    #[inline]
+    const fn length(self) -> u16 {
+        self.length_and_code & Self::LENGTH_MASK
+    }
+
+    #[inline]
+    fn code(self) -> usize {
+        usize::from(self.length_and_code >> Self::LENGTH_BITS)
+    }
+
+    #[inline]
+    fn matching(length: u16, distance: u16) -> Self {
+        let () = Self::CHECK_LAYOUT;
+        debug_assert!((STD_MIN_MATCH..=STD_MAX_MATCH).contains(&usize::from(length)));
+        debug_assert!((1..=1usize << crate::MAX_WBITS).contains(&usize::from(distance)));
+        Self {
+            length_and_code: length
+                | (u16::from(State::d_code(usize::from(distance) - 1)) << Self::LENGTH_BITS),
+            distance,
+        }
+    }
 
     /// Update the best match for one distance-code bucket. Both discovery
     /// strategies deliver byte positions as usize; they share the same compact
@@ -75,13 +103,13 @@ impl MatchCandidate {
             (1..=1usize << crate::MAX_WBITS).contains(&distance),
             "match exceeds DEFLATE distance limit"
         );
-        if length > usize::from(self.length)
-            || (length == usize::from(self.length) && distance < usize::from(self.distance))
+        if length > usize::from(self.length())
+            || (length == usize::from(self.length()) && distance < usize::from(self.distance))
         {
-            *self = Self {
-                length: compact_match_length(length),
-                distance: compact_match_distance(distance),
-            };
+            *self = Self::matching(
+                compact_match_length(length),
+                compact_match_distance(distance),
+            );
         }
     }
 }
@@ -507,7 +535,7 @@ fn scan_direct_buckets(
                 mask &= mask - 1;
                 let next_code = State::d_code(distance - 1);
                 if code != Some(next_code) {
-                    if best.length != 0 {
+                    if best.length() != 0 {
                         stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
                     }
                     best = MatchCandidate::NONE;
@@ -530,7 +558,7 @@ fn scan_direct_buckets(
                         .unwrap_or(0);
                 }
             }
-            if best.length != 0 {
+            if best.length() != 0 {
                 stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
             }
             continue;
@@ -540,7 +568,7 @@ fn scan_direct_buckets(
                 continue;
             }
             let best = direct_bucket_match(input, position, available, min_distance, max_distance);
-            if best.length != 0 {
+            if best.length() != 0 {
                 stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
             }
         }
@@ -596,7 +624,7 @@ fn scan_rank_buckets(
             if let Some(rank) = successor {
                 consider_rank(rank);
             }
-            if best.length != 0 {
+            if best.length() != 0 {
                 stage_candidate(local, best, &mut scratch.counts, &mut scratch.staged);
             }
         }
@@ -1702,10 +1730,7 @@ fn parse_range_with_keys<K: CostKey>(
     // one entry per possible byte offset in the 32 KiB window.
     let distance_costs: [u32; D_CODES] =
         core::array::from_fn(|code| costs.distance_symbol_cost(code));
-    // The per-position bitmap identifies live distance slots and already
-    // records every length where the cheapest capable distance can change.
-    // Reset only these five words, not the values, at each new position.
-    let mut distance_cost_at_max = [0u32; STD_MAX_MATCH + 1];
+    let price_order = DistancePriceOrder::new(&distance_costs);
     let mut absolute_base = 0i64;
     let mut cost_base = 0;
     for local_position in 0..block_len {
@@ -1746,46 +1771,12 @@ fn parse_range_with_keys<K: CostKey>(
         if alternatives.is_empty() {
             continue;
         }
-        let mut markers = [0u64; STD_MAX_MATCH / 64 + 1];
-        let mut longest_match = 0usize;
-        for candidate in alternatives {
-            let max_len = usize::from(candidate.length).min(available);
-            longest_match = longest_match.max(max_len);
-            let marker = 1u64 << (max_len % 64);
-            let word = &mut markers[max_len / 64];
-            let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
-            let cost = distance_costs[code];
-            let slot = &mut distance_cost_at_max[max_len];
-            if *word & marker == 0 || cost < *slot {
-                *slot = cost;
-                *word |= marker;
-            }
+        MatchRelaxation {
+            costs: &mut best_cost[cost_position..],
+            prices: &prices,
+            prefix_key,
         }
-
-        if longest_match < STD_MIN_MATCH {
-            continue;
-        }
-        if longest_match >= GROUPED_RELAX_MIN_LENGTH {
-            MatchRelaxation {
-                costs: &mut best_cost[cost_position..],
-                prices: &prices,
-                prefix_key,
-            }
-            .long_matches(markers, longest_match, &distance_cost_at_max);
-            continue;
-        }
-        let mut distance_cost = distance_cost_at_max[longest_match];
-        for length in (STD_MIN_MATCH..=longest_match).rev() {
-            if markers[0] & (1u64 << length) != 0 {
-                distance_cost = distance_cost.min(distance_cost_at_max[length]);
-            }
-            let token_cost =
-                prices.costs[length] + ((distance_cost.cast_signed()) << ParseScratch::ORIGIN_BITS);
-            relax(
-                &mut best_cost[cost_position + length],
-                prefix_key + K::from(token_cost),
-            );
-        }
+        .relax_candidates(alternatives, compact_match_length(available), &price_order);
     }
 
     let key: i64 = best_cost[block_len - cost_base].into();
@@ -1829,12 +1820,12 @@ fn reconstruct_tokens(
             let best = candidates
                 .for_position(position)
                 .iter()
-                .filter(|candidate| usize::from(candidate.length) >= length)
+                .filter(|candidate| usize::from(candidate.length()) >= length)
                 .min_by_key(|candidate| {
-                    let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
+                    let code = candidate.code();
                     let cost = distance_costs[code];
                     debug_assert!(cost <= u32::MAX >> LENGTH_BITS);
-                    (cost << LENGTH_BITS) | u32::from(max_match - candidate.length.min(available))
+                    (cost << LENGTH_BITS) | u32::from(max_match - candidate.length().min(available))
                 })
                 .unwrap_or_else(|| unreachable!("winning match must have a capable distance"));
             ParseToken::matching(length, best.distance)
@@ -1867,11 +1858,35 @@ impl LengthPrices {
     }
 }
 
-// Short matches are cheaper to enumerate directly. Longer matches contain
-// many equal-price endpoints, which can be relaxed in contiguous spans.
-const GROUPED_RELAX_MIN_LENGTH: usize = 32;
-// The direct short-match traversal tests occupancy in the first word.
-const _: () = assert!(GROUPED_RELAX_MIN_LENGTH <= u64::BITS as usize);
+/// Map the DEFLATE distance alphabet into ascending distinct price
+/// classes once per parser pass. A cost model need not be monotone in
+/// distance code, and several codes may have identical prices.
+struct DistancePriceOrder {
+    rank_by_code: [usize; D_CODES],
+    price_by_rank: [u32; D_CODES],
+}
+
+impl DistancePriceOrder {
+    fn new(distance_costs: &[u32; D_CODES]) -> Self {
+        let mut order: [usize; D_CODES] = core::array::from_fn(|code| code);
+        order.sort_unstable_by_key(|&code| distance_costs[code]);
+        let mut rank_by_code = [0usize; D_CODES];
+        let mut price_by_rank = [0u32; D_CODES];
+        let mut rank = 0;
+        for (index, code) in order.into_iter().enumerate() {
+            let price = distance_costs[code];
+            if index != 0 && price != price_by_rank[rank] {
+                rank += 1;
+            }
+            rank_by_code[code] = rank;
+            price_by_rank[rank] = price;
+        }
+        Self {
+            rank_by_code,
+            price_by_rank,
+        }
+    }
+}
 
 struct MatchRelaxation<'a, K> {
     costs: &'a mut [K],
@@ -1880,30 +1895,42 @@ struct MatchRelaxation<'a, K> {
 }
 
 impl<K: CostKey> MatchRelaxation<'_, K> {
-    fn long_matches(
+    /// For each distinct distance price, only its longest available
+    /// match matters. Visit prices cheapest first; an offer covering an
+    /// already-relaxed endpoint cannot improve it. This constructs the
+    /// exact cost envelope without scattering across 259 length slots.
+    /// Distance choice is still reconstructed from the full frontier,
+    /// retaining the original tie rules independently of price order.
+    #[inline]
+    fn relax_candidates(
         &mut self,
-        markers: [u64; STD_MAX_MATCH / 64 + 1],
-        longest_match: usize,
-        distance_cost_at_max: &[u32; STD_MAX_MATCH + 1],
+        alternatives: &[MatchCandidate],
+        available: u16,
+        order: &DistancePriceOrder,
     ) {
-        // Only lengths at which another distance becomes capable can
-        // change the chosen distance. A descending walk preserves the
-        // longer-maximum-first and strict improvement tie rules.
-        let mut best = distance_cost_at_max[longest_match];
-        let mut high = longest_match;
-        for (word, mut mask) in markers.into_iter().enumerate().rev() {
-            while mask != 0 {
-                let len = word * 64 + highest_bit(mask);
-                mask ^= 1 << (len % 64);
-                let candidate = distance_cost_at_max[len];
-                if candidate < best {
-                    self.span(len + 1..=high, best);
-                    best = candidate;
-                    high = len;
+        const _: () = assert!(D_CODES <= u32::BITS as usize);
+        let mut occupied = 0u32;
+        let mut maximum_by_rank = [0u16; D_CODES];
+        for candidate in alternatives {
+            let max_len = candidate.length().min(available);
+            let rank = order.rank_by_code[candidate.code()];
+            let slot = &mut maximum_by_rank[rank];
+            *slot = (*slot).max(max_len);
+            occupied |= 1 << rank;
+        }
+        let mut low = STD_MIN_MATCH;
+        while occupied != 0 {
+            let rank = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            let high = usize::from(maximum_by_rank[rank]);
+            if high >= low {
+                self.span(low..=high, order.price_by_rank[rank]);
+                if maximum_by_rank[rank] == available {
+                    break;
                 }
+                low = high + 1;
             }
         }
-        self.span(STD_MIN_MATCH..=high, best);
     }
 
     /// Each endpoint is unique for this starting position; traversal
@@ -2006,7 +2033,7 @@ mod tests {
                     }
                 }
 
-                if best.length != 0 {
+                if best.length() != 0 {
                     entries.push(best);
                 }
             }
@@ -2261,18 +2288,9 @@ mod tests {
     fn traceback_recovers_distance_with_clipped_ties() {
         let input = [b'a'; 40];
         let entries = vec![
-            MatchCandidate {
-                length: 4,
-                distance: 1,
-            },
-            MatchCandidate {
-                length: 8,
-                distance: 2,
-            },
-            MatchCandidate {
-                length: 12,
-                distance: 3,
-            },
+            MatchCandidate::matching(4, 1),
+            MatchCandidate::matching(8, 2),
+            MatchCandidate::matching(12, 3),
         ];
         let mut offsets = vec![0; input.len() + 1];
         offsets[21..].fill(entries.len());
@@ -2362,31 +2380,42 @@ mod tests {
         assert_eq!(best, MatchCandidate::NONE);
 
         best.consider(STD_MIN_MATCH, 2);
-        assert_eq!(
-            best,
-            MatchCandidate {
-                length: 3,
-                distance: 2
-            }
-        );
+        assert_eq!(best, MatchCandidate::matching(3, 2));
         best.consider(STD_MIN_MATCH, 32_768);
         assert_eq!(best.distance, 2, "equal-length matches prefer the nearest");
         best.consider(STD_MIN_MATCH, 1);
         assert_eq!(best.distance, 1);
         best.consider(STD_MAX_MATCH, 32_768);
-        assert_eq!(
-            best,
-            MatchCandidate {
-                length: 258,
-                distance: 32_768,
-            }
-        );
+        assert_eq!(best, MatchCandidate::matching(258, 32_768));
         best.consider(STD_MAX_MATCH - 1, 1);
         assert_eq!(
             best.distance, 32_768,
             "a shorter match must not replace a longer one"
         );
         assert_eq!(core::mem::size_of::<MatchCandidate>(), 4);
+    }
+
+    #[test]
+    fn packed_frontier_record_preserves_length_distance_and_class() {
+        let min_len = compact_match_length(STD_MIN_MATCH);
+        let max_len = compact_match_length(STD_MAX_MATCH);
+        for length in [min_len, max_len] {
+            for distance in 1..=compact_match_distance(1usize << crate::MAX_WBITS) {
+                let entry = MatchCandidate::matching(length, distance);
+                assert_eq!(entry.length(), length);
+                assert_eq!(entry.distance, distance);
+                assert_eq!(
+                    entry.code(),
+                    usize::from(State::d_code(usize::from(distance) - 1))
+                );
+            }
+        }
+        for length in min_len..=max_len {
+            let entry = MatchCandidate::matching(length, 32768);
+            assert_eq!(entry.length(), length);
+            assert_eq!(entry.distance, 32768);
+            assert_eq!(entry.code(), D_CODES - 1);
+        }
     }
 
     #[test]
@@ -2419,7 +2448,7 @@ mod tests {
         let table = build_match_candidates(&input, 32_768)?;
         assert!(table.for_position(32_768).iter().any(|candidate| {
             usize::from(candidate.distance) == 32_768
-                && usize::from(candidate.length) == STD_MAX_MATCH
+                && usize::from(candidate.length()) == STD_MAX_MATCH
         }));
         Ok(())
     }
@@ -2442,7 +2471,7 @@ mod tests {
         assert!(table
             .for_position(32_769)
             .iter()
-            .all(|candidate| usize::from(candidate.length) < STD_MAX_MATCH));
+            .all(|candidate| usize::from(candidate.length()) < STD_MAX_MATCH));
         Ok(())
     }
 
@@ -2462,15 +2491,15 @@ mod tests {
             }
             let distance = position - candidate;
             let code = State::d_code(distance - 1) as usize;
-            if length > usize::from(best[code].length) {
-                best[code] = MatchCandidate {
-                    length: compact_match_length(length),
-                    distance: compact_match_distance(distance),
-                };
+            if length > usize::from(best[code].length()) {
+                best[code] = MatchCandidate::matching(
+                    compact_match_length(length),
+                    compact_match_distance(distance),
+                );
             }
         }
         best.into_iter()
-            .filter(|candidate| candidate.length != 0)
+            .filter(|candidate| candidate.length() != 0)
             .collect()
     }
 
@@ -2480,7 +2509,7 @@ mod tests {
             .map(|candidate| {
                 (
                     State::d_code(usize::from(candidate.distance) - 1),
-                    candidate.length,
+                    candidate.length(),
                 )
             })
             .collect()
@@ -2549,12 +2578,12 @@ mod tests {
                 let selected = candidates
                     .for_position(position)
                     .iter()
-                    .filter(|candidate| usize::from(candidate.length) >= len)
+                    .filter(|candidate| usize::from(candidate.length()) >= len)
                     .min_by_key(|candidate| {
                         let code = usize::from(State::d_code(usize::from(candidate.distance) - 1));
                         (
                             costs.distance_symbol_cost(code),
-                            core::cmp::Reverse(usize::from(candidate.length).min(available)),
+                            core::cmp::Reverse(usize::from(candidate.length()).min(available)),
                         )
                     });
                 if let Some(candidate) = selected {
@@ -2639,10 +2668,10 @@ mod tests {
                         .min(STD_MAX_MATCH)
                         .min(input.len() - position);
                     if length >= STD_MIN_MATCH {
-                        entries.push(MatchCandidate {
-                            length: compact_match_length(length),
-                            distance: compact_match_distance(distance),
-                        });
+                        entries.push(MatchCandidate::matching(
+                            compact_match_length(length),
+                            compact_match_distance(distance),
+                        ));
                     }
                 }
             }
@@ -3554,7 +3583,7 @@ fn initial_statistical_costs(
         let best_length = candidates
             .for_position(position)
             .iter()
-            .map(|candidate| usize::from(candidate.length).min(available))
+            .map(|candidate| usize::from(candidate.length()).min(available))
             .max()
             .unwrap_or(0);
         if best_length >= min_match {
