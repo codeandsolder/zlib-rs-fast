@@ -10,7 +10,7 @@ use std::{
 
 use zlib_rs::{compress_bound, compress_slice, BatchJob, DeflateConfig, InflateConfig, ReturnCode};
 
-pub const USAGE: &str = "usage: --profile-file prepare INPUT LEVEL OUTPUT | encode INPUT LEVEL ITERATIONS | decode-slice STREAM EXPECTED ITERATIONS | decode-vector STREAM EXPECTED ITERATIONS";
+const USAGE: &str = "usage: profile_file prepare INPUT LEVEL OUTPUT | encode INPUT LEVEL ITERATIONS | decode-slice STREAM EXPECTED ITERATIONS | decode-vector STREAM EXPECTED ITERATIONS";
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const GUARD: u8 = 0xa5;
@@ -183,7 +183,7 @@ fn encode_profile(input: &[u8], level: i32, iterations: NonZeroUsize) -> Result<
     Ok(())
 }
 
-pub fn run(args: &[String]) -> Result<()> {
+fn run(args: &[String]) -> Result<()> {
     match Operation::parse(args)? {
         Operation::Prepare {
             input,
@@ -221,7 +221,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 }
 
-pub fn self_test() -> Result<()> {
+fn self_test() -> Result<()> {
     let args = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
     assert!(Operation::parse(&args(&["encode", "input", "10", "1"])).is_err());
     assert!(Operation::parse(&args(&["decode-vector", "stream", "input", "0"])).is_err());
@@ -255,4 +255,14 @@ pub fn self_test() -> Result<()> {
         encode_profile(input, 6, iters)?;
     }
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--self-test"] {
+        self_test()?;
+        println!("file profiler invariants passed");
+        return Ok(());
+    }
+    run(&args)
 }

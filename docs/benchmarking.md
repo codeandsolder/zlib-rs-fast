@@ -24,22 +24,24 @@ Routine correctness CI is independent of performance measurement.
 
 ## Isolated real-file profiles
 
-Build the single-stream executable without running it:
+Export the standalone profiler to a directory for this measurement run.
+This also works with ephemeral Cargo build directories:
 
 ```sh
-cargo bench --locked -p zlib-rs --bench single --no-run
+cargo build --locked --release -p zlib-rs --example profile_file \
+  -Z unstable-options --artifact-dir ./profile-artifacts
 ```
 
-Use the executable path printed by Cargo (referred to as `single` below).
+Use the exported executable `./profile-artifacts/profile_file`.
 The file profiler uses explicit positional arguments. Prepare an input
 stream once, outside the profiled process, then use the same compressed
 stream and reference bytes for every decoder comparison:
 
 ```sh
-single --profile-file prepare raw.bin 6 prepared.zlib
-perf stat -e cycles,instructions,branches,branch-misses -- single --profile-file decode-slice prepared.zlib raw.bin 100
-perf stat -e cycles,instructions,branches,branch-misses -- single --profile-file decode-vector prepared.zlib raw.bin 100
-perf stat -e cycles,instructions,branches,branch-misses -- single --profile-file encode raw.bin 9 100
+./profile-artifacts/profile_file prepare raw.bin 6 prepared.zlib
+perf stat -e cycles,instructions,branches,branch-misses -- ./profile-artifacts/profile_file decode-slice prepared.zlib raw.bin 100
+perf stat -e cycles,instructions,branches,branch-misses -- ./profile-artifacts/profile_file decode-vector prepared.zlib raw.bin 100
+perf stat -e cycles,instructions,branches,branch-misses -- ./profile-artifacts/profile_file encode raw.bin 9 100
 ```
 
 `prepare` creates a new file and refuses to overwrite an existing one.
@@ -52,5 +54,5 @@ the repeated codec calls; process-level perf counters additionally include
 startup, file reading and final validation, so use enough iterations to
 amortize that cost. Decode processes do not encode data. For encoding,
 the final round-trip check occurs outside the reported elapsed time.
-Run `single --self-test` to check the profiler's argument and output
-invariants alongside the synthetic benchmark self-test.
+Run `./profile-artifacts/profile_file --self-test` to check the profiler's argument and output invariants. Remove the explicitly exported directory
+after collecting measurements.

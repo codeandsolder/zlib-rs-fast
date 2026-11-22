@@ -67,3 +67,7 @@ required-features = ["gpu"]
 [[example]]
 name = "near_optimal_probe"
 required-features = ["__internal-api", "rust-allocator"]
+
+[[example]]
+name = "profile_file"
+required-features = ["std"]
