@@ -502,6 +502,7 @@ fn decode_whole<O: WritableBytes + ?Sized>(
     // SAFETY: dest/capacity describes the exclusively borrowed caller
     // destination or the live one-byte stack scratch.
     let mut writer = unsafe { InflateOutput::new_uninit(dest, capacity) };
+    writer.discards_tail = output_len != 0 && output.discards_tail();
     let status = state.dispatch(&mut reader, &mut writer, InflateFlush::NoFlush);
     let consumed = input.len() - reader.bytes_remaining();
     let written = writer.len();
@@ -1092,6 +1093,7 @@ const MAX_FAST_ITERATION_RAW_BYTES: usize = 2 * bitreader::MAX_REFILL_BYTES as u
 struct InflateOutput<'a> {
     writer: Writer<'a>,
     accounted_remaining: usize,
+    discards_tail: bool,
 }
 
 impl InflateOutput<'_> {
@@ -1101,6 +1103,7 @@ impl InflateOutput<'_> {
             // exclusive writable buffer contract as Writer::new_uninit.
             writer: unsafe { Writer::new_uninit(ptr, len) },
             accounted_remaining: len,
+            discards_tail: false,
         }
     }
 
@@ -1513,7 +1516,7 @@ impl State<'_> {
         let avail_out = output.remaining();
 
         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
-            inflate_fast_help_impl::<true, _>(self, reader, output);
+            inflate_fast_output(self, reader, output);
             match self.mode {
                 Mode::Len => {}
                 _ => return ControlFlow::Continue(()),
@@ -1628,7 +1631,7 @@ impl State<'_> {
                         // rechecks output space, so keep the complete fast-path reserve available.
                         if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
                             self.mode = mode;
-                            inflate_fast_help_impl::<true, _>(self, &mut bit_reader, output);
+                            inflate_fast_output(self, &mut bit_reader, output);
                             return LenDecodeOutcome::continue_with(self.mode, bit_reader);
                         }
 
@@ -2507,6 +2510,50 @@ impl FastDecodeOutput for InflateOutput<'_> {
             return Ok(());
         }
         copy_fast_match_from_history(self, state, dist, len)
+    }
+}
+
+/// Whole-buffer vector destinations publish only the logical prefix, so
+/// an in-capacity match store may also initialize discarded bytes. Keep
+/// that policy in a separate monomorphization of the fast decoder.
+struct DiscardedTailOutput<'a, 'b>(&'a mut InflateOutput<'b>);
+
+impl FastDecodeOutput for DiscardedTailOutput<'_, '_> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        self.0.writer.push(byte);
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.0.writer.remaining()
+    }
+
+    #[inline]
+    fn copy_back_reference(
+        &mut self,
+        state: &State<'_>,
+        dist: usize,
+        len: usize,
+    ) -> Result<(), &'static str> {
+        if dist <= self.0.len() {
+            self.0.writer.copy_match_discarding_tail::<16>(dist, len);
+            return Ok(());
+        }
+        copy_fast_match_from_history(self.0, state, dist, len)
+    }
+}
+
+#[inline]
+fn inflate_fast_output(
+    state: &mut State<'_>,
+    reader: &mut BitReader<'_>,
+    output: &mut InflateOutput<'_>,
+) {
+    if output.discards_tail {
+        inflate_fast_help_impl::<true, _>(state, reader, &mut DiscardedTailOutput(output));
+    } else {
+        inflate_fast_help_impl::<true, _>(state, reader, output);
     }
 }
 
