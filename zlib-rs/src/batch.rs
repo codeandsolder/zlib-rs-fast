@@ -440,7 +440,7 @@ mod tests {
             }; 2]
         );
         assert_eq!(slice, [0xa5; 7]);
-        assert!(vector.is_empty());
+        assert_eq!(vector, [] as [u8; 0]);
         Ok(())
     }
 
