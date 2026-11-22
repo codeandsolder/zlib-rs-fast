@@ -2,7 +2,7 @@
 
 use std::{
     error::Error,
-    fs,
+    fmt, fs,
     hint::black_box,
     num::NonZeroUsize,
     time::{Duration, Instant},
@@ -10,7 +10,7 @@ use std::{
 
 use zlib_rs::{compress_bound, compress_slice, BatchJob, DeflateConfig, InflateConfig, ReturnCode};
 
-const USAGE: &str = "usage: profile_file prepare INPUT LEVEL OUTPUT | encode INPUT LEVEL ITERATIONS | decode-slice STREAM EXPECTED ITERATIONS | decode-vector STREAM EXPECTED ITERATIONS";
+const USAGE: &str = "usage: profile_file prepare INPUT METHOD OUTPUT | encode INPUT METHOD ITERATIONS | decode-slice STREAM EXPECTED ITERATIONS | decode-vector STREAM EXPECTED ITERATIONS; METHOD is 0..=9 or near-optimal:PASSES (feature near-optimal)";
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const GUARD: u8 = 0xa5;
@@ -23,15 +23,62 @@ enum Destination {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Encoder {
+    Level(i32),
+    #[cfg(feature = "near-optimal")]
+    NearOptimal(NonZeroUsize),
+}
+
+impl Encoder {
+    fn parse(value: &str) -> Result<Self> {
+        if let Some(passes) = value.strip_prefix("near-optimal:") {
+            #[cfg(feature = "near-optimal")]
+            return Ok(Self::NearOptimal(passes.parse()?));
+            #[cfg(not(feature = "near-optimal"))]
+            return Err(format!("near-optimal:{passes} requires the near-optimal feature").into());
+        }
+        let level = value.parse()?;
+        if !(0..=9).contains(&level) {
+            return Err("compression level must be in 0..=9".into());
+        }
+        Ok(Self::Level(level))
+    }
+
+    fn encode(self, input: &[u8], output: &mut [u8]) -> Result<usize> {
+        let (written, code) = match self {
+            Self::Level(level) => compress_slice(output, input, DeflateConfig::new(level)),
+            #[cfg(feature = "near-optimal")]
+            Self::NearOptimal(passes) => {
+                zlib_rs::compress_slice_near_optimal(output, input, passes.get())
+            }
+        };
+        if code != ReturnCode::Ok {
+            return Err(format!("compression failed: {code:?}").into());
+        }
+        Ok(written.len())
+    }
+}
+
+impl fmt::Display for Encoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Level(level) => write!(f, "L{level}"),
+            #[cfg(feature = "near-optimal")]
+            Self::NearOptimal(passes) => write!(f, "near-optimal:{passes}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation<'a> {
     Prepare {
         input: &'a str,
-        level: i32,
+        encoder: Encoder,
         output: &'a str,
     },
     Encode {
         input: &'a str,
-        level: i32,
+        encoder: Encoder,
         iterations: NonZeroUsize,
     },
     Decode {
@@ -42,14 +89,6 @@ enum Operation<'a> {
     },
 }
 
-fn level(value: &str) -> Result<i32> {
-    let level = value.parse()?;
-    if !(0..=9).contains(&level) {
-        return Err("compression level must be in 0..=9".into());
-    }
-    Ok(level)
-}
-
 impl<'a> Operation<'a> {
     fn parse(args: &'a [String]) -> Result<Self> {
         let [mode, first, second, third] = args else {
@@ -58,12 +97,12 @@ impl<'a> Operation<'a> {
         match mode.as_str() {
             "prepare" => Ok(Self::Prepare {
                 input: first,
-                level: level(second)?,
+                encoder: Encoder::parse(second)?,
                 output: third,
             }),
             "encode" => Ok(Self::Encode {
                 input: first,
-                level: level(second)?,
+                encoder: Encoder::parse(second)?,
                 iterations: third.parse()?,
             }),
             "decode-slice" | "decode-vector" => Ok(Self::Decode {
@@ -79,14 +118,6 @@ impl<'a> Operation<'a> {
             _ => Err(USAGE.into()),
         }
     }
-}
-
-fn encoded(input: &[u8], output: &mut [u8], config: DeflateConfig) -> Result<usize> {
-    let (written, code) = compress_slice(output, input, config);
-    if code != ReturnCode::Ok {
-        return Err(format!("compression failed: {code:?}").into());
-    }
-    Ok(written.len())
 }
 
 fn verify_decode(job: &mut BatchJob<'_>, encoded_len: usize, expected_len: usize) -> Result<usize> {
@@ -164,13 +195,12 @@ fn decode_profile(
     Ok(())
 }
 
-fn encode_profile(input: &[u8], level: i32, iterations: NonZeroUsize) -> Result<()> {
+fn encode_profile(input: &[u8], encoder: Encoder, iterations: NonZeroUsize) -> Result<()> {
     let mut output = vec![0; compress_bound(input.len())];
-    let config = DeflateConfig::new(level);
     let start = Instant::now();
     let mut written = 0;
     for _ in 0..iterations.get() {
-        written = black_box(encoded(black_box(input), black_box(&mut output), config)?);
+        written = black_box(encoder.encode(black_box(input), black_box(&mut output))?);
     }
     let elapsed = start.elapsed();
     let mut decoded = vec![0; input.len()];
@@ -179,7 +209,7 @@ fn encode_profile(input: &[u8], level: i32, iterations: NonZeroUsize) -> Result<
     if decoded != input {
         return Err("encoded stream does not round-trip".into());
     }
-    println!("encode L{level}: {} bytes -> {written} compressed bytes, {iterations} iterations, {elapsed:?}", input.len());
+    println!("encode {encoder}: {} bytes -> {written} compressed bytes, {iterations} iterations, {elapsed:?}", input.len());
     Ok(())
 }
 
@@ -187,13 +217,13 @@ fn run(args: &[String]) -> Result<()> {
     match Operation::parse(args)? {
         Operation::Prepare {
             input,
-            level,
+            encoder,
             output,
         } => {
             use std::io::Write;
             let input = fs::read(input)?;
             let mut buffer = vec![0; compress_bound(input.len())];
-            let count = encoded(&input, &mut buffer, DeflateConfig::new(level))?;
+            let count = encoder.encode(&input, &mut buffer)?;
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -204,9 +234,9 @@ fn run(args: &[String]) -> Result<()> {
         }
         Operation::Encode {
             input,
-            level,
+            encoder,
             iterations,
-        } => encode_profile(&fs::read(input)?, level, iterations),
+        } => encode_profile(&fs::read(input)?, encoder, iterations),
         Operation::Decode {
             destination,
             stream,
@@ -232,13 +262,25 @@ fn self_test() -> Result<()> {
         Operation::parse(&args(&["encode", "input", "9", "2"]))?,
         Operation::Encode {
             input: "input",
-            level: 9,
+            encoder: Encoder::Level(9),
             iterations: iters
         }
     );
+    #[cfg(feature = "near-optimal")]
+    {
+        assert_eq!(
+            Encoder::parse("near-optimal:2")?,
+            Encoder::NearOptimal(iters)
+        );
+        assert!(Encoder::parse("near-optimal:0").is_err());
+        assert!(Encoder::parse("near-optimal:").is_err());
+        encode_profile(b"abcabcabcabcabc", Encoder::NearOptimal(iters), iters)?;
+    }
+    #[cfg(not(feature = "near-optimal"))]
+    assert!(Encoder::parse("near-optimal:2").is_err());
     for input in [&b""[..], &b"overlapping match overlapping match"[..]] {
         let mut stream = vec![0; compress_bound(input.len())];
-        let count = encoded(input, &mut stream, DeflateConfig::new(6))?;
+        let count = Encoder::Level(6).encode(input, &mut stream)?;
         for destination in [Destination::Slice, Destination::Vector] {
             decode_profile(&stream[..count], input, destination, iters)?;
             assert!(decode_profile(&stream[..count], b"wrong bytes", destination, iters).is_err());
@@ -252,7 +294,7 @@ fn self_test() -> Result<()> {
             trailing.push(0);
             assert!(decode_profile(&trailing, input, destination, iters).is_err());
         }
-        encode_profile(input, 6, iters)?;
+        encode_profile(input, Encoder::Level(6), iters)?;
     }
     Ok(())
 }

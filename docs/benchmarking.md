@@ -44,6 +44,19 @@ perf stat -e cycles,instructions,branches,branch-misses -- ./profile-artifacts/p
 perf stat -e cycles,instructions,branches,branch-misses -- ./profile-artifacts/profile_file encode raw.bin 9 100
 ```
 
+For near-optimal compression, build the same example with
+`--features near-optimal` and select a positive pass count explicitly:
+
+```sh
+cargo build --locked --release -p zlib-rs --example profile_file --features near-optimal \
+  -Z unstable-options --artifact-dir ./profile-artifacts
+./profile-artifacts/profile_file prepare raw.bin near-optimal:3 prepared-optimal.zlib
+perf stat -e cycles,instructions,branches,branch-misses -- ./profile-artifacts/profile_file encode raw.bin near-optimal:3 10
+```
+
+The near-optimal method does not run a stock level-9 encode in the profiled
+process. Decode either prepared stream with the same decoder command.
+
 `prepare` creates a new file and refuses to overwrite an existing one.
 The decoder modes allocate the bounded destination before their repeated
 calls, verify consumed input and produced output lengths, and check the
