@@ -215,19 +215,19 @@ fn decode_back_table(state: &mut State<'_>, input: &mut BackInput) -> Result<(),
     while state.have < state.nlen + state.ndist {
         let here = loop {
             let here = state.len_table_get(input.bits_usize(state.len_table.bits));
-            if here.bits <= input.bits_in_buffer() {
+            if here.bits() <= input.bits_in_buffer() {
                 break here;
             }
 
             input.pull_byte()?;
         };
 
-        let here_bits = here.bits;
+        let here_bits = here.bits();
 
-        match here.val {
+        match here.val() {
             0..=15 => {
                 input.drop_bits(here_bits);
-                state.lens[state.have] = here.val;
+                state.lens[state.have] = here.val();
                 state.have += 1;
             }
             symbol => {
@@ -293,39 +293,32 @@ fn decode_back_len(
     loop {
         here = len_table[input.bits_usize(state.len_table.bits)];
 
-        if here.bits <= input.bits_in_buffer() {
+        if here.bits() <= input.bits_in_buffer() {
             break;
         }
 
         input.pull_byte()?;
     }
 
-    if here.op != 0 && here.op & 0xf0 == 0 {
+    if here.op() != 0 && here.op() & 0xf0 == 0 {
         let last = here;
         loop {
-            let tmp = input.bits_u16(usize::from(last.bits + last.op));
-            here = len_table[usize::from(last.val + (tmp >> last.bits))];
-            if last.bits + here.bits <= input.bits_in_buffer() {
+            let tmp = input.bits_u16(usize::from(last.bits() + last.op()));
+            here = len_table[usize::from(last.val() + (tmp >> last.bits()))];
+            if last.bits() + here.bits() <= input.bits_in_buffer() {
                 break;
             }
 
             input.pull_byte()?;
         }
 
-        input.drop_bits(last.bits);
+        input.drop_bits(last.bits());
     }
 
-    input.drop_bits(here.bits);
-    state.length = usize::from(here.val);
+    input.drop_bits(here.bits());
+    state.length = usize::from(here.val());
 
-    if here.op == 0 {
-        // A decoded literal is one byte; an invalid table entry must not
-        // silently truncate its value before being exposed to the callback.
-        let Ok(literal) = u8::try_from(here.val) else {
-            state.mode = Mode::Bad;
-            state.bad("invalid literal/length code\0");
-            return Ok(());
-        };
+    if let Some(literal) = here.literal() {
         if (0x20..0x7f).contains(&literal) {
             traceln!("inflate:         literal '{}'", char::from(literal));
         } else {
@@ -337,7 +330,7 @@ fn decode_back_len(
         state.mode = Mode::Len;
         return Ok(());
     }
-    if here.op & 32 != 0 {
+    if here.op() & 32 != 0 {
         // end of block
 
         traceln!("inflate:         end of block");
@@ -345,13 +338,13 @@ fn decode_back_len(
         state.mode = Mode::Type;
         return Ok(());
     }
-    if here.op & 64 != 0 {
+    if here.op() & 64 != 0 {
         state.mode = Mode::Bad;
         state.bad("invalid literal/length code\0");
         return Ok(());
     }
     // length code
-    state.extra = here.op & MAX_BITS;
+    state.extra = here.op() & MAX_BITS;
 
     // get extra bits, if any
     if state.extra != 0 {
@@ -374,43 +367,43 @@ fn decode_back_match(
     let mut here;
     loop {
         here = state.dist_table_get(input.bits_usize(state.dist_table.bits));
-        if here.bits <= input.bits_in_buffer() {
+        if here.bits() <= input.bits_in_buffer() {
             break;
         }
 
         input.pull_byte()?;
     }
 
-    if here.op & 0xf0 == 0 {
+    if here.op() & 0xf0 == 0 {
         let last = here;
 
         loop {
             here = state.dist_table_get(
-                usize::from(last.val)
-                    + (input.bits_usize(usize::from(last.bits + last.op)) >> last.bits),
+                usize::from(last.val())
+                    + (input.bits_usize(usize::from(last.bits() + last.op())) >> last.bits()),
             );
 
-            if last.bits + here.bits <= input.bits_in_buffer() {
+            if last.bits() + here.bits() <= input.bits_in_buffer() {
                 break;
             }
 
             input.pull_byte()?;
         }
 
-        input.drop_bits(last.bits);
+        input.drop_bits(last.bits());
     }
 
-    input.drop_bits(here.bits);
+    input.drop_bits(here.bits());
 
-    if here.op & 64 != 0 {
+    if here.op() & 64 != 0 {
         state.mode = Mode::Bad;
         state.bad("invalid distance code\0");
         return Ok(());
     }
 
-    state.offset = usize::from(here.val);
+    state.offset = usize::from(here.val());
 
-    state.extra = here.op & MAX_BITS;
+    state.extra = here.op() & MAX_BITS;
 
     let extra = state.extra;
 

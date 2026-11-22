@@ -1329,32 +1329,32 @@ fn decode_huffman_code<const LITERAL_LENGTH: bool>(
 ) -> Result<DecodedHuffmanCode, ReturnCode> {
     let mut here = loop {
         let here = table[reader.bits_usize(table_bits)];
-        if here.bits <= reader.bits_in_buffer() {
+        if here.bits() <= reader.bits_in_buffer() {
             break here;
         }
         reader.pull_byte()?;
     };
 
-    let prefix_bits = if here.op & 0xf0 == 0 && (!LITERAL_LENGTH || here.op != 0) {
+    let prefix_bits = if here.op() & 0xf0 == 0 && (!LITERAL_LENGTH || here.op() != 0) {
         let last = here;
         here = loop {
-            let bits = reader.bits_u16(usize::from(last.bits + last.op));
-            let here = table[usize::from(last.val) + usize::from(bits >> last.bits)];
-            if last.bits + here.bits <= reader.bits_in_buffer() {
+            let bits = reader.bits_u16(usize::from(last.bits() + last.op()));
+            let here = table[usize::from(last.val()) + usize::from(bits >> last.bits())];
+            if last.bits() + here.bits() <= reader.bits_in_buffer() {
                 break here;
             }
             reader.pull_byte()?;
         };
-        reader.drop_bits(last.bits);
-        usize::from(last.bits)
+        reader.drop_bits(last.bits());
+        usize::from(last.bits())
     } else {
         0
     };
 
-    reader.drop_bits(here.bits);
+    reader.drop_bits(here.bits());
     Ok(DecodedHuffmanCode {
         entry: here,
-        bits: prefix_bits + usize::from(here.bits),
+        bits: prefix_bits + usize::from(here.bits()),
     })
 }
 
@@ -1366,13 +1366,13 @@ fn decode_distance_code(
 ) -> Result<DecodedDistance, DistanceDecodeError> {
     let decoded = decode_huffman_code::<false>(reader, table, table_bits)
         .map_err(DistanceDecodeError::Input)?;
-    if decoded.entry.op & 64 != 0 {
+    if decoded.entry.op() & 64 != 0 {
         return Err(DistanceDecodeError::InvalidCode);
     }
 
     Ok(DecodedDistance {
-        offset: usize::from(decoded.entry.val),
-        extra: decoded.entry.op & MAX_BITS,
+        offset: usize::from(decoded.entry.val()),
+        extra: decoded.entry.op() & MAX_BITS,
         back_bits: decoded.bits,
     })
 }
@@ -1477,19 +1477,19 @@ fn accept_length_code(
 ) -> Result<Mode, &'static str> {
     *back = decoded.bits;
     let here = decoded.entry;
-    *length = usize::from(here.val);
-    if here.op == 0 {
+    *length = usize::from(here.val());
+    if here.op() == 0 {
         return Ok(Mode::Lit);
     }
-    if here.op & 32 != 0 {
+    if here.op() & 32 != 0 {
         traceln!("inflate:         end of block");
         *back = usize::MAX;
         return Ok(Mode::Type);
     }
-    if here.op & 64 != 0 {
+    if here.op() & 64 != 0 {
         return Err("invalid literal/length code\0");
     }
-    *extra = here.op & MAX_BITS;
+    *extra = here.op() & MAX_BITS;
     Ok(Mode::LenExt)
 }
 
@@ -2140,18 +2140,18 @@ impl State<'_> {
             let here = loop {
                 let bits = bit_reader.bits_usize(self.len_table.bits);
                 let here = self.len_table_get(bits);
-                if here.bits <= bit_reader.bits_in_buffer() {
+                if here.bits() <= bit_reader.bits_in_buffer() {
                     break here;
                 }
 
                 pull_byte_for_mode(bit_reader, Mode::CodeLens)?;
             };
 
-            let here_bits = here.bits;
-            match here.val {
+            let here_bits = here.bits();
+            match here.val() {
                 0..=15 => {
                     bit_reader.drop_bits(here_bits);
-                    self.lens[self.have] = here.val;
+                    self.lens[self.have] = here.val();
                     self.have += 1;
                 }
                 symbol => {
@@ -2608,11 +2608,11 @@ fn decode_fast_distance<O: FastDecodeOutput>(
     }
 
     loop {
-        bit_reader.drop_bits(here.bits);
-        let op = here.op;
+        bit_reader.drop_bits(here.bits());
+        let op = here.op();
         if op & 16 != 0 {
             let op = op & MAX_BITS;
-            let dist = here.val + bit_reader.bits_u16(usize::from(op));
+            let dist = here.val() + bit_reader.bits_u16(usize::from(op));
             if INFLATE_STRICT && usize::from(dist) > state.dmax {
                 return Err("invalid distance too far back\0");
             }
@@ -2625,7 +2625,7 @@ fn decode_fast_distance<O: FastDecodeOutput>(
         }
         // A second-level distance code is followed without advancing the
         // bit reader twice: the next loop iteration drops the entry width.
-        here = dcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
+        here = dcode[usize::from(here.val() + bit_reader.bits_u16(usize::from(op)))];
     }
 }
 
@@ -2740,42 +2740,27 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
             }
         };
 
-        if here.op == 0 {
-            let Ok(literal) = u8::try_from(here.val) else {
-                bad = Some("invalid literal/length code\0");
-                state.mode = Mode::Bad;
-                break 'outer;
-            };
+        if let Some(literal) = here.literal() {
             output.push(literal);
-            bit_reader.drop_bits(here.bits);
+            bit_reader.drop_bits(here.bits());
             here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
 
-            if here.op == 0 {
-                let Ok(literal) = u8::try_from(here.val) else {
-                    bad = Some("invalid literal/length code\0");
-                    state.mode = Mode::Bad;
-                    break 'outer;
-                };
+            if let Some(literal) = here.literal() {
                 output.push(literal);
-                bit_reader.drop_bits(here.bits);
+                bit_reader.drop_bits(here.bits());
                 here = lcode[BitBuffer::lookup_index(bit_reader.hold(), lmask)];
             }
         }
 
         'dolen: loop {
-            bit_reader.drop_bits(here.bits);
-            let op = here.op;
+            bit_reader.drop_bits(here.bits());
+            let op = here.op();
 
-            if op == 0 {
-                let Ok(literal) = u8::try_from(here.val) else {
-                    bad = Some("invalid literal/length code\0");
-                    state.mode = Mode::Bad;
-                    break 'outer;
-                };
+            if let Some(literal) = here.literal() {
                 output.push(literal);
             } else if op & 16 != 0 {
                 let op = op & MAX_BITS;
-                let len = here.val + bit_reader.bits_u16(usize::from(op));
+                let len = here.val() + bit_reader.bits_u16(usize::from(op));
                 bit_reader.drop_bits(op);
 
                 if let Err(msg) =
@@ -2787,7 +2772,7 @@ fn inflate_fast_help_impl<const COUNT_BUFFERED_INPUT: bool, O: FastDecodeOutput>
                 }
             } else if (op & 64) == 0 {
                 // 2nd level length code
-                here = lcode[usize::from(here.val + bit_reader.bits_u16(usize::from(op)))];
+                here = lcode[usize::from(here.val() + bit_reader.bits_u16(usize::from(op)))];
                 continue 'dolen;
             } else if op & 32 != 0 {
                 // end of block
@@ -3555,12 +3540,12 @@ mod tests {
     }
 
     #[test]
-    fn fast_decoder_rejects_invalid_literal_in_each_decode_branch() {
+    fn fast_decoder_rejects_invalid_entries_in_each_decode_branch() {
         let mut output_storage = [core::mem::MaybeUninit::<u8>::uninit(); 260];
 
-        // First literal, second consecutive literal, and an indirect literal
-        // reached through a subtable all must reject out-of-byte-range values.
-        for (case, invalid_literal) in [(0, 256), (0, u16::MAX), (1, 256), (2, u16::MAX)] {
+        // Invalid literal/length symbols can be reached in the first root
+        // lookup, after a literal, or indirectly through a subtable.
+        for case in [0, 1, 2] {
             let mut state = State::new(InflateStateKind::Regular);
             state.len_table = Table {
                 codes: Codes::Len,
@@ -3570,28 +3555,20 @@ mod tests {
                 codes: Codes::Fixed,
                 bits: 5,
             };
-            let invalid = Code {
-                op: 0,
-                bits: 1,
-                val: invalid_literal,
-            };
+            let invalid = Code::new(64, 1, 0);
             let mut input = [0u8; 32];
             state.len_codes[..4].fill(invalid);
             match case {
                 0 => {}
                 1 => {
                     // First symbol is a literal 'A'; second is invalid.
-                    state.len_codes[0].val = u16::from(b'A');
+                    state.len_codes[0] = Code::new(0, 1, u16::from(b'A'));
                     input[0] = 0b10;
                 }
                 2 => {
                     // First lookup redirects to a subtable containing the
                     // invalid literal rather than a normal primary leaf.
-                    state.len_codes[0] = Code {
-                        op: 1,
-                        bits: 1,
-                        val: 2,
-                    };
+                    state.len_codes[0] = Code::new(1, 1, 2);
                 }
                 _ => unreachable!("the test defines only three lookup scenarios"),
             }
@@ -3613,22 +3590,10 @@ mod tests {
 
     #[test]
     fn slow_huffman_lookup_retains_prefix_on_partial_subtable_input() -> Result<(), ReturnCode> {
-        let invalid = Code {
-            op: 64,
-            bits: 1,
-            val: 0,
-        };
+        let invalid = Code::new(64, 1, 0);
         let mut table = [invalid; 4];
-        table[0] = Code {
-            op: 1,
-            bits: 1,
-            val: 2,
-        };
-        table[2] = Code {
-            op: 16,
-            bits: 8,
-            val: 1,
-        };
+        table[0] = Code::new(1, 1, 2);
+        table[2] = Code::new(16, 8, 1);
 
         let mut first = BitReader::from_buffer(BitBuffer::default(), &[0]);
         assert_eq!(
@@ -3641,22 +3606,18 @@ mod tests {
         let next_byte = [0u8];
         let mut resumed = BitReader::from_buffer(first.into_buffer(), &next_byte);
         let decoded = decode_huffman_code::<false>(&mut resumed, &table, 1)?;
-        assert_eq!(decoded.entry.val, 1);
+        assert_eq!(decoded.entry.val(), 1);
         assert_eq!(decoded.bits, 9);
         assert_eq!(resumed.bits_in_buffer(), 7);
         assert_eq!(resumed.bytes_remaining(), 0);
 
         // In a literal/length alphabet, op=0 is a literal rather than
         // a subtable pointer; it must consume only the root code bits.
-        let literals = [Code {
-            op: 0,
-            bits: 1,
-            val: 255,
-        }; 2];
+        let literals = [Code::new(0, 1, 255); 2];
         let literal_input = [0u8];
         let mut literal_reader = BitReader::from_buffer(BitBuffer::default(), &literal_input);
         let literal = decode_huffman_code::<true>(&mut literal_reader, &literals, 1)?;
-        assert_eq!(literal.entry.val, 255);
+        assert_eq!(literal.entry.val(), 255);
         assert_eq!(literal.bits, 1);
         assert_eq!(literal_reader.bits_in_buffer(), 7);
         Ok(())

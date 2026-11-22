@@ -78,11 +78,7 @@ pub fn inflate_table(
 
     if max == 0 {
         // no symbols to code at all
-        let code = Code {
-            op: 64,
-            bits: 1,
-            val: 0,
-        };
+        let code = Code::new(64, 1, 0);
 
         if table.len() < 2 {
             return InflateTable::EnoughIsNotEnough;
@@ -166,26 +162,20 @@ const fn table_space_sufficient(codetype: CodeType, used: usize, capacity: usize
 
 /// Translate one validated alphabet symbol into its DEFLATE lookup entry.
 /// The alphabet's base/extra tables are selected once by the caller.
-fn decode_symbol(symbol: u16, code_bits: u8, length_base: u16, base: &[u16], extra: &[u8]) -> Code {
+fn decode_symbol(
+    symbol: u16,
+    code_bits: u8,
+    length_base: u16,
+    base: &[u16],
+    extra: &[u8],
+) -> Option<Code> {
     if symbol >= length_base {
         let index = usize::from(symbol - length_base);
-        Code {
-            bits: code_bits,
-            op: extra[index],
-            val: base[index],
-        }
+        Code::try_new(extra[index], code_bits, base[index])
     } else if symbol + 1 < length_base {
-        Code {
-            bits: code_bits,
-            op: 0,
-            val: symbol,
-        }
+        Code::try_new(0, code_bits, symbol)
     } else {
-        Code {
-            bits: code_bits,
-            op: 0b0110_0000,
-            val: 0,
-        }
+        Some(Code::new(0b0110_0000, code_bits, 0))
     }
 }
 
@@ -235,7 +225,9 @@ fn emit_decode_lookup(
             return InflateTable::InvalidCode;
         };
         // Decode an already-validated symbol independently of the table topology.
-        let here = decode_symbol(work[sym], code_bits, match_, base, extra);
+        let Some(here) = decode_symbol(work[sym], code_bits, match_, base, extra) else {
+            return InflateTable::InvalidCode;
+        };
 
         // replicate for those indices with low len bits equal to huff
         let incr = 1 << (len - drop_);
@@ -304,7 +296,10 @@ fn emit_decode_lookup(
             else {
                 return InflateTable::EnoughIsNotEnough;
             };
-            table[low] = Code { op, bits, val };
+            let Some(entry) = Code::try_new(op, bits, val) else {
+                return InflateTable::InvalidCode;
+            };
+            table[low] = entry;
         }
     }
 
@@ -315,11 +310,7 @@ fn emit_decode_lookup(
         let Ok(bits) = u8::try_from(len - drop_) else {
             return InflateTable::InvalidCode;
         };
-        let here = Code {
-            op: 64,
-            bits,
-            val: 0,
-        };
+        let here = Code::new(64, bits, 0);
 
         table[next..][huff] = here;
     }
@@ -433,11 +424,12 @@ mod test {
         inflate_table(CodeType::Lens, &lens[..288], &mut next, bits, work);
 
         core::array::from_fn(|i| {
-            let mut code = next[i];
-
-            code.op = if i & 0b0111_1111 == 99 { 64 } else { code.op };
-
-            code
+            let code = next[i];
+            if i & 0b0111_1111 == 99 {
+                Code::new(64, code.bits(), code.val())
+            } else {
+                code
+            }
         })
     }
 

@@ -1,7 +1,7 @@
 use crate::Code;
 
 const fn code(op: u8, bits: u8, val: u16) -> Code {
-    Code { op, bits, val }
+    Code::new(op, bits, val)
 }
 
 pub const LENFIX: [Code; 512] = [

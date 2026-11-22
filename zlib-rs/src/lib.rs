@@ -37,10 +37,13 @@ mod abi_cursor;
 #[cfg(feature = "std")]
 mod batch;
 mod cpu_features;
+mod decode_entry;
 mod output_buffer;
 mod stable;
 mod state_ptr;
 mod weak_slice;
+
+pub(crate) use decode_entry::Code;
 
 pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};
 
@@ -225,16 +228,6 @@ impl TryFrom<i32> for InflateFlush {
             _ => Err(()),
         }
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Code {
-    /// operation, extra bits, table bits
-    pub op: u8,
-    /// bits in this part of the code
-    pub bits: u8,
-    /// offset in table or code value
-    pub val: u16,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
