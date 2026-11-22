@@ -432,6 +432,60 @@ pub(crate) fn uncompress2_into<O: WritableBytes + ?Sized>(
     let Some(window) = parse_inflate_window_bits(config.window_bits) else {
         return (0, 0, ReturnCode::StreamError);
     };
+    let mut state = State::new(InflateStateKind::Regular);
+    state.wrap = window.wrap;
+    state.wbits = window.wbits;
+    state.reset_decode();
+    decode_whole(&mut state, output, input)
+}
+
+/// Stack-local whole-buffer decoder. The state owns no caller buffers or
+/// history storage; repeated independent jobs reuse only table/scratch storage.
+#[cfg(feature = "std")]
+pub(crate) struct WholeDecoder {
+    window: InflateWindowSelection,
+    state: State<'static>,
+}
+
+#[cfg(feature = "std")]
+impl WholeDecoder {
+    pub(crate) fn new(config: InflateConfig) -> Option<Self> {
+        Some(Self {
+            window: parse_inflate_window_bits(config.window_bits)?,
+            state: State::new(InflateStateKind::Regular),
+        })
+    }
+
+    pub(crate) fn decode<O: WritableBytes + ?Sized>(
+        &mut self,
+        output: &mut O,
+        input: &[u8],
+    ) -> (usize, usize, ReturnCode) {
+        self.state.wrap = self.window.wrap;
+        self.state.wbits = self.window.wbits;
+        self.state.reset_decode();
+        self.state.error_message = None;
+        // The preceding stream may have ended in any decoder mode. Reset
+        // the scalar cursor state; each new block initializes its own
+        // reachable table entries and symbol scratch before reading them.
+        self.state.length = 0;
+        self.state.offset = 0;
+        self.state.extra = 0;
+        self.state.was = 0;
+        self.state.ncode = 0;
+        self.state.nlen = 0;
+        self.state.ndist = 0;
+        self.state.have = 0;
+        decode_whole(&mut self.state, output, input)
+    }
+}
+
+#[inline]
+fn decode_whole<O: WritableBytes + ?Sized>(
+    state: &mut State<'_>,
+    output: &mut O,
+    input: &[u8],
+) -> (usize, usize, ReturnCode) {
     let output_len = output.len();
     // An empty destination still needs one byte to distinguish exhaustion
     // from an empty DEFLATE stream, as in the streaming ABI.
@@ -444,10 +498,6 @@ pub(crate) fn uncompress2_into<O: WritableBytes + ?Sized>(
     // A whole-buffer decoder never returns a resumable state to its caller.
     // All previous output remains in this same writer, so no history copy,
     // ABI cursor, or separately allocated ring is needed.
-    let mut state = State::new(InflateStateKind::Regular);
-    state.wrap = window.wrap;
-    state.wbits = window.wbits;
-    state.reset_decode();
     let mut reader = BitReader::from_buffer(state.bit_buffer, input);
     // SAFETY: dest/capacity describes the exclusively borrowed caller
     // destination or the live one-byte stack scratch.
