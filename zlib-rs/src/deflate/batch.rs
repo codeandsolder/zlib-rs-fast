@@ -1265,30 +1265,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn independent_vector_job_matches_batch_result() -> Result<(), std::collections::TryReserveError>
-    {
-        let input = b"independent bounded vector compression/".repeat(512);
-        for level in [0, 1, 6, 9] {
-            let config = DeflateConfig::new(level);
-            for limit in [0, 1, 23, compress_bound(input.len())] {
-                let mut expected = vec![0x79; 3];
-                let mut actual = vec![0x79; 3];
-                let reference = compress_slices_batch(
-                    &mut [BatchJob::with_vec(&input, &mut expected, limit)?],
-                    config,
-                );
-                let result = BatchJob::with_vec(&input, &mut actual, limit)?.compress(config);
-                assert_eq!(reference, [result]);
-                assert_eq!(actual, expected);
-                assert_eq!(actual.len(), result.written);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn batch_vectors_reuse_capacity_and_commit_only_written_prefix(
+    fn check_vector_jobs(
+        mut compress: impl FnMut(&mut [BatchJob<'_>], DeflateConfig) -> Vec<BatchCompressResult>,
     ) -> Result<(), std::collections::TryReserveError> {
         let input = b"vector-backed-batch/".repeat(8000);
         for level in [0, 1, 6, 9] {
@@ -1298,7 +1276,7 @@ mod tests {
                 let mut vector = Vec::with_capacity(cap.max(16));
                 vector.extend_from_slice(b"previous output");
                 let original = vector.as_ptr();
-                let mut slice = vec![0u8; cap];
+                let mut slice = vec![0xa5u8; cap];
                 {
                     let mut jobs = [
                         BatchJob::with_vec(&input, &mut vector, cap)?,
@@ -1309,15 +1287,28 @@ mod tests {
                         code,
                     }; 2];
                     for _ in 0..2 {
-                        assert_eq!(compress_slices_batch(&mut jobs, config), expected);
+                        assert_eq!(compress(&mut jobs, config), expected);
                     }
                 }
                 assert_eq!(vector.as_ptr(), original);
                 assert_eq!(vector, reference);
                 assert_eq!(&slice[..reference.len()], reference);
+                assert!(slice[reference.len()..].iter().all(|&b| b == 0xa5));
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn batch_vectors_reuse_capacity_and_commit_only_written_prefix(
+    ) -> Result<(), std::collections::TryReserveError> {
+        check_vector_jobs(compress_slices_batch)
+    }
+
+    #[test]
+    fn independent_vector_jobs_reuse_capacity_and_commit_only_written_prefix(
+    ) -> Result<(), std::collections::TryReserveError> {
+        check_vector_jobs(|jobs, config| jobs.iter_mut().map(|job| job.compress(config)).collect())
     }
 
     #[test]

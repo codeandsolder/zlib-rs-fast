@@ -37,22 +37,28 @@ operation replaces the vector with exactly the initialized output prefix.
 Use a single job directly when no batch scheduling is needed:
 
 ```rust
+# #[cfg(feature = "std")]
+# fn main() -> Result<(), std::collections::TryReserveError> {
 use zlib_rs::{BatchJob, DeflateConfig, InflateConfig, ReturnCode, compress_bound};
 
 let input = b"Hello World";
 let mut encoded = Vec::new();
 let result = BatchJob::with_vec(input, &mut encoded, compress_bound(input.len()))
-    .expect("reserve compressed output")
+    ?
     .compress(DeflateConfig::default());
 assert_eq!(result.code, ReturnCode::Ok);
 
 let mut decoded = Vec::new();
 let result = BatchJob::with_vec(&encoded, &mut decoded, input.len())
-    .expect("reserve decoded output")
+    ?
     .decompress(InflateConfig::default());
 assert_eq!(result.code, ReturnCode::Ok);
 assert_eq!(result.read, encoded.len());
 assert_eq!(decoded, input);
+# Ok(())
+# }
+# #[cfg(not(feature = "std"))]
+# fn main() {}
 ```
 
 For multiple independent streams, pass the same jobs to
