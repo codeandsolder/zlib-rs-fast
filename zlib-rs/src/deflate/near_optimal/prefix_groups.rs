@@ -43,13 +43,13 @@ impl Occurrence {
     }
 
     #[inline]
-    fn position(self) -> usize {
+    const fn position(self) -> usize {
         let [_, _, _, _, a, b, c, d] = self.0.to_le_bytes();
         suffix_index(u32::from_le_bytes([a, b, c, d]))
     }
 
     #[inline]
-    fn rank(self) -> usize {
+    const fn rank(self) -> usize {
         let [a, b, c, d, ..] = self.0.to_le_bytes();
         suffix_index(u32::from_le_bytes([a, b, c, d]))
     }
@@ -207,8 +207,8 @@ fn scan_word_group(
             let mut best = MatchCandidate::NONE;
             if maximum - minimum + 1 > DIRECT_SCAN_MAX {
                 let mask = prefix[end] ^ prefix[begin];
-                let (left, right) = word_neighbors(mask, rank);
-                for neighbor in [left, right].into_iter().flatten() {
+                let neighbors: [_; 2] = word_neighbors(mask, rank).into();
+                for neighbor in neighbors.into_iter().flatten() {
                     grouped_compare(
                         input,
                         position,
@@ -280,8 +280,8 @@ impl ClassWindow {
                 set.insert(positions[self.add].rank());
                 self.add += 1;
             }
-            let (left, right) = set.neighbors(query.rank());
-            for rank in [left, right].into_iter().flatten() {
+            let neighbors: [_; 2] = set.neighbors(query.rank()).into();
+            for rank in neighbors.into_iter().flatten() {
                 grouped_compare(
                     source.input,
                     position,
@@ -503,10 +503,10 @@ pub(super) fn try_group_local_frontier(
         let group = &suffixes.sa[interval];
         match group.len() {
             n if n <= SMALL_GROUP_DIRECT => {
-                scan_small_group(input, group, wide, max_distance, &mut output)
+                scan_small_group(input, group, wide, max_distance, &mut output);
             }
             n if n <= WORD_GROUP_SIZE => {
-                scan_word_group(input, group, ranges, max_distance, &mut output)
+                scan_word_group(input, group, ranges, max_distance, &mut output);
             }
             _ => scratch.scan_large(input, group, ranges, &mut output),
         }
