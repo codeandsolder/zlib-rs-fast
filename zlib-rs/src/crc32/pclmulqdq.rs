@@ -1,24 +1,35 @@
-//! Polynomial folding over 128-bit CRC states. Only carry-less multiplication
-//! needs an ISA-specific operation; byte loads, permutations and XOR use
-//! portable SIMD. LLVM 23 lowers the native widening_carryless_mul API to
-//! individual XMM products with scalar register transfers, even for independent
-//! products, so it cannot yet replace this small multiplication boundary.
+//! Polynomial folding over 128-bit CRC states, using native polynomial
+//! arithmetic and portable SIMD. Target features select the available
+//! hardware width; all loads, arithmetic and permutations are safe Rust.
 
-use core::{
-    arch::x86_64::{_mm256_clmulepi64_epi128, _mm512_clmulepi64_epi128, _mm_clmulepi64_si128},
-    simd::{simd_swizzle, Simd, ToBytes},
-};
+use core::simd::{simd_swizzle, Simd, ToBytes};
 
 type Polynomial = Simd<u8, 16>;
 type Polynomial256 = Simd<u8, 32>;
 type Polynomial512 = Simd<u8, 64>;
 
 const ZERO: Polynomial = Polynomial::splat(0);
-// Folding factors for two, four and sixteen consecutive 128-bit chunks,
-// respectively, in the reflected IEEE CRC-32 polynomial representation.
-const FOLD_2: Polynomial = polynomial(0xccaa_009e, 0x1_7519_97d0);
-const FOLD_4: Polynomial = polynomial(0x1_c6e4_1596, 0x1_5444_2bd4);
-const FOLD_16: Polynomial = polynomial(0x1_322d_1430, 0x1_1542_778a);
+// A reflected polynomial power has an extra low zero bit in the
+// carry-less multiplication representation.
+const fn reflected_power(bits: u64) -> u64 {
+    (super::combine::x2nmodp(bits, 0) as u64) << 1
+}
+
+// Advance one 128-bit word by the given number of words.
+const fn folding_factors(words: u64) -> Polynomial {
+    polynomial(
+        reflected_power(128 * words - 32),
+        reflected_power(128 * words + 32),
+    )
+}
+
+const FOLD_1: Polynomial = folding_factors(1);
+const FOLD_4: Polynomial = folding_factors(4);
+const FOLD_8: Polynomial = folding_factors(8);
+const FOLD_16: Polynomial = folding_factors(16);
+const REDUCTION_FACTORS: Polynomial = polynomial(reflected_power(96), reflected_power(64));
+// Reflected Barrett reciprocal and the reflected generator polynomial.
+const BARRETT: Polynomial = polynomial(0x1_f701_1640, reflected_power(32));
 // Paired Zen 5 measurements favor XMM below 1 KiB and wide folding from 1 KiB.
 const WIDE_MIN_BYTES: usize = 1024;
 
@@ -60,40 +71,77 @@ fn quad(
 }
 
 #[inline]
-#[target_feature(enable = "pclmulqdq")]
-fn multiply<const SELECT: i32>(left: Polynomial, right: Polynomial) -> Polynomial {
-    _mm_clmulepi64_si128::<SELECT>(left.into(), right.into()).into()
+fn multiply<const LEFT: usize, const RIGHT: usize>(
+    left: Polynomial,
+    right: Polynomial,
+) -> Polynomial {
+    let left = Simd::<u64, 2>::from_le_bytes(left).to_array();
+    let right = Simd::<u64, 2>::from_le_bytes(right).to_array();
+    Polynomial::from_array(
+        left[LEFT]
+            .widening_carryless_mul(right[RIGHT])
+            .to_le_bytes(),
+    )
+}
+
+// Express each half in legal u64 SIMD lanes. Widening directly to u128
+// lanes prevents LLVM from combining the independent products. Keeping
+// both halves separate allows the backend to select full-width CLMUL.
+#[inline]
+fn products<const N: usize>(
+    left: Simd<u64, N>,
+    right: Simd<u64, N>,
+) -> (Simd<u64, N>, Simd<u64, N>) {
+    let left = left.to_array();
+    let right = right.to_array();
+    let low = Simd::from_array(core::array::from_fn(|i| left[i].carryless_mul(right[i])));
+    let high = Simd::from_array(core::array::from_fn(|i| {
+        (left[i].widening_carryless_mul(right[i]) >> 64) as u64
+    }));
+    (low, high)
 }
 
 #[inline]
-#[target_feature(enable = "pclmulqdq")]
 fn fold128(value: Polynomial, factors: Polynomial) -> Polynomial {
-    multiply::<0x01>(value, factors) ^ multiply::<0x10>(value, factors)
+    let value = Simd::<u64, 2>::from_le_bytes(value);
+    let factors = simd_swizzle!(Simd::<u64, 2>::from_le_bytes(factors), [1, 0]);
+    let (low, high) = products(value, factors);
+    (simd_swizzle!(low, high, [0, 2]) ^ simd_swizzle!(low, high, [1, 3])).to_le_bytes()
 }
 
 #[inline]
-#[target_feature(enable = "vpclmulqdq,avx2")]
 fn fold256(value: Polynomial256, factors: Polynomial256) -> Polynomial256 {
-    let high_low: Polynomial256 =
-        _mm256_clmulepi64_epi128::<0x01>(value.into(), factors.into()).into();
-    let low_high: Polynomial256 =
-        _mm256_clmulepi64_epi128::<0x10>(value.into(), factors.into()).into();
-    high_low ^ low_high
+    let value = Simd::<u64, 4>::from_le_bytes(value);
+    let factors = simd_swizzle!(Simd::<u64, 4>::from_le_bytes(factors), [1, 0, 3, 2]);
+    let (lo, hi) = products(value, factors);
+    let (sl, sh) = products(
+        simd_swizzle!(value, [1, 0, 3, 2]),
+        simd_swizzle!(factors, [1, 0, 3, 2]),
+    );
+    (simd_swizzle!(lo, hi, [0, 4, 2, 6]) ^ simd_swizzle!(sl, sh, [0, 4, 2, 6])).to_le_bytes()
 }
 
 #[inline]
-#[target_feature(enable = "vpclmulqdq,avx512f")]
 fn fold512(value: Polynomial512, factors: Polynomial512) -> Polynomial512 {
-    let high_low: Polynomial512 =
-        _mm512_clmulepi64_epi128::<0x01>(value.into(), factors.into()).into();
-    let low_high: Polynomial512 =
-        _mm512_clmulepi64_epi128::<0x10>(value.into(), factors.into()).into();
-    high_low ^ low_high
+    let value = Simd::<u64, 8>::from_le_bytes(value);
+    let factors = simd_swizzle!(
+        Simd::<u64, 8>::from_le_bytes(factors),
+        [1, 0, 3, 2, 5, 4, 7, 6]
+    );
+    let (lo, hi) = products(value, factors);
+    let (sl, sh) = products(
+        simd_swizzle!(value, [1, 0, 3, 2, 5, 4, 7, 6]),
+        simd_swizzle!(factors, [1, 0, 3, 2, 5, 4, 7, 6]),
+    );
+    (simd_swizzle!(lo, hi, [0, 8, 2, 10, 4, 12, 6, 14])
+        ^ simd_swizzle!(sl, sh, [0, 8, 2, 10, 4, 12, 6, 14]))
+    .to_le_bytes()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Width {
     Narrow,
+    NarrowAvx,
     Wide256,
     Wide512,
 }
@@ -104,6 +152,7 @@ impl Width {
         {
             match self {
                 Self::Narrow => crate::cpu_features::is_enabled_pclmulqdq(),
+                Self::NarrowAvx => std::is_x86_feature_detected!("avx"),
                 Self::Wide256 => {
                     std::is_x86_feature_detected!("vpclmulqdq")
                         && std::is_x86_feature_detected!("avx2")
@@ -118,6 +167,7 @@ impl Width {
         {
             match self {
                 Self::Narrow => cfg!(target_feature = "pclmulqdq"),
+                Self::NarrowAvx => cfg!(target_feature = "avx"),
                 Self::Wide256 => cfg!(all(target_feature = "vpclmulqdq", target_feature = "avx2")),
                 Self::Wide512 => cfg!(all(
                     target_feature = "vpclmulqdq",
@@ -132,6 +182,8 @@ impl Width {
             Self::Wide512
         } else if Self::Wide256.supported() {
             Self::Wide256
+        } else if Self::NarrowAvx.supported() {
+            Self::NarrowAvx
         } else {
             Self::Narrow
         }
@@ -180,7 +232,11 @@ impl Accumulator {
                 // feature detection for VPCLMULQDQ and AVX2.
                 unsafe { self.blocks256(blocks) };
             }
-            _ => self.blocks128(blocks),
+            Width::Narrow => self.blocks128(blocks),
+            Width::NarrowAvx | Width::Wide256 | Width::Wide512 => {
+                // SAFETY: every selected width here supports AVX.
+                unsafe { self.blocks128_avx(blocks) };
+            }
         }
 
         let (words, tail) = remainder.as_chunks::<16>();
@@ -223,6 +279,7 @@ impl Accumulator {
         ];
     }
 
+    #[inline]
     #[target_feature(enable = "pclmulqdq")]
     fn blocks128(&mut self, blocks: &[[u8; 64]]) {
         let [mut a, mut b, mut c, mut d] = self.fold;
@@ -235,22 +292,44 @@ impl Accumulator {
         self.fold = [a, b, c, d];
     }
 
-    // Two independent 256-bit accumulators preserve the four-word spacing.
+    // Reuse the narrow loop with nondestructive AVX encodings when available.
+    #[target_feature(enable = "pclmulqdq,avx")]
+    fn blocks128_avx(&mut self, blocks: &[[u8; 64]]) {
+        self.blocks128(blocks);
+    }
+
+    // Four independent 256-bit accumulators hide the multiplication latency.
     #[target_feature(enable = "vpclmulqdq,avx2")]
     fn blocks256(&mut self, blocks: &[[u8; 64]]) {
         let [a, b, c, d] = self.fold;
-        let mut first = pair(a, b);
-        let mut second = pair(c, d);
-        let factors = pair(FOLD_4, FOLD_4);
-        for block in blocks {
-            first = fold256(first, factors) ^ Polynomial256::from_slice(block);
-            second = fold256(second, factors) ^ Polynomial256::from_slice(&block[32..]);
+        let mut a = pair(a, b);
+        let mut b = pair(c, d);
+        let k4 = pair(FOLD_4, FOLD_4);
+        let k8 = pair(FOLD_8, FOLD_8);
+        let (groups, tail) = blocks.as_chunks::<2>();
+        if let Some(([first, second], remaining)) = groups.split_first() {
+            a = fold256(a, k4) ^ Polynomial256::from_slice(first);
+            b = fold256(b, k4) ^ Polynomial256::from_slice(&first[32..]);
+            let mut c = Polynomial256::from_slice(second);
+            let mut d = Polynomial256::from_slice(&second[32..]);
+            for [first, second] in remaining {
+                a = fold256(a, k8) ^ Polynomial256::from_slice(first);
+                b = fold256(b, k8) ^ Polynomial256::from_slice(&first[32..]);
+                c = fold256(c, k8) ^ Polynomial256::from_slice(second);
+                d = fold256(d, k8) ^ Polynomial256::from_slice(&second[32..]);
+            }
+            a = fold256(a, k4) ^ c;
+            b = fold256(b, k4) ^ d;
+        }
+        for block in tail {
+            a = fold256(a, k4) ^ Polynomial256::from_slice(block);
+            b = fold256(b, k4) ^ Polynomial256::from_slice(&block[32..]);
         }
         self.fold = [
-            first.extract::<0, 16>(),
-            first.extract::<16, 16>(),
-            second.extract::<0, 16>(),
-            second.extract::<16, 16>(),
+            a.extract::<0, 16>(),
+            a.extract::<16, 16>(),
+            b.extract::<0, 16>(),
+            b.extract::<16, 16>(),
         ];
     }
 
@@ -258,23 +337,23 @@ impl Accumulator {
     // then reduce to the common four-word persistent representation.
     #[target_feature(enable = "vpclmulqdq,avx512f")]
     fn blocks512(&mut self, blocks: &[[u8; 64]]) {
-        let [a, b, c, d] = self.fold;
-        let mut state = quad(a, b, c, d);
+        let [first, second, third, fourth] = self.fold;
+        let mut state = quad(first, second, third, fourth);
         let factors4 = quad(FOLD_4, FOLD_4, FOLD_4, FOLD_4);
         let factors16 = quad(FOLD_16, FOLD_16, FOLD_16, FOLD_16);
         let (groups, tail) = blocks.as_chunks::<4>();
         if let Some((first, remaining)) = groups.split_first() {
-            let [w, x, y, z] = first.map(Polynomial512::from_array);
-            let mut a = fold512(state, factors4) ^ w;
-            let mut b = x;
-            let mut c = y;
-            let mut d = z;
+            let [word0, word1, word2, word3] = first.map(Polynomial512::from_array);
+            let mut a = fold512(state, factors4) ^ word0;
+            let mut b = word1;
+            let mut c = word2;
+            let mut d = word3;
             for block in remaining {
-                let [w, x, y, z] = block.map(Polynomial512::from_array);
-                a = fold512(a, factors16) ^ w;
-                b = fold512(b, factors16) ^ x;
-                c = fold512(c, factors16) ^ y;
-                d = fold512(d, factors16) ^ z;
+                let [word0, word1, word2, word3] = block.map(Polynomial512::from_array);
+                a = fold512(a, factors16) ^ word0;
+                b = fold512(b, factors16) ^ word1;
+                c = fold512(c, factors16) ^ word2;
+                d = fold512(d, factors16) ^ word3;
             }
             b ^= fold512(a, factors4);
             c ^= fold512(b, factors4);
@@ -297,28 +376,28 @@ impl Accumulator {
     #[target_feature(enable = "pclmulqdq")]
     pub fn finish(self) -> u32 {
         let [a, b, c, d] = self.fold;
-        let b = b ^ fold128(a, FOLD_2);
-        let c = c ^ fold128(b, FOLD_2);
-        let d = d ^ fold128(c, FOLD_2);
+        let b = b ^ fold128(a, FOLD_1);
+        let c = c ^ fold128(b, FOLD_1);
+        let d = d ^ fold128(c, FOLD_1);
 
-        let factors = polynomial(0xccaa_009e, 0x1_63cd_6124);
+        let factors = REDUCTION_FACTORS;
         let upper = simd_swizzle!(
             d,
             ZERO,
             [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
         );
-        let reduced = multiply::<0>(d, factors) ^ upper;
+        let reduced = multiply::<0, 0>(d, factors) ^ upper;
         let shifted = simd_swizzle!(
             reduced,
             ZERO,
             [16, 17, 18, 19, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
-        let reduced = (reduced ^ multiply::<0x10>(shifted, factors))
+        let reduced = (reduced ^ multiply::<0, 1>(shifted, factors))
             & polynomial(0xffff_ffff_0000_0000, u64::MAX);
 
-        let barrett = polynomial(0x1_f701_1640, 0x1_db71_0640);
-        let quotient = (multiply::<0>(reduced, barrett) ^ reduced) & polynomial(u64::MAX, 0);
-        let result = reduced ^ quotient ^ multiply::<0x10>(quotient, barrett);
+        let barrett = BARRETT;
+        let quotient = (multiply::<0, 0>(reduced, barrett) ^ reduced) & polynomial(u64::MAX, 0);
+        let result = reduced ^ quotient ^ multiply::<0, 1>(quotient, barrett);
         !Simd::<u32, 4>::from_le_bytes(result)[2]
     }
 }
@@ -340,7 +419,12 @@ mod tests {
         let input: Vec<u8> = (0usize..8192)
             .map(|index| index.to_le_bytes()[0].wrapping_mul(137) ^ (index >> 8).to_le_bytes()[0])
             .collect();
-        for width in [Width::Narrow, Width::Wide256, Width::Wide512] {
+        for width in [
+            Width::Narrow,
+            Width::NarrowAvx,
+            Width::Wide256,
+            Width::Wide512,
+        ] {
             if !width.supported() {
                 continue;
             }
@@ -385,7 +469,12 @@ mod tests {
         let mut reference = crc32fast::Hasher::new_with_initial(start);
         reference.update(&input);
         let expected = reference.finalize();
-        for width in [Width::Narrow, Width::Wide256, Width::Wide512] {
+        for width in [
+            Width::Narrow,
+            Width::NarrowAvx,
+            Width::Wide256,
+            Width::Wide512,
+        ] {
             if !width.supported() {
                 continue;
             }
