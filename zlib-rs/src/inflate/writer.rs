@@ -433,29 +433,32 @@ impl<'a> Writer<'a> {
     }
 
     /// Copy a match into a destination whose unused capacity will be
-    /// discarded. Short disjoint references can use one full-width load
-    /// and store, avoiding the exact-copy size dispatch. The logical
-    /// initialized prefix grows only by length; no later match may read
-    /// beyond that prefix as history.
+    /// discarded. Use a single full-width store for short disjoint
+    /// references, or two exact endpoints for a reference of up to twice
+    /// that width. The logical extent advances only by the match length.
     #[inline]
     pub(super) fn copy_match_discarding_tail<const WIDTH: usize>(
         &mut self,
         distance: usize,
         length: usize,
     ) {
-        if length <= WIDTH
-            && distance >= WIDTH
-            && distance <= self.filled
-            && self.remaining() >= WIDTH
+        let span = length.max(WIDTH);
+        if length <= 2 * WIDTH && span <= distance.min(self.remaining()) && distance <= self.filled
         {
             let current = self.filled;
             let start = current - distance;
-            // SAFETY: the distance proves the entire WIDTH-byte source is
-            // in the initialized prefix and disjoint from the destination.
-            // The remaining-capacity check proves the full store is valid.
-            // The caller owns the discarded tail and publishes only length.
+            let ptr = self.buf.as_mut_ptr();
+            // SAFETY: the full span is initialized before current and
+            // disjoint from the destination, which has at least span
+            // writable bytes. For a short match the unused tail is discarded.
             unsafe {
-                Self::copy_disjoint_chunk::<WIDTH>(self.buf.as_mut_ptr(), start, current);
+                Self::copy_disjoint_chunk::<WIDTH>(ptr, start, current);
+                if length > WIDTH {
+                    // The second endpoint ends exactly at the logical end,
+                    // so it also lies entirely within the validated spans.
+                    let tail = length - WIDTH;
+                    Self::copy_disjoint_chunk::<WIDTH>(ptr, start + tail, current + tail);
+                }
             }
             self.filled = current + length;
         } else {
@@ -850,6 +853,46 @@ mod test {
     #[cfg_attr(miri, ignore = "exhaustive copy-length and slack matrix")]
     fn fast_copy_match_preserves_logical_bytes_and_allocation_canaries() {
         check_fast_copy::<MATCH_COPY_WIDTH>(false);
+    }
+
+    #[test]
+    fn disjoint_copy_at_full_deflate_window_preserves_guards() {
+        const DISTANCE: usize = 1 << crate::MAX_WBITS;
+        const SLACK: usize = 33;
+        let history = (0..DISTANCE)
+            .map(|i| i.wrapping_mul(73).to_le_bytes()[0] ^ (i >> 8).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        for length in 0..=crate::deflate::STD_MAX_MATCH {
+            for discard_tail in [false, true] {
+                let end = DISTANCE + length;
+                let capacity = end + SLACK;
+                let mut storage = history
+                    .iter()
+                    .copied()
+                    .map(MaybeUninit::new)
+                    .collect::<Vec<_>>();
+                storage.resize(capacity + 1, MaybeUninit::new(0xa5));
+                {
+                    let mut writer = Writer {
+                        buf: WeakSliceMut::from_mut_slice(&mut storage[..capacity]),
+                        filled: DISTANCE,
+                    };
+                    if discard_tail {
+                        writer.copy_match_discarding_tail::<16>(DISTANCE, length);
+                    } else {
+                        writer.copy_match_fast(DISTANCE, length);
+                    }
+                    assert_eq!(writer.len(), end);
+                    assert_eq!(&writer.filled()[..DISTANCE], &history);
+                    assert_eq!(&writer.filled()[DISTANCE..], &history[..length]);
+                }
+                let guard_start = if discard_tail { capacity } else { end };
+                for guard in &storage[guard_start..] {
+                    // SAFETY: the guard was initialized and must remain untouched.
+                    assert_eq!(unsafe { guard.assume_init() }, 0xa5);
+                }
+            }
+        }
     }
 
     #[test]
