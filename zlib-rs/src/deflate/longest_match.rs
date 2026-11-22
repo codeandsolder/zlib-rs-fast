@@ -14,15 +14,34 @@ struct SearchCursor {
     /// an interior substring of the candidate rather than its first byte.
     hash_pos: Pos,
     /// Offset of `hash_pos` from the beginning of the candidate.
-    offset: usize,
+    offset: Pos,
 }
 
 impl SearchCursor {
-    // Hash-chain positions have an exact 16-bit representation. Retaining
-    // that representation makes it impossible for a search to return a start
-    // that cannot be stored in the DEFLATE state.
-    fn candidate_start(self) -> Option<Pos> {
-        self.hash_pos.checked_sub(Pos::try_from(self.offset).ok()?)
+    #[inline]
+    const fn unshifted(hash_pos: Pos) -> Self {
+        Self {
+            hash_pos,
+            offset: 0,
+        }
+    }
+
+    // A returned cursor always satisfies offset <= hash_pos. Unshifted
+    // cursors have offset zero; shifted cursors must denote a position
+    // strictly newer than the history limit. Validate when selecting a
+    // chain, not on every subsequent candidate.
+    #[inline]
+    fn shifted(hash_pos: Pos, offset: usize, limit_base: usize) -> Option<Self> {
+        if usize::from(hash_pos) <= limit_base + offset {
+            return None;
+        }
+        let offset = Pos::try_from(offset).ok()?;
+        Some(Self { hash_pos, offset })
+    }
+
+    #[inline]
+    const fn candidate_start(self) -> Pos {
+        self.hash_pos - self.offset
     }
 }
 
@@ -311,10 +330,7 @@ fn longest_match_help<const SLOW: bool, const FULL: bool, const RING: usize>(
         return break_matching(params, best_len, match_start);
     }
 
-    let mut cursor = SearchCursor {
-        hash_pos: params.cur_match,
-        offset: 0,
-    };
+    let mut cursor = SearchCursor::unshifted(params.cur_match);
 
     if SLOW && best_len >= STD_MIN_MATCH {
         let Some(next) = initial_slow_cursor(resources, scan, best_len, cursor, limit_base) else {
@@ -335,7 +351,8 @@ fn longest_match_help<const SLOW: bool, const FULL: bool, const RING: usize>(
     let scan = &scan[..max_len];
     let mut scan_words = ScanProbeWords::new(scan, max_len, best_len);
 
-    while let Some(candidate_pos) = cursor.candidate_start() {
+    loop {
+        let candidate_pos = cursor.candidate_start();
         let candidate_start = usize::from(candidate_pos);
         if candidate_start >= params.strstart {
             break;
@@ -429,9 +446,11 @@ fn initial_slow_cursor(
     resources: MatchSearchResources<'_>,
     scan: &[u8],
     best_len: usize,
-    mut cursor: SearchCursor,
+    cursor: SearchCursor,
     limit_base: usize,
 ) -> Option<SearchCursor> {
+    let mut selected = cursor.hash_pos;
+    let mut offset = usize::from(cursor.offset);
     let probe = scan.get(..best_len + 1)?;
     let mut hash = 0;
     hash = RollHashCalc::update_hash(hash, u32::from(probe[1]));
@@ -443,15 +462,13 @@ fn initial_slow_cursor(
     for (index, byte) in probe[3..].iter().enumerate() {
         hash = RollHashCalc::update_hash(hash, u32::from(*byte));
         let hash_pos = resources.head[hash as usize];
-        if hash_pos < cursor.hash_pos {
-            cursor = SearchCursor {
-                hash_pos,
-                offset: index + 1,
-            };
+        if hash_pos < selected {
+            selected = hash_pos;
+            offset = index + 1;
         }
     }
 
-    (usize::from(cursor.hash_pos) > limit_base + cursor.offset).then_some(cursor)
+    SearchCursor::shifted(selected, offset, limit_base)
 }
 
 #[inline]
@@ -464,19 +481,13 @@ fn next_slow_cursor(
     wmask: usize,
 ) -> Option<SearchCursor> {
     let prev = resources.prev;
-    let mut next = SearchCursor {
-        hash_pos: candidate_start,
-        offset: 0,
-    };
+    let mut next = SearchCursor::unshifted(candidate_start);
     let candidate_start = usize::from(candidate_start);
 
     for offset in 0..=match_len - STD_MIN_MATCH {
         let hash_pos = prev[(candidate_start + offset) & wmask];
         if hash_pos < next.hash_pos {
-            if usize::from(hash_pos) <= limit_base + offset {
-                return None;
-            }
-            next = SearchCursor { hash_pos, offset };
+            next = SearchCursor::shifted(hash_pos, offset, limit_base)?;
         }
     }
 
@@ -491,10 +502,7 @@ fn next_slow_cursor(
         }
         let hash_pos = resources.head[hash as usize];
         if hash_pos < next.hash_pos {
-            if usize::from(hash_pos) <= limit_base + offset {
-                return None;
-            }
-            next = SearchCursor { hash_pos, offset };
+            next = SearchCursor::shifted(hash_pos, offset, limit_base)?;
         }
     }
 
@@ -519,7 +527,7 @@ fn next_in_chain<const RING: usize>(
     } else {
         prev[usize::from(cursor.hash_pos) & wmask]
     };
-    (usize::from(hash_pos) > limit_base + cursor.offset)
+    (usize::from(hash_pos) > limit_base + usize::from(cursor.offset))
         .then_some(SearchCursor { hash_pos, ..cursor })
 }
 
@@ -805,29 +813,49 @@ mod tests {
     fn search_cursor_rejects_offsets_beyond_the_16_bit_position_domain() {
         let maximum = usize::from(Pos::MAX);
         assert_eq!(
-            SearchCursor {
-                hash_pos: Pos::MAX,
-                offset: 0,
-            }
-            .candidate_start(),
-            Some(Pos::MAX)
+            SearchCursor::unshifted(Pos::MAX).candidate_start(),
+            Pos::MAX
         );
+        assert!(SearchCursor::shifted(Pos::MAX, maximum + 1, 0).is_none());
+        assert!(SearchCursor::shifted(Pos::MAX, maximum, 0).is_none());
         assert_eq!(
-            SearchCursor {
-                hash_pos: Pos::MAX,
-                offset: maximum,
-            }
-            .candidate_start(),
-            Some(0)
+            SearchCursor::shifted(Pos::MAX, maximum - 1, 0).map(SearchCursor::candidate_start),
+            Some(1)
         );
-        assert_eq!(
-            SearchCursor {
-                hash_pos: Pos::MAX,
-                offset: maximum + 1,
+    }
+
+    #[test]
+    fn shifted_cursor_advancement_preserves_position_and_budget() {
+        let mut prev = [0; 512];
+        for offset in [0, 1, 3, 17, 255] {
+            for limit_base in [0, 1, 17, 127, 255] {
+                let hash_pos = Pos::try_from(limit_base + offset + 20).unwrap_or_default();
+                let cursor = SearchCursor::shifted(hash_pos, offset, limit_base)
+                    .unwrap_or_else(|| unreachable!("test cursor must be valid"));
+                for successor in [
+                    0,
+                    1,
+                    limit_base + offset,
+                    limit_base + offset + 1,
+                    usize::from(hash_pos),
+                ] {
+                    prev[usize::from(hash_pos) & 511] =
+                        Pos::try_from(successor).unwrap_or_default();
+                    for budget in [1, 2, 4096] {
+                        let mut remaining = budget;
+                        let next =
+                            next_in_chain::<0>(cursor, &prev, 511, limit_base, &mut remaining);
+                        let expected = if budget > 1 && successor > limit_base + offset {
+                            Pos::try_from(successor - offset).ok()
+                        } else {
+                            None
+                        };
+                        assert_eq!(next.map(SearchCursor::candidate_start), expected);
+                        assert_eq!(remaining, budget - 1);
+                    }
+                }
             }
-            .candidate_start(),
-            None
-        );
+        }
     }
 
     #[test]
@@ -953,23 +981,14 @@ mod tests {
         };
 
         let extended = next_slow_cursor(resources, scan, 12, match_len, 0, 31);
-        assert_eq!(
-            extended,
-            Some(SearchCursor {
-                hash_pos: 10,
-                offset,
-            })
-        );
+        assert_eq!(extended, SearchCursor::shifted(10, offset, 0));
 
         // A stream ending at the match end does not supply the lookahead
         // byte. Never inspect it or discard otherwise valid predecessor links.
         let truncated = &scan[..match_len];
         assert_eq!(
             next_slow_cursor(resources, truncated, 12, match_len, 0, 31),
-            Some(SearchCursor {
-                hash_pos: 12,
-                offset: 0,
-            })
+            Some(SearchCursor::unshifted(12))
         );
     }
 
@@ -1114,21 +1133,10 @@ mod tests {
     #[test]
     fn search_cursor_maps_interior_hash_positions_to_candidate_start() {
         assert_eq!(
-            SearchCursor {
-                hash_pos: 123,
-                offset: 17,
-            }
-            .candidate_start(),
+            SearchCursor::shifted(123, 17, 0).map(SearchCursor::candidate_start),
             Some(106)
         );
-        assert_eq!(
-            SearchCursor {
-                hash_pos: 3,
-                offset: 4,
-            }
-            .candidate_start(),
-            None
-        );
+        assert!(SearchCursor::shifted(3, 4, 0).is_none());
     }
 
     #[test]
