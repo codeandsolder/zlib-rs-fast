@@ -328,13 +328,11 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
             break;
         }
 
-        let candidate = &resources.initialized[candidate_start..candidate_start + max_len];
-        let len = match probe_candidate_cached(
+        let len = match scan_words.probe::<SLOW>(
             scan,
-            candidate,
+            resources.initialized,
+            candidate_start,
             best_len,
-            scan_words.first,
-            scan_words.tail,
         ) {
             CandidateProbe::Reject => {
                 let Some(next) = next_in_chain(
@@ -351,7 +349,9 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
             }
             CandidateProbe::Exact(len) => len,
             CandidateProbe::CompareFrom(prefix) => {
-                prefix + common_match_length(&scan[prefix..], &candidate[prefix..])
+                let candidate =
+                    &resources.initialized[candidate_start + prefix..candidate_start + max_len];
+                prefix + common_match_length(&scan[prefix..], candidate)
             }
         };
 
@@ -525,6 +525,35 @@ impl ScanProbeWords {
         if best_len >= 8 && best_len < self.max_len {
             self.tail = load_u64_le(scan, best_len + 1 - 8);
         }
+    }
+
+    #[inline]
+    fn probe<const TAIL_FIRST: bool>(
+        &self,
+        scan: &[u8],
+        window: &[u8],
+        candidate_start: usize,
+        best_len: usize,
+    ) -> CandidateProbe {
+        debug_assert_eq!(scan.len(), self.max_len);
+        debug_assert!(best_len < self.max_len);
+        debug_assert!(candidate_start + self.max_len <= window.len());
+
+        // Shifted chains benefit from rejecting a long match at its tail
+        // before forming the complete candidate slice. Both word loads are
+        // within the initialized comparison extent, since best_len < max_len.
+        if TAIL_FIRST && best_len >= 8 {
+            let tail_start = best_len + 1 - 8;
+            if self.tail != load_u64_le(window, candidate_start + tail_start)
+                || self.first != load_u64_le(window, candidate_start)
+            {
+                return CandidateProbe::Reject;
+            }
+            return CandidateProbe::CompareFrom(8);
+        }
+
+        let candidate = &window[candidate_start..candidate_start + self.max_len];
+        probe_candidate_cached(scan, candidate, best_len, self.first, self.tail)
     }
 }
 
@@ -898,6 +927,38 @@ mod tests {
                         "width={width} best_len={best_len} mismatch={mismatch}"
                     );
                     candidate[mismatch] = b'a';
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn window_relative_probe_preserves_candidate_classification() {
+        for width in [7, 8, 9, 16, 17, 32, STD_MAX_MATCH] {
+            let scan = vec![b'a'; width];
+            for start in [0, 1, 31, 127] {
+                let mut window = vec![b'x'; start + width];
+                window[start..].copy_from_slice(&scan);
+                for best_len in 0..width {
+                    let words = ScanProbeWords::new(&scan, width, best_len);
+                    for mismatch in 0..=width {
+                        if mismatch < width {
+                            window[start + mismatch] = b'b';
+                        }
+                        let expected = probe_candidate(&scan, &window[start..], best_len);
+                        assert_eq!(
+                            words.probe::<true>(&scan, &window, start, best_len),
+                            expected,
+                            "width={width} start={start} best_len={best_len} mismatch={mismatch}",
+                        );
+                        assert_eq!(
+                            words.probe::<false>(&scan, &window, start, best_len),
+                            expected,
+                        );
+                        if mismatch < width {
+                            window[start + mismatch] = b'a';
+                        }
+                    }
                 }
             }
         }
