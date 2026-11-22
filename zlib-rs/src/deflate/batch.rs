@@ -39,6 +39,15 @@ pub struct BatchCompressResult {
     pub code: ReturnCode,
 }
 
+impl BatchJob<'_> {
+    /// Compress this one independent stream without allocating a batch
+    /// result vector. The destination follows the same bounded-output
+    /// contract as [`compress_slices_batch`].
+    pub fn compress(&mut self, config: DeflateConfig) -> BatchCompressResult {
+        CpuEncoder::new(config).compress(self)
+    }
+}
+
 /// Compress several independent buffers with scalar per-stream compression.
 ///
 /// Every job uses the same configuration and produces the same bytes as an independent
@@ -1251,6 +1260,28 @@ mod tests {
                     reference,
                     "parallel output changed for job {index}, {config:?}"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn independent_vector_job_matches_batch_result() -> Result<(), std::collections::TryReserveError>
+    {
+        let input = b"independent bounded vector compression/".repeat(512);
+        for level in [0, 1, 6, 9] {
+            let config = DeflateConfig::new(level);
+            for limit in [0, 1, 23, compress_bound(input.len())] {
+                let mut expected = vec![0x79; 3];
+                let mut actual = vec![0x79; 3];
+                let reference = compress_slices_batch(
+                    &mut [BatchJob::with_vec(&input, &mut expected, limit)?],
+                    config,
+                );
+                let result = BatchJob::with_vec(&input, &mut actual, limit)?.compress(config);
+                assert_eq!(reference, [result]);
+                assert_eq!(actual, expected);
+                assert_eq!(actual.len(), result.written);
             }
         }
         Ok(())

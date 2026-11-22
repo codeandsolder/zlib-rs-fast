@@ -81,6 +81,15 @@ impl<'a> BatchJob<'a> {
         })
     }
 
+    /// Decode this one independent stream without allocating a batch result
+    /// vector. The destination follows the same bounded-output contract as
+    /// [`decompress_slices_batch`], including partial output on failure.
+    pub fn decompress(&mut self, config: InflateConfig) -> BatchDecompressResult {
+        decompress_job(self, |output, input| {
+            uncompress2_into(output, input, config)
+        })
+    }
+
     /// Run a codec against the bounded destination and commit its reported prefix.
     ///
     /// # Safety
@@ -125,10 +134,7 @@ pub fn decompress_slices_batch(
     config: InflateConfig,
 ) -> Vec<BatchDecompressResult> {
     if jobs.len() <= 1 {
-        return jobs
-            .iter_mut()
-            .map(|job| decompress_job(job, |output, input| uncompress2_into(output, input, config)))
-            .collect();
+        return jobs.iter_mut().map(|job| job.decompress(config)).collect();
     }
     let mut decoder = WholeDecoder::new(config);
     jobs.iter_mut()
@@ -341,6 +347,12 @@ mod tests {
     fn serial_batch_decode_preserves_independent_results_and_canaries(
     ) -> Result<(), std::collections::TryReserveError> {
         run_decode_cases(decompress_slices_batch)
+    }
+
+    #[test]
+    fn independent_jobs_preserve_results_and_canaries(
+    ) -> Result<(), std::collections::TryReserveError> {
+        run_decode_cases(|jobs, config| jobs.iter_mut().map(|job| job.decompress(config)).collect())
     }
 
     #[cfg(feature = "parallel")]
