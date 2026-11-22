@@ -328,12 +328,23 @@ fn longest_match_help<const SLOW: bool, const FULL: bool>(
             break;
         }
 
-        let len = match scan_words.probe::<SLOW>(
-            scan,
-            resources.initialized,
-            candidate_start,
-            best_len,
-        ) {
+        // For shifted chains most long-match candidates are rejected. Probe
+        // the initialized window directly; form the full candidate only on
+        // the path that actually needs an exact prefix comparison.
+        let probe = if SLOW && best_len >= 8 {
+            let tail_start = best_len + 1 - 8;
+            if scan_words.tail != load_u64_le(resources.initialized, candidate_start + tail_start)
+                || scan_words.first != load_u64_le(resources.initialized, candidate_start)
+            {
+                CandidateProbe::Reject
+            } else {
+                CandidateProbe::CompareFrom(8)
+            }
+        } else {
+            let candidate = &resources.initialized[candidate_start..candidate_start + max_len];
+            probe_candidate_cached(scan, candidate, best_len, scan_words.first, scan_words.tail)
+        };
+        let len = match probe {
             CandidateProbe::Reject => {
                 let Some(next) = next_in_chain(
                     cursor,
@@ -525,35 +536,6 @@ impl ScanProbeWords {
         if best_len >= 8 && best_len < self.max_len {
             self.tail = load_u64_le(scan, best_len + 1 - 8);
         }
-    }
-
-    #[inline]
-    fn probe<const TAIL_FIRST: bool>(
-        &self,
-        scan: &[u8],
-        window: &[u8],
-        candidate_start: usize,
-        best_len: usize,
-    ) -> CandidateProbe {
-        debug_assert_eq!(scan.len(), self.max_len);
-        debug_assert!(best_len < self.max_len);
-        debug_assert!(candidate_start + self.max_len <= window.len());
-
-        // Shifted chains benefit from rejecting a long match at its tail
-        // before forming the complete candidate slice. Both word loads are
-        // within the initialized comparison extent, since best_len < max_len.
-        if TAIL_FIRST && best_len >= 8 {
-            let tail_start = best_len + 1 - 8;
-            if self.tail != load_u64_le(window, candidate_start + tail_start)
-                || self.first != load_u64_le(window, candidate_start)
-            {
-                return CandidateProbe::Reject;
-            }
-            return CandidateProbe::CompareFrom(8);
-        }
-
-        let candidate = &window[candidate_start..candidate_start + self.max_len];
-        probe_candidate_cached(scan, candidate, best_len, self.first, self.tail)
     }
 }
 
@@ -933,28 +915,51 @@ mod tests {
     }
 
     #[test]
-    fn window_relative_probe_preserves_candidate_classification() {
+    fn bounded_chain_search_matches_scalar_candidate_oracle() {
         for width in [7, 8, 9, 16, 17, 32, STD_MAX_MATCH] {
-            let scan = vec![b'a'; width];
-            for start in [0, 1, 31, 127] {
-                let mut window = vec![b'x'; start + width];
-                window[start..].copy_from_slice(&scan);
-                for best_len in 0..width {
-                    let words = ScanProbeWords::new(&scan, width, best_len);
+            for start in [1, 7, 31, 127] {
+                let strstart = start + width;
+                let candidate_pos = u16::try_from(start).unwrap_or_default();
+                let mut window = vec![b'a'; strstart + width];
+                // All shifted heads point at the same candidate, so the
+                // initial rolling search keeps its unshifted chain cursor.
+                let prev = [0u16; 512];
+                let head = vec![candidate_pos; 1 << 15];
+                for best_len in 2..width {
+                    let params = MatchSearchParams {
+                        cur_match: candidate_pos,
+                        strstart,
+                        lookahead: width,
+                        wmask: prev.len() - 1,
+                        max_dist: strstart,
+                        prev_length: u16::try_from(best_len).unwrap_or_default(),
+                        match_start: 0,
+                        max_chain_length: 1,
+                        good_match: 258,
+                        nice_match: u16::try_from(best_len + 1).unwrap_or_default(),
+                        level: 9,
+                        kind: MatchSearchKind::RollingOffset,
+                    };
                     for mismatch in 0..=width {
                         if mismatch < width {
                             window[start + mismatch] = b'b';
                         }
-                        let expected = probe_candidate(&scan, &window[start..], best_len);
+                        let resources = MatchSearchResources {
+                            initialized: &window,
+                            prev: &prev,
+                            head: &head,
+                        };
+                        let expected = if mismatch > best_len {
+                            MatchSearchResult::new(mismatch, candidate_pos)
+                        } else {
+                            MatchSearchResult::new(best_len, 0)
+                        };
                         assert_eq!(
-                            words.probe::<true>(&scan, &window, start, best_len),
+                            execute_slow(resources, params),
                             expected,
                             "width={width} start={start} best_len={best_len} mismatch={mismatch}",
                         );
-                        assert_eq!(
-                            words.probe::<false>(&scan, &window, start, best_len),
-                            expected,
-                        );
+                        assert_eq!(execute_standard(resources, params), expected);
                         if mismatch < width {
                             window[start + mismatch] = b'a';
                         }
