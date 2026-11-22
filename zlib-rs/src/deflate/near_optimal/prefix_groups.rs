@@ -451,45 +451,85 @@ impl GroupScratch {
     }
 }
 
+/// Exact three-byte prefix intervals recovered from the existing four-byte
+/// equivalence classes. Later suffix refinement only changes order within
+/// these classes, so the intervals remain valid in the final permutation.
+pub(super) struct PrefixGroups {
+    intervals: Vec<Range<usize>>,
+}
+
+impl PrefixGroups {
+    pub(super) const fn unique() -> Self {
+        Self {
+            intervals: Vec::new(),
+        }
+    }
+
+    pub(super) fn from_refinement(input: &[u8], sa: &[u32], starts: &[u32]) -> Option<Self> {
+        // A small three-byte group can contain only small four-byte
+        // classes. Their total size is a cheap upper bound on the share
+        // of positions eligible for the word-sized strategy.
+        let length = input.len();
+        let ends = starts
+            .iter()
+            .copied()
+            .skip(1)
+            .map(suffix_index)
+            .chain(core::iter::once(length));
+        let upper = starts
+            .iter()
+            .copied()
+            .map(suffix_index)
+            .zip(ends)
+            .filter(|&(start, end)| end - start <= WORD_GROUP_SIZE)
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+        if upper <= length / 2 {
+            return None;
+        }
+        let mut groups = Self::unique();
+        let mut word_positions = 0;
+        let mut group_start = 0;
+        let mut prefix = input[suffix_index(sa[0])..].get(..STD_MIN_MATCH);
+        for &start in &starts[1..] {
+            let start = suffix_index(start);
+            let current = input[suffix_index(sa[start])..].get(..STD_MIN_MATCH);
+            if current != prefix {
+                word_positions += groups.record(group_start..start, prefix.is_some());
+                group_start = start;
+                prefix = current;
+            }
+        }
+        word_positions += groups.record(group_start..length, prefix.is_some());
+        (word_positions > length / 2).then_some(groups)
+    }
+
+    fn record(&mut self, interval: Range<usize>, complete_prefix: bool) -> usize {
+        let len = interval.len();
+        if complete_prefix && len > 1 {
+            self.intervals.push(interval);
+        }
+        if len <= WORD_GROUP_SIZE {
+            len
+        } else {
+            0
+        }
+    }
+}
+
 #[inline(never)]
-pub(super) fn try_group_local_frontier(
+pub(super) fn group_local_frontier(
     input: &[u8],
     suffixes: &SuffixRanks,
+    groups: &PrefixGroups,
     ranges: &[(usize, usize); D_CODES],
     max_distance: usize,
-) -> Option<MatchCandidates> {
-    let mut groups = Vec::<Range<usize>>::new();
-    let mut word_positions = 0;
-    let mut start = 0;
-    while start < input.len() {
-        let position = suffixes.position_at(start);
-        let Some(prefix) = input[position..].get(..STD_MIN_MATCH) else {
-            word_positions += 1;
-            start += 1;
-            continue;
-        };
-        let mut end = start + 1;
-        while end < input.len()
-            && input[suffixes.position_at(end)..].get(..STD_MIN_MATCH) == Some(prefix)
-        {
-            end += 1;
-        }
-        if end - start <= WORD_GROUP_SIZE {
-            word_positions += end - start;
-        }
-        if end - start > 1 {
-            groups.push(start..end);
-        }
-        start = end;
-    }
-    if word_positions <= input.len() / 2 {
-        return None;
-    }
-    if groups.is_empty() {
-        return Some(MatchCandidates {
+) -> MatchCandidates {
+    if groups.intervals.is_empty() {
+        return MatchCandidates {
             offsets: vec![0; input.len() + 1],
             entries: Vec::new(),
-        });
+        };
     }
     let mut wide = 0u32;
     for (code, &(min, max)) in ranges.iter().enumerate() {
@@ -499,8 +539,8 @@ pub(super) fn try_group_local_frontier(
     }
     let mut output = GroupOutput::new(input.len());
     let mut scratch = GroupScratch::new();
-    for interval in groups {
-        let group = &suffixes.sa[interval];
+    for interval in &groups.intervals {
+        let group = &suffixes.sa[interval.clone()];
         match group.len() {
             n if n <= SMALL_GROUP_DIRECT => {
                 scan_small_group(input, group, wide, max_distance, &mut output);
@@ -511,7 +551,7 @@ pub(super) fn try_group_local_frontier(
             _ => scratch.scan_large(input, group, ranges, &mut output),
         }
     }
-    Some(output.finish())
+    output.finish()
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use core::ops::Range;
 use crate::ReturnCode;
 
 mod prefix_groups;
-use prefix_groups::try_group_local_frontier;
+use prefix_groups::{group_local_frontier, PrefixGroups};
 
 use super::{
     match_compare, trees_tbl, State, StaticTreeDesc, D_CODES, LENGTH_CODES, L_CODES, STD_MAX_MATCH,
@@ -627,7 +627,6 @@ pub fn build_match_candidates(
     if max_distance > 1usize << crate::MAX_WBITS {
         return Err(ReturnCode::StreamError);
     }
-    let suffixes = SuffixRanks::new(input)?;
     let ranges = distance_code_ranges(max_distance);
     let first_rank_code = ranges
         .iter()
@@ -635,10 +634,15 @@ pub fn build_match_candidates(
             min_distance != 0 && max_distance - min_distance + 1 > DIRECT_SCAN_MAX
         })
         .unwrap_or(D_CODES);
-    if first_rank_code < D_CODES {
-        if let Some(frontier) = try_group_local_frontier(input, &suffixes, &ranges, max_distance) {
-            return Ok(frontier);
-        }
+    let suffixes = SuffixRanks::new(input, first_rank_code < D_CODES)?;
+    if let Some(groups) = &suffixes.prefix_groups {
+        return Ok(group_local_frontier(
+            input,
+            &suffixes,
+            groups,
+            &ranges,
+            max_distance,
+        ));
     }
     let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
         let (min_distance, max_distance) = ranges[code];
@@ -1057,6 +1061,7 @@ const fn suffix_index(value: u32) -> usize {
 struct SuffixRanks {
     sa: Vec<u32>,
     rank: Vec<u32>,
+    prefix_groups: Option<PrefixGroups>,
 }
 
 /// The packed suffix permutation and counting-sort offsets require indices
@@ -1076,12 +1081,13 @@ impl SuffixRanks {
         suffix_index(self.sa[suffix_rank])
     }
 
-    fn new(input: &[u8]) -> Result<Self, ReturnCode> {
+    fn new(input: &[u8], collect_groups: bool) -> Result<Self, ReturnCode> {
         let length = checked_suffix_input_len(input.len())?;
         if input.is_empty() {
             return Ok(Self {
                 sa: Vec::new(),
                 rank: Vec::new(),
+                prefix_groups: None,
             });
         }
 
@@ -1095,6 +1101,7 @@ impl SuffixRanks {
         let max_rank = rank.iter().copied().max().unwrap_or(0);
         let mut counts = vec![0u32; input.len().max(256) + 1];
         let mut span = 1usize;
+        let mut prefix_groups = None;
         counting_sort_suffixes(&sa, &mut scratch, max_rank, &mut counts, |position| {
             suffix_second_rank(&rank, position, span)
         });
@@ -1123,6 +1130,15 @@ impl SuffixRanks {
                 previous_pair = pair;
             }
 
+            if collect_groups {
+                if span == 1 && class == length {
+                    // Unique two-byte prefixes also imply unique triples.
+                    prefix_groups = Some(PrefixGroups::unique());
+                } else if span == 2 {
+                    prefix_groups =
+                        PrefixGroups::from_refinement(input, &sa, &counts[1..=suffix_index(class)]);
+                }
+            }
             core::mem::swap(&mut rank, &mut next_rank);
             if class == length {
                 break;
@@ -1151,7 +1167,11 @@ impl SuffixRanks {
             rank[suffix_index(position)] = suffix_rank;
         }
 
-        Ok(Self { sa, rank })
+        Ok(Self {
+            sa,
+            rank,
+            prefix_groups,
+        })
     }
 }
 
@@ -1773,7 +1793,7 @@ mod tests {
             return Err(ReturnCode::StreamError);
         }
         // Candidate offsets remain usize because there may be D_CODES entries per byte.
-        let suffixes = SuffixRanks::new(input)?;
+        let suffixes = SuffixRanks::new(input, false)?;
         let ranges = distance_code_ranges(max_distance);
         let mut active: [Option<RankSet>; D_CODES] = core::array::from_fn(|code| {
             let (min_distance, max_distance) = ranges[code];
@@ -1987,7 +2007,7 @@ mod tests {
             *byte = state.to_le_bytes()[4] & 0x1f;
         }
 
-        let suffixes = SuffixRanks::new(&input)?;
+        let suffixes = SuffixRanks::new(&input, false)?;
         for rank in 0..input.len() {
             let position = suffixes.position_at(rank);
             assert_eq!(suffixes.rank_of(position), rank);
@@ -2010,7 +2030,7 @@ mod tests {
                         byte
                     })
                     .collect::<Vec<_>>();
-                let suffixes = SuffixRanks::new(&input)?;
+                let suffixes = SuffixRanks::new(&input, false)?;
                 let mut expected = (0..u32::try_from(len).map_err(|_| ReturnCode::StreamError)?)
                     .collect::<Vec<_>>();
                 expected.sort_unstable_by(|&left, &right| {
@@ -2055,7 +2075,7 @@ mod tests {
                     })
                     .collect();
 
-                let suffixes = SuffixRanks::new(&input)?;
+                let suffixes = SuffixRanks::new(&input, false)?;
                 assert_eq!(suffixes.sa.len(), length);
                 assert_eq!(suffixes.rank.len(), length);
                 for rank in 0..length {
@@ -2587,7 +2607,10 @@ mod tests {
             }
         }
         input.extend_from_slice(&atom);
-        let suffixes = SuffixRanks::new(&input)?;
+        let suffixes = SuffixRanks::new(&input, true)?;
+        let Some(prefix_groups) = &suffixes.prefix_groups else {
+            return Err(ReturnCode::StreamError);
+        };
         for (marker, &count) in (0u8..).zip(&groups) {
             let prefix = [0xf5, 0xe4, marker];
             let actual = suffixes
@@ -2603,10 +2626,7 @@ mod tests {
             0usize, 31, 32, 33, 39, 40, 41, 63, 64, 65, 127, 129, 257, 1025, 32768,
         ] {
             let ranges = distance_code_ranges(distance);
-            let Some(actual) = try_group_local_frontier(&input, &suffixes, &ranges, distance)
-            else {
-                return Err(ReturnCode::StreamError);
-            };
+            let actual = group_local_frontier(&input, &suffixes, prefix_groups, &ranges, distance);
             assert_eq!(
                 actual,
                 build_match_candidates_position_major(&input, distance)?,
