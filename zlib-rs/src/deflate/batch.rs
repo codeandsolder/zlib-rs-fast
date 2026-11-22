@@ -867,32 +867,14 @@ mod tests {
                 );
                 assert_eq!(parallel_outputs, batch_outputs);
             }
-            let mut vector_outputs = vec![vec![0x79; 3]; inputs.len()];
-            let mut vector_jobs = inputs
-                .iter()
-                .zip(&capacities)
-                .zip(&mut vector_outputs)
-                .map(|((input, &capacity), output)| BatchJob::with_vec(input, output, capacity))
-                .collect::<Result<Vec<_>, _>>()?;
-            assert_eq!(
-                compress_slices_batch_gpu(&mut vector_jobs, config, &searcher, 32)?,
-                results
-            );
-            #[cfg(feature = "parallel")]
-            {
-                let pool = BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("worker count")?)?;
-                assert_eq!(
-                    pool.compress_gpu(&mut vector_jobs, config, &searcher, 32)?,
-                    results
-                );
-            }
-            drop(vector_jobs);
-            for (vector, (reference, result)) in vector_outputs
-                .iter()
-                .zip(batch_outputs.iter().zip(&results))
-            {
-                assert_eq!(vector, &reference[..result.written]);
-            }
+            check_gpu_vector_outputs(
+                &inputs,
+                &capacities,
+                &batch_outputs,
+                &results,
+                config,
+                &searcher,
+            )?;
             for (index, ((input, &capacity), result)) in
                 inputs.iter().zip(&capacities).zip(results).enumerate()
             {
@@ -923,6 +905,43 @@ mod tests {
                 assert_eq!(code, ReturnCode::Ok, "level {level} index {index}");
                 assert_eq!(decoded, input.as_slice());
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn check_gpu_vector_outputs(
+        inputs: &[Vec<u8>],
+        capacities: &[usize],
+        batch_outputs: &[Vec<u8>],
+        results: &[BatchCompressResult],
+        config: DeflateConfig,
+        searcher: &GpuMatchSearcher,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut vector_outputs = vec![vec![0x79; 3]; inputs.len()];
+        let mut vector_jobs = inputs
+            .iter()
+            .zip(capacities)
+            .zip(&mut vector_outputs)
+            .map(|((input, &capacity), output)| BatchJob::with_vec(input, output, capacity))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            compress_slices_batch_gpu(&mut vector_jobs, config, searcher, 32)?,
+            results
+        );
+        #[cfg(feature = "parallel")]
+        {
+            let pool = BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("worker count")?)?;
+            assert_eq!(
+                pool.compress_gpu(&mut vector_jobs, config, searcher, 32)?,
+                results
+            );
+        }
+        drop(vector_jobs);
+        for (vector, (reference, result)) in
+            vector_outputs.iter().zip(batch_outputs.iter().zip(results))
+        {
+            assert_eq!(vector, &reference[..result.written]);
         }
         Ok(())
     }

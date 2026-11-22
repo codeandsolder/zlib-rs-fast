@@ -1,13 +1,17 @@
-use std::{env, hint::black_box, time::Instant};
+use std::{
+    env,
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use zlib_rs::{
     compress_bound, compress_slice, compress_slices_batch_gpu, decompress_slice, BatchJob,
-    DeflateConfig, GpuMatch, GpuMatchSearcher, InflateConfig, ReturnCode,
+    DeflateConfig, GpuMatch, GpuMatchSearcher, GpuMatchTable, InflateConfig, ReturnCode,
 };
 
 const HASH_SIZE: usize = 1 << 16;
 const MAX_MATCH: usize = 258;
-const MAX_DIST: usize = 32_768 - (258 + 3 + 1);
+const MAX_DIST: u32 = 32_768 - (258 + 3 + 1);
 const DEFAULT_SEARCH_BUDGET: u32 = 4_096;
 
 #[derive(Clone, Copy, Debug)]
@@ -49,26 +53,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _: u32 = bytes.try_into()?;
 
     let input = make_input(corpus, bytes);
-    let index = timed("cpu CSR index", || build_hash_index(&input));
+    let index = timed("cpu CSR index", || build_hash_index(&input))?;
     let expected = timed("cpu match reference", || {
         match_reference(&input, &index, search_budget)
-    });
+    })?;
 
     let searcher = timed("persistent GPU initialization", || {
         GpuMatchSearcher::new(adapter_filter)
     })?;
     eprintln!("selected adapter: {}", searcher.adapter_name());
 
+    let steady = validate_searches(&searcher, &input, &expected, search_budget, batch)?;
+    let CompressionComparison {
+        scalar_len,
+        scalar_elapsed,
+        compressed_len,
+        compression_elapsed,
+    } = benchmark_compression(
+        &searcher,
+        &input,
+        DeflateConfig::new(level),
+        search_budget,
+        batch,
+    )?;
+    let total_input = input
+        .len()
+        .checked_mul(batch)
+        .ok_or("batch byte count overflow")?;
+    let matches = steady.iter().filter(|item| item.length >= 3).count();
+    let matched_bytes: u64 = steady.iter().map(|item| u64::from(item.length)).sum();
+    println!(
+        "validated batch {} x {} {:?} bytes at budget {} on {}: {} matches/input, {} total matched bytes/input; level {} scalar {} bytes ({}%) in {:?}; GPU-fed {} bytes ({}%) in {:?}",
+        batch,
+        input.len(),
+        corpus,
+        search_budget,
+        searcher.adapter_name(),
+        matches,
+        matched_bytes,
+        level,
+        scalar_len,
+        percentage(scalar_len, total_input),
+        scalar_elapsed,
+        compressed_len,
+        percentage(compressed_len, total_input),
+        compression_elapsed,
+    );
+    black_box((steady, scalar_len, compressed_len));
+    Ok(())
+}
+
+fn validate_searches(
+    searcher: &GpuMatchSearcher,
+    input: &[u8],
+    expected: &[GpuMatch],
+    search_budget: u32,
+    batch: usize,
+) -> Result<GpuMatchTable, Box<dyn std::error::Error>> {
     // First search proves the production match-table implementation against the independent CPU
     // oracle. A second timed search shows steady-state cost with device and pipeline already alive.
-    let first = timed("GPU first table", || searcher.search(&input, search_budget))?;
+    let first = timed("GPU first table", || searcher.search(input, search_budget))?;
     assert!(first.iter().eq(expected.iter().copied()));
-    let steady = timed("GPU steady table", || {
-        searcher.search(&input, search_budget)
-    })?;
+    let steady = timed("GPU steady table", || searcher.search(input, search_budget))?;
     assert!(steady.iter().eq(expected.iter().copied()));
 
-    let batch_inputs = vec![input.as_slice(); batch];
+    let batch_inputs = vec![input; batch];
     let sequential_tables = timed("GPU sequential tables", || {
         batch_inputs
             .iter()
@@ -85,12 +134,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(table.iter().eq(expected.iter().copied()));
     }
 
-    let config = DeflateConfig::new(level);
+    black_box((first, sequential_tables, batch_tables));
+    Ok(steady)
+}
+
+struct CompressionComparison {
+    scalar_len: usize,
+    scalar_elapsed: Duration,
+    compressed_len: usize,
+    compression_elapsed: Duration,
+}
+
+fn benchmark_compression(
+    searcher: &GpuMatchSearcher,
+    input: &[u8],
+    config: DeflateConfig,
+    search_budget: u32,
+    batch: usize,
+) -> Result<CompressionComparison, Box<dyn std::error::Error>> {
     let mut scalar_compressed = vec![0u8; compress_bound(input.len()) + 64];
     let scalar_started = Instant::now();
     let mut scalar_len = 0usize;
     for _ in 0..batch {
-        let (scalar_written, scalar_code) = compress_slice(&mut scalar_compressed, &input, config);
+        let (scalar_written, scalar_code) = compress_slice(&mut scalar_compressed, input, config);
         assert_eq!(scalar_code, ReturnCode::Ok);
         scalar_len += scalar_written.len();
     }
@@ -101,10 +167,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let mut jobs = compressed
         .iter_mut()
-        .map(|output| BatchJob::new(&input, output))
+        .map(|output| BatchJob::new(input, output))
         .collect::<Vec<_>>();
     let started = Instant::now();
-    let results = compress_slices_batch_gpu(&mut jobs, config, &searcher, search_budget)?;
+    let results = compress_slices_batch_gpu(&mut jobs, config, searcher, search_budget)?;
     let compression_elapsed = started.elapsed();
     drop(jobs);
     let compressed_len = results.iter().map(|result| result.written).sum::<usize>();
@@ -118,37 +184,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             InflateConfig::default(),
         );
         assert_eq!(code, ReturnCode::Ok);
-        assert_eq!(decoded, input.as_slice());
+        assert_eq!(decoded, input);
     }
 
-    let matches = steady.iter().filter(|item| item.length >= 3).count();
-    let matched_bytes: u64 = steady.iter().map(|item| u64::from(item.length)).sum();
-    println!(
-        "validated batch {} x {} {:?} bytes at budget {} on {}: {} matches/input, {} total matched bytes/input; level {} scalar {} bytes ({:.3}%) in {:?}; GPU-fed {} bytes ({:.3}%) in {:?}",
-        batch,
-        input.len(),
-        corpus,
-        search_budget,
-        searcher.adapter_name(),
-        matches,
-        matched_bytes,
-        level,
+    Ok(CompressionComparison {
         scalar_len,
-        scalar_len as f64 * 100.0 / (input.len() * batch) as f64,
         scalar_elapsed,
         compressed_len,
-        compressed_len as f64 * 100.0 / (input.len() * batch) as f64,
         compression_elapsed,
-    );
-    black_box((
-        first,
-        steady,
-        sequential_tables,
-        batch_tables,
-        scalar_len,
-        compressed_len,
-    ));
-    Ok(())
+    })
+}
+
+fn percentage(numerator: usize, denominator: usize) -> String {
+    // Thousandths of one percentage point, rounded, without narrowing
+    // the aggregate byte counts through floating-point conversion.
+    let numerator = (numerator as u128) * 100_000;
+    let denominator = denominator as u128;
+    let scaled = (numerator + denominator / 2) / denominator;
+    format!("{}.{:03}", scaled / 1000, scaled % 1000)
 }
 
 fn option_value<'a>(args: &'a [String], prefix: &str) -> Option<&'a str> {
@@ -162,11 +215,11 @@ fn timed<T>(label: &str, run: impl FnOnce() -> T) -> T {
     result
 }
 
-fn build_hash_index(input: &[u8]) -> HashIndex {
-    let valid_positions = input.len().saturating_sub(2);
+fn build_hash_index(input: &[u8]) -> Result<HashIndex, std::num::TryFromIntError> {
+    let valid_positions = u32::try_from(input.len().saturating_sub(2))?;
     let mut counts = vec![0u32; HASH_SIZE];
     for position in 0..valid_positions {
-        counts[hash3(input, position) as usize] += 1;
+        counts[hash3(input, position as usize) as usize] += 1;
     }
 
     let mut offsets = vec![0u32; HASH_SIZE + 1];
@@ -175,17 +228,22 @@ fn build_hash_index(input: &[u8]) -> HashIndex {
     }
 
     let mut cursors = offsets[..HASH_SIZE].to_vec();
-    let mut positions = vec![0u32; valid_positions];
+    let mut positions = vec![0u32; valid_positions as usize];
     for position in 0..valid_positions {
-        let hash = hash3(input, position) as usize;
+        let hash = hash3(input, position as usize) as usize;
         let cursor = &mut cursors[hash];
-        positions[*cursor as usize] = position as u32;
+        positions[*cursor as usize] = position;
         *cursor += 1;
     }
-    HashIndex { offsets, positions }
+    Ok(HashIndex { offsets, positions })
 }
 
-fn match_reference(input: &[u8], index: &HashIndex, search_budget: u32) -> Vec<GpuMatch> {
+fn match_reference(
+    input: &[u8],
+    index: &HashIndex,
+    search_budget: u32,
+) -> Result<Vec<GpuMatch>, std::num::TryFromIntError> {
+    let input_len = u32::try_from(input.len())?;
     let mut results = vec![
         GpuMatch {
             length: 0,
@@ -193,17 +251,14 @@ fn match_reference(input: &[u8], index: &HashIndex, search_budget: u32) -> Vec<G
         };
         input.len()
     ];
-    for position in 0..input.len().saturating_sub(2) {
-        let hash = hash3(input, position) as usize;
+    for position in 0..input_len.saturating_sub(2) {
+        let hash = hash3(input, position as usize) as usize;
         let bucket =
             &index.positions[index.offsets[hash] as usize..index.offsets[hash + 1] as usize];
-        let minimum_start = if position >= MAX_DIST {
-            position - MAX_DIST + 1
-        } else {
-            0
-        };
-        let first = bucket.partition_point(|&candidate| candidate < minimum_start as u32);
-        let end = bucket.partition_point(|&candidate| candidate < position as u32);
+        let minimum_start = position.saturating_sub(MAX_DIST - 1);
+        let first = bucket.partition_point(|&candidate| candidate < minimum_start);
+        let end = bucket.partition_point(|&candidate| candidate < position);
+        let position = position as usize;
         let max_len = (input.len() - position).min(MAX_MATCH);
         let mut best = GpuMatch {
             length: 0,
@@ -211,25 +266,25 @@ fn match_reference(input: &[u8], index: &HashIndex, search_budget: u32) -> Vec<G
         };
 
         for &candidate in bucket[first..end].iter().rev().take(search_budget as usize) {
-            let candidate = candidate as usize;
+            let start = candidate as usize;
             let len = input[position..position + max_len]
                 .iter()
-                .zip(&input[candidate..candidate + max_len])
+                .zip(&input[start..start + max_len])
                 .position(|(left, right)| left != right)
                 .unwrap_or(max_len);
             if len >= 3
                 && (len > best.length as usize
-                    || (len == best.length as usize && candidate > best.start as usize))
+                    || (len == best.length as usize && candidate > best.start))
             {
                 best = GpuMatch {
-                    length: len as u32,
-                    start: candidate as u32,
+                    length: u32::try_from(len)?,
+                    start: candidate,
                 };
             }
         }
         results[position] = best;
     }
-    results
+    Ok(results)
 }
 
 fn hash3(input: &[u8], position: usize) -> u32 {
@@ -271,7 +326,7 @@ fn make_input(corpus: Corpus, len: usize) -> Vec<u8> {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;
-                    state as u8
+                    state.to_le_bytes()[0]
                 })
                 .collect()
         }

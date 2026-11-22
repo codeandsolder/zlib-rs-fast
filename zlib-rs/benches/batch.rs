@@ -303,6 +303,39 @@ fn bench_independent(
     Ok(stats)
 }
 
+enum BatchEngine {
+    Scalar,
+    #[cfg(feature = "parallel")]
+    Parallel(BatchCodec),
+}
+
+impl BatchEngine {
+    fn new(mode: Mode) -> Result<Self, Box<dyn std::error::Error>> {
+        match mode {
+            Mode::BatchScalar => Ok(Self::Scalar),
+            #[cfg(feature = "parallel")]
+            Mode::ParallelStreams(workers) => {
+                let workers = std::num::NonZeroUsize::new(workers)
+                    .ok_or("parallel benchmark needs a nonzero worker count")?;
+                Ok(Self::Parallel(BatchCodec::new(workers)?))
+            }
+            Mode::Independent => Err("independent mode is not a batch engine".into()),
+        }
+    }
+
+    fn compress(
+        &self,
+        jobs: &mut [BatchJob<'_>],
+        config: DeflateConfig,
+    ) -> Vec<zlib_rs::BatchCompressResult> {
+        match self {
+            Self::Scalar => compress_slices_batch(jobs, config),
+            #[cfg(feature = "parallel")]
+            Self::Parallel(codec) => codec.compress(jobs, config),
+        }
+    }
+}
+
 fn bench_batched(
     mode: Mode,
     inputs: &[Vec<u8>],
@@ -311,14 +344,7 @@ fn bench_batched(
     full: bool,
     outputs: &mut [Vec<u8>],
 ) -> Result<Stats, Box<dyn std::error::Error>> {
-    #[cfg(feature = "parallel")]
-    let parallel_compressor = if let Mode::ParallelStreams(workers) = mode {
-        let workers = std::num::NonZeroUsize::new(workers)
-            .ok_or("parallel benchmark needs a nonzero worker count")?;
-        Some(BatchCodec::new(workers)?)
-    } else {
-        None
-    };
+    let engine = BatchEngine::new(mode)?;
 
     let mut written_lengths = Vec::with_capacity(inputs.len());
     {
@@ -328,15 +354,7 @@ fn bench_batched(
             .map(|(input, output)| BatchJob::new(input, output))
             .collect::<Vec<_>>();
         let mut run = || {
-            let results = match mode {
-                Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
-                #[cfg(feature = "parallel")]
-                Mode::ParallelStreams(_) => parallel_compressor
-                    .as_ref()
-                    .expect("parallel mode initialized its compressor")
-                    .compress(&mut jobs, config),
-                Mode::Independent => unreachable!(),
-            };
+            let results = engine.compress(&mut jobs, config);
             results.into_iter().fold(0usize, |sink, result| {
                 assert_eq!(result.code, ReturnCode::Ok);
                 written_lengths.push(result.written);
@@ -357,15 +375,7 @@ fn bench_batched(
             .map(|(input, output)| BatchJob::new(input, output))
             .collect::<Vec<_>>();
         let mut run = || {
-            let results = match mode {
-                Mode::BatchScalar => compress_slices_batch(&mut jobs, config),
-                #[cfg(feature = "parallel")]
-                Mode::ParallelStreams(_) => parallel_compressor
-                    .as_ref()
-                    .expect("parallel mode initialized its compressor")
-                    .compress(&mut jobs, config),
-                Mode::Independent => unreachable!(),
-            };
+            let results = engine.compress(&mut jobs, config);
             results.into_iter().fold(0usize, |sink, result| {
                 assert_eq!(result.code, ReturnCode::Ok);
                 sink ^ result.written
