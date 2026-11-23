@@ -480,20 +480,22 @@ fn next_slow_cursor(
         }
     }
 
-    // Also inspect the current hash head near the end of the match. Using
-    // MIN_MATCH + 1 leaves one byte for the main comparison to extend by.
-    let offset = match_len - (STD_MIN_MATCH + 1);
-    let bytes = scan.get(offset..offset + STD_MIN_MATCH)?;
-    let mut hash = 0;
-    for byte in bytes {
-        hash = RollHashCalc::update_hash(hash, u32::from(*byte));
-    }
-    let hash_pos = resources.head[hash as usize];
-    if hash_pos < next.hash_pos {
-        if usize::from(hash_pos) <= limit_base + offset {
-            return None;
+    // A rolling three-byte probe overlapping the match tail and reaching
+    // one byte beyond it can discover a chain that extends the match.
+    // zlib-ng probes at len - 2; only read the extra byte if initialized.
+    let offset = match_len - (STD_MIN_MATCH - 1);
+    if let Some(bytes) = scan.get(offset..offset + STD_MIN_MATCH) {
+        let mut hash = 0;
+        for byte in bytes {
+            hash = RollHashCalc::update_hash(hash, u32::from(*byte));
         }
-        next = SearchCursor { hash_pos, offset };
+        let hash_pos = resources.head[hash as usize];
+        if hash_pos < next.hash_pos {
+            if usize::from(hash_pos) <= limit_base + offset {
+                return None;
+            }
+            next = SearchCursor { hash_pos, offset };
+        }
     }
 
     Some(next)
@@ -931,6 +933,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rolling_tail_probe_uses_last_two_match_bytes_and_next_initialized_byte() {
+        let scan = b"ABCDEFGHIJKLMNO";
+        let prev = [Pos::MAX; 32];
+        let mut head = vec![Pos::MAX; ROLL_HASH_SIZE];
+        let match_len = 8;
+        let offset = match_len - (STD_MIN_MATCH - 1);
+        let hash = scan[offset..offset + STD_MIN_MATCH]
+            .iter()
+            .fold(0, |h, &byte| RollHashCalc::update_hash(h, u32::from(byte)));
+        head[hash as usize] = 10;
+        let resources = MatchSearchResources {
+            initialized: scan,
+            prev: &prev,
+            head: &head,
+        };
+
+        let extended = next_slow_cursor(resources, scan, 12, match_len, 0, 31);
+        assert_eq!(
+            extended,
+            Some(SearchCursor {
+                hash_pos: 10,
+                offset,
+            })
+        );
+
+        // A stream ending at the match end does not supply the lookahead
+        // byte. Never inspect it or discard otherwise valid predecessor links.
+        let truncated = &scan[..match_len];
+        assert_eq!(
+            next_slow_cursor(resources, truncated, 12, match_len, 0, 31),
+            Some(SearchCursor {
+                hash_pos: 12,
+                offset: 0,
+            })
+        );
     }
 
     #[test]
