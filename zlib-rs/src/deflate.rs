@@ -1004,8 +1004,37 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 
     let state = &mut *stream.state;
 
-    if state.level != level {
-        if changes_hash {
+    let old_algorithm = algorithm::Algorithm::for_stream(state.level, state.strategy);
+    let new_algorithm = algorithm::Algorithm::for_stream(level, strategy);
+    let old_has_full_chain = matches!(
+        old_algorithm,
+        Some(
+            algorithm::Algorithm::Fast | algorithm::Algorithm::Medium | algorithm::Algorithm::Slow
+        )
+    );
+    let new_needs_head = matches!(
+        new_algorithm,
+        Some(
+            algorithm::Algorithm::Quick
+                | algorithm::Algorithm::Fast
+                | algorithm::Algorithm::Medium
+                | algorithm::Algorithm::Slow
+        )
+    );
+    let new_needs_chain = matches!(
+        new_algorithm,
+        Some(
+            algorithm::Algorithm::Fast | algorithm::Algorithm::Medium | algorithm::Algorithm::Slow
+        )
+    );
+    let old_head_only = old_algorithm == Some(algorithm::Algorithm::Quick);
+    let rebuild = changes_hash
+        || (!old_has_full_chain
+            && new_needs_head
+            && (old_algorithm != new_algorithm || (old_head_only && new_needs_chain)));
+
+    if state.level != level || state.strategy != strategy {
+        if rebuild {
             rebuild_hash_history(state, next_hash);
             state.matches = 0;
         } else if state.level == 0 && state.matches != 0 {
@@ -1016,7 +1045,9 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
             }
             state.matches = 0;
         }
+    }
 
+    if state.level != level {
         lm_set_level(state, level, next_config);
     }
 
@@ -2555,7 +2586,16 @@ pub fn fill_window_core_with_hash_maintenance(
             state.insert = Ord::min(state.insert, state.strstart);
 
             if maintain_hash_chain {
-                self::slide_hash::slide_hash(state);
+                if state.level == 1
+                    && matches!(
+                        state.strategy,
+                        Strategy::Default | Strategy::Filtered | Strategy::Fixed
+                    )
+                {
+                    self::slide_hash::slide_hash_head(state);
+                } else {
+                    self::slide_hash::slide_hash(state);
+                }
             }
 
             more += wsize;
@@ -2597,14 +2637,32 @@ pub fn fill_window_core_with_hash_maintenance(
                 let v1 = u32::from(state.window.filled()[string + 1]);
                 state.ins_h = state.update_hash(v0, v1);
             } else if string >= 1 {
-                state.quick_insert_string(string + 2 - STD_MIN_MATCH);
+                if state.level == 1
+                    && matches!(
+                        state.strategy,
+                        Strategy::Default | Strategy::Filtered | Strategy::Fixed
+                    )
+                {
+                    StandardHashCalc::insert_head_string(state, string + 2 - STD_MIN_MATCH);
+                } else {
+                    state.quick_insert_string(string + 2 - STD_MIN_MATCH);
+                }
             }
             let mut count = state.insert;
             if state.lookahead == 1 {
                 count -= 1;
             }
             if count > 0 {
-                state.insert_string(string, count);
+                if state.level == 1
+                    && matches!(
+                        state.strategy,
+                        Strategy::Default | Strategy::Filtered | Strategy::Fixed
+                    )
+                {
+                    StandardHashCalc::insert_head_batch(state, string, count);
+                } else {
+                    state.insert_string(string, count);
+                }
                 state.insert -= count;
             }
         }
@@ -5816,11 +5874,51 @@ mod test {
     }
 
     #[test]
+    fn quick_head_only_history_is_rebuilt_before_chain_search() -> Result<(), ReturnCode> {
+        let source = b"repeated-quick-phase-abc123/".repeat(9_000);
+        let mut stream = DeflateStream::new(DeflateConfig::new(1))?;
+        let mut output = vec![0u8; compress_bound(source.len()) + 64];
+        stream.state.prev.as_mut_slice().fill(0xa55a);
+        set_test_input(&mut stream, &source)?;
+        set_test_output(&mut stream, &mut output)?;
+
+        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.avail_in, 0);
+        assert!(
+            stream
+                .state
+                .prev
+                .as_slice()
+                .iter()
+                .all(|&link| link == 0xa55a),
+            "quick mode must not write predecessor chains, including after a window slide"
+        );
+        assert_eq!(params(&mut stream, 2, Strategy::Default), ReturnCode::Ok);
+        assert!(
+            stream
+                .state
+                .prev
+                .as_slice()
+                .iter()
+                .any(|&link| link != 0xa55a),
+            "switching to a chain walker must reconstruct history"
+        );
+        let written = finish_test_stream(&mut stream)?;
+        assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
+        Ok(())
+    }
+
+    #[test]
     fn level_changes_handle_long_unflushed_block_and_reindex_history() -> Result<(), ReturnCode> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
         let (prefix, suffix) = source.split_at(source.len() - 8_192);
         for (initial_level, next_level) in [
             (1, 6),
+            (1, 2),
+            (1, 3),
+            (1, 7),
+            (1, 8),
+            (1, 9),
             (6, 9),
             (9, 1),
             (9, 2),

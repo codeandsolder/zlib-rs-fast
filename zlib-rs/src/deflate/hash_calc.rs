@@ -71,6 +71,32 @@ impl StandardHashCalc {
         head
     }
 
+    /// The single-candidate quick matcher never follows predecessor links.
+    /// Keeping only the newest head avoids a random ring write per symbol.
+    #[inline]
+    pub const fn insert_head_value(state: &mut State, string: usize, val: u32) -> u16 {
+        let hash = Self::update_hash(0, val) as usize;
+        let previous = state.head.as_slice()[hash];
+        state.head.as_mut_slice()[hash] = hash_chain_position(string);
+        previous
+    }
+
+    #[inline]
+    pub fn insert_head_string(state: &mut State, string: usize) -> u16 {
+        let bytes = &state.window.filled()[string + Self::HASH_CALC_OFFSET..];
+        Self::insert_head_value(state, string, Self::first_four_bytes(bytes))
+    }
+
+    pub fn insert_head_batch(state: &mut State, string: usize, count: usize) {
+        let bytes = &state.window.filled()[string + Self::HASH_CALC_OFFSET..];
+        let bytes = &bytes[..Ord::min(bytes.len(), count + 3)];
+        let head = state.head.as_mut_slice();
+        for (offset, word) in bytes.windows(4).enumerate() {
+            let hash = Self::update_hash(0, Self::first_four_bytes(word)) as usize;
+            head[hash] = hash_chain_position(string + offset);
+        }
+    }
+
     pub fn insert_string(state: &mut State, string: usize, count: usize) {
         let slice = &state.window.filled()[string + Self::HASH_CALC_OFFSET..];
 

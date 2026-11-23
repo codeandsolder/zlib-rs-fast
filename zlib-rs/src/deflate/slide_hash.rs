@@ -19,8 +19,13 @@ pub(super) fn slide_position(position: Pos, displacement: usize) -> Pos {
 }
 
 pub fn slide_hash(state: &mut crate::deflate::State) {
-    slide_hash_chain(state.head.as_mut_slice(), state.w_size);
+    slide_hash_head(state);
     slide_hash_chain(state.prev.as_mut_slice(), state.w_size);
+}
+
+/// Quick compression traverses the hash heads but never reads predecessor links.
+pub fn slide_hash_head(state: &mut crate::deflate::State) {
+    slide_hash_chain(state.head.as_mut_slice(), state.w_size);
 }
 
 fn slide_hash_chain(table: &mut [Pos], displacement: usize) {
