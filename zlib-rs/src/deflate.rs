@@ -5734,6 +5734,20 @@ mod test {
         Ok(())
     }
 
+    /// Feed a non-final input prefix into a live compression stream.
+    /// The caller keeps both buffers alive through the later finish call.
+    fn feed_test_prefix(
+        stream: &mut DeflateStream<'_>,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), ReturnCode> {
+        set_test_input(stream, input)?;
+        set_test_output(stream, output)?;
+        assert_eq!(deflate(stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.avail_in, 0);
+        Ok(())
+    }
+
     fn finish_test_stream(stream: &mut DeflateStream<'_>) -> Result<usize, ReturnCode> {
         assert_eq!(deflate(stream, DeflateFlush::Finish), ReturnCode::StreamEnd);
         assert_eq!(stream.avail_in, 0);
@@ -5879,11 +5893,7 @@ mod test {
         let mut stream = DeflateStream::new(DeflateConfig::new(1))?;
         let mut output = vec![0u8; compress_bound(source.len()) + 64];
         stream.state.prev.as_mut_slice().fill(0xa55a);
-        set_test_input(&mut stream, &source)?;
-        set_test_output(&mut stream, &mut output)?;
-
-        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-        assert_eq!(stream.avail_in, 0);
+        feed_test_prefix(&mut stream, &source, &mut output)?;
         assert!(
             stream
                 .state
@@ -5935,11 +5945,7 @@ mod test {
         ] {
             let mut stream = DeflateStream::new(DeflateConfig::new(initial_level))?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
-            set_test_input(&mut stream, prefix)?;
-            set_test_output(&mut stream, &mut output)?;
-
-            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-            assert_eq!(stream.avail_in, 0);
+            feed_test_prefix(&mut stream, prefix, &mut output)?;
             assert!(stream.state.block_start < 0);
             assert!(
                 unflushed_block_span(stream.state.strstart, stream.state.block_start).1
@@ -8678,10 +8684,7 @@ mod test {
         for (before, after) in [(2, 1), (2, 3), (2, 9), (3, 2), (9, 2)] {
             let mut stream = DeflateStream::new(DeflateConfig::new(before))?;
             let mut output = vec![0u8; compress_bound(source.len()) + 256];
-            set_test_input(&mut stream, prefix)?;
-            set_test_output(&mut stream, &mut output)?;
-            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
-            assert_eq!(stream.avail_in, 0);
+            feed_test_prefix(&mut stream, prefix, &mut output)?;
             assert_eq!(
                 params(&mut stream, after, Strategy::Default),
                 ReturnCode::Ok
