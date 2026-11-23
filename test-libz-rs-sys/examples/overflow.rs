@@ -24,8 +24,7 @@ fn exercise(total: u64) -> Result<(), &'static str> {
     let zeros = vec![0u8; IN_CHUNK];
     let mut output = vec![0u8; OUT_CHUNK];
 
-    let mut compressor =
-        Deflate::new(1, true, 15).map_err(|_| "failed to initialize deflate compressor")?;
+    let mut compressor = Deflate::new(1, true, 15);
     let mut compressed = Vec::new();
 
     let chunk_budget = u64::try_from(IN_CHUNK).map_err(|_| "input chunk exceeds 64-bit count")?;
@@ -81,8 +80,7 @@ fn exercise(total: u64) -> Result<(), &'static str> {
         return Err("deflate aggregate output disagrees with collected data");
     }
 
-    let mut decompressor =
-        Inflate::new(true, 15).map_err(|_| "failed to initialize inflate decoder")?;
+    let mut decompressor = Inflate::new(true, 15);
     let mut input_pos = 0usize;
     loop {
         let input = compressed

@@ -112,6 +112,34 @@ macro_rules! stream_accessors {
     };
 }
 
+// Both high-level streams use the exact zlib ABI input/output cursor fields.
+// Centralizing the attachment/detachment is a correctness invariant: no caller
+// buffer pointer may survive the end of any compress/decompress operation.
+macro_rules! with_stream_buffers {
+    ($stream:ident, $input:expr, $output:expr, $operation:expr) => {{
+        let stream = &mut *$stream;
+        // ABI avail is a u32, even when a caller passes a larger slice.
+        stream.avail_in = abi_avail($input.len());
+        stream.avail_out = abi_avail($output.len());
+        // The ABI declares next_in mutable even though neither engine writes to input.
+        stream.next_in = $input.as_ptr().cast_mut();
+        stream.next_out = $output.byte_ptr();
+
+        let initial_in = stream.avail_in;
+        let initial_out = stream.avail_out;
+        let result = ($operation)(stream);
+
+        let consumed = transferred(initial_in, stream.avail_in);
+        let produced = transferred(initial_out, stream.avail_out);
+        stream.next_in = core::ptr::null_mut();
+        stream.next_out = core::ptr::null_mut();
+        stream.avail_in = 0;
+        stream.avail_out = 0;
+
+        (result, consumed, produced)
+    }};
+}
+
 /// The state that is used to decompress an input.
 pub struct Inflate {
     inner: Result<crate::inflate::InflateStream<'static>, InflateError>,
@@ -119,6 +147,10 @@ pub struct Inflate {
     total_out: u64,
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the owned Inflate stream detaches all caller buffers after each call and mutates only through exclusive access"
+)]
 // SAFETY: The owned decoder exclusively owns its heap state. Callers can only
 // change that state through &mut self. Every decode call clears the ephemeral
 // input/output pointers before returning, and error_message reads only static
@@ -153,6 +185,7 @@ impl Inflate {
     ///
     /// Invalid window bits or allocation failures produce a stream that reports
     /// its initialization error when first used, without panicking.
+    #[must_use = "The returned stream owns either an initialized state or its deferred error."]
     pub fn new(expect_header: bool, window_bits: u8) -> Self {
         if !expect_header && window_bits == 0 {
             return Self {
@@ -175,6 +208,7 @@ impl Inflate {
     ///
     /// Invalid configuration or allocation failures are retained and returned
     /// by subsequent stream operations without panicking.
+    #[must_use = "The returned stream owns either an initialized state or its deferred error."]
     pub fn new_with_config(config: InflateConfig) -> Self {
         let inner = crate::inflate::InflateStream::new(config).map_err(|code| match code {
             ReturnCode::MemError => InflateError::MemError,
@@ -246,32 +280,11 @@ impl Inflate {
         flush: InflateFlush,
     ) -> Result<Status, InflateError> {
         let inner = self.inner.as_mut().map_err(|error| *error)?;
-        // Limit the length of the input and output to the maximum value of a c_uint. For larger
-        // inputs, this will either complete or signal that more input and output is needed. The
-        // caller should be able to handle this regardless.
-        inner.avail_in = abi_avail(input.len());
-        inner.avail_out = abi_avail(output.len());
-
-        // zlib's ABI uses a mutable input pointer even though ordinary inflate only reads it.
-        inner.next_in = input.as_ptr().cast_mut();
-        inner.next_out = output.byte_ptr();
-
-        let initial_input = inner.avail_in;
-        let initial_output = inner.avail_out;
-
-        // SAFETY: the inflate state was properly initialized and the output capability supplies a
-        // writable span of `avail_out` bytes.
-        let ret = unsafe { crate::inflate::inflate(inner, flush) };
-
-        let consumed = transferred(initial_input, inner.avail_in);
-        let produced = transferred(initial_output, inner.avail_out);
-
-        // The caller's input and output borrows end at this method boundary.
-        // Keep internal inflate state, but never retain pointers to their buffers.
-        inner.next_in = core::ptr::null_mut();
-        inner.next_out = core::ptr::null_mut();
-        inner.avail_in = 0;
-        inner.avail_out = 0;
+        let (ret, consumed, produced) = with_stream_buffers!(inner, input, output, |stream| {
+            // SAFETY: the initialized inflate state and output capability
+            // provide valid spans; the wrapper detaches pointers afterward.
+            unsafe { crate::inflate::inflate(stream, flush) }
+        });
 
         let (Some(consumed), Some(produced)) = (consumed, produced) else {
             return Err(InflateError::StreamError);
@@ -363,6 +376,10 @@ pub struct Deflate {
     total_out: u64,
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the owned Deflate stream detaches all caller buffers after each call and mutates only through exclusive access"
+)]
 // SAFETY: The owned encoder holds its independent state allocation, updates it
 // only through &mut self, and removes caller buffer pointers before each public
 // call returns. Shared &self methods only inspect counters or static messages.
@@ -378,6 +395,7 @@ impl Deflate {
     /// The `window_bits` must be in the range `8..=15`, with `15` being most common.
     /// Invalid compression configuration or allocation failures are retained
     /// and reported by subsequent stream operations without panicking.
+    #[must_use = "The returned stream owns either an initialized state or its deferred error."]
     pub fn new(level: i32, zlib_header: bool, window_bits: u8) -> Self {
         let config = DeflateConfig {
             window_bits: if zlib_header {
@@ -400,6 +418,7 @@ impl Deflate {
     /// This allocates, so should be done with care.
     /// Invalid configuration or allocation failures are retained and returned
     /// by subsequent stream operations without panicking.
+    #[must_use = "The returned stream owns either an initialized state or its deferred error."]
     pub fn new_with_config(config: DeflateConfig) -> Self {
         let inner = crate::deflate::DeflateStream::new(config).map_err(|code| match code {
             ReturnCode::MemError => DeflateError::OutOfMemory,
@@ -420,6 +439,10 @@ impl Deflate {
 
         if let Ok(inner) = self.inner.as_mut() {
             crate::deflate::reset(inner);
+        } else {
+            // An invalid or failed initialization has no live stream to reset.
+            // Retry the default configuration so callers can recover from it.
+            self.inner = Self::new_with_config(DeflateConfig::default()).inner;
         }
     }
 
@@ -462,29 +485,9 @@ impl Deflate {
         flush: DeflateFlush,
     ) -> Result<Status, DeflateError> {
         let inner = self.inner.as_mut().map_err(|error| *error)?;
-        // Limit the length of the input and output to the maximum value of a c_uint. For larger
-        // inputs, this will either complete or signal that more input and output is needed. The
-        // caller should be able to handle this regardless.
-        inner.avail_in = abi_avail(input.len());
-        inner.avail_out = abi_avail(output.len());
-
-        // zlib's ABI uses a mutable input pointer even though deflate only reads this input span.
-        inner.next_in = input.as_ptr().cast_mut();
-        inner.next_out = output.byte_ptr();
-
-        let initial_input = inner.avail_in;
-        let initial_output = inner.avail_out;
-
-        let ret = crate::deflate::deflate(inner, flush).into();
-
-        let consumed = transferred(initial_input, inner.avail_in);
-        let produced = transferred(initial_output, inner.avail_out);
-
-        // Clear these pointers so there can be no use after the caller's buffers go out of scope.
-        inner.next_in = core::ptr::null_mut();
-        inner.next_out = core::ptr::null_mut();
-        inner.avail_in = 0;
-        inner.avail_out = 0;
+        let (ret, consumed, produced) = with_stream_buffers!(inner, input, output, |stream| {
+            Result::<Status, DeflateError>::from(crate::deflate::deflate(stream, flush))
+        });
 
         let (Some(consumed), Some(produced)) = (consumed, produced) else {
             return Err(DeflateError::InvalidStream);
@@ -570,6 +573,12 @@ mod tests {
         assert_eq!(
             deflate.error_message(),
             Some(DeflateError::InvalidStream.as_str())
+        );
+        deflate.reset();
+        assert!(deflate.inner.is_ok());
+        assert_eq!(
+            deflate.compress(b"data", &mut output, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
         );
     }
 

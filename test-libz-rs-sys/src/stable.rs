@@ -12,7 +12,7 @@ fn assert_inflates(
     input: &[u8],
     expected: &[u8],
 ) -> Result<(), InflateError> {
-    let mut d = Inflate::new(expect_header, window_bits)?;
+    let mut d = Inflate::new(expect_header, window_bits);
     let mut out = vec![0u8; expected.len()];
     let status = d.decompress(input, &mut out, InflateFlush::Finish)?;
     assert_eq!(status, Status::StreamEnd);
@@ -118,11 +118,10 @@ fn invalid_inflate_window_configurations_return_stream_error() {
         (true, 123),
         (true, u8::MAX),
     ] {
-        assert!(
-            matches!(
-                Inflate::new(expect_header, bits),
-                Err(InflateError::StreamError)
-            ),
+        let mut decoder = Inflate::new(expect_header, bits);
+        assert_eq!(
+            decoder.decompress(&[], &mut [0], InflateFlush::NoFlush),
+            Err(InflateError::StreamError),
             "unexpectedly accepted: header={expect_header}, bits={bits}"
         );
     }
@@ -131,11 +130,10 @@ fn invalid_inflate_window_configurations_return_stream_error() {
 #[test]
 fn invalid_full_configurations_return_stream_error() {
     for bits in [-16, -1, 7, 16, 23, 39, 48, 64, i32::MIN, i32::MAX] {
-        assert!(
-            matches!(
-                Inflate::new_with_config(InflateConfig { window_bits: bits }),
-                Err(InflateError::StreamError)
-            ),
+        let mut decoder = Inflate::new_with_config(InflateConfig { window_bits: bits });
+        assert_eq!(
+            decoder.decompress(&[], &mut [0], InflateFlush::NoFlush),
+            Err(InflateError::StreamError),
             "unexpectedly accepted: {bits}"
         );
     }
