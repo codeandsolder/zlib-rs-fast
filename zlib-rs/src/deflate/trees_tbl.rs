@@ -161,3 +161,23 @@ pub const BASE_DIST: [u16; D_CODES] = [
    32,    48,    64,    96,   128,   192,   256,   384,   512,   768,
  1024,  1536,  2048,  3072,  4096,  6144,  8192, 12288, 16384, 24576
 ];
+
+// Static Huffman encodings are internal constants. Verify their wire lengths
+// at compile time so per-symbol emission can omit a repeated runtime test.
+const _: () = {
+    let mut i = 0;
+    while i < STATIC_LTREE.len() {
+        assert!(STATIC_LTREE[i].len() <= super::MAX_BITS_WIRE);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < STATIC_DTREE.len() {
+        assert!(STATIC_DTREE[i].len() <= super::MAX_BITS_WIRE);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < STATIC_LTREE_ENCODINGS.len() {
+        assert!(STATIC_LTREE_ENCODINGS[i].len() <= super::MAX_BITS_WIRE);
+        i += 1;
+    }
+};

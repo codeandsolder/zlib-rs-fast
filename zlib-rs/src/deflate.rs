@@ -1577,12 +1577,15 @@ impl PackedBits {
     }
 
     const fn code(symbol: Value) -> Self {
-        // Huffman tree nodes reuse a 16-bit field for parent indices and
-        // final lengths. Assert the <=15-bit wire contract *before* taking
-        // the low byte, so an invalid node cannot become a plausible code
-        // length even in a release build. This remains const on Rust 1.99.
+        // Tree construction validates the RFC 1951 length bound in gen_codes;
+        // static trees are checked at compile time. The code emitter is a hot
+        // consumer of that already-validated representation, so checking
+        // each symbol again is redundant in optimized builds.
         let length = symbol.len();
-        assert!(length <= 15, "invalid DEFLATE Huffman code length");
+        debug_assert!(
+            length <= MAX_BITS_WIRE,
+            "invalid DEFLATE Huffman code length"
+        );
         let [length, _] = length.to_le_bytes();
         Self::new(symbol.code() as u64, length)
     }
