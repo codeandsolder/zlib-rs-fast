@@ -37,6 +37,7 @@ jobs:
       command: |
         cargo fmt --all --check
         cargo test --locked --workspace --lib --features gz
+        cargo test --locked --manifest-path tests/flate2-compat/Cargo.toml
         cargo check --locked --workspace --all-targets --features gz
 
   miri-focused:

@@ -117,6 +117,14 @@ pub struct Inflate {
     total_out: u64,
 }
 
+// SAFETY: The owned decoder exclusively owns its heap state. Callers can only
+// change that state through &mut self. Every decode call clears the ephemeral
+// input/output pointers before returning, and error_message reads only static
+// literals. Sharing immutable access or transferring ownership is therefore safe.
+unsafe impl Send for Inflate {}
+// SAFETY: Same ownership and exclusive mutation argument as Send above.
+unsafe impl Sync for Inflate {}
+
 impl Inflate {
     stream_accessors!();
 
@@ -141,14 +149,11 @@ impl Inflate {
     /// `window_bits = 9` in most zlib implementations, and hence should be inflated using
     /// `window_bits = 9`.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Reports invalid configuration or failed allocation.
-    pub fn new(expect_header: bool, window_bits: u8) -> Result<Self, InflateError> {
-        // A raw stream cannot infer its window width from a zlib header.
-        if !expect_header && window_bits == 0 {
-            return Err(InflateError::StreamError);
-        }
+    /// Panics for invalid window bits or failed allocation, matching the
+    /// stable zlib-rs API consumed by flate2.
+    pub fn new(expect_header: bool, window_bits: u8) -> Self {
         let config = InflateConfig {
             window_bits: if expect_header {
                 i32::from(window_bits)
@@ -161,20 +166,22 @@ impl Inflate {
 
     /// Construct a decoder directly from a full inflate configuration.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Reports invalid configuration or failed allocation.
-    pub fn new_with_config(config: InflateConfig) -> Result<Self, InflateError> {
-        let inner = crate::inflate::InflateStream::new(config).map_err(|status| match status {
-            ReturnCode::MemError => InflateError::MemError,
-            ReturnCode::DataError => InflateError::DataError,
-            _ => InflateError::StreamError,
-        })?;
-        Ok(Self {
+    /// Panics for invalid stream configuration or failed allocation, matching
+    /// the stable zlib-rs API.
+    #[expect(
+        clippy::expect_used,
+        reason = "the upstream stable API returns Self and panics on invalid configuration"
+    )]
+    pub fn new_with_config(config: InflateConfig) -> Self {
+        let inner = crate::inflate::InflateStream::new(config)
+            .expect("invalid inflate configuration or failed allocation");
+        Self {
             inner,
             total_in: 0,
             total_out: 0,
-        })
+        }
     }
 
     /// Reset the state to allow handling a new stream.
@@ -347,16 +354,24 @@ pub struct Deflate {
     total_out: u64,
 }
 
+// SAFETY: The owned encoder holds its independent state allocation, updates it
+// only through &mut self, and removes caller buffer pointers before each public
+// call returns. Shared &self methods only inspect counters or static messages.
+unsafe impl Send for Deflate {}
+// SAFETY: The immutable operations do not mutate or expose the inner allocation.
+unsafe impl Sync for Deflate {}
+
 impl Deflate {
     stream_accessors!();
 
     /// Create a new instance - this allocates so should be done with care.
     ///
     /// The `window_bits` must be in the range `8..=15`, with `15` being most common.
-    /// # Errors
+    /// # Panics
     ///
-    /// Reports invalid configuration or failed state allocation.
-    pub fn new(level: i32, zlib_header: bool, window_bits: u8) -> Result<Self, DeflateError> {
+    /// Panics for invalid compression configuration or failed allocation,
+    /// matching the stable zlib-rs API consumed by flate2.
+    pub fn new(level: i32, zlib_header: bool, window_bits: u8) -> Self {
         let config = DeflateConfig {
             window_bits: if zlib_header {
                 i32::from(window_bits)
@@ -376,20 +391,22 @@ impl Deflate {
     /// tweaking `mem_level` or `strategy` is desired.
     ///
     /// This allocates, so should be done with care.
-    /// # Errors
+    /// # Panics
     ///
-    /// Reports invalid configuration or failed state allocation.
-    pub fn new_with_config(config: DeflateConfig) -> Result<Self, DeflateError> {
-        let inner = crate::deflate::DeflateStream::new(config).map_err(|status| match status {
-            ReturnCode::MemError => DeflateError::OutOfMemory,
-            ReturnCode::DataError => DeflateError::InvalidData,
-            _ => DeflateError::InvalidStream,
-        })?;
-        Ok(Self {
+    /// Panics for invalid stream configuration or failed allocation, matching
+    /// the stable zlib-rs API.
+    #[expect(
+        clippy::expect_used,
+        reason = "the upstream stable API returns Self and panics on invalid configuration"
+    )]
+    pub fn new_with_config(config: DeflateConfig) -> Self {
+        let inner = crate::deflate::DeflateStream::new(config)
+            .expect("invalid deflate configuration or failed allocation");
+        Self {
             inner,
             total_in: 0,
             total_out: 0,
-        })
+        }
     }
 
     /// Prepare the instance for a new stream.
@@ -523,6 +540,15 @@ impl Deflate {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stable_streams_satisfy_external_backend_contract() {
+        fn assert_backend<T: Send + Sync>() {}
+        assert_backend::<Inflate>();
+        assert_backend::<Deflate>();
+        let _: Inflate = Inflate::new(true, 15);
+        let _: Deflate = Deflate::new(6, true, 15);
+    }
+
     use super::*;
 
     #[test]
@@ -544,8 +570,7 @@ mod tests {
     fn streaming_deflate_accounts_for_partial_output_and_detaches_caller_buffers(
     ) -> Result<(), &'static str> {
         let source = b"chunked stream input; ".repeat(137);
-        let mut encoder =
-            Deflate::new(6, true, 15).map_err(|_| "valid deflate initialization failed")?;
+        let mut encoder = Deflate::new(6, true, 15);
         let mut compressed = Vec::new();
         let mut finished = false;
 
@@ -607,8 +632,7 @@ mod tests {
     #[test]
     fn safe_inflate_detaches_buffers_with_bounded_output() -> Result<(), &'static str> {
         let source = b"quick brown fox jumps over the lazy dog; ".repeat(36);
-        let mut encoder =
-            Deflate::new(6, true, 15).map_err(|_| "valid deflate initialization failed")?;
+        let mut encoder = Deflate::new(6, true, 15);
         let mut compressed = vec![0u8; source.len() + 128];
         assert_eq!(
             encoder.compress(&source, &mut compressed, DeflateFlush::Finish),
@@ -618,7 +642,7 @@ mod tests {
             usize::try_from(encoder.total_out()).map_err(|_| "compressed size exceeds usize")?;
         compressed.truncate(compressed_bytes);
 
-        let mut decoder = Inflate::new(true, 15).map_err(|_| "inflate initialization failed")?;
+        let mut decoder = Inflate::new(true, 15);
         let mut recovered = vec![0u8; source.len()];
         let mut reached_end = false;
         for _ in 0..source.len() {
@@ -666,8 +690,7 @@ mod tests {
     fn safe_inflate_dictionary_resume_after_detaching_buffers() -> Result<(), &'static str> {
         let dictionary = b"recurring input history - useful to decoder";
         let source = b"recurring input history - useful to decoder, again";
-        let mut encoder =
-            Deflate::new(6, true, 15).map_err(|_| "valid deflate initialization failed")?;
+        let mut encoder = Deflate::new(6, true, 15);
         assert!(encoder.set_dictionary(dictionary).is_ok());
         let mut compressed_stream = [0u8; 256];
         assert_eq!(
@@ -677,7 +700,7 @@ mod tests {
         let compressed_len = usize::try_from(encoder.total_out())
             .map_err(|_| "compressed_stream size exceeds usize")?;
 
-        let mut decoder = Inflate::new(true, 15).map_err(|_| "inflate initialization failed")?;
+        let mut decoder = Inflate::new(true, 15);
         let mut recovered = [0u8; 128];
         let first = decoder.decompress(
             &compressed_stream[..compressed_len],
@@ -710,7 +733,7 @@ mod tests {
         // RFC1950 empty stream. A partial feed must not leave pointers to the
         // temporary caller slices alive while waiting for the next chunk.
         let compressed = [0x78u8, 0x9c, 0x03, 0, 0, 0, 0, 1];
-        let mut inflate = Inflate::new(true, 15).map_err(|_| "inflate initialization failed")?;
+        let mut inflate = Inflate::new(true, 15);
         let mut output = [0u8; 8];
 
         let partial = inflate.decompress(&compressed[..2], &mut output, InflateFlush::NoFlush);
