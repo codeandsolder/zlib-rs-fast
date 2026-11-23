@@ -1004,8 +1004,37 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
 
     let state = &mut *stream.state;
 
-    if state.level != level {
-        if changes_hash {
+    let old_algorithm = algorithm::Algorithm::for_stream(state.level, state.strategy);
+    let new_algorithm = algorithm::Algorithm::for_stream(level, strategy);
+    let old_has_full_chain = matches!(
+        old_algorithm,
+        Some(
+            algorithm::Algorithm::Fast | algorithm::Algorithm::Medium | algorithm::Algorithm::Slow
+        )
+    );
+    let new_needs_head = matches!(
+        new_algorithm,
+        Some(
+            algorithm::Algorithm::Quick
+                | algorithm::Algorithm::Fast
+                | algorithm::Algorithm::Medium
+                | algorithm::Algorithm::Slow
+        )
+    );
+    let new_needs_chain = matches!(
+        new_algorithm,
+        Some(
+            algorithm::Algorithm::Fast | algorithm::Algorithm::Medium | algorithm::Algorithm::Slow
+        )
+    );
+    let old_head_only = old_algorithm == Some(algorithm::Algorithm::Quick);
+    let rebuild = changes_hash
+        || (!old_has_full_chain
+            && new_needs_head
+            && (old_algorithm != new_algorithm || (old_head_only && new_needs_chain)));
+
+    if state.level != level || state.strategy != strategy {
+        if rebuild {
             rebuild_hash_history(state, next_hash);
             state.matches = 0;
         } else if state.level == 0 && state.matches != 0 {
@@ -1016,7 +1045,9 @@ pub fn params(stream: &mut DeflateStream, level: i32, strategy: Strategy) -> Ret
             }
             state.matches = 0;
         }
+    }
 
+    if state.level != level {
         lm_set_level(state, level, next_config);
     }
 
@@ -2555,7 +2586,16 @@ pub fn fill_window_core_with_hash_maintenance(
             state.insert = Ord::min(state.insert, state.strstart);
 
             if maintain_hash_chain {
-                self::slide_hash::slide_hash(state);
+                if state.level == 1
+                    && matches!(
+                        state.strategy,
+                        Strategy::Default | Strategy::Filtered | Strategy::Fixed
+                    )
+                {
+                    self::slide_hash::slide_hash_head(state);
+                } else {
+                    self::slide_hash::slide_hash(state);
+                }
             }
 
             more += wsize;
@@ -2597,14 +2637,32 @@ pub fn fill_window_core_with_hash_maintenance(
                 let v1 = u32::from(state.window.filled()[string + 1]);
                 state.ins_h = state.update_hash(v0, v1);
             } else if string >= 1 {
-                state.quick_insert_string(string + 2 - STD_MIN_MATCH);
+                if state.level == 1
+                    && matches!(
+                        state.strategy,
+                        Strategy::Default | Strategy::Filtered | Strategy::Fixed
+                    )
+                {
+                    StandardHashCalc::insert_head_string(state, string + 2 - STD_MIN_MATCH);
+                } else {
+                    state.quick_insert_string(string + 2 - STD_MIN_MATCH);
+                }
             }
             let mut count = state.insert;
             if state.lookahead == 1 {
                 count -= 1;
             }
             if count > 0 {
-                state.insert_string(string, count);
+                if state.level == 1
+                    && matches!(
+                        state.strategy,
+                        Strategy::Default | Strategy::Filtered | Strategy::Fixed
+                    )
+                {
+                    StandardHashCalc::insert_head_batch(state, string, count);
+                } else {
+                    state.insert_string(string, count);
+                }
                 state.insert -= count;
             }
         }

@@ -134,7 +134,7 @@ fn emit_next<const FULL: bool>(state: &mut State<'_>) {
         };
         let [a, b, c, d, ..] = probe.to_le_bytes();
         let str_val = u32::from_le_bytes([a, b, c, d]);
-        let hash_head = StandardHashCalc::quick_insert_value(state, state.strstart, str_val);
+        let hash_head = StandardHashCalc::insert_head_value(state, state.strstart, str_val);
 
         if let Some(distance) = state.recent_hash_distance(hash_head) {
             let current = &state.window.filled()[state.strstart..];
