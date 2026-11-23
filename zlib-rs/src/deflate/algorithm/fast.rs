@@ -98,7 +98,7 @@ impl FastProducer {
 
             if let Some(result) = result {
                 state.match_start = result.start;
-                let mut match_len = usize::from(result.length);
+                let match_len = usize::from(result.length);
                 if match_len >= WANT_MIN_MATCH {
                     let block_ready = state.tally_dist(
                         state.strstart - usize::from(result.start),
@@ -106,17 +106,18 @@ impl FastProducer {
                     );
                     state.lookahead -= match_len;
                     if LOCAL || self.match_source.maintains_hash_chain() {
-                        if match_len <= usize::from(state.max_insert_length)
-                            && state.lookahead >= WANT_MIN_MATCH
-                        {
-                            match_len -= 1;
-                            state.strstart += 1;
-                            state.insert_string(state.strstart, match_len);
+                        if state.lookahead >= WANT_MIN_MATCH {
+                            let first = state.strstart + 1;
+                            let count = match_len - 1;
+                            let budget = usize::from(state.max_insert_length).max(2);
+                            if count <= budget || count < 3 {
+                                state.insert_string(first, count);
+                            } else {
+                                StandardHashCalc::insert_spaced(state, first, count, budget);
+                            }
                             state.strstart += match_len;
                         } else {
                             state.strstart += match_len;
-                            // Preserve the normal hash insert when a complete
-                            // tail probe is available.
                             if state.lookahead >= STD_MIN_MATCH {
                                 StandardHashCalc::quick_insert_string(
                                     state,

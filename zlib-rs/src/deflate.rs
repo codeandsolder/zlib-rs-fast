@@ -8628,6 +8628,72 @@ mod test {
     }
 
     #[test]
+    fn spread_fast_mode_keeps_exact_bytes_across_input_and_output_chunks() -> Result<(), ReturnCode>
+    {
+        let mut source = Vec::new();
+        for n in 0..2_400usize {
+            source.extend_from_slice(b"sparse-hash/long-match-prefix/");
+            source.extend(core::iter::repeat_n(
+                u8::try_from(n % 37).map_err(|_| ReturnCode::StreamError)?,
+                24 + n % 65,
+            ));
+            let row = u32::try_from(n).map_err(|_| ReturnCode::StreamError)?;
+            source.extend_from_slice(&row.to_le_bytes());
+        }
+        for (window_bits, mem_level) in [(9, 1), (15, 1), (15, 8)] {
+            let config = DeflateConfig {
+                level: 2,
+                method: Method::Deflated,
+                window_bits,
+                mem_level,
+                strategy: Strategy::Default,
+            };
+            let mut reference = vec![0u8; compress_bound(source.len()) + 32];
+            let (compressed, rc) = compress_slice(&mut reference, &source, config);
+            assert_eq!(rc, ReturnCode::Ok);
+            let compressed = compressed.to_vec();
+            for size in [1, 7, 257, 8_192] {
+                assert_eq!(
+                    compress_with_input_chunks(&source, config, size)?,
+                    compressed,
+                    "input chunk {size}, wbits {window_bits}, memory {mem_level}"
+                );
+            }
+            for size in [1, 23, 513] {
+                assert_eq!(
+                    compress_with_output_chunks(&source, config, size)?,
+                    compressed,
+                    "output chunk {size}, wbits {window_bits}, memory {mem_level}"
+                );
+            }
+            assert_test_roundtrip(&compressed, &source, InflateConfig::default());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spread_fast_mode_reindexes_on_midstream_algorithm_changes() -> Result<(), ReturnCode> {
+        let source = b"sparse-dictionary/full-window-long-match/".repeat(4_300);
+        let (prefix, suffix) = source.split_at(source.len() - 17_000);
+        for (before, after) in [(2, 1), (2, 3), (2, 9), (3, 2), (9, 2)] {
+            let mut stream = DeflateStream::new(DeflateConfig::new(before))?;
+            let mut output = vec![0u8; compress_bound(source.len()) + 256];
+            set_test_input(&mut stream, prefix)?;
+            set_test_output(&mut stream, &mut output)?;
+            assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+            assert_eq!(stream.avail_in, 0);
+            assert_eq!(
+                params(&mut stream, after, Strategy::Default),
+                ReturnCode::Ok
+            );
+            set_test_input(&mut stream, suffix)?;
+            let written = finish_test_stream(&mut stream)?;
+            assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn token_producers_are_output_chunking_independent_across_block_boundaries(
     ) -> Result<(), ReturnCode> {
         let mut input = Vec::with_capacity(160_000);

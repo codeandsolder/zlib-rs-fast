@@ -97,6 +97,34 @@ impl StandardHashCalc {
         }
     }
 
+    /// Index a bounded sample of long match interiors without dropping
+    /// either endpoint. The fixed-point increment is an *offset* so even
+    /// 32-bit hosts never shift an absolute window position by 16 bits.
+    #[inline]
+    pub fn insert_spaced(state: &mut State, string: usize, count: usize, max_inserts: usize) {
+        debug_assert!((3..=258).contains(&count));
+        debug_assert!(max_inserts >= 2);
+        let inserts = count.min(max_inserts);
+        let intervals = inserts - 1;
+        let increment = ((count - 1) << 16).div_ceil(intervals);
+        let mask = state.w_mask();
+        let window = state.window.filled();
+        let head = state.head.as_mut_slice();
+        let prev = state.prev.as_mut_slice();
+        let mut offset_fp = 0usize;
+        for _ in 0..inserts {
+            let pos = string + (offset_fp >> 16);
+            offset_fp += increment;
+            let hash = Self::update_hash(0, Self::first_four_bytes(&window[pos..])) as usize;
+            let idx = hash_chain_position(pos);
+            let entry = &mut head[hash];
+            if *entry != idx {
+                prev[pos & mask] = *entry;
+                *entry = idx;
+            }
+        }
+    }
+
     pub fn insert_string(state: &mut State, string: usize, count: usize) {
         let slice = &state.window.filled()[string + Self::HASH_CALC_OFFSET..];
 
@@ -195,6 +223,54 @@ mod tests {
         ] {
             assert_eq!(hash_chain_position(position), expected);
         }
+    }
+
+    #[test]
+    fn spread_hash_indices_cover_endpoints_and_match_reference() {
+        for count in 3..=258usize {
+            for budget in 2..=258usize {
+                let inserts = count.min(budget);
+                let increments = inserts - 1;
+                let step = ((count - 1) << 16).div_ceil(increments);
+                let mut previous = None;
+                let mut fp = 0;
+                for n in 0..inserts {
+                    let offset = fp >> 16;
+                    fp += step;
+                    assert_eq!(offset, n * (count - 1) / increments);
+                    assert!(previous.is_none_or(|x| offset > x));
+                    previous = Some(offset);
+                }
+                assert_eq!(previous, Some(count - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn spread_hash_matches_scalar_repeated_insertions() -> Result<(), crate::ReturnCode> {
+        use crate::deflate::{set_dictionary, DeflateConfig, DeflateStream};
+        let dictionary: Vec<_> = (0..4096usize)
+            .map(|n| ((n * 17) ^ (n >> 4)).to_le_bytes()[0])
+            .collect();
+        for count in [3, 4, 5, 63, 128, 257, 258] {
+            for budget in [2, 3, 4, 16, 56, 128, 258] {
+                let mut bulk = DeflateStream::new(DeflateConfig::new(2))?;
+                let mut scalar = DeflateStream::new(DeflateConfig::new(2))?;
+                for stream in [&mut bulk, &mut scalar] {
+                    assert_eq!(set_dictionary(stream, &dictionary), crate::ReturnCode::Ok);
+                }
+                let start = 41usize;
+                StandardHashCalc::insert_spaced(&mut bulk.state, start, count, budget);
+                let inserts = count.min(budget);
+                for n in 0..inserts {
+                    let offset = n * (count - 1) / (inserts - 1);
+                    StandardHashCalc::quick_insert_string(&mut scalar.state, start + offset);
+                }
+                assert_eq!(bulk.state.head.as_slice(), scalar.state.head.as_slice());
+                assert_eq!(bulk.state.prev.as_slice(), scalar.state.prev.as_slice());
+            }
+        }
+        Ok(())
     }
 
     #[test]
