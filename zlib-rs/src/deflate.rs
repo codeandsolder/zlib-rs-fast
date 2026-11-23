@@ -1631,6 +1631,63 @@ const fn encode_dist(dtree: &[Value], dist: u16) -> PackedBits {
     encoded
 }
 
+/// A combined length Huffman code and its extra bits fit within 20 bits.
+/// Pack the width beside the wire value in one cache-friendly u32.
+#[inline]
+fn packed_length_table(ltree: &[Value]) -> [u32; 256] {
+    core::array::from_fn(|lc| {
+        let code = usize::from(trees_tbl::LENGTH_CODE[lc]) + LITERALS + 1;
+        if ltree[code].len() == 0 {
+            return 0;
+        }
+        let bits = encode_len(ltree, lc);
+        debug_assert!(bits.value < (1 << 24));
+        let Ok(value) = u32::try_from(bits.value) else {
+            unreachable!("DEFLATE length code and extras exceed u32");
+        };
+        value | (u32::from(bits.len) << 24)
+    })
+}
+
+#[inline]
+fn decode_packed_length(entry: u32) -> PackedBits {
+    PackedBits::new(u64::from(entry & 0x00ff_ffff), entry.to_le_bytes()[3])
+}
+
+/// Per-distance-code metadata for a single Huffman block.
+#[derive(Clone, Copy)]
+struct DistancePlan {
+    value: u32,
+    base: u16,
+    prefix_len: u8,
+    total_len: u8,
+}
+
+impl DistancePlan {
+    fn table(dtree: &[Value]) -> [Self; D_CODES] {
+        core::array::from_fn(|code| {
+            let bits = PackedBits::code(dtree[code]);
+            Self {
+                value: u32::from(dtree[code].code()),
+                base: trees_tbl::BASE_DIST[code],
+                prefix_len: bits.len,
+                total_len: bits.len + StaticTreeDesc::EXTRA_DBITS[code],
+            }
+        })
+    }
+
+    #[inline]
+    fn encode(table: &[Self; D_CODES], dist: u16) -> PackedBits {
+        let d = dist - 1;
+        let plan = table[usize::from(State::d_code(usize::from(d)))];
+        let extra = u32::from(d - plan.base);
+        PackedBits::new(
+            u64::from(plan.value | (extra << plan.prefix_len)),
+            plan.total_len,
+        )
+    }
+}
+
 impl<'a> BitWriter<'a> {
     pub(crate) const BIT_BUF_SIZE: u8 = 64;
 
@@ -1828,6 +1885,21 @@ impl<'a> BitWriter<'a> {
             };
         }
 
+        self.emit_end_block(ltree, false);
+    }
+
+    fn compress_block_cached(&mut self, sym_buf: &SymBuf, ltree: &[Value], dtree: &[Value]) {
+        let lengths = packed_length_table(ltree);
+        let distances = DistancePlan::table(dtree);
+        for (dist, lc) in sym_buf.iter() {
+            if dist == 0 {
+                self.emit_lit(ltree, lc);
+            } else {
+                let mut bits = decode_packed_length(lengths[usize::from(lc)]);
+                bits.append(DistancePlan::encode(&distances, dist));
+                self.send_bits(bits.value, bits.len);
+            }
+        }
         self.emit_end_block(ltree, false);
     }
 
@@ -2312,11 +2384,21 @@ impl<'a> State<'a> {
     }
 
     fn compress_block_dynamic_trees(&mut self) {
-        self.bit_writer.compress_block_help(
-            &self.sym_buf,
-            &self.l_desc.dyn_tree,
-            &self.d_desc.dyn_tree,
-        );
+        // Once the existing saturated match counter reaches 255,
+        // the 256-entry setup cost is amortized by the match payload.
+        if self.matches == u8::MAX {
+            self.bit_writer.compress_block_cached(
+                &self.sym_buf,
+                &self.l_desc.dyn_tree,
+                &self.d_desc.dyn_tree,
+            );
+        } else {
+            self.bit_writer.compress_block_help(
+                &self.sym_buf,
+                &self.l_desc.dyn_tree,
+                &self.d_desc.dyn_tree,
+            );
+        }
     }
 
     fn header(&self) -> Result<u16, ReturnCode> {
@@ -5357,6 +5439,64 @@ mod test {
                 u64::from(symbol.code()) | (u64::from(delta) << symbol.len())
             );
             assert_eq!(u16::from(packed.len), symbol.len() + u16::from(extra));
+        }
+    }
+
+    #[test]
+    fn cached_dynamic_match_codes_match_original_for_every_wire_distance() {
+        fn check_tables(ltree: &[Value], dtree: &[Value]) {
+            let lengths = packed_length_table(ltree);
+            for (lc, &cached) in lengths.iter().enumerate() {
+                let symbol = usize::from(trees_tbl::LENGTH_CODE[lc]) + LITERALS + 1;
+                if ltree[symbol].len() == 0 {
+                    assert_eq!(cached, 0);
+                } else {
+                    assert_eq!(
+                        decode_packed_length(cached),
+                        encode_len(ltree, lc),
+                        "length delta {lc}",
+                    );
+                }
+            }
+
+            let distances = DistancePlan::table(dtree);
+            for distance in 1..=32768u16 {
+                let symbol = usize::from(State::d_code(usize::from(distance - 1)));
+                if dtree[symbol].len() != 0 {
+                    assert_eq!(
+                        DistancePlan::encode(&distances, distance),
+                        encode_dist(dtree, distance),
+                        "distance {distance}",
+                    );
+                }
+            }
+        }
+
+        check_tables(&trees_tbl::STATIC_LTREE, &trees_tbl::STATIC_DTREE);
+
+        // Cover custom code widths, unused Huffman symbols and nontrivial
+        // code values independently of the static tree's fixed-width codes.
+        for salt in [0u16, 1, 7, 19] {
+            let make_symbol = |index: usize| {
+                let Ok(index) = u16::try_from(index) else {
+                    unreachable!("DEFLATE tree symbol index exceeds u16");
+                };
+                let width = if (index + salt) % 11 == 0 {
+                    0
+                } else {
+                    1 + (index + salt) % 15
+                };
+                let mask = (1u32 << width) - 1;
+                let code =
+                    u32::from(index).wrapping_mul(0x9e37) ^ u32::from(salt).wrapping_mul(0x79b9);
+                let Ok(code) = u16::try_from(code & mask) else {
+                    unreachable!("masked Huffman code exceeds u16");
+                };
+                Value::new(code, width)
+            };
+            let ltree: [Value; L_CODES] = core::array::from_fn(make_symbol);
+            let dtree: [Value; D_CODES] = core::array::from_fn(make_symbol);
+            check_tables(&ltree, &dtree);
         }
     }
 
