@@ -5874,11 +5874,51 @@ mod test {
     }
 
     #[test]
+    fn quick_head_only_history_is_rebuilt_before_chain_search() -> Result<(), ReturnCode> {
+        let source = b"repeated-quick-phase-abc123/".repeat(9_000);
+        let mut stream = DeflateStream::new(DeflateConfig::new(1))?;
+        let mut output = vec![0u8; compress_bound(source.len()) + 64];
+        stream.state.prev.as_mut_slice().fill(0xa55a);
+        set_test_input(&mut stream, &source)?;
+        set_test_output(&mut stream, &mut output)?;
+
+        assert_eq!(deflate(&mut stream, DeflateFlush::NoFlush), ReturnCode::Ok);
+        assert_eq!(stream.avail_in, 0);
+        assert!(
+            stream
+                .state
+                .prev
+                .as_slice()
+                .iter()
+                .all(|&link| link == 0xa55a),
+            "quick mode must not write predecessor chains, including after a window slide"
+        );
+        assert_eq!(params(&mut stream, 2, Strategy::Default), ReturnCode::Ok);
+        assert!(
+            stream
+                .state
+                .prev
+                .as_slice()
+                .iter()
+                .any(|&link| link != 0xa55a),
+            "switching to a chain walker must reconstruct history"
+        );
+        let written = finish_test_stream(&mut stream)?;
+        assert_test_roundtrip(&output[..written], &source, InflateConfig::default());
+        Ok(())
+    }
+
+    #[test]
     fn level_changes_handle_long_unflushed_block_and_reindex_history() -> Result<(), ReturnCode> {
         let source = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcd".repeat(8_000);
         let (prefix, suffix) = source.split_at(source.len() - 8_192);
         for (initial_level, next_level) in [
             (1, 6),
+            (1, 2),
+            (1, 3),
+            (1, 7),
+            (1, 8),
+            (1, 9),
             (6, 9),
             (9, 1),
             (9, 2),
