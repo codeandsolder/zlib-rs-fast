@@ -2898,9 +2898,10 @@ mod fuzz_based_tests {
             let (output_ng, err) = compress_slice_ng(&mut output_ng, input, config);
             assert_eq!(err, Ok(ReturnCode::Ok));
 
-            // Levels 6-9 deliberately use retuned match finders, so their
-            // valid DEFLATE streams need not be byte-identical to zlib-ng.
-            if (0..=5).contains(&config.level) {
+            // L2 uses sparse hash insertion, and L6-9 use independently
+            // retuned match finders. Their DEFLATE streams are deliberately
+            // not required to be byte-identical to zlib-ng.
+            if (0..=5).contains(&config.level) && config.level != 2 {
                 assert_eq!(output_rs, output_ng);
             }
             if !expected.is_empty() {
@@ -2921,8 +2922,12 @@ mod fuzz_based_tests {
         }
 
         // zlib-ng is unavailable under Miri. Keep byte-exact fixtures for
-        // the levels whose encoding has not changed.
-        if cfg!(miri) && (0..=5).contains(&config.level) && !expected.is_empty() {
+        // unchanged levels while validating all levels by round-trip decode.
+        if cfg!(miri)
+            && (0..=5).contains(&config.level)
+            && config.level != 2
+            && !expected.is_empty()
+        {
             assert_eq!(output_rs, expected);
         }
     }
