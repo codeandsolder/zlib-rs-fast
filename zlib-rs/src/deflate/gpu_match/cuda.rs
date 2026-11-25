@@ -1,11 +1,17 @@
+mod resident;
+
 use super::{
     GpuBatch, GpuMatchError, GpuMatchTable, InputLayout, PreparedGpuInput, MAX_MATCH,
     WORKGROUP_SIZE,
 };
 use cudarc::{
-    driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg},
+    driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+        ValidAsZeroBits,
+    },
     nvrtc::{compile_ptx_with_opts, CompileOptions},
 };
+pub(in crate::deflate) use resident::DEFAULT_WINDOW;
 use std::sync::{Arc, Mutex};
 
 pub(super) struct CudaBackend {
@@ -14,6 +20,7 @@ pub(super) struct CudaBackend {
     aligned: CudaFunction,
     expand: CudaFunction,
     workspace: Mutex<Workspace>,
+    resident: Option<Box<resident::ResidentEncoder>>,
 }
 
 struct Workspace {
@@ -27,9 +34,9 @@ fn failure(error: impl core::fmt::Debug) -> GpuMatchError {
     GpuMatchError(format!("CUDA match search: {error:?}"))
 }
 
-fn reserve(
+fn reserve<T: DeviceRepr + ValidAsZeroBits>(
     stream: &Arc<CudaStream>,
-    buffer: &mut CudaSlice<u32>,
+    buffer: &mut CudaSlice<T>,
     len: usize,
 ) -> Result<(), GpuMatchError> {
     if buffer.len() < len {
@@ -45,7 +52,7 @@ impl CudaBackend {
         unsafe_code,
         reason = "cudarc requires unsafe dynamic library availability probes"
     )]
-    pub(super) fn new(ordinal: usize) -> Result<(Self, String), GpuMatchError> {
+    pub(super) fn new(ordinal: usize, use_resident: bool) -> Result<(Self, String), GpuMatchError> {
         // SAFETY: these probes only load and immediately close the named
         // CUDA driver/NVRTC libraries; no device pointers or kernels are used.
         if !unsafe {
@@ -59,10 +66,14 @@ impl CudaBackend {
         let adapter_name = ctx.name().map_err(failure)?;
         let stream = ctx.default_stream();
         let (major, minor) = ctx.compute_capability().map_err(failure)?;
-        let source = format!(
+        let mut source = format!(
             "#define MATCH_LIMIT {MAX_MATCH}u\n#define GROUP_SIZE {WORKGROUP_SIZE}u\n{}",
             include_str!("search.cu")
         );
+        if use_resident {
+            source.push_str(include_str!("resident.cu"));
+            source.push_str(include_str!("resident_parallel.cu"));
+        }
         let ptx = compile_ptx_with_opts(
             source,
             CompileOptions {
@@ -84,6 +95,9 @@ impl CudaBackend {
             predecessors: stream.alloc_zeros(1).map_err(failure)?,
             results: stream.alloc_zeros(1).map_err(failure)?,
         });
+        let resident = use_resident
+            .then(|| resident::ResidentEncoder::new(Arc::clone(&stream), &module).map(Box::new))
+            .transpose()?;
         Ok((
             Self {
                 stream,
@@ -91,9 +105,29 @@ impl CudaBackend {
                 aligned,
                 expand,
                 workspace,
+                resident,
             },
             adapter_name,
         ))
+    }
+
+    pub(super) fn supports_resident(&self, config: crate::DeflateConfig) -> bool {
+        self.resident.is_some() && resident::supports(config)
+    }
+
+    pub(super) fn compress_resident(
+        &self,
+        input: &[u8],
+        limit: usize,
+        config: crate::DeflateConfig,
+        budget: u32,
+        window: core::num::NonZeroUsize,
+        distance: u32,
+    ) -> Result<(Vec<u8>, crate::ReturnCode), GpuMatchError> {
+        self.resident
+            .as_ref()
+            .ok_or_else(|| GpuMatchError("resident CUDA encoder not selected".into()))?
+            .compress(input, limit, config, budget, window, distance)
     }
 
     pub(super) fn execute(&self, batch: &mut GpuBatch) -> Result<(), GpuMatchError> {

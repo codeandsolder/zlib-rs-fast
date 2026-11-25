@@ -39,11 +39,13 @@ __device__ __forceinline__ u32 advance_token(u32 token) {
 // Compute the lazy choice at every possible start before traversing its
 // functional graph. Match distances use at most 15 bits in DEFLATE.
 extern "C" __global__ void resident_choices(const u32* input,const u32* matches,u32* choices,
-    u32 core,u32 history) {
+    u32 core,u32 history,u32 strategy) {
     const u32 pos=blockIdx.x*blockDim.x+threadIdx.x;
     if(pos>=core)return;
-    const u32 match=matches[pos],len=usable_match(match);
-    const u32 next=pos+1<core ? usable_match(matches[pos+1]) : 0;
+    const u32 match=matches[pos],raw_len=usable_match(match);
+    const u32 raw_next=pos+1<core ? usable_match(matches[pos+1]) : 0;
+    const u32 len=strategy==1 && raw_len<=5 ? 0 : raw_len;
+    const u32 next=strategy==1 && raw_next<=5 ? 0 : raw_next;
     choices[pos]=len>=3 && (len==match_limit || next<=len)
         ? match : input[history+pos]&255;
 }
@@ -161,7 +163,7 @@ __device__ void stored_header(unsigned char* output,u32 pos,u32 len,bool final) 
 // The header and trailer are written first, then independent segments fill
 // the non-overlapping bit ranges between them.
 extern "C" __global__ void resident_tree(EntropyBlock* blocks,const u32* block_count,u32* histograms,
-    u32* output,const u32* entries,u32 core,u32 segment_bytes,u32 arena_stride,u32 final_window) {
+    u32* output,const u32* entries,u32 core,u32 segment_bytes,u32 arena_stride,u32 final_window,u32 strategy) {
     const u32 index=blockIdx.x*blockDim.x+threadIdx.x,n=*block_count;
     if(index>=n)return;
     EntropyBlock& block=blocks[index];
@@ -184,7 +186,7 @@ extern "C" __global__ void resident_tree(EntropyBlock* blocks,const u32* block_c
     for(u32 i=0;i<dd_count;++i){dynamic_bits+=dd_freq[i]*dd.lengths[i];fixed_bits+=dd_freq[i]*5;}
     const bool final=final_window && index+1==n;
     const u32 align_bits=final ? 0 : 3,align_bytes=final ? 0 : 4;
-    const u32 dynamic_bytes=(dynamic_bits+align_bits+7)/8+align_bytes;
+    const u32 dynamic_bytes=strategy==4 ? 0xffffffffu : (dynamic_bits+align_bits+7)/8+align_bytes;
     const u32 fixed_bytes=(fixed_bits+align_bits+7)/8+align_bytes;
     const u32 len=block_core(block,entries,core,segment_bytes);
     const u32 stored_bytes=len+5*((len+65534)/65535);
@@ -288,14 +290,17 @@ extern "C" __global__ void resident_write_stored(const u32* input,const u32* seg
     }
 }
 extern "C" __global__ void resident_parallel_offsets(const EntropyBlock* blocks,const u32* block_count,
-    const u32* checksums,u32* offsets,u32* meta,u32 core,u32 checksum_tile,u32 checksum_tiles) {
+    const u32* checksums,u32* offsets,u32* meta,u32 core,u32 checksum_tile,u32 checksum_tiles,u32 checksum_kind) {
     if(threadIdx.x || blockIdx.x)return;
     u32 total=0,a=0,b=0;
     for(u32 i=0;i<*block_count;++i){offsets[i]=total;total+=blocks[i].bytes;}
     for(u32 i=0;i<checksum_tiles;++i) {
         const u32 n=min(checksum_tile,core-i*checksum_tile);
-        b=static_cast<u32>((b+checksums[2*i+1]+static_cast<u64>(n)*a)%adler_mod);
-        a=(a+checksums[2*i])%adler_mod;
+        if(checksum_kind==2)a=crc_combine(a,checksums[2*i],n);
+        else if(checksum_kind==1) {
+            b=static_cast<u32>((b+checksums[2*i+1]+static_cast<u64>(n)*a)%adler_mod);
+            a=(a+checksums[2*i])%adler_mod;
+        }
     }
     meta[0]=total;meta[1]=a;meta[2]=b;meta[3]=*block_count;
 }

@@ -1,0 +1,603 @@
+//! Whole GPU-resident DEFLATE windows. The only host-device payloads are
+//! decoded input, compact compressed output and four metadata words.
+use super::{failure, reserve};
+use crate::{
+    deflate::gpu_match::{GpuMatchError, MAX_MATCH, WORKGROUP_SIZE},
+    DeflateConfig, ReturnCode,
+};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
+
+const MIB: usize = 1024 * 1024;
+pub(in crate::deflate) const DEFAULT_WINDOW: usize = 16 * MIB;
+const MAX_WINDOW: usize = 64 * MIB;
+const MATCH_TILE: u32 = 128 * 1024;
+const SEGMENT: u32 = 8 * 1024;
+const HASH_COUNT: u32 = 1 << 16;
+const LITERAL_SYMBOLS: u32 = 286;
+const DISTANCE_SYMBOLS: u32 = 30;
+const HIST_WORDS: u32 = LITERAL_SYMBOLS + DISTANCE_SYMBOLS + 1;
+const BLOCK_WORDS: u32 = LITERAL_SYMBOLS + DISTANCE_SYMBOLS + 5;
+const ARENA_STRIDE: u32 = SEGMENT + MAX_MATCH.next_multiple_of(4) + 12;
+const MAX_BLOCK_SPAN: u32 = 4 * 1024 * 1024;
+const ADLER_MOD: u64 = 65_521;
+
+#[derive(Clone, Copy)]
+enum Wrapper {
+    Raw,
+    Zlib(u8),
+    Gzip,
+}
+
+impl Wrapper {
+    fn from_bits(bits: i32) -> Option<Self> {
+        match bits {
+            -15..=-9 => Some(Self::Raw),
+            8..=15 => Some(Self::Zlib(u8::try_from(bits.max(9)).ok()?)),
+            25..=31 => Some(Self::Gzip),
+            _ => None,
+        }
+    }
+
+    const fn checksum_kind(self) -> u32 {
+        match self {
+            Self::Raw => 0,
+            Self::Zlib(_) => 1,
+            Self::Gzip => 2,
+        }
+    }
+}
+
+pub(super) fn supports(config: DeflateConfig) -> bool {
+    use crate::deflate::{Method, Strategy};
+    matches!(config.level, -1 | 1..=9)
+        && config.method == Method::Deflated
+        && (1..=9).contains(&config.mem_level)
+        && matches!(
+            config.strategy,
+            Strategy::Default | Strategy::Filtered | Strategy::Fixed
+        )
+        && Wrapper::from_bits(config.window_bits).is_some()
+}
+
+macro_rules! kernel_set {
+    ($($name:ident),+ $(,)?) => {
+        struct Kernels { $($name: CudaFunction),+ }
+        impl Kernels {
+            fn new(module: &Arc<CudaModule>) -> Result<Self, GpuMatchError> {
+                Ok(Self { $($name: module.load_function(stringify!($name)).map_err(failure)?),+ })
+            }
+        }
+    };
+}
+
+kernel_set! {
+    expand_aligned, resident_index, resident_match, resident_choices,
+    resident_mark_paths, resident_transitions, resident_scan_paths, resident_parse_paths,
+    resident_partition, resident_histogram, resident_tree, resident_segment_bits,
+    resident_bit_offsets, resident_write_segments, resident_write_stored,
+    resident_adler, resident_crc, resident_parallel_offsets, resident_parallel_compact,
+}
+
+macro_rules! buffer_set {
+    ($($name:ident: $ty:ty),+ $(,)?) => {
+        struct Buffers { $($name: CudaSlice<$ty>),+ }
+        impl Buffers {
+            fn new(stream: &Arc<CudaStream>) -> Result<Self, GpuMatchError> {
+                Ok(Self { $($name: stream.alloc_zeros(1).map_err(failure)?),+ })
+            }
+        }
+    };
+}
+
+buffer_set! {
+    input: u8, aligned: u32, heads: u32, predecessors: u16, matches: u32,
+    choices: u32, exits: u32, transitions: u16, entries: u32, counts: u32,
+    block_ids: u32, blocks: u32, block_count: u32, hist: u32, arena: u32,
+    bits: u32, bit_offsets: u32, checksums: u32, offsets: u32, meta: u32,
+    compact: u8,
+}
+
+#[derive(Clone, Copy)]
+struct Geometry {
+    size: u32,
+    core: u32,
+    history: u32,
+    distance: u32,
+    budget: u32,
+    tiles: u32,
+    stride: u32,
+    segments: u32,
+    target_tokens: u32,
+    final_window: u32,
+    strategy: u32,
+    checksum_kind: u32,
+}
+
+impl Geometry {
+    fn new(
+        input_len: usize,
+        history: usize,
+        distance: u32,
+        budget: u32,
+        final_window: bool,
+        config: DeflateConfig,
+        wrapper: Wrapper,
+    ) -> Result<Self, GpuMatchError> {
+        let size = u32::try_from(input_len).map_err(failure)?;
+        let history = u32::try_from(history).map_err(failure)?;
+        let core = size
+            .checked_sub(history)
+            .filter(|&n| n != 0 && n as usize <= MAX_WINDOW)
+            .ok_or_else(|| GpuMatchError("invalid resident CUDA core window".into()))?;
+        if !(1..=32_768).contains(&distance) || budget == 0 {
+            return Err(GpuMatchError(
+                "invalid resident CUDA search parameters".into(),
+            ));
+        }
+        Ok(Self {
+            size,
+            core,
+            history,
+            distance,
+            budget,
+            tiles: core.div_ceil(MATCH_TILE),
+            stride: (MATCH_TILE + distance - 1 + MAX_MATCH - 1).next_multiple_of(2),
+            segments: core.div_ceil(SEGMENT),
+            target_tokens: (1u32 << (config.mem_level + 6)) - 1,
+            final_window: u32::from(final_window),
+            strategy: config.strategy as u32,
+            checksum_kind: wrapper.checksum_kind(),
+        })
+    }
+
+    const fn arena_bytes(self) -> u32 {
+        self.segments * ARENA_STRIDE
+    }
+}
+
+impl Buffers {
+    fn prepare(&mut self, stream: &Arc<CudaStream>, g: Geometry) -> Result<(), GpuMatchError> {
+        // All products are bounded by the validated MAX_WINDOW and fixed
+        // geometry (including the history/lookahead and per-block overhead).
+        macro_rules! grow {
+            ($($field:ident => $count:expr),+ $(,)?) => {
+                $(reserve(stream, &mut self.$field, $count as usize)?;)+
+            };
+        }
+        grow! {
+            input => g.size.next_multiple_of(4), aligned => g.size,
+            heads => g.tiles * HASH_COUNT, predecessors => g.tiles * g.stride,
+            matches => g.tiles * MATCH_TILE, choices => g.core,
+            exits => g.segments, transitions => g.segments * MAX_MATCH,
+            entries => g.segments + 1, counts => g.segments,
+            block_ids => g.segments, blocks => g.segments * BLOCK_WORDS,
+            hist => g.segments * HIST_WORDS, arena => g.arena_bytes() / 4,
+            bits => g.segments, bit_offsets => g.segments,
+            checksums => g.tiles * 2, offsets => g.segments, meta => 4,
+            compact => g.arena_bytes(),
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct ResidentEncoder {
+    stream: Arc<CudaStream>,
+    kernels: Kernels,
+    buffers: Mutex<Buffers>,
+}
+
+// All launches share one stream and a locked buffer set. Each kernel's ABI
+// is declared in resident.cu / resident_parallel.cu. Geometry::new and
+// Buffers::prepare establish the exact index, token, tree and arena bounds.
+// Input/output buffers use the element widths expected by those kernels.
+macro_rules! launch {
+    ($this:expr, $name:ident, $grid:expr, $threads:expr; $($arg:expr),* $(,)?) => {{
+        let mut args = $this.stream.launch_builder(&$this.kernels.$name);
+        $(args.arg($arg);)*
+        // SAFETY: the phase-specific arguments match the CUDA kernel ABI;
+        // all device pointers refer to the validated exclusive workspace.
+        unsafe { args.launch(LaunchConfig {
+            grid_dim: $grid, block_dim: ($threads, 1, 1), shared_mem_bytes: 0,
+        }) }.map_err(failure)?;
+    }};
+}
+
+impl ResidentEncoder {
+    pub(super) fn new(
+        stream: Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+    ) -> Result<Self, GpuMatchError> {
+        let buffers = Mutex::new(Buffers::new(&stream)?);
+        Ok(Self {
+            stream,
+            kernels: Kernels::new(module)?,
+            buffers,
+        })
+    }
+
+    #[expect(unsafe_code, reason = "validated CUDA index and match kernel ABI")]
+    fn index_and_match(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+        launch!(self, expand_aligned, (g.size.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
+            &b.input, &mut b.aligned, &g.size);
+        launch!(self, resident_index, (g.tiles.div_ceil(WORKGROUP_SIZE / 32), 1, 1), WORKGROUP_SIZE;
+            &b.aligned, &mut b.heads, &mut b.predecessors, &g.size, &g.history,
+            &MATCH_TILE, &g.stride, &g.distance, &g.tiles);
+        launch!(self, resident_match, (MATCH_TILE.div_ceil(WORKGROUP_SIZE), g.tiles, 1), WORKGROUP_SIZE;
+            &b.aligned, &b.predecessors, &mut b.matches, &g.size, &g.history,
+            &MATCH_TILE, &g.stride, &g.distance, &g.budget);
+        Ok(())
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "validated CUDA path-reconciliation and partition kernel ABI"
+    )]
+    fn parse(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+        let segment_grid = (g.segments.div_ceil(32), 1, 1);
+        launch!(self, resident_choices, (g.core.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
+            &b.aligned, &b.matches, &mut b.choices, &g.core, &g.history, &g.strategy);
+        launch!(self, resident_mark_paths, segment_grid, 32;
+            &mut b.choices, &mut b.exits, &g.core, &SEGMENT, &g.segments);
+        launch!(self, resident_transitions, (g.segments, 1, 1), 256;
+            &b.choices, &b.exits, &mut b.transitions, &g.core, &SEGMENT);
+        launch!(self, resident_scan_paths, (1, 1, 1), 1;
+            &b.transitions, &mut b.entries, &g.segments);
+        launch!(self, resident_parse_paths, segment_grid, 32;
+            &b.choices, &mut b.matches, &b.entries, &mut b.counts, &g.core, &SEGMENT, &g.segments);
+        launch!(self, resident_partition, (1, 1, 1), 1;
+            &b.counts, &mut b.block_ids, &mut b.blocks, &mut b.block_count,
+            &g.segments, &g.target_tokens, &(MAX_BLOCK_SPAN / SEGMENT));
+        Ok(())
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "validated CUDA histogram, Huffman and bit emission kernel ABI"
+    )]
+    fn encode(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+        let segment_grid = (g.segments.div_ceil(32), 1, 1);
+        let all_segments = (g.segments, 1, 1);
+        self.stream
+            .memset_zeros(&mut b.hist.slice_mut(..(g.segments * HIST_WORDS) as usize))
+            .map_err(failure)?;
+        self.stream
+            .memset_zeros(&mut b.arena.slice_mut(..(g.arena_bytes() / 4) as usize))
+            .map_err(failure)?;
+        launch!(self, resident_histogram, all_segments, WORKGROUP_SIZE;
+            &b.matches, &b.counts, &b.block_ids, &mut b.hist, &SEGMENT);
+        launch!(self, resident_tree, all_segments, 1;
+            &mut b.blocks, &b.block_count, &mut b.hist, &mut b.arena, &b.entries,
+            &g.core, &SEGMENT, &ARENA_STRIDE, &g.final_window, &g.strategy);
+        launch!(self, resident_segment_bits, all_segments, WORKGROUP_SIZE;
+            &b.matches, &b.counts, &b.block_ids, &b.blocks, &mut b.bits, &SEGMENT);
+        launch!(self, resident_bit_offsets, segment_grid, 32;
+            &b.blocks, &b.block_count, &b.bits, &mut b.bit_offsets);
+        launch!(self, resident_write_segments, segment_grid, 32;
+            &b.matches, &b.counts, &b.block_ids, &b.blocks, &b.bit_offsets,
+            &mut b.arena, &SEGMENT, &ARENA_STRIDE, &g.segments);
+        launch!(self, resident_write_stored, all_segments, WORKGROUP_SIZE;
+            &b.aligned, &b.block_ids, &b.blocks, &mut b.arena, &b.entries,
+            &g.core, &g.history, &SEGMENT, &ARENA_STRIDE);
+        Ok(())
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "validated CUDA checksum and output compaction kernel ABI"
+    )]
+    fn compact(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+        if g.checksum_kind == 1 {
+            launch!(self, resident_adler, (g.tiles, 1, 1), WORKGROUP_SIZE;
+                &b.aligned, &mut b.checksums, &g.size, &g.history, &MATCH_TILE, &g.distance);
+        } else if g.checksum_kind == 2 {
+            launch!(self, resident_crc, (g.tiles, 1, 1), WORKGROUP_SIZE;
+                &b.aligned, &mut b.checksums, &g.size, &g.history, &MATCH_TILE, &g.distance);
+        }
+        launch!(self, resident_parallel_offsets, (1, 1, 1), 1;
+            &b.blocks, &b.block_count, &b.checksums, &mut b.offsets, &mut b.meta,
+            &g.core, &MATCH_TILE, &g.tiles, &g.checksum_kind);
+        launch!(self, resident_parallel_compact, (g.segments, 1, 1), WORKGROUP_SIZE;
+            &b.blocks, &b.block_count, &b.offsets, &b.arena, &mut b.compact, &ARENA_STRIDE);
+        Ok(())
+    }
+
+    fn window(
+        &self,
+        input: &[u8],
+        g: Geometry,
+        limit: usize,
+    ) -> Result<WindowOutput, GpuMatchError> {
+        let mut b = self.buffers.lock().map_err(failure)?;
+        b.prepare(&self.stream, g)?;
+        self.stream
+            .memcpy_htod(input, &mut b.input)
+            .map_err(failure)?;
+        self.index_and_match(&mut b, g)?;
+        self.parse(&mut b, g)?;
+        self.encode(&mut b, g)?;
+        self.compact(&mut b, g)?;
+        let meta = self
+            .stream
+            .clone_dtoh(&b.meta.slice(..4))
+            .map_err(failure)?;
+        let [len, a, checksum_b, blocks] = <[u32; 4]>::try_from(meta).map_err(failure)?;
+        if len > g.arena_bytes() || blocks == 0 || blocks > g.segments {
+            return Err(GpuMatchError(
+                "invalid resident CUDA output metadata".into(),
+            ));
+        }
+        let count = (len as usize).min(limit);
+        let output = if count == 0 {
+            Vec::new()
+        } else {
+            self.stream
+                .clone_dtoh(&b.compact.slice(..count))
+                .map_err(failure)?
+        };
+        Ok(WindowOutput {
+            output,
+            complete: count == len as usize,
+            a,
+            b: checksum_b,
+        })
+    }
+
+    pub(super) fn compress(
+        &self,
+        input: &[u8],
+        limit: usize,
+        config: DeflateConfig,
+        budget: u32,
+        window: NonZeroUsize,
+        distance: u32,
+    ) -> Result<(Vec<u8>, ReturnCode), GpuMatchError> {
+        let wrapper = Wrapper::from_bits(config.window_bits)
+            .ok_or_else(|| GpuMatchError("invalid resident CUDA wrapper".into()))?;
+        let mut output = Vec::new();
+        let (header, header_len) = stream_header(wrapper, config.level);
+        if !append(&mut output, &header[..header_len], limit) {
+            return Ok((output, ReturnCode::BufError));
+        }
+        let mut checksum = Checksum::new(wrapper);
+        if input.is_empty() && !append(&mut output, &[3, 0], limit) {
+            return Ok((output, ReturnCode::BufError));
+        }
+        let window = window.get().min(MAX_WINDOW);
+        for start in (0..input.len()).step_by(window) {
+            if output.len() == limit {
+                return Ok((output, ReturnCode::BufError));
+            }
+            let end = start.saturating_add(window).min(input.len());
+            let origin = start.saturating_sub(distance as usize - 1);
+            let g = Geometry::new(
+                end - origin,
+                start - origin,
+                distance,
+                budget,
+                end == input.len(),
+                config,
+                wrapper,
+            )?;
+            let result = self.window(&input[origin..end], g, limit - output.len())?;
+            output.extend_from_slice(&result.output);
+            if !result.complete {
+                return Ok((output, ReturnCode::BufError));
+            }
+            checksum.update(&result, end - start);
+        }
+        let (trailer, trailer_len) = checksum.trailer(input.len());
+        let code = if append(&mut output, &trailer[..trailer_len], limit) {
+            ReturnCode::Ok
+        } else {
+            ReturnCode::BufError
+        };
+        Ok((output, code))
+    }
+}
+
+struct WindowOutput {
+    output: Vec<u8>,
+    complete: bool,
+    a: u32,
+    b: u32,
+}
+
+fn append(output: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bool {
+    let count = bytes.len().min(limit - output.len());
+    output.extend_from_slice(&bytes[..count]);
+    count == bytes.len()
+}
+
+fn stream_header(wrapper: Wrapper, level: i32) -> ([u8; 10], usize) {
+    let mut header = [0; 10];
+    let len = match wrapper {
+        Wrapper::Raw => 0,
+        Wrapper::Zlib(bits) => {
+            let cmf = ((bits - 8) << 4) | 8;
+            let level_bits = match level {
+                0..=1 => 0,
+                2..=5 => 1,
+                -1 | 6 => 2,
+                _ => 3,
+            };
+            let flg = level_bits << 6;
+            let combined = u16::from_be_bytes([cmf, flg]);
+            header[0] = cmf;
+            header[1] = flg | ((31 - combined % 31) % 31).to_le_bytes()[0];
+            2
+        }
+        Wrapper::Gzip => {
+            header = [
+                31,
+                139,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                match level {
+                    1 => 4,
+                    9 => 2,
+                    _ => 0,
+                },
+                255,
+            ];
+            10
+        }
+    };
+    (header, len)
+}
+
+enum Checksum {
+    None,
+    Adler { a: u64, b: u64 },
+    Crc(u32),
+}
+
+impl Checksum {
+    const fn new(wrapper: Wrapper) -> Self {
+        match wrapper {
+            Wrapper::Raw => Self::None,
+            Wrapper::Zlib(_) => Self::Adler { a: 1, b: 0 },
+            Wrapper::Gzip => Self::Crc(0),
+        }
+    }
+
+    fn update(&mut self, result: &WindowOutput, length: usize) {
+        match self {
+            Self::None => {}
+            Self::Adler { a, b } => {
+                *b = (*b + u64::from(result.b) + length as u64 * *a) % ADLER_MOD;
+                *a = (*a + u64::from(result.a)) % ADLER_MOD;
+            }
+            Self::Crc(crc) => *crc = crate::crc32::crc32_combine(*crc, result.a, length as u64),
+        }
+    }
+
+    fn trailer(self, len: usize) -> ([u8; 8], usize) {
+        let mut bytes = [0; 8];
+        let size = match self {
+            Self::None => 0,
+            Self::Adler { a, b } => {
+                let combined = ((b << 16) | a).to_be_bytes();
+                bytes[..4].copy_from_slice(&combined[4..]);
+                4
+            }
+            Self::Crc(crc) => {
+                bytes[..4].copy_from_slice(&crc.to_le_bytes());
+                bytes[4..].copy_from_slice(&len.to_le_bytes()[..4]);
+                8
+            }
+        };
+        (bytes, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deflate::gpu_match::{build_predecessors, predecessor_distance, GpuMatchSearcher};
+
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_resident_index_and_parse_are_exact() -> Result<(), Box<dyn std::error::Error>> {
+        let (backend, _) = super::super::CudaBackend::new(0, true)?;
+        let encoder = backend.resident.as_deref().ok_or("resident encoder")?;
+        let reference = GpuMatchSearcher::new(Some("cuda-match:0"))?;
+        let mut seed = 0x9e37_79b9u32;
+        let random = (0..70_013)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0] & 31
+            })
+            .collect::<Vec<_>>();
+        let mut input = random.repeat(3);
+        input.extend(b"abc".repeat(55_013));
+        input.extend(random.iter().copied());
+        let history = 30_017;
+        let distance = 32_506;
+        let budget = 128;
+        let config = DeflateConfig::new(9);
+        let g = Geometry::new(
+            input.len(),
+            history,
+            distance,
+            budget,
+            true,
+            config,
+            Wrapper::Zlib(15),
+        )?;
+        let mut b = encoder.buffers.lock().map_err(failure)?;
+        b.prepare(&encoder.stream, g)?;
+        encoder
+            .stream
+            .memcpy_htod(&input, &mut b.input)
+            .map_err(failure)?;
+        encoder.index_and_match(&mut b, g)?;
+        let pred = encoder
+            .stream
+            .clone_dtoh(&b.predecessors.slice(..(g.tiles * g.stride) as usize))
+            .map_err(failure)?;
+        let matches = encoder
+            .stream
+            .clone_dtoh(&b.matches.slice(..g.core as usize))
+            .map_err(failure)?;
+        for tile in 0..g.tiles as usize {
+            let start = history + tile * MATCH_TILE as usize;
+            let origin = start.saturating_sub(distance as usize - 1);
+            let end = (start + MATCH_TILE as usize + MAX_MATCH as usize - 1).min(input.len());
+            let expected = build_predecessors(&input[origin..end], distance)?;
+            let actual = &pred[tile * g.stride as usize..][..end - origin - 2];
+            for (position, &value) in actual.iter().enumerate() {
+                assert_eq!(
+                    usize::from(value),
+                    predecessor_distance(&expected, position)
+                );
+            }
+        }
+        let dense = reference.search_with_max_dist(&input, budget, distance)?;
+        assert_eq!(matches, dense.entries[history..]);
+        encoder.parse(&mut b, g)?;
+        let counts = encoder
+            .stream
+            .clone_dtoh(&b.counts.slice(..g.segments as usize))
+            .map_err(failure)?;
+        let actual = encoder
+            .stream
+            .clone_dtoh(&b.matches.slice(..g.core as usize))
+            .map_err(failure)?;
+        let mut expected = Vec::new();
+        let mut pos = 0;
+        while pos < matches.len() {
+            let current = matches[pos];
+            let len = current & 65535;
+            let next = matches.get(pos + 1).copied().unwrap_or(0) & 65535;
+            if len >= 3 && next <= len {
+                expected.push(current);
+                pos += len as usize;
+            } else {
+                expected.push(u32::from(input[history + pos]));
+                pos += 1;
+            }
+        }
+        let tokens = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(segment, &count)| {
+                let start = segment * SEGMENT as usize;
+                actual[start..start + count as usize].iter().copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, expected);
+        Ok(())
+    }
+}

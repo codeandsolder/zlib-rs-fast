@@ -2,6 +2,8 @@
 
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(feature = "cuda")]
+pub(super) use cuda::DEFAULT_WINDOW as CUDA_DEFAULT_WINDOW;
 
 use std::{
     fmt,
@@ -965,13 +967,22 @@ impl GpuMatchSearcher {
     /// # Errors
     /// Returns an error for invalid device selection or initialization failure.
     pub fn new(adapter_filter: Option<&str>) -> Result<Self, GpuMatchError> {
-        if let Some(ordinal) = adapter_filter.and_then(|filter| filter.strip_prefix("cuda:")) {
+        if let Some((ordinal, use_resident)) = adapter_filter.and_then(|filter| {
+            filter
+                .strip_prefix("cuda:")
+                .map(|ordinal| (ordinal, true))
+                .or_else(|| {
+                    filter
+                        .strip_prefix("cuda-match:")
+                        .map(|ordinal| (ordinal, false))
+                })
+        }) {
             #[cfg(feature = "cuda")]
             {
                 let ordinal = ordinal.parse::<usize>().map_err(|error| {
                     GpuMatchError(format!("invalid CUDA device ordinal: {error}"))
                 })?;
-                let (backend, adapter_name) = cuda::CudaBackend::new(ordinal)?;
+                let (backend, adapter_name) = cuda::CudaBackend::new(ordinal, use_resident)?;
                 return Ok(Self {
                     backend: GpuBackend::Cuda(backend),
                     limits: Limits::default(),
@@ -980,7 +991,7 @@ impl GpuMatchSearcher {
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = ordinal;
+                let _ = (ordinal, use_resident);
                 return Err(GpuMatchError("CUDA requires the cuda feature".into()));
             }
         }
@@ -991,6 +1002,34 @@ impl GpuMatchSearcher {
             limits,
             adapter_name,
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn supports_resident(&self, config: crate::DeflateConfig) -> bool {
+        match &self.backend {
+            GpuBackend::Cuda(backend) => backend.supports_resident(config),
+            GpuBackend::Vulkan(_) => false,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn compress_resident(
+        &self,
+        input: &[u8],
+        limit: usize,
+        config: crate::DeflateConfig,
+        budget: u32,
+        window: core::num::NonZeroUsize,
+        distance: u32,
+    ) -> Result<(Vec<u8>, crate::ReturnCode), GpuMatchError> {
+        match &self.backend {
+            GpuBackend::Cuda(backend) => {
+                backend.compress_resident(input, limit, config, budget, window, distance)
+            }
+            GpuBackend::Vulkan(_) => {
+                Err(GpuMatchError("resident CUDA backend not selected".into()))
+            }
+        }
     }
 
     const fn input_preparation(&self) -> InputPreparation {

@@ -101,6 +101,12 @@ impl BatchCodec {
         searcher: &GpuMatchSearcher,
         search_budget: u32,
     ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
+        #[cfg(feature = "cuda")]
+        if searcher.supports_resident(config) {
+            let window = NonZeroUsize::new(super::gpu_match::CUDA_DEFAULT_WINDOW)
+                .ok_or_else(|| GpuMatchError("invalid resident CUDA default window".into()))?;
+            return self.compress_gpu_windowed(jobs, config, searcher, search_budget, window);
+        }
         let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, |inputs, max_dist| {
             searcher.search_batch_with_pool(inputs, search_budget, max_dist, self)
         })?
@@ -148,6 +154,32 @@ impl BatchCodec {
             return Ok(self.compress(jobs, config));
         };
         validate_search_parameters(search_budget, max_dist)?;
+        #[cfg(feature = "cuda")]
+        if searcher.supports_resident(config) {
+            return self
+                .run_items(
+                    jobs,
+                    || {
+                        Ok(BatchCompressResult {
+                            written: 0,
+                            code: ReturnCode::StreamError,
+                        })
+                    },
+                    |_, job| {
+                        compress_resident_job(
+                            job,
+                            config,
+                            searcher,
+                            search_budget,
+                            window_bytes,
+                            max_dist,
+                        )
+                    },
+                )
+                .into_iter()
+                .collect();
+        }
+
         self.run_items(
             jobs,
             || {
@@ -194,6 +226,12 @@ pub fn compress_slices_batch_gpu(
     searcher: &GpuMatchSearcher,
     search_budget: u32,
 ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
+    #[cfg(feature = "cuda")]
+    if searcher.supports_resident(config) {
+        let window = NonZeroUsize::new(super::gpu_match::CUDA_DEFAULT_WINDOW)
+            .ok_or_else(|| GpuMatchError("invalid resident CUDA default window".into()))?;
+        return compress_slices_batch_gpu_windowed(jobs, config, searcher, search_budget, window);
+    }
     let Some((algorithm, tables)) = prepare_gpu_matches(jobs, config, |inputs, max_dist| {
         searcher.search_batch_with_max_dist(inputs, search_budget, max_dist)
     })?
@@ -230,6 +268,16 @@ pub fn compress_slices_batch_gpu_windowed(
         return Ok(compress_synchronously(jobs, config));
     };
     validate_search_parameters(search_budget, max_dist)?;
+    #[cfg(feature = "cuda")]
+    if searcher.supports_resident(config) {
+        return jobs
+            .iter_mut()
+            .map(|job| {
+                compress_resident_job(job, config, searcher, search_budget, window_bytes, max_dist)
+            })
+            .collect();
+    }
+
     jobs.iter_mut()
         .enumerate()
         .map(|(index, job)| {
@@ -244,6 +292,38 @@ pub fn compress_slices_batch_gpu_windowed(
             )
         })
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn compress_resident_job(
+    job: &mut BatchJob<'_>,
+    config: DeflateConfig,
+    searcher: &GpuMatchSearcher,
+    search_budget: u32,
+    window: NonZeroUsize,
+    max_dist: u32,
+) -> Result<BatchCompressResult, GpuMatchError> {
+    // SAFETY: the GPU result is bounded to the destination's declared limit;
+    // only the downloaded initialized prefix is copied and committed.
+    unsafe {
+        job.write(|input, output| {
+            match searcher.compress_resident(
+                input,
+                output.len(),
+                config,
+                search_budget,
+                window,
+                max_dist,
+            ) {
+                Ok((bytes, code)) => {
+                    let written = bytes.len();
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), output.byte_ptr(), written);
+                    (written, Ok(BatchCompressResult { written, code }))
+                }
+                Err(error) => (0, Err(error)),
+            }
+        })
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -981,6 +1061,103 @@ mod tests {
         );
         assert_eq!(code, ReturnCode::Ok);
         assert_eq!(decoded, inputs[1]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_resident_roundtrips_wrappers_strategies_and_exact_caps(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::Strategy;
+        let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
+        let window = NonZeroUsize::new(65_537).ok_or("window")?;
+        let mut seed = 0x1234_5678u32;
+        let random = (0..140_013)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let repeated = b"abc".repeat(73_017);
+        let mut mixed = random[..33_009].repeat(3);
+        mixed.extend_from_slice(&repeated);
+        let inputs = [b"".as_slice(), b"a", b"abc", &random, &repeated, &mixed];
+        for (window_bits, strategy) in [
+            (-15, Strategy::Default),
+            (9, Strategy::Default),
+            (15, Strategy::Filtered),
+            (15, Strategy::Fixed),
+            (31, Strategy::Default),
+        ] {
+            let config = DeflateConfig {
+                level: 9,
+                window_bits,
+                strategy,
+                ..DeflateConfig::default()
+            };
+            assert!(searcher.supports_resident(config));
+            for input in inputs {
+                check_resident_caps(&searcher, config, window, input)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn check_resident_caps(
+        searcher: &GpuMatchSearcher,
+        config: DeflateConfig,
+        window: NonZeroUsize,
+        input: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut full = Vec::new();
+        let result = compress_slices_batch_gpu_windowed(
+            &mut [BatchJob::with_vec(
+                input,
+                &mut full,
+                compress_bound(input.len()) + 512,
+            )?],
+            config,
+            searcher,
+            128,
+            window,
+        )?;
+        assert_eq!(result[0].code, ReturnCode::Ok);
+        let mut decoded = vec![0u8; input.len()];
+        let (decoded, code) = decompress_slice(
+            &mut decoded,
+            &full,
+            InflateConfig {
+                window_bits: config.window_bits,
+            },
+        );
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, input);
+        for cap in [0, 1, 2, full.len() - 1, full.len(), full.len() + 1] {
+            let mut output = vec![0x55; cap + 7];
+            let result = compress_slices_batch_gpu_windowed(
+                &mut [BatchJob::new(input, &mut output[..cap])],
+                config,
+                searcher,
+                128,
+                window,
+            )?[0];
+            let written = full.len().min(cap);
+            assert_eq!(result.written, written);
+            assert_eq!(
+                result.code,
+                if cap < full.len() {
+                    ReturnCode::BufError
+                } else {
+                    ReturnCode::Ok
+                }
+            );
+            assert_eq!(&output[..written], &full[..written]);
+            assert!(output[written..].iter().all(|&b| b == 0x55));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "gpu")]

@@ -28,11 +28,11 @@ __device__ __forceinline__ u32 hash_at(const u32* input, u32 pos) {
 // ordered before writes; processing 32 positions at a time preserves the
 // exact serial nearest-predecessor relation, including hash collisions.
 extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16* predecessors,
-    u32 size, u32 history, u32 tile_bytes, u32 stride, u32 max_dist, u32 tiles, u32 lookahead) {
+    u32 size, u32 history, u32 tile_bytes, u32 stride, u32 max_dist, u32 tiles) {
     const u32 lane=threadIdx.x%warp_size;
     const u32 tile=(blockIdx.x*blockDim.x+threadIdx.x)/warp_size;
     if (tile>=tiles) return;
-    const Tile t=lookahead ? search_tile_at(tile,size,history,tile_bytes,max_dist) : tile_at(tile,size,history,tile_bytes,max_dist);
+    const Tile t=search_tile_at(tile,size,history,tile_bytes,max_dist);
     u32* heads=heads_all+static_cast<u64>(tile)*hash_count;
     u16* pred_out=predecessors+static_cast<u64>(tile)*stride;
     for (u32 h=lane; h<hash_count; h+=warp_size) heads[h]=0;
@@ -58,9 +58,9 @@ extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16*
 // Only search core positions. History is present in the index and input,
 // but we never compute match results for the unused history halo.
 extern "C" __global__ void resident_match(const u32* input,const u32* predecessors,u32* matches,
-    u32 size,u32 history,u32 tile_bytes,u32 stride,u32 max_dist,u32 budget,u32 lookahead) {
+    u32 size,u32 history,u32 tile_bytes,u32 stride,u32 max_dist,u32 budget) {
     const u32 tile=blockIdx.y;
-    const Tile t=lookahead ? search_tile_at(tile,size,history,tile_bytes,max_dist) : tile_at(tile,size,history,tile_bytes,max_dist);
+    const Tile t=search_tile_at(tile,size,history,tile_bytes,max_dist);
     const u32* words=input+t.origin;
     const u32* p=predecessors+static_cast<u64>(tile)*(stride/2);
     u32* output=matches+static_cast<u64>(tile)*tile_bytes;
@@ -102,27 +102,6 @@ __device__ __forceinline__ Symbol distance_symbol(u32 distance) {
 __device__ __forceinline__ u32 reverse_bits(u32 code,u32 len) {
     return len ? __brev(code)>>(32-len) : 0;
 }
-struct BitWriter {
-    unsigned char* output;
-    u32 bytes=0, pending=0, count=0;
-    __device__ void put(u32 value,u32 bits) {
-        pending|=value<<count;
-        count+=bits;
-        while (count>=8) {
-            output[bytes++]=static_cast<unsigned char>(pending);
-            pending>>=8;
-            count-=8;
-        }
-    }
-    __device__ void align() {
-        if (count) put(0,8-count);
-    }
-    __device__ void stored(const u32* input,u32 start,u32 len,bool final) {
-        put(final,3); align();
-        put(len,16); put((~len)&65535,16);
-        for (u32 i=0;i<len;++i) output[bytes++]=static_cast<unsigned char>(input[start+i]);
-    }
-};
 constexpr u32 ll_count=286, dd_count=30, cl_count=19;
 struct Huffman {
     u16 codes[ll_count];
@@ -208,16 +187,8 @@ __device__ void build_huffman(const u32* freq,u32 n,u32 max_bits,Huffman& out) {
         if(len){out.codes[i]=static_cast<u16>(reverse_bits(next_code[len]++,len));out.symbols=i+1;}
     }
 }
-__device__ __forceinline__ void emit(BitWriter& w,const Huffman& h,u32 sym) {
-    w.put(h.codes[sym],h.lengths[sym]);
-}
 __device__ __forceinline__ u32 fixed_length(u32 sym) {
     return sym<144 ? 8 : sym<256 ? 9 : sym<280 ? 7 : 8;
-}
-__device__ __forceinline__ void fixed_emit(BitWriter& w,u32 sym) {
-    const u32 code=sym<144 ? 48+sym : sym<256 ? 400+sym-144 : sym<280 ? sym-256 : 192+sym-280;
-    const u32 bits=fixed_length(sym);
-    w.put(reverse_bits(code,bits),bits);
 }
 __device__ __forceinline__ u32 rle_extra(u32 sym) {
     return sym==16 ? 2 : sym==17 ? 3 : sym==18 ? 7 : 0;
@@ -251,89 +222,6 @@ __device__ u32 header_rle(const Huffman& ll,const Huffman& dd,u32 nl,u32 nd,u16*
 __device__ __forceinline__ u32 usable_match(u32 word) {
     return word&65535;
 }
-// One lane owns each independent block's parser, histogram, tree and
-// bitstream. Many blocks run in parallel, with exact previous-window
-// history; match storage is reused in-place as the compact token list.
-extern "C" __global__ void resident_encode(const u32* input,u32* matches,unsigned char* output,u32* sizes,
-    u32 size,u32 history,u32 tile_bytes,u32 out_stride,u32 max_dist,u32 tiles,u32 final_window) {
-    const u32 tile=blockIdx.x*blockDim.x+threadIdx.x;
-    if(tile>=tiles)return;
-    const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
-    u32* tokens=matches+static_cast<u64>(tile)*tile_bytes;
-    u32 ll_freq[ll_count]={},dd_freq[dd_count]={};
-    u32 count=0,extra_bits=0;
-    for(u32 pos=0;pos<t.core;) {
-        const u32 match=tokens[pos];
-        const u32 len=usable_match(match);
-        // One-byte lazy parse. If the next start has a longer match, emit
-        // this literal; full-length matches cannot be improved.
-        if(len>=3 && (len==match_limit || pos+1==t.core || usable_match(tokens[pos+1])<=len)) {
-            tokens[count++]=match;
-            const Symbol l=length_symbol(len),d=distance_symbol(match>>16);
-            ++ll_freq[l.code];++dd_freq[d.code];extra_bits+=l.extra+d.extra;
-            pos+=len;
-        } else {
-            const u32 literal=input[t.start+pos]&255;
-            tokens[count++]=literal;++ll_freq[literal];++pos;
-        }
-    }
-    ++ll_freq[256];
-    Huffman ll,dd,cl;
-    build_huffman(ll_freq,ll_count,15,ll);
-    build_huffman(dd_freq,dd_count,15,dd);
-    const u32 nl=max(ll.symbols,257u),nd=dd.symbols;
-    u16 runs[ll_count+dd_count];
-    u32 cl_freq[cl_count]={};
-    const u32 nr=header_rle(ll,dd,nl,nd,runs,cl_freq);
-    build_huffman(cl_freq,cl_count,7,cl);
-    u32 nc=cl_count;
-    while(nc>4 && !cl.lengths[cl_order[nc-1]])--nc;
-    u32 dynamic_bits=3+5+5+4+3*nc+extra_bits, fixed_bits=3+extra_bits;
-    for(u32 i=0;i<cl_count;++i)dynamic_bits+=cl_freq[i]*(cl.lengths[i]+rle_extra(i));
-    for(u32 i=0;i<ll_count;++i){dynamic_bits+=ll_freq[i]*ll.lengths[i];fixed_bits+=ll_freq[i]*fixed_length(i);}
-    for(u32 i=0;i<dd_count;++i){dynamic_bits+=dd_freq[i]*dd.lengths[i];fixed_bits+=dd_freq[i]*5;}
-    const bool final=final_window && tile+1==tiles;
-    // Every nonfinal compressed tile appends an empty stored block so
-    // the next independent tile can start on a byte boundary.
-    const u32 alignment_bits=final ? 0 : 3;
-    const u32 alignment_bytes=final ? 0 : 4;
-    const u32 dynamic_bytes=(dynamic_bits+alignment_bits+7)/8+alignment_bytes;
-    const u32 fixed_bytes=(fixed_bits+alignment_bits+7)/8+alignment_bytes;
-    const u32 stored_bytes=t.core+5*((t.core+65534)/65535);
-    BitWriter w{output+static_cast<u64>(tile)*out_stride};
-    if(stored_bytes<=min(dynamic_bytes,fixed_bytes)) {
-        for(u32 pos=0;pos<t.core;) {
-            const u32 len=min(65535u,t.core-pos);
-            w.stored(input,t.start+pos,len,final && pos+len==t.core);
-            pos+=len;
-        }
-    } else {
-        const bool dynamic=dynamic_bytes<=fixed_bytes;
-        w.put((dynamic ? 4u : 2u)|static_cast<u32>(final),3);
-        if(dynamic) {
-            w.put(nl-257,5);w.put(nd-1,5);w.put(nc-4,4);
-            for(u32 i=0;i<nc;++i)w.put(cl.lengths[cl_order[i]],3);
-            for(u32 i=0;i<nr;++i) {
-                const u32 sym=runs[i]&31;
-                emit(w,cl,sym);w.put(runs[i]>>5,rle_extra(sym));
-            }
-        }
-        for(u32 i=0;i<count;++i) {
-            const u32 token=tokens[i];
-            if(token>>16) {
-                const Symbol l=length_symbol(token&65535),d=distance_symbol(token>>16);
-                if(dynamic)emit(w,ll,l.code);else fixed_emit(w,l.code);
-                w.put(l.value,l.extra);
-                if(dynamic)emit(w,dd,d.code);else w.put(reverse_bits(d.code,5),5);
-                w.put(d.value,d.extra);
-            } else if(dynamic)emit(w,ll,token);else fixed_emit(w,token);
-        }
-        if(dynamic)emit(w,ll,256);else fixed_emit(w,256);
-        if(!final)w.stored(input,0,0,false);
-        w.align();
-    }
-    sizes[tile]=w.bytes;
-}
 // Per-tile Adler components for the core only, with initial A=B=0.
 // Use 64-bit weighted sums so all supported block sizes are exact.
 extern "C" __global__ void resident_adler(const u32* input,u32* checksums,
@@ -356,23 +244,49 @@ extern "C" __global__ void resident_adler(const u32* input,u32* checksums,
         checksums[2*tile+1]=static_cast<u32>(b%adler_mod);
     }
 }
-// Prefix offsets and checksum combination are small (one entry per tile).
-extern "C" __global__ void resident_offsets(const u32* sizes,const u32* checksums,u32* offsets,u32* meta,
-    u32 size,u32 history,u32 tile_bytes,u32 tiles) {
-    if(threadIdx.x || blockIdx.x)return;
-    u32 total=0,a=0,b=0;
-    for(u32 tile=0;tile<tiles;++tile){
-        offsets[tile]=total;total+=sizes[tile];
-        const u32 n=min(tile_bytes,size-history-tile*tile_bytes);
-        b=static_cast<u32>((b+checksums[2*tile+1]+static_cast<u64>(n)*a)%adler_mod);
-        a=(a+checksums[2*tile])%adler_mod;
+// Reflected CRC-32 polynomial operations, for gzip framing. Contiguous
+// thread chunks combine in a parallel reduction; host combines only windows.
+constexpr u32 crc_poly=0xedb88320u;
+__device__ u32 crc_multiply(u32 a,u32 b) {
+    u32 result=0;
+    for(u32 mask=0x80000000u;mask;mask>>=1) {
+        if(a&mask)result^=b;
+        if(!(a&(mask-1)))break;
+        b=(b>>1)^((0u-(b&1))&crc_poly);
     }
-    meta[0]=total;meta[1]=a;meta[2]=b;
+    return result;
 }
-extern "C" __global__ void resident_compact(const unsigned char* output,const u32* sizes,const u32* offsets,
-    unsigned char* compact,u32 out_stride) {
+__device__ __constant__ u32 crc_shift_powers[32]={
+    0x00800000u,0x00008000u,0xedb88320u,0xb1e6b092u,0xa06a2517u,0xed627daeu,0x88d14467u,0xd7bbfe6au,0xec447f11u,0x8e7ea170u,0x6427800eu,0x4d47bae0u,0x09fe548fu,0x83852d0fu,0x30362f1au,0x7b5a9cc3u,0x31fec169u,0x9fec022au,0x6c8dedc4u,0x15d6874du,0x5fde7a4eu,0xbad90e37u,0x2e4e5eefu,0x4eaba214u,0xa8a472c0u,0x429a969eu,0x148d302au,0xc40ba6d0u,0xc4e22c3cu,0x40000000u,0x20000000u,0x08000000u};
+__device__ u32 crc_combine(u32 first,u32 second,u32 len) {
+    u32 op=0x80000000u;
+    for(u32 i=0;len;++i,len>>=1)if(len&1)op=crc_multiply(crc_shift_powers[i],op);
+    return crc_multiply(op,first)^second;
+}
+__device__ __forceinline__ u32 crc_update(u32 crc,u32 byte) {
+    crc^=byte;
+    #pragma unroll
+    for(u32 i=0;i<8;++i)crc=(crc>>1)^((0u-(crc&1))&crc_poly);
+    return crc;
+}
+extern "C" __global__ void resident_crc(const u32* input,u32* checksums,
+    u32 size,u32 history,u32 tile_bytes,u32 max_dist) {
     const u32 tile=blockIdx.x;
-    const unsigned char* src=output+static_cast<u64>(tile)*out_stride;
-    unsigned char* dst=compact+offsets[tile];
-    for(u32 i=threadIdx.x;i<sizes[tile];i+=blockDim.x)dst[i]=src[i];
+    const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
+    const u32 chunk=(t.core+blockDim.x-1)/blockDim.x;
+    const u32 start=min(t.core,threadIdx.x*chunk),end=min(t.core,start+chunk);
+    u32 crc=0xffffffffu;
+    for(u32 i=start;i<end;++i)crc=crc_update(crc,input[t.start+i]&255);
+    __shared__ u32 crcs[128],lengths[128];
+    crcs[threadIdx.x]=~crc;lengths[threadIdx.x]=end-start;
+    __syncthreads();
+    for(u32 stride=1;stride<blockDim.x;stride*=2) {
+        if(threadIdx.x%(2*stride)==0) {
+            const u32 j=threadIdx.x+stride;
+            crcs[threadIdx.x]=crc_combine(crcs[threadIdx.x],crcs[j],lengths[j]);
+            lengths[threadIdx.x]+=lengths[j];
+        }
+        __syncthreads();
+    }
+    if(!threadIdx.x){checksums[2*tile]=crcs[0];checksums[2*tile+1]=0;}
 }
