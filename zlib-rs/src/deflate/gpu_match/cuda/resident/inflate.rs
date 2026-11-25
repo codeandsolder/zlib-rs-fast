@@ -802,6 +802,82 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_transcode_source_windows_and_oversize_index_fallback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
+        let input = b"resident token ranges with small source dictionaries".repeat(8193);
+        let config = DeflateConfig::new(9);
+        let window = NonZeroUsize::new(131_071).ok_or("window")?;
+        let options = GpuTranscodeOptions {
+            output_limit: compress_bound(input.len()),
+            decoded_limit: u32::try_from(input.len())?,
+            minimum_decoded_len: 0,
+            config,
+            search_budget: 128,
+            window,
+        };
+        let mut expected = Vec::new();
+        let result = compress_slices_batch_gpu_windowed(
+            &mut [BatchJob::with_vec(
+                &input,
+                &mut expected,
+                options.output_limit,
+            )?],
+            config,
+            &searcher,
+            options.search_budget,
+            window,
+        )?[0];
+        assert_eq!(result.code, ReturnCode::Ok);
+        for window_bits in 9..=15 {
+            let mut source = vec![0; compress_bound(input.len())];
+            let (source, code) = compress_slice(
+                &mut source,
+                &input,
+                DeflateConfig {
+                    window_bits,
+                    ..config
+                },
+            );
+            assert_eq!(code, ReturnCode::Ok);
+            let result = searcher
+                .recompress_zlib(source, options)?
+                .ok_or("missing transcode")?;
+            assert_eq!(result.code, ReturnCode::Ok);
+            assert_eq!(result.output, expected);
+            check_resident_index(&result, source, options.output_limit);
+            assert_eq!(source[2] & 6, 4, "fixture requires a dynamic block");
+            assert!(result.device_tokens > 0, "dynamic tokens were not retained");
+        }
+
+        let large = vec![42; index::MAX_SOURCE + 1];
+        let mut source = vec![0; compress_bound(large.len())];
+        let (source, code) = compress_slice(&mut source, &large, DeflateConfig::new(0));
+        assert_eq!(code, ReturnCode::Ok);
+        assert!(source.len() > index::MAX_SOURCE);
+        let options = GpuTranscodeOptions {
+            decoded_limit: u32::try_from(large.len())?,
+            output_limit: compress_bound(large.len()),
+            window: NonZeroUsize::new(1_048_576).ok_or("window")?,
+            ..options
+        };
+        let result = searcher
+            .recompress_zlib(source, options)?
+            .ok_or("missing fallback transcode")?;
+        assert_eq!(result.code, ReturnCode::Ok);
+        assert!(!result.device_indexed);
+        assert_eq!(result.device_tokens, 0);
+        assert!(result.descriptor_bytes_uploaded > 0);
+        let mut decoded = vec![0; large.len()];
+        let (decoded, code) =
+            decompress_slice(&mut decoded, &result.output, InflateConfig::default());
+        assert_eq!(code, ReturnCode::Ok);
+        assert_eq!(decoded, large);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
     fn cuda_transcode_matches_raw_encoder_and_checks_source(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
