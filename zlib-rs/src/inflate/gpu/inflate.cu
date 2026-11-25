@@ -182,16 +182,28 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_head
     u32 pos=seg.start,token_index=0;
     for(;;){
         u32 symbol=0,length=0,distance=0;
-        if(!lane){
-            if(predecoded){
-                if(token_index==range.count){symbol=256;ok=pos==seg.end;}
-                else {
-                    const u32 token=tokens[range.offset+token_index++];
-                    length=token>>16;distance=token&65535;
-                    if(!length){symbol=distance;length=1;distance=0;ok=symbol<256&&pos<seg.end;}
-                    else {symbol=257;ok=length>=3&&length<=258&&distance&&distance<=min(pos,window)&&length<=seg.end-pos;}
-                }
-            }else if(!seg.ends_block && pos==seg.end){
+        if(predecoded){
+            if(token_index==range.count){ok=pos==seg.end;break;}
+            const u32 token=tokens[range.offset+token_index];
+            length=token>>16;distance=token&65535;
+            if(!length){
+                // One lane per candidate literal. Stop at the first match
+                // or invalid token; later lanes never write past that point.
+                const u32 remaining=range.count-token_index;
+                const u32 next=lane<remaining?tokens[range.offset+token_index+lane]:65536u;
+                const u32 valid=__ballot_sync(0xffffffffu,next<256);
+                const u32 run=valid==0xffffffffu?warp_width:__ffs(~valid)-1;
+                if(!run||run>seg.end-pos){ok=0;break;}
+                if(lane<run)symbolic[pos-base+lane]=static_cast<u16>(next);
+                __syncwarp();
+                pos+=run;token_index+=run;
+                continue;
+            }
+            ++token_index;
+            symbol=257;
+            ok=length>=3&&length<=258&&distance&&distance<=min(pos,window)&&length<=seg.end-pos;
+        }else if(!lane){
+            if(!seg.ends_block && pos==seg.end){
                 symbol=256;ok=r.position==seg.end_bit;
             } else {
                 symbol=ll.decode(r);
@@ -201,10 +213,12 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_head
                 else ok=match(r,dd,symbol,length,distance)&&distance<=min(pos,window)&&length<=seg.end-pos;
             }
         }
-        ok=__shfl_sync(0xffffffffu,ok,0);
-        symbol=__shfl_sync(0xffffffffu,symbol,0);
-        length=__shfl_sync(0xffffffffu,length,0);
-        distance=__shfl_sync(0xffffffffu,distance,0);
+        if(!predecoded){
+            ok=__shfl_sync(0xffffffffu,ok,0);
+            symbol=__shfl_sync(0xffffffffu,symbol,0);
+            length=__shfl_sync(0xffffffffu,length,0);
+            distance=__shfl_sync(0xffffffffu,distance,0);
+        }
         if(!ok||symbol==256)break;
         if(symbol<256){if(!lane)symbolic[pos-base]=static_cast<u16>(symbol);}
         else {
