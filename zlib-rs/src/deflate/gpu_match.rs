@@ -1487,6 +1487,7 @@ fn build_predecessors_parallel(
     max_dist: u32,
     pool: &crate::BatchCodec,
 ) -> Result<Vec<u32>, GpuMatchError> {
+    const MIN_SHARD_WORDS: usize = 128 * 1024;
     let positions = input.len().saturating_sub(2);
     u32::try_from(positions)
         .map_err(|_| GpuMatchError("GPU hash index exceeds u32::MAX positions".into()))?;
@@ -1494,7 +1495,6 @@ fn build_predecessors_parallel(
     // Bound duplicated warmup and dense head-table allocation. Divide large
     // streams among the existing pool, without splitting the GPU dispatch
     // or duplicating its input/result transfers.
-    const MIN_SHARD_WORDS: usize = 128 * 1024;
     let shard_words = words.div_ceil(pool.workers()).max(MIN_SHARD_WORDS);
     if words <= shard_words {
         return build_predecessors(input, max_dist);

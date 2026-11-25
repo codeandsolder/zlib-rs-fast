@@ -289,7 +289,7 @@ fn compress_windowed_job(
                 .as_ref()
                 .is_some_and(|window| window.core.contains(&position))
             {
-                let core_start = position / window_bytes.get() * window_bytes.get();
+                let core_start = position / window_bytes * window_bytes.get();
                 let core_end = core_start
                     .saturating_add(window_bytes.get())
                     .min(input.len());
@@ -1163,7 +1163,7 @@ mod tests {
             let (algorithm, max_dist) = gpu_configuration(config).ok_or("GPU configuration")?;
             let mut output = Vec::new();
             let mut job = BatchJob::with_vec(&random, &mut output, 1024)?;
-            let mut searched = 0;
+            let mut submitted_bytes = 0;
             let result = compress_windowed_job(
                 0,
                 &mut job,
@@ -1172,14 +1172,14 @@ mod tests {
                 max_dist,
                 window_bytes,
                 |input, distance| {
-                    searched += input.len();
+                    submitted_bytes += input.len();
                     searcher.search_with_max_dist(input, 32, distance)
                 },
             )?;
             assert_eq!(result.code, ReturnCode::BufError);
             assert!(
-                searched < random.len(),
-                "searched {searched} of {} bytes",
+                submitted_bytes < random.len(),
+                "searched {submitted_bytes} of {} bytes",
                 random.len()
             );
         }

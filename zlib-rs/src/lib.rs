@@ -1,6 +1,7 @@
 #![doc = core::include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![feature(portable_simd)]
+#![cfg_attr(feature = "gpu", recursion_limit = "256")]
 #![cfg_attr(target_arch = "x86_64", feature(uint_carryless_mul))]
 
 #[cfg(any(test, feature = "rust-allocator", feature = "c-allocator"))]
