@@ -174,9 +174,24 @@ fn search(
         if length >= 3u && length > best_len {
             best_len = length;
             best_distance = position - candidate;
-            if best_len < max_len && best_len > 3u {
-                chain_offset = shifted_offset(candidate, best_len);
-                distance = predecessor_distance(candidate + chain_offset);
+            if best_len < max_len {
+                if best_len > 3u {
+                    chain_offset = shifted_offset(candidate, best_len);
+                    distance = predecessor_distance(candidate + chain_offset);
+                }
+                // The triple spanning the first mismatching byte must also
+                // occur in any longer match. Its query-side predecessor is
+                // another safe bound, but only when older than the candidate.
+                if distance != 0u {
+                    let extension_offset = best_len - 2u;
+                    let extension_distance = predecessor_distance(position + extension_offset);
+                    if extension_distance == 0u {
+                        distance = 0u;
+                    } else if extension_distance > best_distance + distance {
+                        chain_offset = extension_offset;
+                        distance = extension_distance - best_distance;
+                    }
+                }
             }
             // A three-byte best match uses the existing first-word probe.
             // Complete matches never read a following byte.
@@ -1407,10 +1422,24 @@ fn resolve_bounded(
             if len > best_len {
                 best_len = len;
                 best_distance = position - cursor;
-                if len < max_len && len > 3 {
-                    work_left = work_left.checked_sub(3)?;
-                    chain_offset = shifted_offset(predecessors, cursor, len);
-                    distance = predecessor_distance(predecessors, cursor + chain_offset);
+                if len < max_len {
+                    if len > 3 {
+                        work_left = work_left.checked_sub(3)?;
+                        chain_offset = shifted_offset(predecessors, cursor, len);
+                        distance = predecessor_distance(predecessors, cursor + chain_offset);
+                    }
+                    if distance != 0 {
+                        work_left = work_left.checked_sub(1)?;
+                        let extension_offset = len - 2;
+                        let extension_distance =
+                            predecessor_distance(predecessors, position + extension_offset);
+                        if extension_distance == 0 {
+                            distance = 0;
+                        } else if extension_distance > best_distance + distance {
+                            chain_offset = extension_offset;
+                            distance = extension_distance - best_distance;
+                        }
+                    }
                 }
             }
         }
@@ -2016,7 +2045,7 @@ mod tests {
                 if n == len {
                     break;
                 }
-                if n > 3 {
+                {
                     let mut selected = 0;
                     let mut nearest = (minimum..start).rev().find(|&candidate| {
                         hash3(&input[candidate..candidate + 3]) == hash3(&input[pos..pos + 3])
@@ -2029,6 +2058,17 @@ mod tests {
                         });
                         if next < nearest {
                             nearest = next;
+                            selected = probe_offset;
+                        }
+                    }
+                    if nearest.is_some() {
+                        let probe_offset = n - 2;
+                        let key = hash3(&input[pos + probe_offset..pos + probe_offset + 3]);
+                        let next = (minimum..pos).rev().find(|&candidate| {
+                            hash3(&input[candidate + probe_offset..candidate + probe_offset + 3])
+                                == key
+                        });
+                        if next < nearest {
                             selected = probe_offset;
                         }
                     }
@@ -2053,6 +2093,19 @@ mod tests {
         let table = resolve_bounded(&input, &predecessors, 4, DEFAULT_MAX_DIST)
             .ok_or_else(|| GpuMatchError("bounded test exceeded work".into()))?;
         assert_eq!(table.get(position).map(|entry| entry.length), Some(26));
+        let mut short_prefix = b"abcDEFGHIJKLMNOPQRSTUVWXYZ".to_vec();
+        for byte in 0..100u8 {
+            if byte != b'D' {
+                short_prefix.extend_from_slice(&[b'a', b'b', b'c', byte, b'!']);
+            }
+        }
+        short_prefix.extend_from_slice(b"abcDEFGHIJKLMNOPQRSTUVWXYZ");
+        let query = short_prefix.len() - 26;
+        let index = build_predecessors(&short_prefix, DEFAULT_MAX_DIST)?;
+        let resolved = resolve_bounded(&short_prefix, &index, 4, DEFAULT_MAX_DIST)
+            .ok_or_else(|| GpuMatchError("bounded extension test exceeded work".into()))?;
+        assert_eq!(resolved.get(query).map(|entry| entry.length), Some(26));
+
         let searcher = GpuMatchSearcher::new(None)?;
         let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
         let tables = searcher.search_with_geometry(
@@ -2136,11 +2189,15 @@ mod tests {
             }
         }
         assert!(completed > 300);
-        // An expensive search must decline without publishing partial results.
-        let repeated = (0u8..=255)
-            .flat_map(|i| [b'a', b'a', b'a', i])
-            .cycle()
-            .take(8192)
+        // Dense, irregular two-symbol input retains many candidates even
+        // with shifted and extension bounds. The work cap must still abort.
+        let repeated = (0..8192)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                b'a' + (seed.to_le_bytes()[0] & 1)
+            })
             .collect::<Vec<_>>();
         let pred = build_predecessors(&repeated, DEFAULT_MAX_DIST)?;
         assert!(resolve_bounded(&repeated, &pred, 512, DEFAULT_MAX_DIST).is_none());
