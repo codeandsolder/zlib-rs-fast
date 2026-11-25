@@ -2,8 +2,8 @@
 //! compressed source bytes are uploaded. Decoded windows never leave CUDA.
 use super::super::{allocation_capacity, failure, reserve};
 use super::{
-    append, stream_header, Checksum, DeviceInput, Geometry, ResidentEncoder, ResidentPool, Wrapper,
-    MAX_WINDOW, WORKGROUP_SIZE,
+    append, stream_header, Checksum, DeviceInput, Geometry, LaneCapacity, ResidentEncoder,
+    ResidentPool, Wrapper, MAX_WINDOW, WORKGROUP_SIZE,
 };
 use crate::{
     deflate::gpu_match::{GpuMatchError, GpuTranscodeOptions, GpuTranscodeResult},
@@ -65,18 +65,21 @@ impl Workspace {
         })
     }
 
-    pub(super) fn upper_bound() -> usize {
+    pub(super) fn upper_bound(window: usize, source: usize) -> usize {
+        if window == 0 {
+            return 4096;
+        }
         let allocation = |n: usize, width: usize| allocation_capacity(n) * width;
-        index::Workspace::upper_bound()
+        index::Workspace::upper_bound(source)
             + allocation(MAX_BATCH_INPUT, 1)
             + allocation(4096, 1)
             + allocation(MAX_BATCH_SEGMENTS * WORDS_PER_SEGMENT, 8)
-            + allocation(MAX_WINDOW + MAX_SEGMENT, 2)
+            + allocation(window + MAX_SEGMENT, 2)
             + allocation(MAX_BATCH_SEGMENTS * HISTORY, 1)
             + allocation(MAX_BATCH_SEGMENTS * HISTORY / 32, 4)
             + allocation(MAX_BATCH_SEGMENTS, 4)
             + 4
-            + allocation((MAX_WINDOW + CARRY_BYTES).next_multiple_of(4), 1)
+            + allocation((window + CARRY_BYTES).next_multiple_of(4), 1)
             + allocation(CARRY_BYTES, 1)
     }
 }
@@ -196,8 +199,8 @@ impl Decoder {
         })
     }
 
-    pub(super) fn upper_bound() -> usize {
-        Workspace::upper_bound()
+    pub(super) fn upper_bound(window: usize, source: usize) -> usize {
+        Workspace::upper_bound(window, source)
     }
 
     fn device_index(
@@ -632,9 +635,23 @@ impl ResidentPool {
         if options.minimum_decoded_len as usize > source.len().saturating_mul(1032) {
             return Ok(None);
         }
+        let window = options
+            .window
+            .get()
+            .min(MAX_WINDOW)
+            .min(options.decoded_limit as usize)
+            .max(1);
+        let capacity = LaneCapacity::transcode(
+            window,
+            if index::eligible(source) {
+                source.len()
+            } else {
+                0
+            },
+        );
         let mut uploaded = 0;
         if options.output_limit > 2 && index::eligible(source) {
-            let encoder = self.acquire()?;
+            let encoder = self.acquire(capacity)?;
             uploaded = source.len();
             if let Some(index) = encoder.decoder.device_index(
                 source,
@@ -683,7 +700,7 @@ impl ResidentPool {
                 return Ok(None);
             }
         }
-        self.acquire()?
+        self.acquire(capacity)?
             .transcode(source, scan, options, distance, self.index_tiles)
             .map(Some)
     }

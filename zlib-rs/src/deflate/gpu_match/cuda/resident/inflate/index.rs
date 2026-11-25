@@ -101,26 +101,38 @@ impl Workspace {
         })
     }
 
-    pub(super) fn upper_bound() -> usize {
+    pub(super) fn upper_bound(source: usize) -> usize {
+        if source == 0 {
+            return 4096;
+        }
+        let source = source.min(MAX_SOURCE);
+        let preliminary = source.div_ceil(2).clamp(256, MAX_PRELIMINARY);
+        let headers = preliminary.min(MAX_HEADERS);
+        let tiles = (source * 8)
+            .div_ceil(TILE_BITS)
+            .saturating_add(headers)
+            .min(MAX_TILES);
+        let tokens = (source * 8).min(MAX_TOKENS);
+
         let allocation = |n: usize, width: usize| allocation_capacity(n) * width;
-        allocation(MAX_SOURCE + 16, 1)
+        allocation(source + 16, 1)
             + allocation(MAX_SEGMENTS * WORDS_PER_SEGMENT, 8)
-            + allocation(MAX_PRELIMINARY, 8)
-            + allocation(MAX_SOURCE / 4, 4)
-            + allocation(MAX_SOURCE / (4 * HEADER_CHUNK_WORDS as usize) + 1, 4)
-            + allocation(MAX_HEADERS, 8)
-            + allocation(MAX_HEADERS * BLOCK_WORDS, 8)
-            + allocation(MAX_TILES, 8)
-            + allocation(MAX_HEADERS * TREE_BYTES, 1)
-            + allocation(MAX_TILES * PATH_WORDS, 8)
-            + allocation(MAX_HEADERS * EXTENT_WORDS, 8)
-            + allocation(MAX_TILES * WORDS_PER_SEGMENT, 8)
-            + allocation(MAX_HEADERS, 4)
-            + allocation(MAX_HEADERS * 4, 4)
+            + allocation(preliminary, 8)
+            + allocation(source.div_ceil(4), 4)
+            + allocation(source.div_ceil(4 * HEADER_CHUNK_WORDS as usize) + 1, 4)
+            + allocation(headers, 8)
+            + allocation(headers * BLOCK_WORDS, 8)
+            + allocation(tiles, 8)
+            + allocation(headers * TREE_BYTES, 1)
+            + allocation(tiles * PATH_WORDS, 8)
+            + allocation(headers * EXTENT_WORDS, 8)
+            + allocation(tiles * WORDS_PER_SEGMENT, 8)
+            + allocation(headers, 4)
+            + allocation(headers * 4, 4)
             + allocation(MAX_SEGMENTS * 2, 4)
-            + allocation(MAX_TILES * 2, 4)
-            + allocation(MAX_TILES * 4, 4)
-            + allocation(MAX_TOKENS, 4)
+            + allocation(tiles * 2, 4)
+            + allocation(tiles * 4, 4)
+            + allocation(tokens, 4)
             + allocation(MAX_SEGMENTS * 4, 4)
             + 36
     }

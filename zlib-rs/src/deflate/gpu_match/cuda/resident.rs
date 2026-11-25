@@ -224,38 +224,116 @@ pub(super) struct ResidentEncoder {
     decoder: inflate::Decoder,
 }
 
-/// Independent CUDA streams may overlap kernel execution, transfers and
-/// launch latency. The lane count is bounded by the largest supported
-/// workspace rather than by the host worker count.
+/// Account for retained workspace capacities, not only the current job.
+/// A size class bounds every allocation of any job admitted to that lane.
+#[derive(Clone, Copy, Debug)]
+struct LaneCapacity {
+    window: usize,
+    decode_window: usize,
+    source: usize,
+}
+
+impl LaneCapacity {
+    fn compression(window: usize) -> Self {
+        Self {
+            window: window.max(MIB).next_power_of_two().min(MAX_WINDOW),
+            decode_window: 0,
+            source: 0,
+        }
+    }
+
+    fn transcode(window: usize, source: usize) -> Self {
+        let mut capacity = Self::compression(window);
+        capacity.decode_window = capacity.window;
+        capacity.source = if source == 0 {
+            0
+        } else {
+            source.max(64 * 1024).next_power_of_two()
+        };
+        capacity
+    }
+
+    const fn fits(self, requested: Self) -> bool {
+        self.window >= requested.window
+            && self.decode_window >= requested.decode_window
+            && self.source >= requested.source
+    }
+
+    fn bytes(self) -> Result<usize, GpuMatchError> {
+        let mut worst = Geometry::new(
+            self.window + 32_767,
+            32_767,
+            32_768,
+            1,
+            false,
+            DeflateConfig::new(9),
+            Wrapper::Zlib(15),
+        )?;
+        // Smaller adaptive tiles may need more head tables than a larger
+        // job at the same size class. Bound all geometries in the class.
+        worst.tile = MIN_MATCH_TILE;
+        worst.tiles = worst.core.div_ceil(MIN_MATCH_TILE);
+        worst.index_tiles = worst.size.div_ceil(MIN_MATCH_TILE);
+        Ok(Buffers::upper_bound(worst)
+            + inflate::Decoder::upper_bound(self.decode_window, self.source)
+            + 4096)
+    }
+}
+
+struct CachedLane {
+    encoder: Arc<ResidentEncoder>,
+    capacity: LaneCapacity,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct LaneState {
+    idle: Vec<CachedLane>,
+    active: usize,
+    reserved: usize,
+}
+
+/// Independent CUDA streams share a VRAM budget. Small jobs can occupy
+/// more lanes than maximum-sized jobs; idle oversized workspaces are
+/// reclaimed before admitting new work.
 pub(super) struct ResidentPool {
-    lanes: Vec<ResidentEncoder>,
-    available: Mutex<Vec<usize>>,
+    context: Arc<CudaContext>,
+    module: Arc<CudaModule>,
+    budget: usize,
+    state: Mutex<LaneState>,
     ready: Condvar,
     index_tiles: u32,
 }
 
+const MAX_LANES: usize = 8;
+
 struct Lane<'a> {
     pool: &'a ResidentPool,
-    index: usize,
+    cached: CachedLane,
 }
 
 impl core::ops::Deref for Lane<'_> {
     type Target = ResidentEncoder;
     fn deref(&self) -> &Self::Target {
-        &self.pool.lanes[self.index]
+        &self.cached.encoder
     }
 }
 
 impl Drop for Lane<'_> {
     fn drop(&mut self) {
-        let mut available = self
+        let mut state = self
             .pool
-            .available
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        available.push(self.index);
-        drop(available);
-        self.pool.ready.notify_one();
+        state.active -= 1;
+        state.idle.push(CachedLane {
+            encoder: Arc::clone(&self.cached.encoder),
+            capacity: self.cached.capacity,
+            bytes: self.cached.bytes,
+        });
+        drop(state);
+        self.pool.ready.notify_all();
     }
 }
 
@@ -265,43 +343,72 @@ impl ResidentPool {
         module: &Arc<CudaModule>,
         multiprocessors: u32,
     ) -> Result<Self, GpuMatchError> {
-        let index_tiles = multiprocessors.saturating_mul(4).max(1);
-        // The peak is the full window with maximum history, at the smallest
-        // tile size that the adaptive geometry can select for that window.
-        let worst = Geometry::new(
-            MAX_WINDOW + 32_767,
-            32_767,
-            32_768,
-            1,
-            false,
-            DeflateConfig::new(9),
-            Wrapper::Zlib(15),
-        )?
-        .with_index_tiles(index_tiles);
-        let bytes = Buffers::upper_bound(worst) + inflate::Decoder::upper_bound();
         context.bind_to_thread().map_err(failure)?;
         let (free, _) = cudarc::driver::result::mem_get_info().map_err(failure)?;
-        // Leave space for display, context, other workloads and transient
-        // reallocation. A single lane remains usable on small devices.
-        let count = (free.saturating_sub(free / 4) / bytes).clamp(1, 4);
-        let lanes = (0..count)
-            .map(|_| ResidentEncoder::new(context.new_stream().map_err(failure)?, module))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            lanes,
-            available: Mutex::new((0..count).rev().collect()),
+            context: Arc::clone(context),
+            module: Arc::clone(module),
+            budget: free.saturating_sub(free / 4),
+            state: Mutex::default(),
             ready: Condvar::new(),
-            index_tiles,
+            index_tiles: multiprocessors.saturating_mul(4).max(1),
         })
     }
 
-    fn acquire(&self) -> Result<Lane<'_>, GpuMatchError> {
-        let mut available = self.available.lock().map_err(failure)?;
+    fn acquire(&self, capacity: LaneCapacity) -> Result<Lane<'_>, GpuMatchError> {
+        let bytes = capacity.bytes()?;
+        let mut state = self.state.lock().map_err(failure)?;
         loop {
-            if let Some(index) = available.pop() {
-                return Ok(Lane { pool: self, index });
+            if let Some((index, _)) = state
+                .idle
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| lane.capacity.fits(capacity))
+                .min_by_key(|(_, lane)| lane.bytes)
+            {
+                let cached = state.idle.swap_remove(index);
+                state.active += 1;
+                return Ok(Lane { pool: self, cached });
             }
-            available = self.ready.wait(available).map_err(failure)?;
+            if state.active < MAX_LANES {
+                // An incompatible idle lane cannot service this request.
+                // Reclaim it only when necessary for the byte or lane cap.
+                while (state.reserved.saturating_add(bytes) > self.budget
+                    || state.active + state.idle.len() >= MAX_LANES)
+                    && !state.idle.is_empty()
+                {
+                    let Some((index, _)) = state
+                        .idle
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, lane)| lane.bytes)
+                    else {
+                        break;
+                    };
+                    let lane = state.idle.swap_remove(index);
+                    state.reserved -= lane.bytes;
+                    drop(lane);
+                }
+                // Permit one oversized request on small devices, preserving
+                // the existing single-lane behavior instead of waiting forever.
+                if state.reserved.saturating_add(bytes) <= self.budget || state.active == 0 {
+                    let encoder = Arc::new(ResidentEncoder::new(
+                        self.context.new_stream().map_err(failure)?,
+                        &self.module,
+                    )?);
+                    state.reserved += bytes;
+                    state.active += 1;
+                    return Ok(Lane {
+                        pool: self,
+                        cached: CachedLane {
+                            encoder,
+                            capacity,
+                            bytes,
+                        },
+                    });
+                }
+            }
+            state = self.ready.wait(state).map_err(failure)?;
         }
     }
 
@@ -311,7 +418,8 @@ impl ResidentPool {
         g: Geometry,
         limit: usize,
     ) -> Result<WindowOutput, GpuMatchError> {
-        self.acquire()?.window(input, g, limit)
+        self.acquire(LaneCapacity::compression(g.core as usize))?
+            .window(input, g, limit)
     }
 }
 
@@ -586,7 +694,9 @@ impl ResidentPool {
         // Each window is an independent byte-aligned DEFLATE fragment with
         // real preceding history. Reuse the caller's Rayon pool to pipeline
         // a bounded pair, never spawn a second worker pool or threads.
-        let pipeline = cfg!(feature = "parallel") && schedule.parallel && self.lanes.len() > 1;
+        let pipeline = cfg!(feature = "parallel")
+            && schedule.parallel
+            && LaneCapacity::compression(window).bytes()?.saturating_mul(2) <= self.budget;
         let mut start = 0;
         while start < input.len() {
             if output.len() == limit {
@@ -856,7 +966,7 @@ mod tests {
     fn cuda_resident_index_and_parse_are_exact() -> Result<(), Box<dyn std::error::Error>> {
         let (backend, _) = super::super::CudaBackend::new(0, true)?;
         let pool = backend.resident.as_deref().ok_or("resident encoder")?;
-        let encoder = pool.acquire()?;
+        let encoder = pool.acquire(LaneCapacity::compression(MIB))?;
         let reference = GpuMatchSearcher::new(Some("cuda-match:0"))?;
         let mut seed = 0x9e37_79b9u32;
         let random = (0..70_013)
