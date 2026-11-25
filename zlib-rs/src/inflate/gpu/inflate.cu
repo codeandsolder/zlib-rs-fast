@@ -1,15 +1,16 @@
 // Experimental block-indexed CUDA DEFLATE decoder.
-// Index entries are bit offsets in the raw DEFLATE member and logical output
+// Index entries are bit offsets in the zlib member and logical output
 // offsets. Every block is checked against both of its indexed endpoints.
 // Symbols below 256 are known bytes; other symbols refer to a byte in the
-// 32 KiB history preceding the block (distance = symbol - 255).
+// 32 KiB history preceding the segment (distance = symbol - 255).
 using u8 = unsigned char;
 using u16 = unsigned short;
 using u32 = unsigned int;
 using u64 = unsigned long long;
 constexpr u32 history_limit=32768;
 constexpr u32 warp_width=32;
-struct Boundary { u64 bit; u32 output; u32 reserved; };
+struct Segment { u64 header_bit,start_bit,end_bit; u32 start,end,kind,ends_block; };
+static_assert(sizeof(Segment)==40);
 struct Reader {
     const u8* input;
     u64 position, end;
@@ -112,43 +113,51 @@ __device__ bool match(Reader& r,const Tree& dd,u32 code,u32& length,u32& dist) {
     }
     return r.good;
 }
-// One warp per indexed block. Lane zero decodes the entropy stream; lanes
-// expand a match in parallel. Independent block histories are symbolic, so
-// blocks never wait on each other or read unwritten global output.
-extern "C" __global__ void inflate_symbolic(const u8* input,const Boundary* boundaries,u32 blocks,
+// A segment starts and ends at exact token boundaries, possibly inside
+// a large entropy block. Rebuild the same tree from its original header.
+// One warp decodes independently, using symbolic preceding history.
+extern "C" __global__ void inflate_symbolic(const u8* input,const Segment* segments,u32 count,
     u16* symbolic,u32* status,u32 window) {
     const u32 index=(blockIdx.x*blockDim.x+threadIdx.x)/warp_width,lane=threadIdx.x%warp_width;
-    if(index>=blocks)return;
-    const Boundary b=boundaries[index],e=boundaries[index+1];
-    Reader r{input,b.bit,e.bit};
+    if(index>=count)return;
+    const Segment seg=segments[index];
+    Reader r{input,seg.header_bit,seg.end_bit};
     Tree ll,dd;
-    u32 type=0,last=0,ok=1,stored=0;
+    u32 ok=1,stored=0;
     if(!lane){
-        last=r.take(1);type=r.take(2);
-        ok=r.good && type!=3 && last==(index+1==blocks);
+        r.take(1);const u32 type=r.take(2);
+        ok=r.good && type==seg.kind && type!=3;
         if(ok && type==0){
             r.position=(r.position+7)&~7ull;
             stored=r.take(16);const u32 inverse=r.take(16);
-            ok=r.good && (stored^inverse)==65535u && stored==e.output-b.output && r.position+8ull*stored==e.bit;
-        }else if(ok)ok=tables(r,type,ll,dd);
+            ok=r.good && (stored^inverse)==65535u && stored==seg.end-seg.start &&
+                r.position==seg.start_bit && r.position+8ull*stored==seg.end_bit;
+        }else if(ok){
+            ok=tables(r,type,ll,dd) && r.position<=seg.start_bit;
+            r.position=seg.start_bit;
+        }
     }
-    ok=__shfl_sync(0xffffffffu,ok,0);type=__shfl_sync(0xffffffffu,type,0);
+    ok=__shfl_sync(0xffffffffu,ok,0);
     stored=__shfl_sync(0xffffffffu,stored,0);
     if(!ok){if(!lane)status[index]=1;return;}
-    if(type==0){
-        const u64 start=__shfl_sync(0xffffffffu,r.position,0)/8;
-        for(u32 i=lane;i<stored;i+=warp_width)symbolic[b.output+i]=input[start+i];
+    if(seg.kind==0){
+        const u64 start=seg.start_bit/8;
+        for(u32 i=lane;i<stored;i+=warp_width)symbolic[seg.start+i]=input[start+i];
         if(!lane)status[index]=0;return;
     }
-    u32 pos=b.output;
+    u32 pos=seg.start;
     for(;;){
         u32 symbol=0,length=0,distance=0;
         if(!lane){
-            symbol=ll.decode(r);
-            if(!r.good)ok=0;
-            else if(symbol<256){length=1;ok=pos<e.output;}
-            else if(symbol==256){ok=pos==e.output&&r.position==e.bit;}
-            else ok=match(r,dd,symbol,length,distance)&&distance<=min(pos,window)&&length<=e.output-pos;
+            if(!seg.ends_block && pos==seg.end){
+                symbol=256;ok=r.position==seg.end_bit;
+            } else {
+                symbol=ll.decode(r);
+                if(!r.good)ok=0;
+                else if(symbol<256){length=1;ok=pos<seg.end;}
+                else if(symbol==256){ok=seg.ends_block && pos==seg.end&&r.position==seg.end_bit;}
+                else ok=match(r,dd,symbol,length,distance)&&distance<=min(pos,window)&&length<=seg.end-pos;
+            }
         }
         ok=__shfl_sync(0xffffffffu,ok,0);
         symbol=__shfl_sync(0xffffffffu,symbol,0);
@@ -157,11 +166,12 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const Boundary* boun
         if(!ok||symbol==256)break;
         if(symbol<256){if(!lane)symbolic[pos]=static_cast<u16>(symbol);}
         else {
-            // Every source is before the token, including self-overlap.
-            // Map the whole output token into its initial distance bytes.
+            // Self-overlap maps to the initial distance bytes, all of
+            // which precede the token. Earlier segments are represented
+            // symbolically, never read before their producer completes.
             for(u32 i=lane;i<length;i+=warp_width){
                 const u32 source=pos-distance+(i%distance);
-                symbolic[pos+i]=source<b.output?static_cast<u16>(255+b.output-source):symbolic[source];
+                symbolic[pos+i]=source<seg.start?static_cast<u16>(255+seg.start-source):symbolic[source];
             }
         }
         __syncwarp();
@@ -169,26 +179,31 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const Boundary* boun
     }
     if(!lane)status[index]=ok?0:2;
 }
+// Refuse to dereference any symbolic output if a segment failed validation.
+extern "C" __global__ void inflate_status(const u32* status,u32 count,u32* error) {
+    for(u32 i=blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=gridDim.x*blockDim.x)
+        if(status[i])atomicOr(error,status[i]);
+}
 // Resolve symbolic references, which strictly decrease the originating
-// block. Binary search only when crossing a block boundary. No output read
-// depends on scheduling, and malformed block endpoints are rejected first.
-extern "C" __global__ void inflate_resolve(const Boundary* boundaries,u32 blocks,const u16* symbolic,
+// segment. Binary search only when crossing a segment boundary.
+extern "C" __global__ void inflate_resolve(const Segment* segments,u32 count,const u16* symbolic,
     u8* output,u32* error) {
+    if(*error)return;
     const u32 index=blockIdx.y;
-    const u32 start=boundaries[index].output,end=boundaries[index+1].output;
+    const u32 start=segments[index].start,end=segments[index].end;
     for(u32 pos=start+blockIdx.x*blockDim.x+threadIdx.x;pos<end;pos+=gridDim.x*blockDim.x){
         u32 origin=start,block=index;
         u16 value=symbolic[pos];
         while(value>=256){
             const u32 distance=static_cast<u32>(value)-255;
-            if(distance>origin||!block){atomicOr(error,1u);return;}
+            if(distance>origin||!block){atomicOr(error,4u);return;}
             const u32 source=origin-distance;
             u32 lo=0,hi=block;
             while(lo+1<hi){
                 const u32 middle=lo+(hi-lo)/2;
-                if(boundaries[middle].output<=source)lo=middle;else hi=middle;
+                if(segments[middle].start<=source)lo=middle;else hi=middle;
             }
-            block=lo;origin=boundaries[block].output;value=symbolic[source];
+            block=lo;origin=segments[block].start;value=symbolic[source];
         }
         output[pos]=static_cast<u8>(value);
     }
