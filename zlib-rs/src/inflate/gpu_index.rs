@@ -1,4 +1,5 @@
 //! Discover independent entropy decode segments without materializing output.
+//!
 //! Reuse the ordinary inflater's validated tables and fast symbol decoder.
 //! An index is not proof of a correct checksum: the device must check Adler
 //! against the decoded bytes before publishing any recompressed result.
@@ -299,11 +300,12 @@ impl<'a> IndexScanner<'a> {
 }
 
 /// Structurally index an RFC 1950 member, without output bytes or checksum work.
+///
 /// The caller supplies a decoded-byte bound and a descriptor bound to prevent
 /// untrusted input from causing unbounded allocation. A dictionary member or
 /// trailing bytes is rejected; the regular inflater remains available.
 /// # Errors
-/// Returns DataError for invalid/truncated members or distances, BufError when
+/// Returns `DataError` for invalid/truncated members or distances, `BufError` when
 /// the decoded size or descriptor limit is exceeded.
 #[cfg(any(test, feature = "__internal-api"))]
 pub fn index_zlib(

@@ -451,7 +451,9 @@ impl ResidentEncoder {
         self.stream
             .memcpy_htod(input, &mut b.input)
             .map_err(failure)?;
-        self.window_loaded(&mut b, g, limit)
+        let result = self.window_loaded(&mut b, g, limit);
+        drop(b);
+        result
     }
 
     fn window_loaded(

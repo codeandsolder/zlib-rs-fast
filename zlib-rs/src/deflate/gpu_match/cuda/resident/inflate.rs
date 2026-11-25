@@ -444,20 +444,32 @@ impl ResidentEncoder {
             checksum.update(&piece, end - start);
             start = end;
         }
-        let (trailer, n) = checksum.trailer(start);
-        if Some(u32::from_be_bytes(
-            trailer[..n].try_into().map_err(failure)?,
-        )) != scan.scanner.adler()
-        {
-            return Ok(scan.result(Vec::new(), ReturnCode::DataError));
-        }
-        let code = if append(&mut output, &trailer[..n], limit) {
-            ReturnCode::Ok
-        } else {
-            ReturnCode::BufError
-        };
-        Ok(scan.result(output, code))
+        drop(b);
+        drop(w);
+        finish_transcode(scan, output, checksum, start, limit)
     }
+}
+
+fn finish_transcode(
+    scan: ScanAhead<'_>,
+    mut output: Vec<u8>,
+    checksum: Checksum,
+    start: usize,
+    limit: usize,
+) -> Result<GpuTranscodeResult, GpuMatchError> {
+    let (trailer, n) = checksum.trailer(start);
+    if Some(u32::from_be_bytes(
+        trailer[..n].try_into().map_err(failure)?,
+    )) != scan.scanner.adler()
+    {
+        return Ok(scan.result(Vec::new(), ReturnCode::DataError));
+    }
+    let code = if append(&mut output, &trailer[..n], limit) {
+        ReturnCode::Ok
+    } else {
+        ReturnCode::BufError
+    };
+    Ok(scan.result(output, code))
 }
 
 impl ResidentPool {
@@ -508,6 +520,37 @@ mod tests {
         BatchJob, GpuMatchSearcher, InflateConfig, Strategy,
     };
     use std::num::NonZeroUsize;
+
+    fn check_bad_source(
+        searcher: &GpuMatchSearcher,
+        source: &[u8],
+        expected: &[u8],
+        max: u32,
+        options: impl Fn(usize, u32) -> GpuTranscodeOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut corrupt = source.to_vec();
+        let last = corrupt.last_mut().ok_or("trailer")?;
+        *last ^= 1;
+        let result = searcher
+            .recompress_zlib(&corrupt, options(expected.len() + 512, max))?
+            .ok_or("unexpected transcode routing")?;
+        assert_eq!(result.code, ReturnCode::DataError);
+        assert_eq!(result.output, [] as [u8; 0]);
+        let truncated = searcher
+            .recompress_zlib(
+                &source[..source.len() - 1],
+                options(expected.len() + 512, max),
+            )?
+            .ok_or("unexpected transcode routing")?;
+        assert_eq!(truncated.code, ReturnCode::DataError);
+        if max != 0 {
+            let bounded = searcher
+                .recompress_zlib(source, options(expected.len() + 512, max - 1))?
+                .ok_or("unexpected transcode routing")?;
+            assert_eq!(bounded.code, ReturnCode::BufError);
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUDA hardware and NVRTC"]
@@ -594,27 +637,7 @@ mod tests {
                         }
                     );
                 }
-                let mut corrupt = source.to_vec();
-                let last = corrupt.last_mut().ok_or("trailer")?;
-                *last ^= 1;
-                let result = searcher
-                    .recompress_zlib(&corrupt, options(expected.len() + 512, max))?
-                    .ok_or("unexpected transcode routing")?;
-                assert_eq!(result.code, ReturnCode::DataError);
-                assert!(result.output.is_empty());
-                let truncated = searcher
-                    .recompress_zlib(
-                        &source[..source.len() - 1],
-                        options(expected.len() + 512, max),
-                    )?
-                    .ok_or("unexpected transcode routing")?;
-                assert_eq!(truncated.code, ReturnCode::DataError);
-                if max != 0 {
-                    let bounded = searcher
-                        .recompress_zlib(source, options(expected.len() + 512, max - 1))?
-                        .ok_or("unexpected transcode routing")?;
-                    assert_eq!(bounded.code, ReturnCode::BufError);
-                }
+                check_bad_source(&searcher, source, &expected, max, options)?;
             }
             let mut scratch = vec![0; input.len()];
             let (decoded, code) =
