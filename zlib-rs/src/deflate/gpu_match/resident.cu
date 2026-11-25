@@ -249,8 +249,7 @@ __device__ u32 header_rle(const Huffman& ll,const Huffman& dd,u32 nl,u32 nd,u16*
     return count;
 }
 __device__ __forceinline__ u32 usable_match(u32 word) {
-    const u32 len=word&65535,dist=word>>16;
-    return len==3 && dist>4096 ? 0 : len;
+    return word&65535;
 }
 // One lane owns each independent block's parser, histogram, tree and
 // bitstream. Many blocks run in parallel, with exact previous-window
