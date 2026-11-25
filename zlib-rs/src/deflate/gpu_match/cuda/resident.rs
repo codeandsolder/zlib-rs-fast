@@ -99,7 +99,7 @@ macro_rules! workspace_geometry {
             block_ids: u32 => $g.segments, blocks: u32 => $g.segments * BLOCK_WORDS,
             hist: u32 => $g.segments * HIST_WORDS, arena: u32 => $g.arena_bytes() / 4,
             bits: u32 => $g.segments, bit_offsets: u32 => $g.segments,
-            checksums: u32 => $g.tiles * 2, offsets: u32 => $g.segments, meta: u32 => 4,
+            checksums: u32 => $g.tiles * 2, offsets: u32 => $g.segments, meta: u32 => 5,
             compact: u8 => $g.arena_bytes(),
         }
     };
@@ -503,7 +503,7 @@ impl ResidentEncoder {
         let mut b = self.buffers.lock().map_err(failure)?;
         b.prepare(&self.stream, g)?;
         self.submit_window(&mut b, g, source)?;
-        let result = self.read_window(&b, g, limit);
+        let result = self.read_window(&b, g, limit, false);
         drop(b);
         drop(device);
         result
@@ -526,12 +526,19 @@ impl ResidentEncoder {
         b: &Buffers,
         g: Geometry,
         limit: usize,
+        check_inflate: bool,
     ) -> Result<WindowOutput, GpuMatchError> {
         let meta = self
             .stream
-            .clone_dtoh(&b.meta.slice(..4))
+            .clone_dtoh(&b.meta.slice(..if check_inflate { 5 } else { 4 }))
             .map_err(failure)?;
-        let [len, a, checksum_b, blocks] = <[u32; 4]>::try_from(meta).map_err(failure)?;
+        if check_inflate && meta[4] != 0 {
+            return Err(GpuMatchError(format!(
+                "CUDA inflate segment validation failed: {}",
+                meta[4]
+            )));
+        }
+        let [len, a, checksum_b, blocks] = <[u32; 4]>::try_from(&meta[..4]).map_err(failure)?;
         if len > g.arena_bytes() || blocks == 0 || blocks > g.segments {
             return Err(GpuMatchError(
                 "invalid resident CUDA output metadata".into(),

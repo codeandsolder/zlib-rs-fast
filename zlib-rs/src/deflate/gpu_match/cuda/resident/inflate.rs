@@ -84,8 +84,7 @@ impl Workspace {
 #[derive(Default)]
 struct Cursor {
     segment: usize,
-    absolute_segment: usize,
-    device_index: bool,
+    group: usize,
     decoded: u32,
     origin: u32,
     source_bytes_uploaded: usize,
@@ -156,6 +155,34 @@ impl<'a> Group<'a> {
     }
 }
 
+enum DecodeBatch<'a> {
+    Host(Group<'a>),
+    Device(index::DeviceGroup),
+}
+
+impl DecodeBatch<'_> {
+    fn bounds(&self) -> Result<(u32, u32, u32), GpuMatchError> {
+        match self {
+            Self::Host(group) => {
+                let first = group
+                    .segments
+                    .first()
+                    .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
+                let last = group
+                    .segments
+                    .last()
+                    .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
+                Ok((
+                    u32::try_from(group.segments.len()).map_err(failure)?,
+                    first.start,
+                    last.end,
+                ))
+            }
+            Self::Device(group) => Ok((group.count, group.start, group.end)),
+        }
+    }
+}
+
 impl Decoder {
     pub(super) fn new(
         stream: Arc<CudaStream>,
@@ -177,9 +204,11 @@ impl Decoder {
         &self,
         source: &[u8],
         limit: u32,
+        compression_window: u32,
     ) -> Result<Option<index::DeviceIndex>, GpuMatchError> {
         let mut w = self.workspace.lock().map_err(failure)?;
-        self.indexer.prepare(&mut w.index, source, limit)
+        self.indexer
+            .prepare(&mut w.index, source, limit, compression_window)
     }
 
     fn retain_history(
@@ -218,88 +247,85 @@ impl Decoder {
     fn decode_group(
         &self,
         w: &mut Workspace,
-        group: &Group<'_>,
+        group: DecodeBatch<'_>,
         cursor: &mut Cursor,
         window: u32,
     ) -> Result<(), GpuMatchError> {
-        let first = group
-            .segments
-            .first()
-            .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
-        let last = group
-            .segments
-            .last()
-            .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
-        let count = u32::try_from(group.segments.len()).map_err(failure)?;
+        let (count, start, end) = group.bounds()?;
         let base = cursor.decoded;
-        if first.start != base || (last.end - cursor.origin) as usize > w.raw.len() {
+        if start != base || (end - cursor.origin) as usize > w.raw.len() {
             return Err(GpuMatchError(
                 "inflate group exceeds decoded workspace".into(),
             ));
         }
         let seed_count = (count * window) as usize;
-        let word_count = group.segments.len() * WORDS_PER_SEGMENT;
-        if !cursor.device_index {
-            let words = group
-                .segments
-                .iter()
-                .flat_map(|s| {
-                    [
-                        s.header_bit,
-                        s.header_end_bit,
-                        s.start_bit,
-                        s.end_bit,
-                        u64::from(s.start) | (u64::from(s.end) << 32),
-                        u64::from(s.kind) | (u64::from(s.ends_block) << 32),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            reserve(&self.stream, &mut w.input, group.payload.len())?;
-            reserve(&self.stream, &mut w.header, group.header.len())?;
-            reserve(&self.stream, &mut w.segments, words.len())?;
-            self.stream
-                .memcpy_htod(group.payload, &mut w.input)
-                .map_err(failure)?;
-            self.stream
-                .memcpy_htod(group.header, &mut w.header)
-                .map_err(failure)?;
-            self.stream
-                .memcpy_htod(&words, &mut w.segments)
-                .map_err(failure)?;
-            cursor.source_bytes_uploaded += group.payload.len() + group.header.len();
-            cursor.descriptor_bytes_uploaded += words.len() * core::mem::size_of::<u64>();
-        }
-        reserve(&self.stream, &mut w.symbolic, (last.end - base) as usize)?;
+        let word_count = count as usize * WORDS_PER_SEGMENT;
+        reserve(&self.stream, &mut w.symbolic, (end - base) as usize)?;
         reserve(&self.stream, &mut w.seeds, seed_count)?;
         reserve(&self.stream, &mut w.used_seeds, seed_count / 32)?;
         reserve(&self.stream, &mut w.status, count as usize)?;
-        // The GPU indexer owns both the full compact source and the
-        // absolute descriptor list on this same exclusively leased stream.
-        // The host readback is only metadata for bounded window scheduling.
-        let (input, header, input_origin, header_origin, descriptors) = if cursor.device_index {
-            let offset = cursor.absolute_segment * WORDS_PER_SEGMENT;
-            (
-                &w.index.source,
-                &w.index.source,
-                0_u64,
-                0_u64,
-                w.index.segments.slice(offset..offset + word_count),
-            )
-        } else {
-            (
-                &w.input,
-                &w.header,
-                group.input_origin,
-                group.header_origin,
-                w.segments.slice(..word_count),
-            )
+        let (input, header, input_origin, header_origin, first_header, descriptors) = match group {
+            DecodeBatch::Device(group) => {
+                let offset = group.offset * WORDS_PER_SEGMENT;
+                cursor.group += 1;
+                (
+                    &w.index.source,
+                    &w.index.source,
+                    0_u64,
+                    0_u64,
+                    0_u64,
+                    w.index.segments.slice(offset..offset + word_count),
+                )
+            }
+            DecodeBatch::Host(group) => {
+                let first = group
+                    .segments
+                    .first()
+                    .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
+                let words = group
+                    .segments
+                    .iter()
+                    .flat_map(|s| {
+                        [
+                            s.header_bit,
+                            s.header_end_bit,
+                            s.start_bit,
+                            s.end_bit,
+                            u64::from(s.start) | (u64::from(s.end) << 32),
+                            u64::from(s.kind) | (u64::from(s.ends_block) << 32),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                reserve(&self.stream, &mut w.input, group.payload.len())?;
+                reserve(&self.stream, &mut w.header, group.header.len())?;
+                reserve(&self.stream, &mut w.segments, words.len())?;
+                self.stream
+                    .memcpy_htod(group.payload, &mut w.input)
+                    .map_err(failure)?;
+                self.stream
+                    .memcpy_htod(group.header, &mut w.header)
+                    .map_err(failure)?;
+                self.stream
+                    .memcpy_htod(&words, &mut w.segments)
+                    .map_err(failure)?;
+                cursor.source_bytes_uploaded += group.payload.len() + group.header.len();
+                cursor.descriptor_bytes_uploaded += words.len() * core::mem::size_of::<u64>();
+                cursor.segment += count as usize;
+                (
+                    &w.input,
+                    &w.header,
+                    group.input_origin,
+                    group.header_origin,
+                    first.header_bit,
+                    w.segments.slice(..word_count),
+                )
+            }
         };
         self.stream
             .memset_zeros(&mut w.used_seeds.slice_mut(..seed_count / 32))
             .map_err(failure)?;
-        self.stream.memset_zeros(&mut w.error).map_err(failure)?;
         launch!(self,inflate_symbolic,(count.div_ceil(4),1,1),WORKGROUP_SIZE;
-            input,header,&input_origin,&header_origin,&first.header_bit,
+            input,header,&input_origin,&header_origin,&first_header,
             &descriptors,&count,&mut w.symbolic,&mut w.status,&mut w.used_seeds,&window,&base);
         launch!(self,inflate_status,(count.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
             &w.status,&count,&mut w.error);
@@ -307,16 +333,12 @@ impl Decoder {
             &descriptors,&w.symbolic,&w.raw,&w.used_seeds,&mut w.seeds,&mut w.error,&window,&base,&cursor.origin);
         launch!(self,inflate_resolve,(32,count,1),WORKGROUP_SIZE;
             &descriptors,&w.symbolic,&w.seeds,&mut w.raw,&w.error,&window,&base,&cursor.origin);
-        let error = self.stream.clone_dtoh(&w.error).map_err(failure)?;
-        if error[0] != 0 {
-            return Err(GpuMatchError(format!(
-                "CUDA inflate segment validation failed: {}",
-                error[0]
-            )));
-        }
-        cursor.decoded = last.end;
-        cursor.segment += count as usize;
-        cursor.absolute_segment += count as usize;
+        // Do not synchronize between inflate and compression. The error
+        // flag is cumulative and read with the compact compression metadata.
+        // On an invalid group all later resolve kernels are suppressed;
+        // the bounded raw allocation remains safe to read, but no result
+        // can be published until that error flag has been checked.
+        cursor.decoded = end;
         Ok(())
     }
 
@@ -324,14 +346,24 @@ impl Decoder {
         &self,
         w: &mut Workspace,
         source: &[u8],
-        segments: &[InflateSegment],
-        window: u32,
+        scan: &ScanAhead<'_>,
         cursor: &mut Cursor,
         target: u32,
     ) -> Result<(), GpuMatchError> {
         while cursor.decoded < target {
-            let group = Group::next(source, &segments[cursor.segment..], target)?;
-            self.decode_group(w, &group, cursor, window)?;
+            let group = match &scan.source {
+                SourceIndex::Device { groups, .. } => DecodeBatch::Device(
+                    *groups
+                        .get(cursor.group)
+                        .ok_or_else(|| GpuMatchError("CUDA decode schedule ended early".into()))?,
+                ),
+                SourceIndex::Host(_) => DecodeBatch::Host(Group::next(
+                    source,
+                    &scan.pending[cursor.segment..],
+                    target,
+                )?),
+            };
+            self.decode_group(w, group, cursor, scan.window())?;
         }
         Ok(())
     }
@@ -340,6 +372,7 @@ impl Decoder {
 enum SourceIndex<'a> {
     Host(Box<IndexScanner<'a>>),
     Device {
+        groups: Vec<index::DeviceGroup>,
         decoded: u32,
         window: u32,
         adler: u32,
@@ -370,12 +403,13 @@ impl<'a> ScanAhead<'a> {
     fn device(index: index::DeviceIndex, uploaded: usize) -> Self {
         Self {
             source: SourceIndex::Device {
+                groups: index.groups,
                 decoded: index.decoded,
                 window: index.window,
                 adler: index.adler,
             },
-            count: index.segments.len(),
-            pending: index.segments,
+            count: 0,
+            pending: Vec::new(),
             processed: 0,
             source_bytes_uploaded: uploaded,
             descriptor_bytes_uploaded: 0,
@@ -474,9 +508,9 @@ impl ResidentEncoder {
         reserve(&self.stream, &mut w.carry, CARRY_BYTES)?;
         let mut cursor = Cursor {
             source_bytes_uploaded: scan.source_bytes_uploaded,
-            device_index: scan.is_device(),
             ..Cursor::default()
         };
+        self.stream.memset_zeros(&mut w.error).map_err(failure)?;
         let source_window = scan.window();
         let history = (source_window as usize).max(distance as usize - 1);
         let mut b = self.buffers.lock().map_err(failure)?;
@@ -495,8 +529,7 @@ impl ResidentEncoder {
             self.decoder.decode_to(
                 &mut w,
                 source,
-                &scan.pending,
-                source_window,
+                &scan,
                 &mut cursor,
                 u32::try_from(end).map_err(failure)?,
             )?;
@@ -527,7 +560,10 @@ impl ResidentEncoder {
             } else {
                 scan.fill_to(end.saturating_add(window))
             };
-            let piece = self.read_window(&b, g, limit - output.len())?;
+            self.stream
+                .memcpy_dtod(&w.error, &mut b.meta.slice_mut(4..5))
+                .map_err(failure)?;
+            let piece = self.read_window(&b, g, limit - output.len(), true)?;
             scan.processed = end;
             output.extend_from_slice(&piece.output);
             if !piece.complete {
@@ -586,10 +622,11 @@ impl ResidentPool {
         if options.output_limit > 2 && index::eligible(source) {
             let encoder = self.acquire()?;
             uploaded = source.len();
-            if let Some(index) = encoder
-                .decoder
-                .device_index(source, options.decoded_limit)?
-            {
+            if let Some(index) = encoder.decoder.device_index(
+                source,
+                options.decoded_limit,
+                u32::try_from(options.window.get().min(MAX_WINDOW)).map_err(failure)?,
+            )? {
                 if index.decoded < options.minimum_decoded_len {
                     return Ok(None);
                 }

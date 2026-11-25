@@ -1,7 +1,7 @@
 //! Compact-source device index. Every speculative edge is validated by the
 //! exact block-chain walk before any segment is exposed to the inflater.
 use super::{
-    allocation_capacity, failure, reserve, GpuMatchError, InflateSegment, MAX_SEGMENT,
+    allocation_capacity, failure, reserve, GpuMatchError, MAX_BATCH_SEGMENTS, MAX_SEGMENT,
     WORDS_PER_SEGMENT, WORKGROUP_SIZE,
 };
 use cudarc::driver::{
@@ -266,39 +266,69 @@ impl Indexer {
         launch!(self,inflate_schedule_groups,(1,1,1),1;
             &w.segments,&mut w.info,&compression_window,&max_group,&mut w.groups);
         let info = self.stream.clone_dtoh(&w.info).map_err(failure)?;
-        if info[0] != 0 { return Ok(None); }
+        if info[0] != 0 {
+            return Ok(None);
+        }
         let n = info[1] as usize;
         let decoded = info[2];
         let group_count = info[5] as usize;
         if n > MAX_SEGMENTS || decoded > limit || info[3] != window || group_count > n {
             return Err(GpuMatchError("invalid CUDA index metadata".into()));
         }
-        let words = if group_count == 0 { Vec::new() } else {
-            self.stream.clone_dtoh(&w.groups.slice(..group_count*4)).map_err(failure)?
+        let words = if group_count == 0 {
+            Vec::new()
+        } else {
+            self.stream
+                .clone_dtoh(&w.groups.slice(..group_count * 4))
+                .map_err(failure)?
         };
         let groups = validate_groups(&words, n, decoded, compression_window)?;
-        Ok(Some(DeviceIndex { groups, decoded, window, adler: info[4] }))
+        Ok(Some(DeviceIndex {
+            groups,
+            decoded,
+            window,
+            adler: info[4],
+        }))
     }
 }
 
-fn validate_groups(words:&[u32],segments:usize,decoded:u32,window:u32)->Result<Vec<DeviceGroup>,GpuMatchError>{
-    let mut groups=Vec::with_capacity(words.len()/4);
-    let mut position=0;
-    let mut offset=0;
-    for g in words.chunks_exact(4){
-        let count=g[1];
-        let target=(u64::from(position)/u64::from(window)+1)*u64::from(window);
-        if g[0] as usize!=offset || count==0 || count as usize>MAX_BATCH_SEGMENTS ||
-            g[2]!=position || g[3]<=position || g[3]>decoded ||
-            u64::from(g[3])>target+MAX_SEGMENT as u64 {
+fn validate_groups(
+    words: &[u32],
+    segments: usize,
+    decoded: u32,
+    window: u32,
+) -> Result<Vec<DeviceGroup>, GpuMatchError> {
+    let mut groups = Vec::with_capacity(words.len() / 4);
+    let mut position = 0;
+    let mut offset = 0;
+    for g in words.chunks_exact(4) {
+        let count = g[1];
+        let target = (u64::from(position) / u64::from(window) + 1) * u64::from(window);
+        if g[0] as usize != offset
+            || count == 0
+            || count as usize > MAX_BATCH_SEGMENTS
+            || g[2] != position
+            || g[3] <= position
+            || g[3] > decoded
+            || u64::from(g[3]) > target + MAX_SEGMENT as u64
+        {
             return Err(GpuMatchError("invalid CUDA decode group".into()));
         }
-        groups.push(DeviceGroup{offset,count,start:g[2],end:g[3]});
-        offset=offset.checked_add(count as usize).ok_or_else(||GpuMatchError("CUDA group offset overflow".into()))?;
-        position=g[3];
+        groups.push(DeviceGroup {
+            offset,
+            count,
+            start: g[2],
+            end: g[3],
+        });
+        offset = offset
+            .checked_add(count as usize)
+            .ok_or_else(|| GpuMatchError("CUDA group offset overflow".into()))?;
+        position = g[3];
     }
-    if offset!=segments || position!=decoded || words.len()%4!=0 {
-        return Err(GpuMatchError("CUDA decode groups do not cover member".into()));
+    if offset != segments || position != decoded || words.len() % 4 != 0 {
+        return Err(GpuMatchError(
+            "CUDA decode groups do not cover member".into(),
+        ));
     }
     Ok(groups)
 }
