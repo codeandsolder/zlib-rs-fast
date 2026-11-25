@@ -243,6 +243,29 @@ impl BatchCodec {
         Ok((cpu_results, gpu_results?))
     }
 
+    /// Recompress independent zlib members on the CUDA backend using this
+    /// codec's bounded worker pool. Each job carries its own size limits and
+    /// compression settings; results retain the original job order.
+    ///
+    /// CPU entropy indexing runs concurrently across jobs while GPU work
+    /// uses the searcher's bounded resident lane pool.
+    /// # Errors
+    /// Returns the same CUDA errors as the single-member transcode API.
+    #[cfg(feature = "cuda")]
+    pub fn recompress_zlib_batch(
+        &self,
+        jobs: &mut [(&[u8], crate::GpuTranscodeOptions)],
+        searcher: &crate::GpuMatchSearcher,
+    ) -> Result<Vec<Option<crate::GpuTranscodeResult>>, crate::GpuMatchError> {
+        self.run_items(
+            jobs,
+            || Ok(None),
+            |_, (source, options)| searcher.recompress_zlib(source, *options),
+        )
+        .into_iter()
+        .collect()
+    }
+
     /// Decode streams concurrently. Each job's input consumption, initialized
     /// output, and return code match an independent whole-slice decode.
     pub fn decompress(
