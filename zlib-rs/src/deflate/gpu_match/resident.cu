@@ -15,6 +15,11 @@ __device__ __forceinline__ Tile tile_at(u32 tile, u32 size, u32 history, u32 til
     const u32 end = start+min(tile_bytes,size-start);
     return {start, origin, end-origin, end-start};
 }
+__device__ __forceinline__ Tile search_tile_at(u32 tile,u32 size,u32 history,u32 tile_bytes,u32 max_dist) {
+    Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
+    t.len+=min(match_limit-1,size-t.start-t.core);
+    return t;
+}
 __device__ __forceinline__ u32 hash_at(const u32* input, u32 pos) {
     return ((input[pos]&0xffffffu)*2654435761u)>>16;
 }
@@ -23,11 +28,11 @@ __device__ __forceinline__ u32 hash_at(const u32* input, u32 pos) {
 // ordered before writes; processing 32 positions at a time preserves the
 // exact serial nearest-predecessor relation, including hash collisions.
 extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16* predecessors,
-    u32 size, u32 history, u32 tile_bytes, u32 stride, u32 max_dist, u32 tiles) {
+    u32 size, u32 history, u32 tile_bytes, u32 stride, u32 max_dist, u32 tiles, u32 lookahead) {
     const u32 lane=threadIdx.x%warp_size;
     const u32 tile=(blockIdx.x*blockDim.x+threadIdx.x)/warp_size;
     if (tile>=tiles) return;
-    const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
+    const Tile t=lookahead ? search_tile_at(tile,size,history,tile_bytes,max_dist) : tile_at(tile,size,history,tile_bytes,max_dist);
     u32* heads=heads_all+static_cast<u64>(tile)*hash_count;
     u16* pred_out=predecessors+static_cast<u64>(tile)*stride;
     for (u32 h=lane; h<hash_count; h+=warp_size) heads[h]=0;
@@ -53,9 +58,9 @@ extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16*
 // Only search core positions. History is present in the index and input,
 // but we never compute match results for the unused history halo.
 extern "C" __global__ void resident_match(const u32* input,const u32* predecessors,u32* matches,
-    u32 size,u32 history,u32 tile_bytes,u32 stride,u32 max_dist,u32 budget) {
+    u32 size,u32 history,u32 tile_bytes,u32 stride,u32 max_dist,u32 budget,u32 lookahead) {
     const u32 tile=blockIdx.y;
-    const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
+    const Tile t=lookahead ? search_tile_at(tile,size,history,tile_bytes,max_dist) : tile_at(tile,size,history,tile_bytes,max_dist);
     const u32* words=input+t.origin;
     const u32* p=predecessors+static_cast<u64>(tile)*(stride/2);
     u32* output=matches+static_cast<u64>(tile)*tile_bytes;
