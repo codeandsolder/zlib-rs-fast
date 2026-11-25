@@ -10,7 +10,7 @@ use super::{
 };
 use crate::ReturnCode;
 
-const MAX_SEGMENT_BYTES: usize = 128 * 1024;
+const MAX_SEGMENT_BYTES: usize = 32 * 1024;
 
 /// A token-aligned entropy segment. Header and payload positions are bit
 /// offsets in the entire zlib member, including the two-byte wrapper.
