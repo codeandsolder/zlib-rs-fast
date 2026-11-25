@@ -91,6 +91,7 @@ impl CudaBackend {
             source.push_str(include_str!("resident.cu"));
             source.push_str(include_str!("resident_parallel.cu"));
             source.push_str(include_str!("../../inflate/gpu/inflate.cu"));
+            source.push_str(include_str!("../../inflate/gpu/index.cu"));
         }
         let ptx = compile_ptx_with_opts(
             source,
