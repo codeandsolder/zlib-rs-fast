@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reference.push((output, result.code));
     }
     println!(
-        "workers,round,ms,streams,decoded,accepted,output_bytes,source_upload,descriptor_upload"
+        "workers,round,ms,streams,decoded,accepted,output_bytes,source_upload,descriptor_upload,peak_lanes,peak_reserved_bytes,budget_bytes"
     );
     for round in 0..rounds {
         let t = Instant::now();
