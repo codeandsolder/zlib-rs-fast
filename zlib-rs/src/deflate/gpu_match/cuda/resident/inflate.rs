@@ -157,7 +157,7 @@ impl<'a> Group<'a> {
 
 enum DecodeBatch<'a> {
     Host(Group<'a>),
-    Device(index::DeviceGroup),
+    Device(index::DeviceGroup, u32),
 }
 
 impl DecodeBatch<'_> {
@@ -178,7 +178,7 @@ impl DecodeBatch<'_> {
                     last.end,
                 ))
             }
-            Self::Device(group) => Ok((group.count, group.start, group.end)),
+            Self::Device(group, _) => Ok((group.count, group.start, group.end)),
         }
     }
 }
@@ -264,69 +264,76 @@ impl Decoder {
         reserve(&self.stream, &mut w.seeds, seed_count)?;
         reserve(&self.stream, &mut w.used_seeds, seed_count / 32)?;
         reserve(&self.stream, &mut w.status, count as usize)?;
-        let (input, header, input_origin, header_origin, first_header, descriptors) = match group {
-            DecodeBatch::Device(group) => {
-                let offset = group.offset * WORDS_PER_SEGMENT;
-                cursor.group += 1;
-                (
-                    &w.index.source,
-                    &w.index.source,
-                    0_u64,
-                    0_u64,
-                    0_u64,
-                    w.index.segments.slice(offset..offset + word_count),
-                )
-            }
-            DecodeBatch::Host(group) => {
-                let first = group
-                    .segments
-                    .first()
-                    .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
-                let words = group
-                    .segments
-                    .iter()
-                    .flat_map(|s| {
-                        [
-                            s.header_bit,
-                            s.header_end_bit,
-                            s.start_bit,
-                            s.end_bit,
-                            u64::from(s.start) | (u64::from(s.end) << 32),
-                            u64::from(s.kind) | (u64::from(s.ends_block) << 32),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                reserve(&self.stream, &mut w.input, group.payload.len())?;
-                reserve(&self.stream, &mut w.header, group.header.len())?;
-                reserve(&self.stream, &mut w.segments, words.len())?;
-                self.stream
-                    .memcpy_htod(group.payload, &mut w.input)
-                    .map_err(failure)?;
-                self.stream
-                    .memcpy_htod(group.header, &mut w.header)
-                    .map_err(failure)?;
-                self.stream
-                    .memcpy_htod(&words, &mut w.segments)
-                    .map_err(failure)?;
-                cursor.source_bytes_uploaded += group.payload.len() + group.header.len();
-                cursor.descriptor_bytes_uploaded += words.len() * core::mem::size_of::<u64>();
-                cursor.segment += count as usize;
-                (
-                    &w.input,
-                    &w.header,
-                    group.input_origin,
-                    group.header_origin,
-                    first.header_bit,
-                    w.segments.slice(..word_count),
-                )
-            }
-        };
+        let (input, header, input_origin, header_origin, first_header, descriptors, ranges, tokens) =
+            match group {
+                DecodeBatch::Device(group, tokens) => {
+                    let offset = group.offset * WORDS_PER_SEGMENT;
+                    cursor.group += 1;
+                    (
+                        &w.index.source,
+                        &w.index.source,
+                        0_u64,
+                        0_u64,
+                        0_u64,
+                        w.index.segments.slice(offset..offset + word_count),
+                        w.index
+                            .ranges
+                            .slice(group.offset * 2..(group.offset + count as usize) * 2),
+                        tokens,
+                    )
+                }
+                DecodeBatch::Host(group) => {
+                    let first = group
+                        .segments
+                        .first()
+                        .ok_or_else(|| GpuMatchError("empty inflate group".into()))?;
+                    let words = group
+                        .segments
+                        .iter()
+                        .flat_map(|s| {
+                            [
+                                s.header_bit,
+                                s.header_end_bit,
+                                s.start_bit,
+                                s.end_bit,
+                                u64::from(s.start) | (u64::from(s.end) << 32),
+                                u64::from(s.kind) | (u64::from(s.ends_block) << 32),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    reserve(&self.stream, &mut w.input, group.payload.len())?;
+                    reserve(&self.stream, &mut w.header, group.header.len())?;
+                    reserve(&self.stream, &mut w.segments, words.len())?;
+                    self.stream
+                        .memcpy_htod(group.payload, &mut w.input)
+                        .map_err(failure)?;
+                    self.stream
+                        .memcpy_htod(group.header, &mut w.header)
+                        .map_err(failure)?;
+                    self.stream
+                        .memcpy_htod(&words, &mut w.segments)
+                        .map_err(failure)?;
+                    cursor.source_bytes_uploaded += group.payload.len() + group.header.len();
+                    cursor.descriptor_bytes_uploaded += words.len() * core::mem::size_of::<u64>();
+                    cursor.segment += count as usize;
+                    (
+                        &w.input,
+                        &w.header,
+                        group.input_origin,
+                        group.header_origin,
+                        first.header_bit,
+                        w.segments.slice(..word_count),
+                        w.index.ranges.slice(..1),
+                        0_u32,
+                    )
+                }
+            };
         self.stream
             .memset_zeros(&mut w.used_seeds.slice_mut(..seed_count / 32))
             .map_err(failure)?;
         launch!(self,inflate_symbolic,(count.div_ceil(4),1,1),WORKGROUP_SIZE;
             input,header,&input_origin,&header_origin,&first_header,
-            &descriptors,&count,&mut w.symbolic,&mut w.status,&mut w.used_seeds,&window,&base);
+            &descriptors,&count,&w.index.tokens,&ranges,&tokens,&mut w.symbolic,&mut w.status,&mut w.used_seeds,&window,&base);
         launch!(self,inflate_status,(count.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
             &w.status,&count,&mut w.error);
         launch!(self,inflate_seed,(8,count,1),WORKGROUP_SIZE;
@@ -352,10 +359,11 @@ impl Decoder {
     ) -> Result<(), GpuMatchError> {
         while cursor.decoded < target {
             let group = match &scan.source {
-                SourceIndex::Device { groups, .. } => DecodeBatch::Device(
+                SourceIndex::Device { groups, tokens, .. } => DecodeBatch::Device(
                     *groups
                         .get(cursor.group)
                         .ok_or_else(|| GpuMatchError("CUDA decode schedule ended early".into()))?,
+                    *tokens,
                 ),
                 SourceIndex::Host(_) => DecodeBatch::Host(Group::next(
                     source,
@@ -373,6 +381,7 @@ enum SourceIndex<'a> {
     Host(Box<IndexScanner<'a>>),
     Device {
         groups: Vec<index::DeviceGroup>,
+        tokens: u32,
         decoded: u32,
         window: u32,
         adler: u32,
@@ -404,6 +413,7 @@ impl<'a> ScanAhead<'a> {
         Self {
             source: SourceIndex::Device {
                 groups: index.groups,
+                tokens: index.tokens,
                 decoded: index.decoded,
                 window: index.window,
                 adler: index.adler,
@@ -468,6 +478,10 @@ impl<'a> ScanAhead<'a> {
             source_bytes_uploaded: self.source_bytes_uploaded,
             descriptor_bytes_uploaded: self.descriptor_bytes_uploaded,
             device_indexed: self.is_device(),
+            device_tokens: match &self.source {
+                SourceIndex::Device { tokens, .. } => *tokens,
+                SourceIndex::Host(_) => 0,
+            },
             code,
         }
     }
@@ -655,6 +669,7 @@ impl ResidentPool {
                     source_bytes_uploaded: uploaded,
                     descriptor_bytes_uploaded: 0,
                     device_indexed: false,
+                    device_tokens: 0,
                     code,
                 }))
             }

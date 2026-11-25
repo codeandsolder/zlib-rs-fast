@@ -339,21 +339,21 @@ extern "C" __global__ void inflate_emit_tokens(const u8* input,const TileBlock* 
     const u64 start=t.payload+static_cast<u64>(task.tile)*tile_bits;
     Reader r{input,0,start+select.entry,b.upper};
     if(p.token_base>info->tokens || select.offset>info->tokens-p.token_base ||
-        select.count>info->tokens-p.token_base-select.offset){atomicOr(&info->status,4u);return;}
+        select.count>info->tokens-p.token_base-select.offset){atomicOr(&info->reserved,4u);return;}
     for(u32 j=0;j<select.count;++j){
         const u32 symbol=t.ll.decode(r);
         u32 value=0;
-        if(!r.good||symbol==256){atomicOr(&info->status,4u);return;}
+        if(!r.good||symbol==256){atomicOr(&info->reserved,4u);return;}
         if(symbol<256)value=symbol;
         else {
             u32 length=0,distance=0;
-            if(!match(r,t.dd,symbol,length,distance)||distance>window){atomicOr(&info->status,4u);return;}
+            if(!match(r,t.dd,symbol,length,distance)||distance>window){atomicOr(&info->reserved,4u);return;}
             value=(length<<16)|distance;
         }
         tokens[p.token_base+select.offset+j]=value;
     }
     if((select.end>>16)==1 && t.ll.decode(r)!=256)r.good=false;
-    if(!r.good||r.position!=start+(select.end&65535))atomicOr(&info->status,4u);
+    if(!r.good||r.position!=start+(select.end&65535))atomicOr(&info->reserved,4u);
 }
 
 // Ordered compaction of validated dynamic headers. The bitmap is one bit
@@ -434,6 +434,7 @@ static_assert(sizeof(DecodeGroup)==16);
 extern "C" __global__ void inflate_schedule_groups(const Segment* segments,IndexInfo* info,
     u32 compression_window,u32 max_group,DecodeGroup* groups) {
     if(threadIdx.x||blockIdx.x||info->status)return;
+    if(info->reserved){info->status=4;return;}
     if(!compression_window||!max_group){info->status=1;return;}
     u32 offset=0,position=0,group_count=0;
     while(offset<info->count){

@@ -45,6 +45,8 @@ pub struct GpuTranscodeResult {
     pub descriptor_bytes_uploaded: usize,
     /// True when the complete entropy index was constructed on CUDA.
     pub device_indexed: bool,
+    /// Compact entropy tokens materialized on the device (zero for the bounded fallback).
+    pub device_tokens: u32,
     pub code: crate::ReturnCode,
 }
 

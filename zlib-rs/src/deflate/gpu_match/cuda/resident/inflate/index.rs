@@ -15,6 +15,7 @@ const MAX_HEADERS: usize = 16_384;
 const TILE_BITS: usize = 512;
 const MAX_TILES: usize = MAX_SOURCE * 8 / TILE_BITS + MAX_HEADERS;
 const MAX_SEGMENTS: usize = 65_536;
+const MAX_TOKENS: usize = 16 * 1024 * 1024;
 const HEADER_CHUNK_WORDS: u32 = 128;
 const TREE_BYTES: usize = 2392;
 const PATH_WORDS: usize = 48 * 2;
@@ -25,7 +26,7 @@ kernel_set! {
     inflate_header_candidates, inflate_validate_bitmap, inflate_count_header_chunks,
     inflate_header_offsets, inflate_scatter_headers, inflate_make_tile_specs,
     inflate_make_tile_tasks, inflate_prepare_tiles, inflate_tile_paths,
-    inflate_compose_segments, inflate_assemble_index, inflate_place_segments, inflate_schedule_groups,
+    inflate_compose_segments, inflate_assemble_index, inflate_place_segments, inflate_emit_tokens, inflate_schedule_groups,
 }
 
 pub(super) struct Indexer {
@@ -46,11 +47,14 @@ pub(super) struct DeviceIndex {
     pub(super) decoded: u32,
     pub(super) window: u32,
     pub(super) adler: u32,
+    pub(super) tokens: u32,
 }
 
 pub(super) struct Workspace {
     pub(super) source: CudaSlice<u8>,
     pub(super) segments: CudaSlice<u64>,
+    pub(super) ranges: CudaSlice<u32>,
+    pub(super) tokens: CudaSlice<u32>,
     preliminary: CudaSlice<u64>,
     bitmap: CudaSlice<u32>,
     offsets: CudaSlice<u32>,
@@ -61,6 +65,8 @@ pub(super) struct Workspace {
     paths: CudaSlice<u64>,
     extents: CudaSlice<u64>,
     relative: CudaSlice<u64>,
+    relative_ranges: CudaSlice<u32>,
+    selected: CudaSlice<u32>,
     counts: CudaSlice<u32>,
     placements: CudaSlice<u32>,
     count: CudaSlice<u32>,
@@ -73,6 +79,8 @@ impl Workspace {
         Ok(Self {
             source: stream.alloc_zeros(1).map_err(failure)?,
             segments: stream.alloc_zeros(1).map_err(failure)?,
+            ranges: stream.alloc_zeros(1).map_err(failure)?,
+            tokens: stream.alloc_zeros(1).map_err(failure)?,
             preliminary: stream.alloc_zeros(1).map_err(failure)?,
             bitmap: stream.alloc_zeros(1).map_err(failure)?,
             offsets: stream.alloc_zeros(1).map_err(failure)?,
@@ -83,10 +91,12 @@ impl Workspace {
             paths: stream.alloc_zeros(1).map_err(failure)?,
             extents: stream.alloc_zeros(1).map_err(failure)?,
             relative: stream.alloc_zeros(1).map_err(failure)?,
+            relative_ranges: stream.alloc_zeros(1).map_err(failure)?,
+            selected: stream.alloc_zeros(1).map_err(failure)?,
             counts: stream.alloc_zeros(1).map_err(failure)?,
             placements: stream.alloc_zeros(1).map_err(failure)?,
             count: stream.alloc_zeros(1).map_err(failure)?,
-            info: stream.alloc_zeros(6).map_err(failure)?,
+            info: stream.alloc_zeros(8).map_err(failure)?,
             groups: stream.alloc_zeros(1).map_err(failure)?,
         })
     }
@@ -106,9 +116,13 @@ impl Workspace {
             + allocation(MAX_HEADERS * EXTENT_WORDS, 8)
             + allocation(MAX_TILES * WORDS_PER_SEGMENT, 8)
             + allocation(MAX_HEADERS, 4)
-            + allocation(MAX_HEADERS * 3, 4)
+            + allocation(MAX_HEADERS * 4, 4)
+            + allocation(MAX_SEGMENTS * 2, 4)
+            + allocation(MAX_TILES * 2, 4)
+            + allocation(MAX_TILES * 4, 4)
+            + allocation(MAX_TOKENS, 4)
             + allocation(MAX_SEGMENTS * 4, 4)
-            + 28
+            + 36
     }
 }
 
@@ -202,9 +216,9 @@ impl Indexer {
         end: u64,
         window: u32,
         limit: u32,
-    ) -> Result<bool, GpuMatchError> {
+    ) -> Result<Option<u32>, GpuMatchError> {
         if count == 0 {
-            return Ok(true);
+            return Ok(Some(0));
         }
         let n = count as usize;
         reserve(&self.stream, &mut w.blocks, n * BLOCK_WORDS)?;
@@ -213,7 +227,7 @@ impl Indexer {
         let tiles = self.stream.clone_dtoh(&w.count).map_err(failure)?[0];
         let t = tiles as usize;
         if t == 0 || t > MAX_TILES {
-            return Ok(false);
+            return Ok(None);
         }
         reserve(&self.stream, &mut w.tasks, t)?;
         reserve(&self.stream, &mut w.trees, n * TREE_BYTES)?;
@@ -221,14 +235,20 @@ impl Indexer {
         reserve(&self.stream, &mut w.extents, n * EXTENT_WORDS)?;
         reserve(&self.stream, &mut w.relative, t * WORDS_PER_SEGMENT)?;
         reserve(&self.stream, &mut w.counts, n)?;
+        reserve(&self.stream, &mut w.relative_ranges, t * 2)?;
+        reserve(&self.stream, &mut w.selected, t * 4)?;
+        self.stream
+            .memset_zeros(&mut w.selected.slice_mut(..t * 4))
+            .map_err(failure)?;
+
         launch!(self,inflate_make_tile_tasks,(count,1,1),WORKGROUP_SIZE;&w.blocks,&mut w.tasks);
         launch!(self,inflate_prepare_tiles,(count.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
             &w.source,&w.blocks,&count,&mut w.trees);
         launch!(self,inflate_tile_paths,(tiles,1,1),WORKGROUP_SIZE;
             &w.source,&w.blocks,&w.trees,&w.tasks,&window,&mut w.paths);
         launch!(self,inflate_compose_segments,(count.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
-            &w.blocks,&w.trees,&w.paths,&count,&limit,&mut w.extents,&mut w.relative,&mut w.counts);
-        Ok(true)
+            &w.blocks,&w.trees,&w.paths,&count,&limit,&mut w.extents,&mut w.relative,&mut w.counts,&mut w.relative_ranges,&mut w.selected);
+        Ok(Some(tiles))
     }
 
     #[expect(
@@ -252,19 +272,23 @@ impl Indexer {
         let Some(count) = self.candidates(w, source, end)? else {
             return Ok(None);
         };
-        if !self.extents(w, count, end, window, limit)? {
+        let Some(tiles) = self.extents(w, count, end, window, limit)? else {
             return Ok(None);
-        }
+        };
         reserve(
             &self.stream,
             &mut w.segments,
             MAX_SEGMENTS * WORDS_PER_SEGMENT,
         )?;
         let capacity = u32::try_from(MAX_SEGMENTS).map_err(failure)?;
+        let token_capacity = u32::try_from((source.len() * 8).min(MAX_TOKENS)).map_err(failure)?;
+        reserve(&self.stream, &mut w.ranges, MAX_SEGMENTS * 2)?;
+        self.stream.memset_zeros(&mut w.ranges).map_err(failure)?;
         if count != 0 {
-            reserve(&self.stream, &mut w.placements, count as usize * 3)?;
+            reserve(&self.stream, &mut w.tokens, token_capacity as usize)?;
+            reserve(&self.stream, &mut w.placements, count as usize * 4)?;
             self.stream
-                .memset_zeros(&mut w.placements.slice_mut(..count as usize * 3))
+                .memset_zeros(&mut w.placements.slice_mut(..count as usize * 4))
                 .map_err(failure)?;
         }
         launch!(self,inflate_assemble_index,(1,1,1),1;
@@ -272,7 +296,10 @@ impl Indexer {
             &mut w.segments,&capacity,&mut w.placements,&mut w.info);
         if count != 0 {
             launch!(self,inflate_place_segments,(count,1,1),WORKGROUP_SIZE;
-                &w.blocks,&w.relative,&w.placements,&mut w.segments,&w.info);
+                &w.blocks,&w.relative,&w.placements,&mut w.segments,&w.info,&w.relative_ranges,&mut w.ranges);
+            launch!(self,inflate_emit_tokens,(tiles.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
+                &w.source,&w.blocks,&w.trees,&w.tasks,&w.selected,&w.placements,
+                &tiles,&token_capacity,&mut w.tokens,&mut w.info,&window);
         }
         reserve(&self.stream, &mut w.groups, MAX_SEGMENTS * 4)?;
         let max_group = u32::try_from(MAX_BATCH_SEGMENTS).map_err(failure)?;
@@ -301,6 +328,11 @@ impl Indexer {
             decoded,
             window,
             adler: info[4],
+            tokens: if info[6] <= token_capacity {
+                info[6]
+            } else {
+                0
+            },
         }))
     }
 }
