@@ -446,12 +446,12 @@ impl ResidentEncoder {
         }
         drop(b);
         drop(w);
-        finish_transcode(scan, output, checksum, start, limit)
+        finish_transcode(&scan, output, checksum, start, limit)
     }
 }
 
 fn finish_transcode(
-    scan: ScanAhead<'_>,
+    scan: &ScanAhead<'_>,
     mut output: Vec<u8>,
     checksum: Checksum,
     start: usize,
@@ -520,6 +520,64 @@ mod tests {
         BatchJob, GpuMatchSearcher, InflateConfig, Strategy,
     };
     use std::num::NonZeroUsize;
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_transcode_batch_preserves_order_and_routing() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
+        let pool = crate::BatchCodec::new(NonZeroUsize::new(4).ok_or("workers")?)?;
+        let input = b"independent CUDA decode lane payload".repeat(27_000);
+        let mut source = vec![0; compress_bound(input.len())];
+        let (source, code) = compress_slice(&mut source, &input, DeflateConfig::new(6));
+        assert_eq!(code, ReturnCode::Ok);
+        let options = GpuTranscodeOptions {
+            output_limit: compress_bound(input.len()),
+            decoded_limit: u32::try_from(input.len())?,
+            minimum_decoded_len: 0,
+            config: DeflateConfig::new(9),
+            search_budget: 128,
+            window: NonZeroUsize::new(65_537).ok_or("window")?,
+        };
+        let mut jobs = [
+            (source, options),
+            (
+                source,
+                GpuTranscodeOptions {
+                    output_limit: 8,
+                    ..options
+                },
+            ),
+            (
+                source,
+                GpuTranscodeOptions {
+                    decoded_limit: u32::MAX,
+                    minimum_decoded_len: options.decoded_limit + 1,
+                    ..options
+                },
+            ),
+            (&source[..source.len() - 1], options),
+            (source, options),
+        ];
+        let expected = jobs
+            .iter()
+            .map(|&(source, options)| searcher.recompress_zlib(source, options))
+            .collect::<Result<Vec<_>, _>>()?;
+        let actual = pool.recompress_zlib_batch(&mut jobs, &searcher)?;
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Some(a), Some(e)) => {
+                    assert_eq!(a.code, e.code);
+                    assert_eq!(a.output, e.output);
+                    assert_eq!(a.decoded_len, e.decoded_len);
+                    assert_eq!(a.decoded_bytes_processed, e.decoded_bytes_processed);
+                }
+                (a, e) => assert_eq!(a.is_none(), e.is_none()),
+            }
+        }
+        Ok(())
+    }
 
     fn check_bad_source(
         searcher: &GpuMatchSearcher,
