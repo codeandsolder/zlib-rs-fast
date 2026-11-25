@@ -709,6 +709,12 @@ mod tests {
             .map(|input| compress(input))
             .collect::<Result<Vec<_>, _>>()?;
         let parallel = std::thread::scope(|scope| {
+            // Collect the handles before joining: joining inside the spawn
+            // iterator would serialize the hardware concurrency test.
+            #[expect(
+                clippy::needless_collect,
+                reason = "spawn all workers before joining any"
+            )]
             let workers = inputs
                 .iter()
                 .map(|input| scope.spawn(|| compress(input)))
