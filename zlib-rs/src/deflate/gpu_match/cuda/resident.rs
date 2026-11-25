@@ -14,7 +14,8 @@ const MIB: usize = 1024 * 1024;
 pub(in crate::deflate) const DEFAULT_WINDOW: usize = 16 * MIB;
 const MAX_WINDOW: usize = 64 * MIB;
 const MIN_MATCH_TILE: u32 = 16 * 1024;
-const MAX_MATCH_TILE: u32 = 128 * 1024;
+// Local head positions are one-based u16 values.
+const MAX_MATCH_TILE: u32 = 32 * 1024;
 const SEGMENT: u32 = 8 * 1024;
 const HASH_COUNT: u32 = 1 << 16;
 const LITERAL_SYMBOLS: u32 = 286;
@@ -91,7 +92,7 @@ macro_rules! workspace_geometry {
     ($macro:ident, $g:ident) => {
         $macro! {
             input: u8 => $g.size.next_multiple_of(4), aligned: u32 => $g.size,
-            heads: u32 => $g.index_tiles * HASH_COUNT, predecessors: u16 => $g.size.next_multiple_of(2),
+            heads: u16 => $g.index_tiles * HASH_COUNT, predecessors: u16 => $g.size.next_multiple_of(2),
             matches: u32 => $g.core,
             exits: u32 => $g.segments, transitions: u16 => $g.segments * MAX_MATCH,
             entries: u32 => $g.segments + 1, counts: u32 => $g.segments,
@@ -113,7 +114,7 @@ impl Buffers {
 }
 
 buffer_set! {
-    input: u8, aligned: u32, heads: u32, predecessors: u16, matches: u32,
+    input: u8, aligned: u32, heads: u16, predecessors: u16, matches: u32,
     exits: u32, transitions: u16, entries: u32, counts: u32,
     block_ids: u32, blocks: u32, block_count: u32, hist: u32, arena: u32,
     bits: u32, bit_offsets: u32, checksums: u32, offsets: u32, meta: u32,

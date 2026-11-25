@@ -20,13 +20,13 @@ __device__ __forceinline__ u32 hash_at(const u32* input, u32 pos) {
 }
 // One warp per disjoint input tile. Construct each local chain and retain
 // its last occurrence per hash. No tile reprocesses the history of another.
-extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16* predecessors,
+extern "C" __global__ void resident_index(const u32* input, u16* heads_all, u16* predecessors,
     u32 size, u32 tile_bytes, u32 max_dist, u32 tiles) {
     const u32 lane=threadIdx.x%warp_size;
     const u32 tile=(blockIdx.x*blockDim.x+threadIdx.x)/warp_size;
     if (tile>=tiles) return;
     const u32 start=tile*tile_bytes, len=min(tile_bytes,size-start);
-    u32* heads=heads_all+static_cast<u64>(tile)*hash_count;
+    u16* heads=heads_all+static_cast<u64>(tile)*hash_count;
     u16* pred_out=predecessors+start;
     for (u32 h=lane; h<hash_count; h+=warp_size) heads[h]=0;
     __syncwarp();
@@ -41,7 +41,7 @@ extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16*
             const u32 distance=previous ? pos+1-previous : 0;
             pred_out[pos]=static_cast<u16>(distance<max_dist ? distance : 0);
             __syncwarp(active);
-            if (lane==31-__clz(peers)) heads[hash]=pos+1;
+            if (lane==31-__clz(peers)) heads[hash]=static_cast<u16>(pos+1);
         } else if (pos<len) {
             pred_out[pos]=0;
         }
@@ -52,7 +52,7 @@ extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16*
 // in an earlier tile. Resolve that edge using the preceding tiles' final
 // heads. A local chain whose nearest member exceeded the distance bound
 // cannot enter this branch, because its local position is >= max_dist.
-extern "C" __global__ void resident_index_bridge(const u32* input,const u32* heads,
+extern "C" __global__ void resident_index_bridge(const u32* input,const u16* heads,
     u16* predecessors,u32 size,u32 tile_bytes,u32 max_dist) {
     const u32 tile=blockIdx.y;
     const u32 start=tile*tile_bytes;
