@@ -1063,6 +1063,10 @@ impl GpuMatchSearcher {
             });
         let packed_layout = self.packed_pipeline.get_bind_group_layout(0);
         let aligned_layout = self.aligned_pipeline.get_bind_group_layout(0);
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("whole-input match batch"),
+            timestamp_writes: None,
+        });
         for dispatch in dispatches {
             let item = &dispatch.input;
             let (pipeline, layout) = match item.input_layout {
@@ -1107,21 +1111,18 @@ impl GpuMatchSearcher {
                     },
                 ],
             });
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("whole-input match search"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(item.dispatch.0, item.dispatch.1, 1);
-            }
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(item.dispatch.0, item.dispatch.1, 1);
+        }
+        drop(pass);
+        for dispatch in dispatches {
             encoder.copy_buffer_to_buffer(
                 &workspace.results.buffer,
                 dispatch.result_offset,
                 &workspace.download.buffer,
                 dispatch.download.start as u64,
-                item.result_size(),
+                dispatch.input.result_size(),
             );
         }
         self.queue.submit(Some(encoder.finish()));
