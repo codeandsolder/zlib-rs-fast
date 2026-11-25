@@ -171,7 +171,10 @@ impl BatchCodec {
                             config,
                             searcher,
                             search_budget,
-                            window_bytes,
+                            super::gpu_match::ResidentSchedule {
+                                window: window_bytes,
+                                parallel: true,
+                            },
                             max_dist,
                         )
                     },
@@ -273,7 +276,17 @@ pub fn compress_slices_batch_gpu_windowed(
         return jobs
             .iter_mut()
             .map(|job| {
-                compress_resident_job(job, config, searcher, search_budget, window_bytes, max_dist)
+                compress_resident_job(
+                    job,
+                    config,
+                    searcher,
+                    search_budget,
+                    super::gpu_match::ResidentSchedule {
+                        window: window_bytes,
+                        parallel: false,
+                    },
+                    max_dist,
+                )
             })
             .collect();
     }
@@ -300,7 +313,7 @@ fn compress_resident_job(
     config: DeflateConfig,
     searcher: &GpuMatchSearcher,
     search_budget: u32,
-    window: NonZeroUsize,
+    schedule: super::gpu_match::ResidentSchedule,
     max_dist: u32,
 ) -> Result<BatchCompressResult, GpuMatchError> {
     // SAFETY: the GPU result is bounded to the destination's declared limit;
@@ -312,7 +325,7 @@ fn compress_resident_job(
                 output.len(),
                 config,
                 search_budget,
-                window,
+                schedule,
                 max_dist,
             ) {
                 Ok((bytes, code)) => {

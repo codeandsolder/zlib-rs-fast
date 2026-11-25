@@ -1,8 +1,8 @@
 mod resident;
 
 use super::{
-    GpuBatch, GpuMatchError, GpuMatchTable, InputLayout, PreparedGpuInput, MAX_MATCH,
-    WORKGROUP_SIZE,
+    GpuBatch, GpuMatchError, GpuMatchTable, InputLayout, PreparedGpuInput, ResidentSchedule,
+    MAX_MATCH, WORKGROUP_SIZE,
 };
 use cudarc::{
     driver::{
@@ -133,13 +133,13 @@ impl CudaBackend {
         limit: usize,
         config: crate::DeflateConfig,
         budget: u32,
-        window: core::num::NonZeroUsize,
+        schedule: ResidentSchedule,
         distance: u32,
     ) -> Result<(Vec<u8>, crate::ReturnCode), GpuMatchError> {
         self.resident
             .as_ref()
             .ok_or_else(|| GpuMatchError("resident CUDA encoder not selected".into()))?
-            .compress(input, limit, config, budget, window, distance)
+            .compress(input, limit, config, budget, schedule, distance)
     }
 
     pub(super) fn execute(&self, batch: &mut GpuBatch) -> Result<(), GpuMatchError> {

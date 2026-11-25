@@ -2,16 +2,13 @@
 //! decoded input, compact compressed output and four metadata words.
 use super::{failure, reserve};
 use crate::{
-    deflate::gpu_match::{GpuMatchError, MAX_MATCH, WORKGROUP_SIZE},
+    deflate::gpu_match::{GpuMatchError, ResidentSchedule, MAX_MATCH, WORKGROUP_SIZE},
     DeflateConfig, ReturnCode,
 };
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use std::{
-    num::NonZeroUsize,
-    sync::{Arc, Condvar, Mutex},
-};
+use std::sync::{Arc, Condvar, Mutex};
 
 const MIB: usize = 1024 * 1024;
 pub(in crate::deflate) const DEFAULT_WINDOW: usize = 16 * MIB;
@@ -486,7 +483,7 @@ impl ResidentPool {
         limit: usize,
         config: DeflateConfig,
         budget: u32,
-        window: NonZeroUsize,
+        schedule: ResidentSchedule,
         distance: u32,
     ) -> Result<(Vec<u8>, ReturnCode), GpuMatchError> {
         let wrapper = Wrapper::from_bits(config.window_bits)
@@ -500,29 +497,62 @@ impl ResidentPool {
         if input.is_empty() && !append(&mut output, &[3, 0], limit) {
             return Ok((output, ReturnCode::BufError));
         }
-        let window = window.get().min(MAX_WINDOW);
-        for start in (0..input.len()).step_by(window) {
+        let window = schedule.window.get().min(MAX_WINDOW);
+        // Each window is an independent byte-aligned DEFLATE fragment with
+        // real preceding history. Reuse the caller's Rayon pool to pipeline
+        // a bounded pair, never spawn a second worker pool or threads.
+        let pipeline = cfg!(feature = "parallel") && schedule.parallel && self.lanes.len() > 1;
+        let mut start = 0;
+        while start < input.len() {
             if output.len() == limit {
                 return Ok((output, ReturnCode::BufError));
             }
+            let remaining = limit - output.len();
             let end = start.saturating_add(window).min(input.len());
-            let origin = start.saturating_sub(distance as usize - 1);
-            let g = Geometry::new(
-                end - origin,
-                start - origin,
-                distance,
-                budget,
-                end == input.len(),
-                config,
-                wrapper,
-            )?
-            .with_index_tiles(self.index_tiles);
-            let result = self.window(&input[origin..end], g, limit - output.len())?;
-            output.extend_from_slice(&result.output);
-            if !result.complete {
+            let run = |start: usize, end: usize| {
+                let origin = start.saturating_sub(distance as usize - 1);
+                let g = Geometry::new(
+                    end - origin,
+                    start - origin,
+                    distance,
+                    budget,
+                    end == input.len(),
+                    config,
+                    wrapper,
+                )?
+                .with_index_tiles(self.index_tiles);
+                self.window(&input[origin..end], g, remaining)
+            };
+            let second_end = if pipeline {
+                end.saturating_add(window).min(input.len())
+            } else {
+                end
+            };
+            #[cfg(feature = "parallel")]
+            let (first, second) = if second_end > end {
+                let (a, b) = rayon_core::join(|| run(start, end), || run(end, second_end));
+                (a, Some(b))
+            } else {
+                (run(start, end), None)
+            };
+            #[cfg(not(feature = "parallel"))]
+            let (first, second) = (run(start, end), None::<Result<WindowOutput, GpuMatchError>>);
+            let first = first?;
+            if !append(&mut output, &first.output, limit) || !first.complete {
                 return Ok((output, ReturnCode::BufError));
             }
-            checksum.update(&result, end - start);
+            checksum.update(&first, end - start);
+            if let Some(second) = second {
+                // Commit only in logical input order. The second fragment
+                // was bounded to the prior remaining capacity; truncate
+                // to the new remaining capacity if the first consumed it.
+                let second = second?;
+                if !append(&mut output, &second.output, limit) || !second.complete {
+                    return Ok((output, ReturnCode::BufError));
+                }
+                checksum.update(&second, second_end - end);
+            }
+            start = second_end;
         }
         let (trailer, trailer_len) = checksum.trailer(input.len());
         let code = if append(&mut output, &trailer[..trailer_len], limit) {
@@ -637,6 +667,7 @@ impl Checksum {
 mod tests {
     use super::*;
     use crate::deflate::gpu_match::{build_predecessors, predecessor_distance, GpuMatchSearcher};
+    use std::num::NonZeroUsize;
 
     #[test]
     #[ignore = "requires CUDA hardware and NVRTC"]
@@ -662,7 +693,10 @@ mod tests {
                 input.len() + 512,
                 DeflateConfig::new(9),
                 128,
-                window,
+                ResidentSchedule {
+                    window,
+                    parallel: false,
+                },
                 32_506,
             )
         };

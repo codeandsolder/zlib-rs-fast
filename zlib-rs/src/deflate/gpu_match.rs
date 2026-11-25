@@ -21,6 +21,13 @@ use wgpu::{
     ShaderModuleDescriptor, Trace,
 };
 
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub(super) struct ResidentSchedule {
+    pub(super) window: core::num::NonZeroUsize,
+    pub(super) parallel: bool,
+}
+
 const HASH_SIZE: usize = 1 << 16;
 const NO_PREDECESSOR: u32 = u32::MAX;
 const PACKED_DISTANCE_LIMIT: u32 = u16::MAX as u32 + 1;
@@ -1020,12 +1027,12 @@ impl GpuMatchSearcher {
         limit: usize,
         config: crate::DeflateConfig,
         budget: u32,
-        window: core::num::NonZeroUsize,
+        schedule: ResidentSchedule,
         distance: u32,
     ) -> Result<(Vec<u8>, crate::ReturnCode), GpuMatchError> {
         match &self.backend {
             GpuBackend::Cuda(backend) => {
-                backend.compress_resident(input, limit, config, budget, window, distance)
+                backend.compress_resident(input, limit, config, budget, schedule, distance)
             }
             GpuBackend::Vulkan(_) => {
                 Err(GpuMatchError("resident CUDA backend not selected".into()))
