@@ -2,8 +2,8 @@
 //! compressed source bytes are uploaded. Decoded windows never leave CUDA.
 use super::super::{allocation_capacity, failure, reserve};
 use super::{
-    append, stream_header, Buffers, Checksum, Geometry, ResidentEncoder, ResidentPool, Wrapper,
-    MAX_WINDOW, WORKGROUP_SIZE,
+    append, stream_header, Checksum, Geometry, ResidentEncoder, ResidentPool, Wrapper, MAX_WINDOW,
+    WORKGROUP_SIZE,
 };
 use crate::{
     deflate::gpu_match::{GpuMatchError, GpuTranscodeResult},
@@ -420,5 +420,121 @@ impl ResidentPool {
             distance,
             self.index_tiles,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        compress_bound, compress_slice, compress_slices_batch_gpu_windowed, decompress_slice,
+        BatchJob, GpuMatchSearcher, InflateConfig, Strategy,
+    };
+
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_transcode_matches_raw_encoder_and_checks_source(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
+        let config = DeflateConfig::new(9);
+        let mut seed = 0x1234_5678u32;
+        let random = (0..180_013)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let mut mixed = random[..33_019].repeat(5);
+        mixed.extend(b"123456789abcdef".repeat(42_000));
+        let repeated = vec![0; 1_040_001];
+        let inputs = [b"".as_slice(), b"a", b"abc", &random, &mixed, &repeated];
+        let window = NonZeroUsize::new(65_537).ok_or("window")?;
+        for input in inputs {
+            let mut expected = Vec::new();
+            let full = compress_slices_batch_gpu_windowed(
+                &mut [BatchJob::with_vec(
+                    input,
+                    &mut expected,
+                    compress_bound(input.len()) + 512,
+                )?],
+                config,
+                &searcher,
+                128,
+                window,
+            )?[0];
+            assert_eq!(full.code, ReturnCode::Ok);
+            for (level, strategy) in [
+                (0, Strategy::Default),
+                (6, Strategy::Fixed),
+                (9, Strategy::Default),
+            ] {
+                let mut bytes = vec![0; compress_bound(input.len())];
+                let (source, code) = compress_slice(
+                    &mut bytes,
+                    input,
+                    DeflateConfig {
+                        level,
+                        strategy,
+                        ..DeflateConfig::default()
+                    },
+                );
+                assert_eq!(code, ReturnCode::Ok);
+                let max = u32::try_from(input.len())?;
+                for cap in [0, 1, expected.len() / 2, expected.len(), expected.len() + 1] {
+                    let actual = searcher.recompress_zlib(source, cap, max, config, 128, window)?;
+                    assert_eq!(actual.decoded_len, input.len());
+                    assert_eq!(actual.output, expected[..expected.len().min(cap)]);
+                    assert_eq!(
+                        actual.code,
+                        if cap < expected.len() {
+                            ReturnCode::BufError
+                        } else {
+                            ReturnCode::Ok
+                        }
+                    );
+                }
+                let mut corrupt = source.to_vec();
+                let last = corrupt.last_mut().ok_or("trailer")?;
+                *last ^= 1;
+                let result = searcher.recompress_zlib(
+                    &corrupt,
+                    expected.len() + 512,
+                    max,
+                    config,
+                    128,
+                    window,
+                )?;
+                assert_eq!(result.code, ReturnCode::DataError);
+                assert!(result.output.is_empty());
+                let truncated = searcher.recompress_zlib(
+                    &source[..source.len() - 1],
+                    expected.len() + 512,
+                    max,
+                    config,
+                    128,
+                    window,
+                )?;
+                assert_eq!(truncated.code, ReturnCode::DataError);
+                if max != 0 {
+                    let bounded = searcher.recompress_zlib(
+                        source,
+                        expected.len() + 512,
+                        max - 1,
+                        config,
+                        128,
+                        window,
+                    )?;
+                    assert_eq!(bounded.code, ReturnCode::BufError);
+                }
+            }
+            let mut scratch = vec![0; input.len()];
+            let (decoded, code) =
+                decompress_slice(&mut scratch, &expected, InflateConfig::default());
+            assert_eq!(code, ReturnCode::Ok);
+            assert_eq!(decoded, input);
+        }
+        Ok(())
     }
 }
