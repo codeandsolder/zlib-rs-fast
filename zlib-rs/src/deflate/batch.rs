@@ -1094,7 +1094,8 @@ mod tests {
         let varied = (0u8..=255).cycle().take(160_123).collect::<Vec<_>>();
         let cpu_inputs = [b"".as_slice(), &repeated[..], &varied[..], b"small"];
         let gpu_inputs = [&varied[..], b"short", &repeated[..], &varied[..]];
-        let caps = [64, 128, 0, 1024];
+        let cpu_caps = [64, compress_bound(repeated.len()), 0, 1024];
+        let gpu_caps = [64, 128, compress_bound(repeated.len()), 1024];
         let config = DeflateConfig::new(9);
         for workers in [1, 4] {
             let pool = BatchCodec::new(NonZeroUsize::new(workers).ok_or("workers")?)?;
@@ -1105,13 +1106,13 @@ mod tests {
                     let mut cpu_jobs = cpu_inputs
                         .iter()
                         .zip(&mut cpu_outputs)
-                        .zip(caps)
+                        .zip(cpu_caps)
                         .map(|((&input, output), cap)| BatchJob::with_vec(input, output, cap))
                         .collect::<Result<Vec<_>, _>>()?;
                     let mut gpu_jobs = gpu_inputs
                         .iter()
                         .zip(&mut gpu_outputs)
-                        .zip(caps)
+                        .zip(gpu_caps)
                         .map(|((&input, output), cap)| BatchJob::with_vec(input, output, cap))
                         .collect::<Result<Vec<_>, _>>()?;
                     let (cpu, gpu) = if mixed {

@@ -21,6 +21,9 @@ const NO_PREDECESSOR: u32 = u32::MAX;
 const PACKED_DISTANCE_LIMIT: u32 = u16::MAX as u32 + 1;
 const WORKGROUP_SIZE: u32 = 128;
 const MAX_MATCH: u32 = 258;
+const COOPERATIVE_SPAN: u32 = (WORKGROUP_SIZE + MAX_MATCH - 1).next_multiple_of(4);
+// The cooperative verifier assigns one word of the overlapping span per lane.
+const _: () = assert!(COOPERATIVE_SPAN <= WORKGROUP_SIZE * 4);
 const DEFAULT_MAX_DIST: u32 = 32_768 - (258 + 3 + 1);
 
 const SHADER: &str = r"
@@ -121,13 +124,13 @@ var<workgroup> repeat_equal: atomic<u32>;
 fn cooperative_distance(base: u32, lane: u32) -> u32 {
     // 128 starts with 258 bytes of lookahead span 385 bytes; round
     // to complete words so each participating lane performs one load.
-    let span = 388u;
+    let span = cooperative_span;
     if params.repeat_groups == 0u || params.input_len - base < span {
         return 0u;
     }
     if lane == 0u {
         let first = predecessor_distance(base);
-        let last = predecessor_distance(base + 127u);
+        let last = predecessor_distance(base + group_size - 1u);
         var selected = 0u;
         if first != 0u && first == last && first <= base && first < params.max_dist {
             selected = first;
@@ -148,7 +151,7 @@ fn cooperative_distance(base: u32, lane: u32) -> u32 {
     return distance;
 }
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(group_size)
 fn search(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) grid: vec3<u32>,
@@ -157,8 +160,8 @@ fn search(
     // Flatten rows of workgroups. Guard padded groups before multiplying so
     // position arithmetic is valid even at the u32 input-length boundary.
     let group_index = group.y * grid.x + group.x;
-    if group_index > (params.input_len - 1u) / 128u { return; }
-    let base = group_index * 128u;
+    if group_index > (params.input_len - 1u) / group_size { return; }
+    let base = group_index * group_size;
     let shared_distance = cooperative_distance(base, lane);
     let position = base + lane;
     if position >= params.input_len { return; }
@@ -922,7 +925,7 @@ impl GpuMatchSearcher {
             let module = device.create_shader_module(ShaderModuleDescriptor {
                 label: Some("zlib whole-input match search"),
                 source: wgpu::ShaderSource::Wgsl(
-                    format!("const aligned_input: bool = {aligned};\nconst max_match: u32 = {MAX_MATCH}u;\n{SHADER}").into(),
+                    format!("const aligned_input: bool = {aligned};\nconst max_match: u32 = {MAX_MATCH}u;\nconst group_size: u32 = {WORKGROUP_SIZE}u;\nconst cooperative_span: u32 = {COOPERATIVE_SPAN}u;\n{SHADER}").into(),
                 ),
             });
             device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -1304,14 +1307,14 @@ const fn device_type_rank(device_type: DeviceType) -> u8 {
 fn cooperative_groups_likely(input: &[u8], predecessors: &[u32]) -> bool {
     const SAMPLES: usize = 64;
     const GROUP: usize = WORKGROUP_SIZE as usize;
-    const SPAN: usize = (GROUP + MAX_MATCH as usize - 1).next_multiple_of(4);
+    const SPAN: usize = COOPERATIVE_SPAN as usize;
     let groups = input.len().saturating_sub(SPAN) / GROUP;
     if groups < SAMPLES {
         return false;
     }
     let mut repeated = 0;
     for sample in 0..SAMPLES {
-        let group = sample * (groups / SAMPLES);
+        let group = sample * groups / SAMPLES;
         let base = group * GROUP;
         let distance = predecessor_distance(predecessors, base);
         if distance != 0
