@@ -1,3 +1,4 @@
+namespace resident_inflate {
 // Experimental block-indexed CUDA DEFLATE decoder.
 // Index entries are bit offsets in the zlib member and logical output
 // offsets. Every block is checked against both of its indexed endpoints.
@@ -241,3 +242,5 @@ extern "C" __global__ void inflate_resolve(const Segment* segments,const u16* sy
         raw[pos-raw_origin]=value<256?static_cast<u8>(value):dictionary[value-256];
     }
 }
+
+} // namespace resident_inflate

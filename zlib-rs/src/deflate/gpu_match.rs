@@ -28,6 +28,15 @@ pub(super) struct ResidentSchedule {
     pub(super) parallel: bool,
 }
 
+/// Result of recompressing a zlib member without copying decoded bytes to the host.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct GpuTranscodeResult {
+    pub output: Vec<u8>,
+    pub decoded_len: usize,
+    pub code: crate::ReturnCode,
+}
+
 const HASH_SIZE: usize = 1 << 16;
 const NO_PREDECESSOR: u32 = u32::MAX;
 const PACKED_DISTANCE_LIMIT: u32 = u16::MAX as u32 + 1;
@@ -1037,6 +1046,49 @@ impl GpuMatchSearcher {
             GpuBackend::Vulkan(_) => {
                 Err(GpuMatchError("resident CUDA backend not selected".into()))
             }
+        }
+    }
+
+    /// Whether this adapter supports compressed-input zlib recompression.
+    #[cfg(feature = "cuda")]
+    pub fn supports_zlib_transcode(&self, config: crate::DeflateConfig) -> bool {
+        (8..=15).contains(&config.window_bits) && self.supports_resident(config)
+    }
+
+    /// Structurally scan a zlib member on the host, then decode and recompress
+    /// it in bounded GPU windows. On success the source Adler is verified.
+    /// A cap-exhausted prefix is returned without decoding the remaining tail.
+    /// # Errors
+    /// Returns an error for unsupported configurations or CUDA failures.
+    #[cfg(feature = "cuda")]
+    pub fn recompress_zlib(
+        &self,
+        input: &[u8],
+        limit: usize,
+        decoded_limit: u32,
+        config: crate::DeflateConfig,
+        budget: u32,
+        window: core::num::NonZeroUsize,
+    ) -> Result<GpuTranscodeResult, GpuMatchError> {
+        if !self.supports_zlib_transcode(config) {
+            return Err(GpuMatchError(
+                "resident CUDA zlib transcoding is unavailable".into(),
+            ));
+        }
+        let distance = super::batch::configured_max_dist(config)
+            .ok_or_else(|| GpuMatchError("invalid transcode distance".into()))?;
+        validate_search_parameters(budget, distance)?;
+        match &self.backend {
+            GpuBackend::Cuda(backend) => backend.recompress_zlib(
+                input,
+                limit,
+                decoded_limit,
+                config,
+                budget,
+                window,
+                distance,
+            ),
+            GpuBackend::Vulkan(_) => Err(GpuMatchError("CUDA backend not selected".into())),
         }
     }
 

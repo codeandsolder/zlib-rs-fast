@@ -220,6 +220,7 @@ pub(super) struct ResidentEncoder {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     buffers: Mutex<Buffers>,
+    decoder: inflate::Decoder,
 }
 
 /// Independent CUDA streams may overlap kernel execution, transfers and
@@ -276,7 +277,7 @@ impl ResidentPool {
             Wrapper::Zlib(15),
         )?
         .with_index_tiles(index_tiles);
-        let bytes = Buffers::upper_bound(worst);
+        let bytes = Buffers::upper_bound(worst) + inflate::Decoder::upper_bound();
         context.bind_to_thread().map_err(failure)?;
         let (free, _) = cudarc::driver::result::mem_get_info().map_err(failure)?;
         // Leave space for display, context, other workloads and transient
@@ -329,16 +330,20 @@ macro_rules! launch {
     }};
 }
 
+mod inflate;
+
 impl ResidentEncoder {
     pub(super) fn new(
         stream: Arc<CudaStream>,
         module: &Arc<CudaModule>,
     ) -> Result<Self, GpuMatchError> {
         let buffers = Mutex::new(Buffers::new(&stream)?);
+        let decoder = inflate::Decoder::new(Arc::clone(&stream), module)?;
         Ok(Self {
             stream,
             kernels: Kernels::new(module)?,
             buffers,
+            decoder,
         })
     }
 
@@ -446,10 +451,19 @@ impl ResidentEncoder {
         self.stream
             .memcpy_htod(input, &mut b.input)
             .map_err(failure)?;
-        self.index_and_match(&mut b, g)?;
-        self.parse(&mut b, g)?;
-        self.encode(&mut b, g)?;
-        self.compact(&mut b, g)?;
+        self.window_loaded(&mut b, g, limit)
+    }
+
+    fn window_loaded(
+        &self,
+        b: &mut Buffers,
+        g: Geometry,
+        limit: usize,
+    ) -> Result<WindowOutput, GpuMatchError> {
+        self.index_and_match(b, g)?;
+        self.parse(b, g)?;
+        self.encode(b, g)?;
+        self.compact(b, g)?;
         let meta = self
             .stream
             .clone_dtoh(&b.meta.slice(..4))

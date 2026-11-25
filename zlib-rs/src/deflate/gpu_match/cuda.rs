@@ -1,8 +1,8 @@
 mod resident;
 
 use super::{
-    GpuBatch, GpuMatchError, GpuMatchTable, InputLayout, PreparedGpuInput, ResidentSchedule,
-    MAX_MATCH, WORKGROUP_SIZE,
+    GpuBatch, GpuMatchError, GpuMatchTable, GpuTranscodeResult, InputLayout, PreparedGpuInput,
+    ResidentSchedule, MAX_MATCH, WORKGROUP_SIZE,
 };
 use cudarc::{
     driver::{
@@ -90,6 +90,7 @@ impl CudaBackend {
         if use_resident {
             source.push_str(include_str!("resident.cu"));
             source.push_str(include_str!("resident_parallel.cu"));
+            source.push_str(include_str!("../../../inflate/gpu/inflate.cu"));
         }
         let ptx = compile_ptx_with_opts(
             source,
@@ -148,6 +149,30 @@ impl CudaBackend {
             .as_ref()
             .ok_or_else(|| GpuMatchError("resident CUDA encoder not selected".into()))?
             .compress(input, limit, config, budget, schedule, distance)
+    }
+
+    pub(super) fn recompress_zlib(
+        &self,
+        input: &[u8],
+        limit: usize,
+        decoded_limit: u32,
+        config: crate::DeflateConfig,
+        budget: u32,
+        window: core::num::NonZeroUsize,
+        distance: u32,
+    ) -> Result<GpuTranscodeResult, GpuMatchError> {
+        self.resident
+            .as_ref()
+            .ok_or_else(|| GpuMatchError("resident CUDA encoder not selected".into()))?
+            .recompress_zlib(
+                input,
+                limit,
+                decoded_limit,
+                config,
+                budget,
+                window,
+                distance,
+            )
     }
 
     pub(super) fn execute(&self, batch: &mut GpuBatch) -> Result<(), GpuMatchError> {

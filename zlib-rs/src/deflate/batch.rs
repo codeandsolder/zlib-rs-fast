@@ -451,7 +451,7 @@ const fn uses_match_search(algorithm: Algorithm) -> bool {
 }
 
 #[cfg(feature = "gpu")]
-fn configured_max_dist(config: DeflateConfig) -> Option<u32> {
+pub(super) fn configured_max_dist(config: DeflateConfig) -> Option<u32> {
     let mut window_bits = config.window_bits;
     let zlib_wrapper = if window_bits < 0 {
         if window_bits < -MAX_WBITS {
