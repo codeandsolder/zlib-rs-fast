@@ -12,11 +12,13 @@ pub(super) struct CudaBackend {
     stream: Arc<CudaStream>,
     packed: CudaFunction,
     aligned: CudaFunction,
+    expand: CudaFunction,
     workspace: Mutex<Workspace>,
 }
 
 struct Workspace {
     input: CudaSlice<u32>,
+    aligned_input: CudaSlice<u32>,
     predecessors: CudaSlice<u32>,
     results: CudaSlice<u32>,
 }
@@ -75,8 +77,10 @@ impl CudaBackend {
         let module = ctx.load_module(ptx).map_err(failure)?;
         let packed = module.load_function("search_packed").map_err(failure)?;
         let aligned = module.load_function("search_aligned").map_err(failure)?;
+        let expand = module.load_function("expand_aligned").map_err(failure)?;
         let workspace = Mutex::new(Workspace {
             input: stream.alloc_zeros(1).map_err(failure)?,
+            aligned_input: stream.alloc_zeros(1).map_err(failure)?,
             predecessors: stream.alloc_zeros(1).map_err(failure)?,
             results: stream.alloc_zeros(1).map_err(failure)?,
         });
@@ -85,6 +89,7 @@ impl CudaBackend {
                 stream,
                 packed,
                 aligned,
+                expand,
                 workspace,
             },
             adapter_name,
@@ -123,24 +128,34 @@ impl CudaBackend {
         self.stream
             .memcpy_htod(&input.predecessors, &mut workspace.predecessors)
             .map_err(failure)?;
-        let function = match input.input_layout {
-            InputLayout::Packed => &self.packed,
-            InputLayout::Aligned => &self.aligned,
-        };
         let [size, distance, cooperative, budget] = input.params;
+        let geometry = LaunchConfig {
+            grid_dim: (size.div_ceil(WORKGROUP_SIZE), 1, 1),
+            block_dim: (WORKGROUP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (function, input_buffer) = match input.input_layout {
+            InputLayout::Packed => (&self.packed, &workspace.input),
+            InputLayout::Aligned => {
+                reserve(&self.stream, &mut workspace.aligned_input, len)?;
+                let mut expand = self.stream.launch_builder(&self.expand);
+                expand.arg(&workspace.input);
+                expand.arg(&mut workspace.aligned_input);
+                expand.arg(&size);
+                // SAFETY: packed input has ceil(size/4) words; the expansion
+                // writes one aligned word for each position, padding its tail.
+                unsafe { expand.launch(geometry) }.map_err(failure)?;
+                (&self.aligned, &workspace.aligned_input)
+            }
+        };
         let mut launch = self.stream.launch_builder(function);
-        launch.arg(&workspace.input);
+        launch.arg(input_buffer);
         launch.arg(&workspace.predecessors);
         launch.arg(&mut workspace.results);
         launch.arg(&size);
         launch.arg(&distance);
         launch.arg(&cooperative);
         launch.arg(&budget);
-        let geometry = LaunchConfig {
-            grid_dim: (size.div_ceil(WORKGROUP_SIZE), 1, 1),
-            block_dim: (WORKGROUP_SIZE, 1, 1),
-            shared_mem_bytes: 0,
-        };
         // SAFETY: the two functions have the same seven argument ABI.
         // PreparedGpuInput owns the correctly padded input and predecessor
         // arrays; buffers are at least their sizes. One lane writes each

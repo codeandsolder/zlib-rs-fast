@@ -501,13 +501,56 @@ enum PreparedSearch {
     Gpu(PreparedGpuInput),
 }
 
+#[derive(Clone, Copy)]
+enum InputPreparation {
+    Vulkan,
+    #[cfg(feature = "cuda")]
+    Cuda,
+    #[cfg(test)]
+    Forced(InputLayout),
+    #[cfg(all(test, feature = "cuda"))]
+    ForcedCuda(InputLayout),
+}
+
+impl InputPreparation {
+    fn layout(self, input: &[u8], predecessors: &[u32], budget: u32, max_dist: u32) -> InputLayout {
+        match self {
+            #[cfg(test)]
+            Self::Forced(layout) => layout,
+            #[cfg(all(test, feature = "cuda"))]
+            Self::ForcedCuda(layout) => layout,
+            _ => InputLayout::select(input, predecessors, budget, max_dist),
+        }
+    }
+
+    const fn allows_local(self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Forced(_) => false,
+            #[cfg(all(test, feature = "cuda"))]
+            Self::ForcedCuda(_) => false,
+            _ => true,
+        }
+    }
+
+    const fn packs_input(self, layout: InputLayout) -> InputLayout {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda => InputLayout::Packed,
+            #[cfg(all(test, feature = "cuda"))]
+            Self::ForcedCuda(_) => InputLayout::Packed,
+            _ => layout,
+        }
+    }
+}
+
 fn prepare_input(
     input_index: usize,
     input: &[u8],
     search_budget: u32,
     max_dist: u32,
     max_workgroups: u32,
-    forced_layout: Option<InputLayout>,
+    preparation: InputPreparation,
 ) -> Result<PreparedSearch, GpuMatchError> {
     prepare_indexed_input(
         input_index,
@@ -515,7 +558,7 @@ fn prepare_input(
         search_budget,
         max_dist,
         max_workgroups,
-        forced_layout,
+        preparation,
         build_predecessors,
     )
 }
@@ -526,7 +569,7 @@ fn prepare_indexed_input(
     search_budget: u32,
     max_dist: u32,
     max_workgroups: u32,
-    forced_layout: Option<InputLayout>,
+    preparation: InputPreparation,
     build_index: impl FnOnce(&[u8], u32) -> Result<Vec<u32>, GpuMatchError>,
 ) -> Result<PreparedSearch, GpuMatchError> {
     let input_len = u32::try_from(input.len())
@@ -547,9 +590,8 @@ fn prepare_indexed_input(
             entries: vec![0; input.len()],
         }));
     }
-    let input_layout = forced_layout
-        .unwrap_or_else(|| InputLayout::select(input, &predecessors, search_budget, max_dist));
-    if forced_layout.is_none()
+    let input_layout = preparation.layout(input, &predecessors, search_budget, max_dist);
+    if preparation.allows_local()
         && input_layout == InputLayout::Packed
         && input.len() <= MAX_LOCAL_INPUT_BYTES
     {
@@ -559,7 +601,7 @@ fn prepare_indexed_input(
     }
     let dispatch = dispatch_grid(input_len, max_workgroups)?;
     let repeat_groups = u32::from(cooperative_groups_likely(input, &predecessors));
-    let input_words = input_layout.pack(input);
+    let input_words = preparation.packs_input(input_layout).pack(input);
     Ok(PreparedSearch::Gpu(PreparedGpuInput {
         input_index,
         input_len,
@@ -576,12 +618,20 @@ fn prepare_serial(
     search_budget: u32,
     max_dist: u32,
     max_workgroups: u32,
+    preparation: InputPreparation,
 ) -> Result<Vec<PreparedSearch>, GpuMatchError> {
     inputs
         .iter()
         .enumerate()
         .map(|(index, input)| {
-            prepare_input(index, input, search_budget, max_dist, max_workgroups, None)
+            prepare_input(
+                index,
+                input,
+                search_budget,
+                max_dist,
+                max_workgroups,
+                preparation,
+            )
         })
         .collect()
 }
@@ -592,6 +642,7 @@ fn prepare_parallel(
     search_budget: u32,
     max_dist: u32,
     max_workgroups: u32,
+    preparation: InputPreparation,
     pool: &crate::BatchCodec,
 ) -> Result<Vec<PreparedSearch>, GpuMatchError> {
     let mut inputs = inputs.to_vec();
@@ -605,7 +656,7 @@ fn prepare_parallel(
                 search_budget,
                 max_dist,
                 max_workgroups,
-                None,
+                preparation,
                 |bytes, distance| build_predecessors_parallel(bytes, distance, pool),
             )
         },
@@ -942,6 +993,14 @@ impl GpuMatchSearcher {
         })
     }
 
+    const fn input_preparation(&self) -> InputPreparation {
+        match self.backend {
+            GpuBackend::Vulkan(_) => InputPreparation::Vulkan,
+            #[cfg(feature = "cuda")]
+            GpuBackend::Cuda(_) => InputPreparation::Cuda,
+        }
+    }
+
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
     }
@@ -990,7 +1049,14 @@ impl GpuMatchSearcher {
         search_budget: u32,
         max_dist: u32,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
-        self.search_batch_with_preparation(inputs, search_budget, max_dist, &prepare_serial)
+        self.search_batch_with_preparation(
+            inputs,
+            search_budget,
+            max_dist,
+            &|inputs, budget, distance, groups| {
+                prepare_serial(inputs, budget, distance, groups, self.input_preparation())
+            },
+        )
     }
 
     #[cfg(feature = "parallel")]
@@ -1006,7 +1072,14 @@ impl GpuMatchSearcher {
             search_budget,
             max_dist,
             &|inputs, budget, distance, workgroups| {
-                prepare_parallel(inputs, budget, distance, workgroups, pool)
+                prepare_parallel(
+                    inputs,
+                    budget,
+                    distance,
+                    workgroups,
+                    self.input_preparation(),
+                    pool,
+                )
             },
         )
     }
@@ -1797,23 +1870,37 @@ mod tests {
         };
         let make = || -> Result<Vec<PreparedSearch>, GpuMatchError> {
             Ok(vec![
-                prepare_input(0, b"", 32, DEFAULT_MAX_DIST, 65535, None)?,
+                prepare_input(
+                    0,
+                    b"",
+                    32,
+                    DEFAULT_MAX_DIST,
+                    65535,
+                    InputPreparation::Vulkan,
+                )?,
                 prepare_input(
                     1,
                     &[b'a'; 127],
                     32,
                     DEFAULT_MAX_DIST,
                     65535,
-                    Some(InputLayout::Packed),
+                    InputPreparation::Forced(InputLayout::Packed),
                 )?,
-                prepare_input(2, b"abc", 32, DEFAULT_MAX_DIST, 65535, None)?,
+                prepare_input(
+                    2,
+                    b"abc",
+                    32,
+                    DEFAULT_MAX_DIST,
+                    65535,
+                    InputPreparation::Vulkan,
+                )?,
                 prepare_input(
                     3,
                     &[b'b'; 131],
                     32,
                     DEFAULT_MAX_DIST,
                     65535,
-                    Some(InputLayout::Aligned),
+                    InputPreparation::Forced(InputLayout::Aligned),
                 )?,
             ])
         };
@@ -1896,7 +1983,14 @@ mod tests {
                             .iter()
                             .enumerate()
                             .map(|(index, input)| {
-                                prepare_input(index, input, budget, distance, groups, Some(layout))
+                                prepare_input(
+                                    index,
+                                    input,
+                                    budget,
+                                    distance,
+                                    groups,
+                                    InputPreparation::ForcedCuda(layout),
+                                )
                             })
                             .collect()
                     },
@@ -1944,7 +2038,7 @@ mod tests {
                                         budget,
                                         distance,
                                         groups,
-                                        Some(layout),
+                                        InputPreparation::Forced(layout),
                                     )?;
                                     if let PreparedSearch::Gpu(item) = &mut prepared {
                                         assert_eq!(item.params[2], 1);
@@ -2153,7 +2247,14 @@ mod tests {
                             .iter()
                             .enumerate()
                             .map(|(index, input)| {
-                                prepare_input(index, input, budget, distance, groups, Some(layout))
+                                prepare_input(
+                                    index,
+                                    input,
+                                    budget,
+                                    distance,
+                                    groups,
+                                    InputPreparation::Forced(layout),
+                                )
                             })
                             .collect()
                     },
@@ -2350,7 +2451,7 @@ mod tests {
                             budget,
                             distance,
                             groups,
-                            Some(InputLayout::Aligned),
+                            InputPreparation::Forced(InputLayout::Aligned),
                         )
                     })
                     .collect()
@@ -2433,19 +2534,32 @@ mod tests {
     #[test]
     fn preparation_handles_local_results_and_forced_gpu() -> Result<(), GpuMatchError> {
         for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
-            let PreparedSearch::Local(table) =
-                prepare_input(0, input, 1, DEFAULT_MAX_DIST, 65535, None)?
+            let PreparedSearch::Local(table) = prepare_input(
+                0,
+                input,
+                1,
+                DEFAULT_MAX_DIST,
+                65535,
+                InputPreparation::Vulkan,
+            )?
             else {
                 return Err(GpuMatchError("empty candidate chain dispatched".into()));
             };
             assert_eq!(table.entries, vec![0; input.len()]);
         }
         assert!(matches!(
-            prepare_input(0, b"aaaaaaaa", 1, 1, 65535, None)?,
+            prepare_input(0, b"aaaaaaaa", 1, 1, 65535, InputPreparation::Vulkan)?,
             PreparedSearch::Local(_)
         ));
         assert!(matches!(
-            prepare_input(0, b"aaaaaaaa", 1, 2, 65535, Some(InputLayout::Packed))?,
+            prepare_input(
+                0,
+                b"aaaaaaaa",
+                1,
+                2,
+                65535,
+                InputPreparation::Forced(InputLayout::Packed)
+            )?,
             PreparedSearch::Gpu(_)
         ));
         assert!(matches!(
@@ -2455,7 +2569,7 @@ mod tests {
                 1,
                 DEFAULT_MAX_DIST,
                 65535,
-                Some(InputLayout::Packed)
+                InputPreparation::Forced(InputLayout::Packed)
             )?,
             PreparedSearch::Gpu(_)
         ));
@@ -2503,8 +2617,8 @@ mod tests {
             b"aaaaaaaa",
             &long,
         ];
-        let expected = prepare_serial(&inputs, 7, 64, 65535)?;
-        let actual = prepare_parallel(&inputs, 7, 64, 65535, &pool)?;
+        let expected = prepare_serial(&inputs, 7, 64, 65535, InputPreparation::Vulkan)?;
+        let actual = prepare_parallel(&inputs, 7, 64, 65535, InputPreparation::Vulkan, &pool)?;
         assert_eq!(actual.len(), expected.len());
         for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
             let (a, b) = match (a, b) {
@@ -2524,7 +2638,7 @@ mod tests {
             assert_eq!(a.predecessors, b.predecessors);
             assert_eq!(a.params, b.params);
         }
-        assert!(prepare_parallel(&[], 7, 64, 65535, &pool)?.is_empty());
+        assert!(prepare_parallel(&[], 7, 64, 65535, InputPreparation::Vulkan, &pool)?.is_empty());
         Ok(())
     }
 
@@ -2557,7 +2671,9 @@ mod tests {
                 budget,
                 max_dist,
                 geometry,
-                &prepare_serial,
+                &|inputs, budget, distance, groups| {
+                    prepare_serial(inputs, budget, distance, groups, InputPreparation::Vulkan)
+                },
             )?;
             #[cfg(feature = "parallel")]
             {
@@ -2569,7 +2685,14 @@ mod tests {
                     max_dist,
                     geometry,
                     &|inputs, budget, distance, groups| {
-                        prepare_parallel(inputs, budget, distance, groups, &pool)
+                        prepare_parallel(
+                            inputs,
+                            budget,
+                            distance,
+                            groups,
+                            InputPreparation::Vulkan,
+                            &pool,
+                        )
                     },
                 )?;
                 assert_eq!(pooled.len(), expected.len());

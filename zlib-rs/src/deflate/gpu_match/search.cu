@@ -124,3 +124,19 @@ extern "C" __global__ void search_packed(const u32* input,const u32* p,u32* out,
 extern "C" __global__ void search_aligned(const u32* input,const u32* p,u32* out,u32 size,u32 distance,u32 cooperative,u32 budget) {
     search<true>(input,p,out,size,distance,cooperative,budget);
 }
+
+
+// Expand compact input to overlapping words on the device. The last word is
+// zero-padded; each lane owns exactly one aligned output element.
+extern "C" __global__ void expand_aligned(const u32* packed, u32* aligned, u32 size) {
+    const u32 pos = blockIdx.x * group_size + threadIdx.x;
+    if (pos >= size) return;
+    if (size - pos >= 4) {
+        aligned[pos] = word<false>(packed, pos);
+    } else {
+        u32 value = 0;
+        for (u32 offset = 0; offset < size - pos; ++offset)
+            value |= byte_at<false>(packed, pos + offset) << (8 * offset);
+        aligned[pos] = value;
+    }
+}
