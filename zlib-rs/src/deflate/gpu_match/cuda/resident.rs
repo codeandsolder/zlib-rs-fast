@@ -78,7 +78,7 @@ macro_rules! kernel_set {
 }
 
 kernel_set! {
-    expand_aligned, resident_index, resident_match, resident_choices,
+    expand_aligned, resident_index, resident_index_bridge, resident_match, resident_choices,
     resident_mark_paths, resident_transitions, resident_scan_paths, resident_parse_paths,
     resident_partition, resident_histogram, resident_tree, resident_segment_bits,
     resident_bit_offsets, resident_write_segments, resident_write_stored,
@@ -94,8 +94,8 @@ macro_rules! workspace_geometry {
     ($macro:ident, $g:ident) => {
         $macro! {
             input: u8 => $g.size.next_multiple_of(4), aligned: u32 => $g.size,
-            heads: u32 => $g.tiles * HASH_COUNT, predecessors: u16 => $g.tiles * $g.stride,
-            matches: u32 => $g.tiles * $g.tile, choices: u32 => $g.core,
+            heads: u32 => $g.index_tiles * HASH_COUNT, predecessors: u16 => $g.size.next_multiple_of(2),
+            matches: u32 => $g.core, choices: u32 => $g.core,
             exits: u32 => $g.segments, transitions: u16 => $g.segments * MAX_MATCH,
             entries: u32 => $g.segments + 1, counts: u32 => $g.segments,
             block_ids: u32 => $g.segments, blocks: u32 => $g.segments * BLOCK_WORDS,
@@ -132,7 +132,7 @@ struct Geometry {
     budget: u32,
     tile: u32,
     tiles: u32,
-    stride: u32,
+    index_tiles: u32,
     segments: u32,
     target_tokens: u32,
     final_window: u32,
@@ -169,7 +169,7 @@ impl Geometry {
             budget,
             tile: MAX_MATCH_TILE,
             tiles: core.div_ceil(MAX_MATCH_TILE),
-            stride: (MAX_MATCH_TILE + distance - 1 + MAX_MATCH - 1).next_multiple_of(2),
+            index_tiles: size.div_ceil(MAX_MATCH_TILE),
             segments: core.div_ceil(SEGMENT),
             target_tokens: (1u32 << (config.mem_level + 6)) - 1,
             final_window: u32::from(final_window),
@@ -188,7 +188,7 @@ impl Geometry {
             .next_power_of_two()
             .clamp(MIN_MATCH_TILE, MAX_MATCH_TILE);
         self.tiles = self.core.div_ceil(self.tile);
-        self.stride = (self.tile + self.distance - 1 + MAX_MATCH - 1).next_multiple_of(2);
+        self.index_tiles = self.size.div_ceil(self.tile);
         self
     }
 
@@ -348,12 +348,16 @@ impl ResidentEncoder {
     fn index_and_match(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
         launch!(self, expand_aligned, (g.size.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
             &b.input, &mut b.aligned, &g.size);
-        launch!(self, resident_index, (g.tiles.div_ceil(WORKGROUP_SIZE / 32), 1, 1), WORKGROUP_SIZE;
-            &b.aligned, &mut b.heads, &mut b.predecessors, &g.size, &g.history,
-            &g.tile, &g.stride, &g.distance, &g.tiles);
-        launch!(self, resident_match, (g.tile.div_ceil(WORKGROUP_SIZE), g.tiles, 1), WORKGROUP_SIZE;
+        launch!(self, resident_index, (g.index_tiles.div_ceil(WORKGROUP_SIZE / 32), 1, 1), WORKGROUP_SIZE;
+            &b.aligned, &mut b.heads, &mut b.predecessors, &g.size,
+            &g.tile, &g.distance, &g.index_tiles);
+        if g.index_tiles > 1 && g.distance > 1 {
+            launch!(self, resident_index_bridge, (g.tile.min(g.distance - 1).div_ceil(WORKGROUP_SIZE), g.index_tiles, 1), WORKGROUP_SIZE;
+                &b.aligned, &b.heads, &mut b.predecessors, &g.size, &g.tile, &g.distance);
+        }
+        launch!(self, resident_match, (g.core.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
             &b.aligned, &b.predecessors, &mut b.matches, &g.size, &g.history,
-            &g.tile, &g.stride, &g.distance, &g.budget);
+            &g.distance, &g.budget);
         Ok(())
     }
 
@@ -673,24 +677,19 @@ mod tests {
         encoder.index_and_match(&mut b, g)?;
         let pred = encoder
             .stream
-            .clone_dtoh(&b.predecessors.slice(..(g.tiles * g.stride) as usize))
+            .clone_dtoh(&b.predecessors.slice(..g.size as usize))
             .map_err(failure)?;
         let matches = encoder
             .stream
             .clone_dtoh(&b.matches.slice(..g.core as usize))
             .map_err(failure)?;
-        for tile in 0..g.tiles as usize {
-            let start = history + tile * g.tile as usize;
-            let origin = start.saturating_sub(distance as usize - 1);
-            let end = (start + g.tile as usize + MAX_MATCH as usize - 1).min(input.len());
-            let expected = build_predecessors(&input[origin..end], distance)?;
-            let actual = &pred[tile * g.stride as usize..][..end - origin - 2];
-            for (position, &value) in actual.iter().enumerate() {
-                assert_eq!(
-                    usize::from(value),
-                    predecessor_distance(&expected, position)
-                );
-            }
+        let expected = build_predecessors(&input, distance)?;
+        for (position, &value) in pred.iter().take(input.len() - 2).enumerate() {
+            assert_eq!(
+                usize::from(value),
+                predecessor_distance(&expected, position),
+                "position {position}"
+            );
         }
         let dense = reference.search_with_max_dist(&input, budget, distance)?;
         assert_eq!(matches, dense.entries[history..]);

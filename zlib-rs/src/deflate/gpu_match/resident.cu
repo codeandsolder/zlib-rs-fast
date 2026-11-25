@@ -15,33 +15,26 @@ __device__ __forceinline__ Tile tile_at(u32 tile, u32 size, u32 history, u32 til
     const u32 end = start+min(tile_bytes,size-start);
     return {start, origin, end-origin, end-start};
 }
-__device__ __forceinline__ Tile search_tile_at(u32 tile,u32 size,u32 history,u32 tile_bytes,u32 max_dist) {
-    Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
-    t.len+=min(match_limit-1,size-t.start-t.core);
-    return t;
-}
 __device__ __forceinline__ u32 hash_at(const u32* input, u32 pos) {
     return ((input[pos]&0xffffffu)*2654435761u)>>16;
 }
-// One warp per tile. Same-hash lanes find their nearest earlier lane by
-// ballot, and only the last lane updates the hash head. All head loads are
-// ordered before writes; processing 32 positions at a time preserves the
-// exact serial nearest-predecessor relation, including hash collisions.
+// One warp per disjoint input tile. Construct each local chain and retain
+// its last occurrence per hash. No tile reprocesses the history of another.
 extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16* predecessors,
-    u32 size, u32 history, u32 tile_bytes, u32 stride, u32 max_dist, u32 tiles) {
+    u32 size, u32 tile_bytes, u32 max_dist, u32 tiles) {
     const u32 lane=threadIdx.x%warp_size;
     const u32 tile=(blockIdx.x*blockDim.x+threadIdx.x)/warp_size;
     if (tile>=tiles) return;
-    const Tile t=search_tile_at(tile,size,history,tile_bytes,max_dist);
+    const u32 start=tile*tile_bytes, len=min(tile_bytes,size-start);
     u32* heads=heads_all+static_cast<u64>(tile)*hash_count;
-    u16* pred_out=predecessors+static_cast<u64>(tile)*stride;
+    u16* pred_out=predecessors+start;
     for (u32 h=lane; h<hash_count; h+=warp_size) heads[h]=0;
     __syncwarp();
-    for (u32 base=0; base<t.len; base+=warp_size) {
+    for (u32 base=0; base<len; base+=warp_size) {
         const u32 pos=base+lane;
-        const u32 active=__ballot_sync(0xffffffffu,pos+2<t.len);
-        if (pos+2<t.len) {
-            const u32 hash=hash_at(input,t.origin+pos);
+        const u32 active=__ballot_sync(0xffffffffu,pos<len && start+pos+2<size);
+        if (pos<len && start+pos+2<size) {
+            const u32 hash=hash_at(input,start+pos);
             const u32 peers=__match_any_sync(active,hash);
             const u32 lower=peers&((1u<<lane)-1);
             const u32 previous=lower ? base+31-__clz(lower)+1 : heads[hash];
@@ -49,39 +42,60 @@ extern "C" __global__ void resident_index(const u32* input, u32* heads_all, u16*
             pred_out[pos]=static_cast<u16>(distance<max_dist ? distance : 0);
             __syncwarp(active);
             if (lane==31-__clz(peers)) heads[hash]=pos+1;
-        } else if (pos<t.len) {
+        } else if (pos<len) {
             pred_out[pos]=0;
         }
         __syncwarp();
     }
 }
-// Only search core positions. History is present in the index and input,
-// but we never compute match results for the unused history halo.
-extern "C" __global__ void resident_match(const u32* input,const u32* predecessors,u32* matches,
-    u32 size,u32 history,u32 tile_bytes,u32 stride,u32 max_dist,u32 budget) {
+// Only the first occurrence of a hash in a tile can have a predecessor
+// in an earlier tile. Resolve that edge using the preceding tiles' final
+// heads. A local chain whose nearest member exceeded the distance bound
+// cannot enter this branch, because its local position is >= max_dist.
+extern "C" __global__ void resident_index_bridge(const u32* input,const u32* heads,
+    u16* predecessors,u32 size,u32 tile_bytes,u32 max_dist) {
     const u32 tile=blockIdx.y;
-    const Tile t=search_tile_at(tile,size,history,tile_bytes,max_dist);
-    const u32* words=input+t.origin;
-    const u32* p=predecessors+static_cast<u64>(tile)*(stride/2);
-    u32* output=matches+static_cast<u64>(tile)*tile_bytes;
+    const u32 start=tile*tile_bytes;
+    const u32 local=blockIdx.x*blockDim.x+threadIdx.x;
+    const u32 pos=start+local;
+    if (!tile || local>=min(tile_bytes,max_dist-1) || pos+2>=size || predecessors[pos]) return;
+    const u32 hash=hash_at(input,pos);
+    for (u32 earlier=tile;earlier;) {
+        --earlier;
+        const u32 origin=earlier*tile_bytes;
+        // Even the final position in this earlier tile is too old.
+        if (pos-(origin+tile_bytes-1)>=max_dist) break;
+        const u32 head=heads[static_cast<u64>(earlier)*hash_count+hash];
+        if (head) {
+            const u32 distance=pos-(origin+head-1);
+            if (distance<max_dist) predecessors[pos]=static_cast<u16>(distance);
+            break;
+        }
+    }
+}
+// Search only the core. The global predecessor index includes history and
+// lookahead exactly once, so match search is independent of index tile size.
+extern "C" __global__ void resident_match(const u32* input,const u32* predecessors,u32* matches,
+    u32 size,u32 history,u32 max_dist,u32 budget) {
+    const u32 core=size-history;
     const u32 base=blockIdx.x*group_size, lane=threadIdx.x, core_pos=base+lane;
-    const u32 pos=t.start-t.origin+core_pos;
-    if (base>=t.core) return;
-    if (t.core-base>=cooperative_span) {
-        const u32 first=pos-lane, d=pred(p,first);
-        if (d && d==pred(p,first+group_size-1) && d<=first && d<max_dist) {
+    const u32 pos=history+core_pos;
+    if (base>=core) return;
+    if (core-base>=cooperative_span) {
+        const u32 first=pos-lane, d=pred(predecessors,first);
+        if (d && d==pred(predecessors,first+group_size-1) && d<=first && d<max_dist) {
             bool same=true;
             if (lane<cooperative_span/4) {
                 const u32 offset=first+lane*4;
-                same=words[offset]==words[offset-d];
+                same=input[offset]==input[offset-d];
             }
-            if (__syncthreads_and(same) && pred(p,pos)==d) {
-                output[core_pos]=(d<<16)|match_limit;
+            if (__syncthreads_and(same) && pred(predecessors,pos)==d) {
+                matches[core_pos]=(d<<16)|match_limit;
                 return;
             }
         }
     }
-    if (core_pos<t.core) output[core_pos]=match_word<true>(words,p,t.len,max_dist,budget,pos);
+    if (core_pos<core) matches[core_pos]=match_word<true>(input,predecessors,size,max_dist,budget,pos);
 }
 
 struct Symbol {
