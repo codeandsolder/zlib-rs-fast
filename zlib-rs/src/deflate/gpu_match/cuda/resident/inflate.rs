@@ -80,6 +80,8 @@ struct Cursor {
     segment: usize,
     decoded: u32,
     origin: u32,
+    source_bytes_uploaded: usize,
+    descriptor_bytes_uploaded: usize,
 }
 
 struct Group<'a> {
@@ -268,6 +270,8 @@ impl Decoder {
                 error[0]
             )));
         }
+        cursor.source_bytes_uploaded += group.payload.len() + group.header.len();
+        cursor.descriptor_bytes_uploaded += words.len() * core::mem::size_of::<u64>();
         cursor.decoded = last.end;
         cursor.segment += count as usize;
         Ok(())
@@ -294,6 +298,9 @@ struct ScanAhead<'a> {
     scanner: IndexScanner<'a>,
     pending: Vec<InflateSegment>,
     count: usize,
+    processed: usize,
+    source_bytes_uploaded: usize,
+    descriptor_bytes_uploaded: usize,
 }
 
 impl<'a> ScanAhead<'a> {
@@ -302,6 +309,9 @@ impl<'a> ScanAhead<'a> {
             scanner: IndexScanner::new(source, limit)?,
             pending: Vec::new(),
             count: 0,
+            processed: 0,
+            source_bytes_uploaded: 0,
+            descriptor_bytes_uploaded: 0,
         })
     }
 
@@ -325,6 +335,9 @@ impl<'a> ScanAhead<'a> {
             output,
             decoded_len: self.scanner.adler().map(|_| self.scanner.decoded()),
             decoded_bytes_indexed: self.scanner.decoded(),
+            decoded_bytes_processed: self.processed,
+            source_bytes_uploaded: self.source_bytes_uploaded,
+            descriptor_bytes_uploaded: self.descriptor_bytes_uploaded,
             code,
         }
     }
@@ -387,6 +400,8 @@ impl ResidentEncoder {
                 &mut cursor,
                 u32::try_from(end).map_err(failure)?,
             )?;
+            scan.source_bytes_uploaded = cursor.source_bytes_uploaded;
+            scan.descriptor_bytes_uploaded = cursor.descriptor_bytes_uploaded;
             scan.pending.drain(..cursor.segment);
             cursor.segment = 0;
             let input_origin = start.saturating_sub(distance as usize - 1);
@@ -418,6 +433,7 @@ impl ResidentEncoder {
                 scan.fill_to(end.saturating_add(window))
             };
             let piece = self.read_window(&b, g, limit - output.len())?;
+            scan.processed = end;
             output.extend_from_slice(&piece.output);
             if !piece.complete {
                 return Ok(scan.result(output, ReturnCode::BufError));
@@ -461,6 +477,9 @@ impl ResidentPool {
                     output: Vec::new(),
                     decoded_len: None,
                     decoded_bytes_indexed: 0,
+                    decoded_bytes_processed: 0,
+                    source_bytes_uploaded: 0,
+                    descriptor_bytes_uploaded: 0,
                     code,
                 }))
             }
@@ -549,6 +568,15 @@ mod tests {
                     search_budget: 128,
                     window,
                 };
+                let skipped = searcher.recompress_zlib(
+                    source,
+                    GpuTranscodeOptions {
+                        minimum_decoded_len: max.saturating_add(1),
+                        decoded_limit: u32::MAX,
+                        ..options(expected.len() + 512, max)
+                    },
+                )?;
+                assert!(skipped.is_none());
                 for cap in [0, 1, expected.len() / 2, expected.len(), expected.len() + 1] {
                     let actual = searcher
                         .recompress_zlib(source, options(cap, max))?

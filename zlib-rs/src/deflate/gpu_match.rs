@@ -37,6 +37,12 @@ pub struct GpuTranscodeResult {
     pub decoded_len: Option<usize>,
     /// Bytes structurally indexed, including lookahead for pipelining.
     pub decoded_bytes_indexed: usize,
+    /// Decoded core bytes actually submitted to the GPU compressor.
+    pub decoded_bytes_processed: usize,
+    /// Compact source and entropy-header bytes uploaded.
+    pub source_bytes_uploaded: usize,
+    /// Structural segment descriptor bytes uploaded.
+    pub descriptor_bytes_uploaded: usize,
     pub code: crate::ReturnCode,
 }
 
@@ -1074,6 +1080,7 @@ impl GpuMatchSearcher {
     /// Structurally scan a zlib member on the host, then decode and recompress
     /// it in bounded GPU windows. On success the source Adler is verified.
     /// A cap-exhausted prefix is returned without decoding the remaining tail.
+    /// Returns None if the decoded source is below the configured minimum.
     /// # Errors
     /// Returns an error for unsupported configurations or CUDA failures.
     #[cfg(feature = "cuda")]
