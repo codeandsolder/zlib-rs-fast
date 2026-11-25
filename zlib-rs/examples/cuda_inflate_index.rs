@@ -21,8 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|s| {
                 format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     s.header_bit,
+                    s.header_end_bit,
                     s.start_bit,
                     s.end_bit,
                     s.start,

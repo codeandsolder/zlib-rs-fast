@@ -9,17 +9,17 @@ using u32 = unsigned int;
 using u64 = unsigned long long;
 constexpr u32 history_limit=32768;
 constexpr u32 warp_width=32;
-struct Segment { u64 header_bit,start_bit,end_bit; u32 start,end,kind,ends_block; };
-static_assert(sizeof(Segment)==40);
+struct Segment { u64 header_bit,header_end_bit,start_bit,end_bit; u32 start,end,kind,ends_block; };
+static_assert(sizeof(Segment)==48);
 struct Reader {
     const u8* input;
-    u64 position, end;
+    u64 origin, position, end;
     bool good=true;
     __device__ u32 peek(u32 n) {
-        if(position>=end) {good=false;return 0;}
+        if(position>=end || position/8<origin) {good=false;return 0;}
         const u64 byte=position/8;
         u32 v=0;
-        for(u32 i=0;i<4 && (byte+i)*8<end;++i) v|=static_cast<u32>(input[byte+i])<<(8*i);
+        for(u32 i=0;i<4 && (byte+i)*8<end;++i) v|=static_cast<u32>(input[byte+i-origin])<<(8*i);
         return (v>>(position%8))&((1u<<n)-1);
     }
     __device__ u32 take(u32 n) {
@@ -33,7 +33,7 @@ struct Tree {
     u16 symbols[288];
     u16 counts[16], first[16], offsets[16];
     u32 width=0;
-    __device__ bool build(const u8* lengths,u32 n,bool allow_empty=false) {
+    __device__ bool build(const u8* lengths,u32 n,bool allow_empty=false,bool allow_single=true) {
         for(u32 i=0;i<=max_bits;++i)counts[i]=first[i]=offsets[i]=0;
         width=0;
         for(u32 i=0;i<n;++i){
@@ -49,7 +49,7 @@ struct Tree {
             offsets[i]=static_cast<u16>(offset);
             offset+=counts[i];
         }
-        if(code+counts[width]!=(1u<<width) && !(width==1&&offset==1))return false;
+        if(code+counts[width]!=(1u<<width) && !(allow_single&&width==1&&offset==1))return false;
         u16 next[16];
         for(u32 i=0;i<=width;++i)next[i]=offsets[i];
         for(u32 i=0;i<n;++i)if(lengths[i])symbols[next[lengths[i]]++]=static_cast<u16>(i);
@@ -78,11 +78,11 @@ __device__ bool tables(Reader& r,u32 type,Tree& ll,Tree& dd) {
         return dd.build(lengths,32);
     }
     const u32 nl=r.take(5)+257,nd=r.take(5)+1,nc=r.take(4)+4;
-    if(nl>286 || nd>32 || nc>19)return false;
+    if(nl>286 || nd>30 || nc>19)return false;
     u8 cl[19]={};
     for(u32 i=0;i<nc;++i)cl[cl_order[i]]=static_cast<u8>(r.take(3));
     Tree ct;
-    if(!r.good || !ct.build(cl,19))return false;
+    if(!r.good || !ct.build(cl,19,false,false))return false;
     for(u32 i=0;i<nl+nd && r.good;){
         const u32 s=ct.decode(r);
         if(s<16)lengths[i++]=static_cast<u8>(s);
@@ -116,25 +116,27 @@ __device__ bool match(Reader& r,const Tree& dd,u32 code,u32& length,u32& dist) {
 // A segment starts and ends at exact token boundaries, possibly inside
 // a large entropy block. Rebuild the same tree from its original header.
 // One warp decodes independently, using symbolic preceding history.
-extern "C" __global__ void inflate_symbolic(const u8* input,const Segment* segments,u32 count,
-    u16* symbolic,u32* status,u32 window) {
+extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_header,
+    u64 input_origin,u64 header_origin,u64 first_header_bit,const Segment* segments,u32 count,
+    u16* symbolic,u32* status,u32* used_seeds,u32 window,u32 base) {
     const u32 index=(blockIdx.x*blockDim.x+threadIdx.x)/warp_width,lane=threadIdx.x%warp_width;
     if(index>=count)return;
     const Segment seg=segments[index];
-    Reader r{input,seg.header_bit,seg.end_bit};
+    const bool first=seg.header_bit==first_header_bit;
+    Reader header{first?first_header:input,first?header_origin:input_origin,seg.header_bit,seg.header_end_bit};
+    Reader r{input,input_origin,seg.start_bit,seg.end_bit};
     Tree ll,dd;
     u32 ok=1,stored=0;
     if(!lane){
-        r.take(1);const u32 type=r.take(2);
-        ok=r.good && type==seg.kind && type!=3;
+        header.take(1);const u32 type=header.take(2);
+        ok=header.good && type==seg.kind && type!=3;
         if(ok && type==0){
-            r.position=(r.position+7)&~7ull;
-            stored=r.take(16);const u32 inverse=r.take(16);
-            ok=r.good && (stored^inverse)==65535u && stored==seg.end-seg.start &&
-                r.position==seg.start_bit && r.position+8ull*stored==seg.end_bit;
+            header.position=(header.position+7)&~7ull;
+            stored=header.take(16);const u32 inverse=header.take(16);
+            ok=header.good && (stored^inverse)==65535u && stored==seg.end-seg.start &&
+                header.position==seg.start_bit && header.position+8ull*stored==seg.end_bit;
         }else if(ok){
-            ok=tables(r,type,ll,dd) && r.position<=seg.start_bit;
-            r.position=seg.start_bit;
+            ok=tables(header,type,ll,dd) && header.position==seg.header_end_bit && header.position<=seg.start_bit;
         }
     }
     ok=__shfl_sync(0xffffffffu,ok,0);
@@ -142,7 +144,7 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const Segment* segme
     if(!ok){if(!lane)status[index]=1;return;}
     if(seg.kind==0){
         const u64 start=seg.start_bit/8;
-        for(u32 i=lane;i<stored;i+=warp_width)symbolic[seg.start+i]=input[start+i];
+        for(u32 i=lane;i<stored;i+=warp_width)symbolic[seg.start-base+i]=input[start+i-input_origin];
         if(!lane)status[index]=0;return;
     }
     u32 pos=seg.start;
@@ -164,14 +166,18 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const Segment* segme
         length=__shfl_sync(0xffffffffu,length,0);
         distance=__shfl_sync(0xffffffffu,distance,0);
         if(!ok||symbol==256)break;
-        if(symbol<256){if(!lane)symbolic[pos]=static_cast<u16>(symbol);}
+        if(symbol<256){if(!lane)symbolic[pos-base]=static_cast<u16>(symbol);}
         else {
             // Self-overlap maps to the initial distance bytes, all of
             // which precede the token. Earlier segments are represented
             // symbolically, never read before their producer completes.
             for(u32 i=lane;i<length;i+=warp_width){
                 const u32 source=pos-distance+(i%distance);
-                symbolic[pos+i]=source<seg.start?static_cast<u16>(255+seg.start-source):symbolic[source];
+                if(source<seg.start){
+                    const u32 seed=seg.start-source-1;
+                    symbolic[pos+i-base]=static_cast<u16>(256+seed);
+                    atomicOr(used_seeds+static_cast<u64>(index)*(window/32)+seed/32,1u<<(seed%32));
+                }else symbolic[pos+i-base]=symbolic[source-base];
             }
         }
         __syncwarp();
@@ -184,64 +190,54 @@ extern "C" __global__ void inflate_status(const u32* status,u32 count,u32* error
     for(u32 i=blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=gridDim.x*blockDim.x)
         if(status[i])atomicOr(error,status[i]);
 }
-// Resolve symbolic references, which strictly decrease the originating
-// segment. Binary search only when crossing a segment boundary.
-extern "C" __global__ void inflate_resolve(const Segment* segments,u32 count,const u16* symbolic,
-    u8* output,u32* error) {
-    if(*error)return;
-    const u32 index=blockIdx.y;
-    const u32 start=segments[index].start,end=segments[index].end;
-    for(u32 pos=start+blockIdx.x*blockDim.x+threadIdx.x;pos<end;pos+=gridDim.x*blockDim.x){
-        u32 origin=start,block=index;
-        u16 value=symbolic[pos];
-        while(value>=256){
-            const u32 distance=static_cast<u32>(value)-255;
-            if(distance>origin||!block){atomicOr(error,4u);return;}
-            const u32 source=origin-distance;
-            u32 lo=0,hi=block;
-            while(lo+1<hi){
-                const u32 middle=lo+(hi-lo)/2;
-                if(segments[middle].start<=source)lo=middle;else hi=middle;
-            }
-            block=lo;origin=segments[block].start;value=symbolic[source];
+// Each cross-segment edge strictly decreases the segment index. Earlier
+// decoded batches already have concrete bytes in the retained raw prefix.
+// Resolve the seed only once; propagation inside a segment does not create
+// any new seed IDs, so unused dictionary entries need never be resolved.
+__device__ u8 resolve_seed(const Segment* segments,const u16* symbolic,const u8* raw,
+    u32 index,u32 distance,u32 base,u32 raw_origin,u32* error) {
+    u32 origin=segments[index].start,block=index;
+    for(;;){
+        if(distance>origin){atomicOr(error,4u);return 0;}
+        const u32 source=origin-distance;
+        if(source<base){
+            if(source<raw_origin){atomicOr(error,4u);return 0;}
+            return raw[source-raw_origin];
         }
-        output[pos]=static_cast<u8>(value);
+        if(!block){atomicOr(error,4u);return 0;}
+        u32 lo=0,hi=block;
+        while(lo+1<hi){
+            const u32 middle=lo+(hi-lo)/2;
+            if(segments[middle].start<=source)lo=middle;else hi=middle;
+        }
+        block=lo;origin=segments[block].start;
+        const u16 value=symbolic[source-base];
+        if(value<256)return static_cast<u8>(value);
+        distance=static_cast<u32>(value)-255;
     }
 }
-
-// Resolve each possible seed byte once per segment, rather than repeating
-// a potentially long cross-segment dependency chain for every output byte.
-extern "C" __global__ void inflate_seed(const Segment* segments,u32 count,const u16* symbolic,
-    u8* seeds,u32* error,u32 window) {
+extern "C" __global__ void inflate_seed(const Segment* segments,const u16* symbolic,const u8* raw,
+    const u32* used_seeds,u8* seeds,u32* error,u32 window,u32 base,u32 raw_origin) {
     if(*error)return;
-    const u32 index=blockIdx.y;
-    const u32 start=segments[index].start;
-    const u32 available=min(start,window);
-    for(u32 d=1+blockIdx.x*blockDim.x+threadIdx.x;d<=available;d+=gridDim.x*blockDim.x) {
-        u32 origin=start,block=index,distance=d;
-        u16 value;
-        for(;;){
-            if(distance>origin||!block){atomicOr(error,4u);return;}
-            const u32 source=origin-distance;
-            u32 lo=0,hi=block;
-            while(lo+1<hi){
-                const u32 middle=lo+(hi-lo)/2;
-                if(segments[middle].start<=source)lo=middle;else hi=middle;
-            }
-            block=lo;origin=segments[block].start;value=symbolic[source];
-            if(value<256)break;
-            distance=static_cast<u32>(value)-255;
+    const u32 index=blockIdx.y,available=min(segments[index].start,window);
+    const u32* used=used_seeds+static_cast<u64>(index)*(window/32);
+    for(u32 word=blockIdx.x*blockDim.x+threadIdx.x;word<(available+31)/32;word+=gridDim.x*blockDim.x){
+        u32 bits=used[word];
+        while(bits){
+            const u32 bit=__ffs(bits)-1,seed=word*32+bit;
+            if(seed>=available){atomicOr(error,4u);return;}
+            seeds[static_cast<u64>(index)*window+seed]=resolve_seed(segments,symbolic,raw,index,seed+1,base,raw_origin,error);
+            bits&=bits-1;
         }
-        seeds[static_cast<u64>(index)*window+d-1]=static_cast<u8>(value);
     }
 }
-extern "C" __global__ void inflate_resolve_seeded(const Segment* segments,u32 count,const u16* symbolic,
-    const u8* seeds,u8* output,const u32* error,u32 window) {
+extern "C" __global__ void inflate_resolve(const Segment* segments,const u16* symbolic,const u8* seeds,
+    u8* raw,const u32* error,u32 window,u32 base,u32 raw_origin) {
     if(*error)return;
     const u32 index=blockIdx.y,start=segments[index].start,end=segments[index].end;
     const u8* dictionary=seeds+static_cast<u64>(index)*window;
     for(u32 pos=start+blockIdx.x*blockDim.x+threadIdx.x;pos<end;pos+=gridDim.x*blockDim.x){
-        const u16 value=symbolic[pos];
-        output[pos]=value<256?static_cast<u8>(value):dictionary[value-256];
+        const u16 value=symbolic[pos-base];
+        raw[pos-raw_origin]=value<256?static_cast<u8>(value):dictionary[value-256];
     }
 }

@@ -16,6 +16,7 @@ const MAX_SEGMENT_BYTES: usize = 128 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InflateSegment {
     pub header_bit: u64,
+    pub header_end_bit: u64,
     pub start_bit: u64,
     pub end_bit: u64,
     pub start: u32,
@@ -62,7 +63,10 @@ impl FastDecodeOutput for Counter {
         if distance > self.position || distance > self.window || distance == 0 {
             return Err("invalid distance too far back\0");
         }
-        self.position += length;
+        self.position = self
+            .position
+            .checked_add(length)
+            .ok_or("decoded length overflow\0")?;
         Ok(())
     }
 }
@@ -90,7 +94,10 @@ fn slow_token(
         .map_err(|_| ReturnCode::DataError)?
         .entry;
     if entry.op == 0 {
-        counter.position += 1;
+        counter.position = counter
+            .position
+            .checked_add(1)
+            .ok_or(ReturnCode::BufError)?;
     } else if entry.op & 32 != 0 {
         return Ok(true);
     } else if entry.op & 64 != 0 {
@@ -196,6 +203,7 @@ pub fn index_zlib(
                 }
                 segments.push(InflateSegment {
                     header_bit,
+                    header_end_bit: start_bit,
                     start_bit,
                     end_bit: offset(&reader, input.len()),
                     start: u32::try_from(start).map_err(|_| ReturnCode::BufError)?,
@@ -221,6 +229,7 @@ pub fn index_zlib(
             _ => return Err(ReturnCode::DataError),
         };
         if kind != 0 {
+            let header_end_bit = offset(&reader, input.len());
             loop {
                 if segments.len() == segment_limit {
                     return Err(ReturnCode::BufError);
@@ -235,6 +244,7 @@ pub fn index_zlib(
                 )?;
                 segments.push(InflateSegment {
                     header_bit,
+                    header_end_bit,
                     start_bit,
                     end_bit: offset(&reader, input.len()),
                     start: u32::try_from(start).map_err(|_| ReturnCode::BufError)?,
