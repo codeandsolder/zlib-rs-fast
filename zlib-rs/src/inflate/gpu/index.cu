@@ -196,3 +196,162 @@ extern "C" __global__ void inflate_compose_tiles(const TileBlock* blocks,const T
     extents[i]=out;
 }
 } // namespace resident_inflate
+
+namespace resident_inflate {
+// GPU index ABI. Segments have the same layout as the bounded decoder's
+// descriptors; intermediate descriptors use block-relative output offsets.
+constexpr u32 segment_bytes=128*1024;
+struct IndexInfo {
+    u32 status,count,decoded,window,adler,reserved;
+};
+static_assert(sizeof(IndexInfo)==24);
+
+__device__ bool emit_segment(Segment* out,u32 capacity,u32& count,
+    u64 header,u64 header_end,u64 start_bit,u64 end_bit,
+    u32 start,u32 end,u32 kind,bool last) {
+    if(start==end)return true;
+    if(count==capacity)return false;
+    out[count++]={header,header_end,start_bit,end_bit,start,end,kind,last?1u:0u};
+    return true;
+}
+
+// Produce independently indexed block-relative segments by composing only
+// the token paths reachable from the real beginning of this candidate.
+// Each tile consumes at most 559 bits (at least two bits per match), so its
+// decoded span is strictly smaller than the 128 KiB segment bound.
+extern "C" __global__ void inflate_compose_segments(const TileBlock* blocks,const TileTrees* trees,
+    const TilePath* paths,u32 count,u32 limit,BlockExtent* extents,Segment* segments,u32* counts) {
+    const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=count)return;
+    const TileBlock b=blocks[i];
+    const TileTrees& t=trees[i];
+    BlockExtent out{b.bit,t.payload,0,0,0,2,t.last,1,0};
+    u32 emitted=0;
+    Segment* dest=segments+b.first_tile;
+    if(!t.status){
+        u32 entry=0,seg_start=0;
+        u64 seg_bit=t.payload;
+        for(u32 tile=0;tile<b.tile_count;++tile){
+            const u64 start=t.payload+static_cast<u64>(tile)*tile_bits;
+            if(start>=b.upper)break;
+            const TilePath path=paths[(static_cast<u64>(b.first_tile)+tile)*max_token_bits+entry];
+            if(path.status==2 || path.length>limit-out.length || path.length>segment_bytes)break;
+            if(path.required_history>out.length)
+                out.required_history=max(out.required_history,path.required_history-out.length);
+            if(out.length-seg_start+path.length>segment_bytes){
+                if(!emit_segment(dest,b.tile_count,emitted,b.bit,t.payload,seg_bit,start+entry,seg_start,out.length,2,false))break;
+                seg_start=out.length;seg_bit=start+entry;
+            }
+            out.length+=path.length;
+            if(path.status==1){
+                out.end_bit=start+path.step;
+                if(emit_segment(dest,b.tile_count,emitted,b.bit,t.payload,seg_bit,out.end_bit,seg_start,out.length,2,true))out.status=0;
+                break;
+            }
+            if(path.step<tile_bits || path.step>=tile_bits+max_token_bits)break;
+            entry=path.step-tile_bits;
+        }
+    }
+    extents[i]=out;
+    counts[i]=out.status?0:emitted;
+}
+
+// Exact fallback for fixed/stored blocks and dynamic candidates whose
+// speculative interval contained a false header. No candidate assumption
+// is used here. The absolute output position checks the history bound.
+__device__ bool scan_emit(const u8* input,u64 end,u64& bit,u32& decoded,u32 window,u32 limit,
+    Segment* segments,u32 capacity,u32& count,bool& last,u32& status) {
+    const u64 header=bit;
+    Reader r{input,0,bit,end};
+    last=r.take(1)!=0;
+    const u32 kind=r.take(2);
+    status=1;
+    if(!r.good||kind==3)return false;
+    if(kind==0){
+        r.position=(r.position+7)&~7ull;
+        const u32 length=r.take(16),inverse=r.take(16);
+        if(!r.good||(length^inverse)!=65535 || r.position+8ull*length>end)return false;
+        if(length>limit-decoded){status=2;return false;}
+        bit=r.position+8ull*length;
+        if(!emit_segment(segments,capacity,count,header,r.position,r.position,bit,decoded,decoded+length,0,true)){
+            status=3;return false;
+        }
+        decoded+=length;return true;
+    }
+    Tree ll,dd;
+    if(!tables(r,kind,ll,dd))return false;
+    const u64 header_end=r.position;
+    u64 start_bit=header_end;
+    u32 start=decoded;
+    while(r.good){
+        const u64 token_bit=r.position;
+        const u32 symbol=ll.decode(r);
+        if(!r.good)return false;
+        if(symbol==256){
+            bit=r.position;
+            if(!emit_segment(segments,capacity,count,header,header_end,start_bit,bit,start,decoded,kind,true)){
+                status=3;return false;
+            }
+            return true;
+        }
+        u32 length=1,distance=0;
+        if(symbol>=257 && !match(r,dd,symbol,length,distance))return false;
+        if(distance>min(decoded,window))return false;
+        if(length>limit-decoded){status=2;return false;}
+        if(decoded-start+length>segment_bytes){
+            if(!emit_segment(segments,capacity,count,header,header_end,start_bit,token_bit,start,decoded,kind,false)){
+                status=3;return false;
+            }
+            start=decoded;start_bit=token_bit;
+        }
+        decoded+=length;
+    }
+    return false;
+}
+
+// Walk only proven edges from the zlib member's actual first bit. Dynamic
+// candidate extents never authorize a jump unless their exact header offset
+// is reached, their history is legal, and their decoded bound is satisfied.
+// Fixed/stored gaps and failed speculative candidates are parsed exactly.
+extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
+    const TileBlock* blocks,const BlockExtent* extents,const Segment* relative,
+    const u32* counts,u32 candidates,u32 limit,Segment* segments,u32 capacity,IndexInfo* info) {
+    if(threadIdx.x||blockIdx.x)return;
+    *info={1,0,0,0,0,0};
+    if(size<6)return;
+    const u32 cmf=input[0],flg=input[1];
+    if((cmf&15)!=8 || (cmf>>4)>7 || ((cmf<<8)|flg)%31 || (flg&32))return;
+    const u32 window=256u<<(cmf>>4);
+    info->window=window;
+    const u64 body_end=(size-4)*8;
+    u64 bit=16;
+    u32 decoded=0,count=0,candidate=0;
+    bool last=false;
+    while(!last){
+        if(bit>=body_end)return;
+        while(candidate<candidates && blocks[candidate].bit<bit)++candidate;
+        if(candidate<candidates && blocks[candidate].bit==bit && !extents[candidate].status){
+            const BlockExtent extent=extents[candidate];
+            if(extent.end_bit<=bit || extent.end_bit>body_end || extent.required_history>decoded)return;
+            if(extent.length>limit-decoded){info->status=2;return;}
+            const u32 n=counts[candidate];
+            if(n>capacity-count){info->status=3;return;}
+            const Segment* source=relative+blocks[candidate].first_tile;
+            for(u32 i=0;i<n;++i){
+                Segment seg=source[i];seg.start+=decoded;seg.end+=decoded;segments[count++]=seg;
+            }
+            decoded+=extent.length;bit=extent.end_bit;last=extent.last!=0;
+            ++candidate;
+        }else{
+            u32 status=1;
+            if(!scan_emit(input,body_end,bit,decoded,window,limit,segments,capacity,count,last,status)){
+                info->status=status;return;
+            }
+        }
+    }
+    if((bit+7)/8!=size-4)return;
+    const u32 adler=(static_cast<u32>(input[size-4])<<24)|(static_cast<u32>(input[size-3])<<16)|
+        (static_cast<u32>(input[size-2])<<8)|input[size-1];
+    *info={0,count,decoded,window,adler,0};
+}
+} // namespace resident_inflate
