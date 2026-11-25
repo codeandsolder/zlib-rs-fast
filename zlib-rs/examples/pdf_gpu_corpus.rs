@@ -32,10 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = DeflateConfig::new(level);
         for (lo, hi) in [
             (0, 4096),
-            (4096, 65536),
-            (65536, 262144),
-            (262144, 1048576),
-            (1048576, usize::MAX),
+            (4096, 65_536),
+            (65_536, 262_144),
+            (262_144, 1_048_576),
+            (1_048_576, usize::MAX),
         ] {
             let selected = inputs
                 .iter()
