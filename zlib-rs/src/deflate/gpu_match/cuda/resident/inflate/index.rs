@@ -25,7 +25,7 @@ kernel_set! {
     inflate_header_candidates, inflate_validate_bitmap, inflate_count_header_chunks,
     inflate_header_offsets, inflate_scatter_headers, inflate_make_tile_specs,
     inflate_make_tile_tasks, inflate_prepare_tiles, inflate_tile_paths,
-    inflate_compose_segments, inflate_assemble_index, inflate_schedule_groups,
+    inflate_compose_segments, inflate_assemble_index, inflate_place_segments, inflate_schedule_groups,
 }
 
 pub(super) struct Indexer {
@@ -62,6 +62,7 @@ pub(super) struct Workspace {
     extents: CudaSlice<u64>,
     relative: CudaSlice<u64>,
     counts: CudaSlice<u32>,
+    placements: CudaSlice<u32>,
     count: CudaSlice<u32>,
     info: CudaSlice<u32>,
     groups: CudaSlice<u32>,
@@ -83,6 +84,7 @@ impl Workspace {
             extents: stream.alloc_zeros(1).map_err(failure)?,
             relative: stream.alloc_zeros(1).map_err(failure)?,
             counts: stream.alloc_zeros(1).map_err(failure)?,
+            placements: stream.alloc_zeros(1).map_err(failure)?,
             count: stream.alloc_zeros(1).map_err(failure)?,
             info: stream.alloc_zeros(6).map_err(failure)?,
             groups: stream.alloc_zeros(1).map_err(failure)?,
@@ -104,6 +106,7 @@ impl Workspace {
             + allocation(MAX_HEADERS * EXTENT_WORDS, 8)
             + allocation(MAX_TILES * WORDS_PER_SEGMENT, 8)
             + allocation(MAX_HEADERS, 4)
+            + allocation(MAX_HEADERS * 3, 4)
             + allocation(MAX_SEGMENTS * 4, 4)
             + 28
     }
@@ -258,9 +261,19 @@ impl Indexer {
             MAX_SEGMENTS * WORDS_PER_SEGMENT,
         )?;
         let capacity = u32::try_from(MAX_SEGMENTS).map_err(failure)?;
+        if count != 0 {
+            reserve(&self.stream, &mut w.placements, count as usize * 3)?;
+            self.stream
+                .memset_zeros(&mut w.placements.slice_mut(..count as usize * 3))
+                .map_err(failure)?;
+        }
         launch!(self,inflate_assemble_index,(1,1,1),1;
-            &w.source,&size,&w.blocks,&w.extents,&w.relative,&w.counts,&count,&limit,
-            &mut w.segments,&capacity,&mut w.info);
+            &w.source,&size,&w.blocks,&w.extents,&w.counts,&count,&limit,
+            &mut w.segments,&capacity,&mut w.placements,&mut w.info);
+        if count != 0 {
+            launch!(self,inflate_place_segments,(count,1,1),WORKGROUP_SIZE;
+                &w.blocks,&w.relative,&w.placements,&mut w.segments,&w.info);
+        }
         reserve(&self.stream, &mut w.groups, MAX_SEGMENTS * 4)?;
         let max_group = u32::try_from(MAX_BATCH_SEGMENTS).map_err(failure)?;
         launch!(self,inflate_schedule_groups,(1,1,1),1;

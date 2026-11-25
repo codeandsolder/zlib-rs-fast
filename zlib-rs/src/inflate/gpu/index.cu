@@ -234,13 +234,17 @@ __device__ bool scan_emit(const u8* input,u64 end,u64& bit,u32& decoded,u32 wind
     return false;
 }
 
+struct Placement {
+    u32 dest,decoded,count;
+};
+static_assert(sizeof(Placement)==12);
 // Walk only proven edges from the zlib member's actual first bit. Dynamic
 // candidate extents never authorize a jump unless their exact header offset
 // is reached, their history is legal, and their decoded bound is satisfied.
 // Fixed/stored gaps and failed speculative candidates are parsed exactly.
 extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
-    const TileBlock* blocks,const BlockExtent* extents,const Segment* relative,
-    const u32* counts,u32 candidates,u32 limit,Segment* segments,u32 capacity,IndexInfo* info) {
+    const TileBlock* blocks,const BlockExtent* extents,
+    const u32* counts,u32 candidates,u32 limit,Segment* segments,u32 capacity,Placement* placements,IndexInfo* info) {
     if(threadIdx.x||blockIdx.x)return;
     *info={1,0,0,0,0,0};
     if(size<6)return;
@@ -261,10 +265,8 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
             if(extent.length>limit-decoded){info->status=2;return;}
             const u32 n=counts[candidate];
             if(n>capacity-count){info->status=3;return;}
-            const Segment* source=relative+blocks[candidate].first_tile;
-            for(u32 i=0;i<n;++i){
-                Segment seg=source[i];seg.start+=decoded;seg.end+=decoded;segments[count++]=seg;
-            }
+            placements[candidate]={count,decoded,n};
+            count+=n;
             decoded+=extent.length;bit=extent.end_bit;last=extent.last!=0;
             ++candidate;
         }else{
@@ -278,6 +280,19 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
     const u32 adler=(static_cast<u32>(input[size-4])<<24)|(static_cast<u32>(input[size-3])<<16)|
         (static_cast<u32>(input[size-2])<<8)|input[size-1];
     *info={0,count,decoded,window,adler,0};
+}
+
+// Copy only the candidates reached by the exact chain. Destinations are
+// disjoint, with serial fixed/stored fallback segments already written.
+extern "C" __global__ void inflate_place_segments(const TileBlock* blocks,
+    const Segment* relative,const Placement* placements,Segment* segments,const IndexInfo* info) {
+    if(info->status)return;
+    const Placement p=placements[blockIdx.x];
+    const Segment* source=relative+blocks[blockIdx.x].first_tile;
+    for(u32 i=threadIdx.x;i<p.count;i+=blockDim.x){
+        Segment seg=source[i];seg.start+=p.decoded;seg.end+=p.decoded;
+        segments[p.dest+i]=seg;
+    }
 }
 
 // Ordered compaction of validated dynamic headers. The bitmap is one bit
