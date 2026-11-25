@@ -56,26 +56,8 @@ __device__ __forceinline__ u32 shifted_offset(const u32* p, u32 candidate, u32 l
     return (!middle_distance || middle_distance>distance) ? middle : offset;
 }
 template<bool aligned> __device__ __forceinline__
-void search(const u32* input, const u32* p, u32* output, u32 size, u32 max_dist, u32 cooperative, u32 budget) {
-    const u32 base=blockIdx.x*group_size, lane=threadIdx.x;
-    const u32 pos=base+lane;
-    if (cooperative && size-base >= cooperative_span) {
-        // All lanes compute the same two cheap loads; vote over the shared span.
-        const u32 distance=pred(p,base);
-        if (distance && distance==pred(p,base+group_size-1) && distance<=base && distance<max_dist) {
-            bool same=true;
-            if (lane < cooperative_span/4) {
-                const u32 offset=base+lane*4;
-                same=word<aligned>(input,offset)==word<aligned>(input,offset-distance);
-            }
-            if (__syncthreads_and(same) && pred(p,pos)==distance) {
-                output[pos]=(distance<<16)|match_limit;
-                return;
-            }
-        }
-    }
-    if (pos>=size) return;
-    if (size-pos<3) {output[pos]=0; return;}
+u32 match_word(const u32* input, const u32* p, u32 size, u32 max_dist, u32 budget, u32 pos) {
+    if (size-pos<3) return 0;
     const u32 minimum=pos>=max_dist ? pos-max_dist+1 : 0;
     const u32 limit=min(match_limit,size-pos);
     const u32 probe=limit>=4 ? word<aligned>(input,pos) : 0;
@@ -116,8 +98,30 @@ void search(const u32* input, const u32* p, u32* output, u32 size, u32 max_dist,
             }
         }
     }
-    output[pos]=(best_distance<<16)|best_len;
+    return (best_distance<<16)|best_len;
 }
+template<bool aligned> __device__ __forceinline__
+void search(const u32* input, const u32* p, u32* output, u32 size, u32 max_dist, u32 cooperative, u32 budget) {
+    const u32 base=blockIdx.x*group_size, lane=threadIdx.x;
+    const u32 pos=base+lane;
+    if (cooperative && size-base >= cooperative_span) {
+        // All lanes compute the same two cheap loads; vote over the shared span.
+        const u32 distance=pred(p,base);
+        if (distance && distance==pred(p,base+group_size-1) && distance<=base && distance<max_dist) {
+            bool same=true;
+            if (lane < cooperative_span/4) {
+                const u32 offset=base+lane*4;
+                same=word<aligned>(input,offset)==word<aligned>(input,offset-distance);
+            }
+            if (__syncthreads_and(same) && pred(p,pos)==distance) {
+                output[pos]=(distance<<16)|match_limit;
+                return;
+            }
+        }
+    }
+    if (pos<size) output[pos]=match_word<aligned>(input,p,size,max_dist,budget,pos);
+}
+
 extern "C" __global__ void search_packed(const u32* input,const u32* p,u32* out,u32 size,u32 distance,u32 cooperative,u32 budget) {
     search<false>(input,p,out,size,distance,cooperative,budget);
 }
