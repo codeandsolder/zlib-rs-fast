@@ -2,8 +2,8 @@
 //! compressed source bytes are uploaded. Decoded windows never leave CUDA.
 use super::super::{allocation_capacity, failure, reserve};
 use super::{
-    append, stream_header, Checksum, Geometry, ResidentEncoder, ResidentPool, Wrapper, MAX_WINDOW,
-    WORKGROUP_SIZE,
+    append, stream_header, Checksum, DeviceInput, Geometry, ResidentEncoder, ResidentPool, Wrapper,
+    MAX_WINDOW, WORKGROUP_SIZE,
 };
 use crate::{
     deflate::gpu_match::{GpuMatchError, GpuTranscodeOptions, GpuTranscodeResult},
@@ -70,7 +70,7 @@ impl Workspace {
             + allocation(MAX_BATCH_SEGMENTS * HISTORY / 32, 4)
             + allocation(MAX_BATCH_SEGMENTS, 4)
             + 4
-            + allocation(MAX_WINDOW + CARRY_BYTES, 1)
+            + allocation((MAX_WINDOW + CARRY_BYTES).next_multiple_of(4), 1)
             + allocation(CARRY_BYTES, 1)
     }
 }
@@ -373,7 +373,7 @@ impl ResidentEncoder {
         reserve(
             &self.stream,
             &mut w.raw,
-            window.min(options.decoded_limit as usize) + CARRY_BYTES,
+            (window.min(options.decoded_limit as usize) + CARRY_BYTES).next_multiple_of(4),
         )?;
         reserve(&self.stream, &mut w.carry, CARRY_BYTES)?;
         let mut cursor = Cursor::default();
@@ -417,13 +417,8 @@ impl ResidentEncoder {
             )?
             .with_index_tiles(index_tiles);
             b.prepare(&self.stream, g)?;
-            self.stream
-                .memcpy_dtod(
-                    &w.raw.slice(input_origin - origin..end - origin),
-                    &mut b.input,
-                )
-                .map_err(failure)?;
-            self.submit_window(&mut b, g)?;
+            let input = DeviceInput::new(&w.raw, input_origin - origin, g.size)?;
+            self.submit_window(&mut b, g, input)?;
             // The stream is now busy with index, parse and entropy kernels.
             // Discover the next window's token boundaries on the host before
             // synchronizing for the compact result. No extra thread pool.

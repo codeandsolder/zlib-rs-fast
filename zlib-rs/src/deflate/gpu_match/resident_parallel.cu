@@ -39,7 +39,7 @@ __device__ __forceinline__ u32 advance_token(u32 token) {
 // Compute the lazy choice at every possible start before traversing its
 // functional graph. Match distances use at most 15 bits in DEFLATE.
 extern "C" __global__ void resident_choices(const u32* input,const u32* matches,u32* choices,
-    u32 core,u32 history,u32 strategy) {
+    u32 core,u32 history,u32 strategy,u32 offset) {
     const u32 pos=blockIdx.x*blockDim.x+threadIdx.x;
     if(pos>=core)return;
     const u32 match=matches[pos],raw_len=usable_match(match);
@@ -47,7 +47,7 @@ extern "C" __global__ void resident_choices(const u32* input,const u32* matches,
     const u32 len=strategy==1 && raw_len<=5 ? 0 : raw_len;
     const u32 next=strategy==1 && raw_next<=5 ? 0 : raw_next;
     choices[pos]=len>=3 && (len==match_limit || next<=len)
-        ? match : byte_at<false>(input,history+pos);
+        ? match : byte_at<false>(input,offset+history+pos);
 }
 // Mark a canonical path starting at each segment boundary. Each path
 // exclusively modifies its own segment and may end up to 257 bytes beyond it.
@@ -276,7 +276,7 @@ extern "C" __global__ void resident_write_segments(const u32* matches,const u32*
 }
 // Stored payload is bulk-copied in parallel, excluding its five-byte headers.
 extern "C" __global__ void resident_write_stored(const u32* input,const u32* segment_blocks,
-    const EntropyBlock* blocks,u32* output,const u32* entries,u32 core,u32 history,u32 segment_bytes,u32 arena_stride) {
+    const EntropyBlock* blocks,u32* output,const u32* entries,u32 core,u32 history,u32 segment_bytes,u32 arena_stride,u32 offset) {
     const u32 segment=blockIdx.x;
     const EntropyBlock& block=blocks[segment_blocks[segment]];
     if(block.mode)return;
@@ -286,7 +286,7 @@ extern "C" __global__ void resident_write_stored(const u32* input,const u32* seg
     const u32 block_start=actual_start(block.first,entries,core,segment_bytes);
     for(u32 i=threadIdx.x;i<len;i+=blockDim.x) {
         const u32 pos=start-block_start+i;
-        dest[pos+5*(pos/65535+1)]=static_cast<unsigned char>(byte_at<false>(input,history+start+i));
+        dest[pos+5*(pos/65535+1)]=static_cast<unsigned char>(byte_at<false>(input,offset+history+start+i));
     }
 }
 extern "C" __global__ void resident_parallel_offsets(const EntropyBlock* blocks,const u32* block_count,

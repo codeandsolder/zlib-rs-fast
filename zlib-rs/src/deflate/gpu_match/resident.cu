@@ -18,6 +18,18 @@ __device__ __forceinline__ Tile tile_at(u32 tile, u32 size, u32 history, u32 til
 __device__ __forceinline__ u32 hash_at(const u32* input, u32 pos) {
     return ((input[pos]&0xffffffu)*2654435761u)>>16;
 }
+// Directly consume a logical window of a packed allocation (including an
+// arbitrary byte-aligned start in the retained inflate history).
+extern "C" __global__ void resident_expand(const u32* input,u32* aligned,u32 size,u32 offset) {
+    const u32 pos=blockIdx.x*group_size+threadIdx.x;
+    if(pos>=size)return;
+    if(size-pos>=4)aligned[pos]=word<false>(input,offset+pos);
+    else {
+        u32 value=0;
+        for(u32 i=0;i<size-pos;++i)value|=byte_at<false>(input,offset+pos+i)<<(8*i);
+        aligned[pos]=value;
+    }
+}
 // One warp per disjoint input tile. Construct each local chain and retain
 // its last occurrence per hash. No tile reprocesses the history of another.
 extern "C" __global__ void resident_index(const u32* input, u16* heads_all, u16* predecessors,
@@ -239,12 +251,12 @@ __device__ __forceinline__ u32 usable_match(u32 word) {
 // Per-tile Adler components for the core only, with initial A=B=0.
 // Use 64-bit weighted sums so all supported block sizes are exact.
 extern "C" __global__ void resident_adler(const u32* input,u32* checksums,
-    u32 size,u32 history,u32 tile_bytes,u32 max_dist) {
+    u32 size,u32 history,u32 tile_bytes,u32 max_dist,u32 offset) {
     const u32 tile=blockIdx.x;
     const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
     u64 a=0,b=0;
     for(u32 i=threadIdx.x;i<t.core;i+=blockDim.x) {
-        const u32 value=byte_at<false>(input,t.start+i);
+        const u32 value=byte_at<false>(input,offset+t.start+i);
         a+=value;b+=static_cast<u64>(t.core-i)*value;
     }
     for(u32 shift=16;shift;shift>>=1){a+=__shfl_down_sync(0xffffffffu,a,shift);b+=__shfl_down_sync(0xffffffffu,b,shift);}
@@ -284,13 +296,13 @@ __device__ __forceinline__ u32 crc_update(u32 crc,u32 byte) {
     return crc;
 }
 extern "C" __global__ void resident_crc(const u32* input,u32* checksums,
-    u32 size,u32 history,u32 tile_bytes,u32 max_dist) {
+    u32 size,u32 history,u32 tile_bytes,u32 max_dist,u32 offset) {
     const u32 tile=blockIdx.x;
     const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
     const u32 chunk=(t.core+blockDim.x-1)/blockDim.x;
     const u32 start=min(t.core,threadIdx.x*chunk),end=min(t.core,start+chunk);
     u32 crc=0xffffffffu;
-    for(u32 i=start;i<end;++i)crc=crc_update(crc,byte_at<false>(input,t.start+i));
+    for(u32 i=start;i<end;++i)crc=crc_update(crc,byte_at<false>(input,offset+t.start+i));
     __shared__ u32 crcs[128],lengths[128];
     crcs[threadIdx.x]=~crc;lengths[threadIdx.x]=end-start;
     __syncthreads();

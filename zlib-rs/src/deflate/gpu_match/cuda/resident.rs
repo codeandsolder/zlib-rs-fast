@@ -76,7 +76,7 @@ macro_rules! kernel_set {
 }
 
 kernel_set! {
-    expand_aligned, resident_index, resident_index_bridge, resident_match, resident_choices,
+    resident_expand, resident_index, resident_index_bridge, resident_match, resident_choices,
     resident_mark_paths, resident_transitions, resident_scan_paths, resident_parse_paths,
     resident_partition, resident_histogram, resident_tree, resident_segment_bits,
     resident_bit_offsets, resident_write_segments, resident_write_stored,
@@ -91,7 +91,7 @@ macro_rules! buffer_set {
 macro_rules! workspace_geometry {
     ($macro:ident, $g:ident) => {
         $macro! {
-            input: u8 => $g.size.next_multiple_of(4), aligned: u32 => $g.size,
+            aligned: u32 => $g.size,
             heads: u16 => $g.index_tiles * HASH_COUNT, predecessors: u16 => $g.size.next_multiple_of(2),
             matches: u32 => $g.core,
             exits: u32 => $g.segments, transitions: u16 => $g.segments * MAX_MATCH,
@@ -114,7 +114,7 @@ impl Buffers {
 }
 
 buffer_set! {
-    input: u8, aligned: u32, heads: u16, predecessors: u16, matches: u32,
+    aligned: u32, heads: u16, predecessors: u16, matches: u32,
     exits: u32, transitions: u16, entries: u32, counts: u32,
     block_ids: u32, blocks: u32, block_count: u32, hist: u32, arena: u32,
     bits: u32, bit_offsets: u32, checksums: u32, offsets: u32, meta: u32,
@@ -212,7 +212,7 @@ impl Buffers {
                 0 $(+ allocation_capacity($count as usize) * core::mem::size_of::<$ty>())+
             };
         }
-        workspace_geometry!(count, g)
+        allocation_capacity(g.size.next_multiple_of(4) as usize) + workspace_geometry!(count, g)
     }
 }
 
@@ -220,6 +220,7 @@ pub(super) struct ResidentEncoder {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     buffers: Mutex<Buffers>,
+    host_input: Mutex<CudaSlice<u8>>,
     decoder: inflate::Decoder,
 }
 
@@ -332,25 +333,57 @@ macro_rules! launch {
 
 mod inflate;
 
+// Immutable packed input in a CUDA allocation. The logical window can begin
+// at any byte offset; keeping the base pointer aligned preserves word loads.
+#[derive(Clone, Copy)]
+struct DeviceInput<'a> {
+    bytes: &'a CudaSlice<u8>,
+    offset: u32,
+}
+
+impl<'a> DeviceInput<'a> {
+    fn new(bytes: &'a CudaSlice<u8>, offset: usize, size: u32) -> Result<Self, GpuMatchError> {
+        let end = offset
+            .checked_add(size as usize)
+            .ok_or_else(|| GpuMatchError("resident input range overflow".into()))?;
+        if end.next_multiple_of(4) > bytes.len() {
+            return Err(GpuMatchError(
+                "resident input exceeds padded allocation".into(),
+            ));
+        }
+        Ok(Self {
+            bytes,
+            offset: u32::try_from(offset).map_err(failure)?,
+        })
+    }
+}
+
 impl ResidentEncoder {
     pub(super) fn new(
         stream: Arc<CudaStream>,
         module: &Arc<CudaModule>,
     ) -> Result<Self, GpuMatchError> {
         let buffers = Mutex::new(Buffers::new(&stream)?);
+        let host_input = Mutex::new(stream.alloc_zeros(1).map_err(failure)?);
         let decoder = inflate::Decoder::new(Arc::clone(&stream), module)?;
         Ok(Self {
             stream,
             kernels: Kernels::new(module)?,
             buffers,
+            host_input,
             decoder,
         })
     }
 
     #[expect(unsafe_code, reason = "validated CUDA index and match kernel ABI")]
-    fn index_and_match(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
-        launch!(self, expand_aligned, (g.size.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
-            &b.input, &mut b.aligned, &g.size);
+    fn index_and_match(
+        &self,
+        b: &mut Buffers,
+        g: Geometry,
+        input: DeviceInput<'_>,
+    ) -> Result<(), GpuMatchError> {
+        launch!(self, resident_expand, (g.size.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
+            input.bytes, &mut b.aligned, &g.size, &input.offset);
         launch!(self, resident_index, (g.index_tiles.div_ceil(WORKGROUP_SIZE / 32), 1, 1), WORKGROUP_SIZE;
             &b.aligned, &mut b.heads, &mut b.predecessors, &g.size,
             &g.tile, &g.distance, &g.index_tiles);
@@ -368,13 +401,18 @@ impl ResidentEncoder {
         unsafe_code,
         reason = "validated CUDA path-reconciliation and partition kernel ABI"
     )]
-    fn parse(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+    fn parse(
+        &self,
+        b: &mut Buffers,
+        g: Geometry,
+        input: DeviceInput<'_>,
+    ) -> Result<(), GpuMatchError> {
         let segment_grid = (g.segments.div_ceil(32), 1, 1);
         // The aligned match-search input is dead after resident_match.
         // Reuse that allocation for choices; original literals, stored
         // blocks and checksum kernels read the compact immutable input.
         launch!(self, resident_choices, (g.core.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
-            &b.input, &b.matches, &mut b.aligned, &g.core, &g.history, &g.strategy);
+            input.bytes, &b.matches, &mut b.aligned, &g.core, &g.history, &g.strategy, &input.offset);
         launch!(self, resident_mark_paths, segment_grid, 32;
             &mut b.aligned, &mut b.exits, &g.core, &SEGMENT, &g.segments);
         launch!(self, resident_transitions, (g.segments, 1, 1), 256;
@@ -393,7 +431,12 @@ impl ResidentEncoder {
         unsafe_code,
         reason = "validated CUDA histogram, Huffman and bit emission kernel ABI"
     )]
-    fn encode(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+    fn encode(
+        &self,
+        b: &mut Buffers,
+        g: Geometry,
+        input: DeviceInput<'_>,
+    ) -> Result<(), GpuMatchError> {
         let segment_grid = (g.segments.div_ceil(32), 1, 1);
         let all_segments = (g.segments, 1, 1);
         self.stream
@@ -415,8 +458,8 @@ impl ResidentEncoder {
             &b.matches, &b.counts, &b.block_ids, &b.blocks, &b.bit_offsets,
             &mut b.arena, &SEGMENT, &ARENA_STRIDE, &g.segments);
         launch!(self, resident_write_stored, all_segments, WORKGROUP_SIZE;
-            &b.input, &b.block_ids, &b.blocks, &mut b.arena, &b.entries,
-            &g.core, &g.history, &SEGMENT, &ARENA_STRIDE);
+            input.bytes, &b.block_ids, &b.blocks, &mut b.arena, &b.entries,
+            &g.core, &g.history, &SEGMENT, &ARENA_STRIDE, &input.offset);
         Ok(())
     }
 
@@ -424,13 +467,18 @@ impl ResidentEncoder {
         unsafe_code,
         reason = "validated CUDA checksum and output compaction kernel ABI"
     )]
-    fn compact(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
+    fn compact(
+        &self,
+        b: &mut Buffers,
+        g: Geometry,
+        input: DeviceInput<'_>,
+    ) -> Result<(), GpuMatchError> {
         if g.checksum_kind == 1 {
             launch!(self, resident_adler, (g.tiles, 1, 1), WORKGROUP_SIZE;
-                &b.input, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
+                input.bytes, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance, &input.offset);
         } else if g.checksum_kind == 2 {
             launch!(self, resident_crc, (g.tiles, 1, 1), WORKGROUP_SIZE;
-                &b.input, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
+                input.bytes, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance, &input.offset);
         }
         launch!(self, resident_parallel_offsets, (1, 1, 1), 1;
             &b.blocks, &b.block_count, &b.checksums, &mut b.offsets, &mut b.meta,
@@ -446,31 +494,31 @@ impl ResidentEncoder {
         g: Geometry,
         limit: usize,
     ) -> Result<WindowOutput, GpuMatchError> {
+        let mut device = self.host_input.lock().map_err(failure)?;
+        reserve(&self.stream, &mut device, input.len().next_multiple_of(4))?;
+        self.stream
+            .memcpy_htod(input, &mut device)
+            .map_err(failure)?;
+        let source = DeviceInput::new(&device, 0, g.size)?;
         let mut b = self.buffers.lock().map_err(failure)?;
         b.prepare(&self.stream, g)?;
-        self.stream
-            .memcpy_htod(input, &mut b.input)
-            .map_err(failure)?;
-        let result = self.window_loaded(&mut b, g, limit);
+        self.submit_window(&mut b, g, source)?;
+        let result = self.read_window(&b, g, limit);
         drop(b);
+        drop(device);
         result
     }
 
-    fn window_loaded(
+    fn submit_window(
         &self,
         b: &mut Buffers,
         g: Geometry,
-        limit: usize,
-    ) -> Result<WindowOutput, GpuMatchError> {
-        self.submit_window(b, g)?;
-        self.read_window(b, g, limit)
-    }
-
-    fn submit_window(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
-        self.index_and_match(b, g)?;
-        self.parse(b, g)?;
-        self.encode(b, g)?;
-        self.compact(b, g)
+        input: DeviceInput<'_>,
+    ) -> Result<(), GpuMatchError> {
+        self.index_and_match(b, g, input)?;
+        self.parse(b, g, input)?;
+        self.encode(b, g, input)?;
+        self.compact(b, g, input)
     }
 
     fn read_window(
@@ -831,11 +879,20 @@ mod tests {
         .with_index_tiles(pool.index_tiles);
         let mut b = encoder.buffers.lock().map_err(failure)?;
         b.prepare(&encoder.stream, g)?;
+        let mut device = encoder.host_input.lock().map_err(failure)?;
+        let mut padded = vec![0x65; 3];
+        padded.extend_from_slice(&input);
+        reserve(
+            &encoder.stream,
+            &mut device,
+            padded.len().next_multiple_of(4),
+        )?;
         encoder
             .stream
-            .memcpy_htod(&input, &mut b.input)
+            .memcpy_htod(&padded, &mut device)
             .map_err(failure)?;
-        encoder.index_and_match(&mut b, g)?;
+        let source = DeviceInput::new(&device, 3, g.size)?;
+        encoder.index_and_match(&mut b, g, source)?;
         let pred = encoder
             .stream
             .clone_dtoh(&b.predecessors.slice(..g.size as usize))
@@ -854,7 +911,7 @@ mod tests {
         }
         let dense = reference.search_with_max_dist(&input, budget, distance)?;
         assert_eq!(matches, dense.entries[history..]);
-        encoder.parse(&mut b, g)?;
+        encoder.parse(&mut b, g, source)?;
         let counts = encoder
             .stream
             .clone_dtoh(&b.counts.slice(..g.segments as usize))
@@ -864,6 +921,7 @@ mod tests {
             .clone_dtoh(&b.matches.slice(..g.core as usize))
             .map_err(failure)?;
         drop(b);
+        drop(device);
         let mut expected = Vec::new();
         let mut pos = 0;
         while pos < matches.len() {
