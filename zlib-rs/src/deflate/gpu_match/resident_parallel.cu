@@ -30,26 +30,74 @@ struct WordWriter {
     }
     __device__ u32 position() const {return word*32+count;}
 };
-__device__ __forceinline__ u32 segment_length(u32 segment,u32 core,u32 segment_bytes) {
-    return min(segment_bytes,core-segment*segment_bytes);
+constexpr u32 path_mark=0x80000000u;
+constexpr u32 path_token_mask=~path_mark;
+constexpr u32 path_states=match_limit;
+__device__ __forceinline__ u32 advance_token(u32 token) {
+    return token&0x7fff0000u ? token&65535u : 1u;
 }
-extern "C" __global__ void resident_parse(const u32* input,u32* matches,u32* counts,
-    u32 core,u32 history,u32 segment_bytes,u32 segments) {
+// Compute the lazy choice at every possible start before traversing its
+// functional graph. Match distances use at most 15 bits in DEFLATE.
+extern "C" __global__ void resident_choices(const u32* input,const u32* matches,u32* choices,
+    u32 core,u32 history) {
+    const u32 pos=blockIdx.x*blockDim.x+threadIdx.x;
+    if(pos>=core)return;
+    const u32 match=matches[pos],len=usable_match(match);
+    const u32 next=pos+1<core ? usable_match(matches[pos+1]) : 0;
+    choices[pos]=len>=3 && (len==match_limit || next<=len)
+        ? match : input[history+pos]&255;
+}
+// Mark a canonical path starting at each segment boundary. Each path
+// exclusively modifies its own segment and may end up to 257 bytes beyond it.
+extern "C" __global__ void resident_mark_paths(u32* choices,u32* exits,
+    u32 core,u32 segment_bytes,u32 segments) {
     const u32 segment=blockIdx.x*blockDim.x+threadIdx.x;
     if(segment>=segments)return;
-    const u32 start=segment*segment_bytes,len=segment_length(segment,core,segment_bytes);
-    u32* tokens=matches+start;
-    u32 count=0;
-    for(u32 pos=0;pos<len;) {
-        const u32 match=tokens[pos],match_len=min(usable_match(match),len-pos);
-        const u32 next=pos+1<len ? min(usable_match(tokens[pos+1]),len-pos-1) : 0;
-        if(match_len>=3 && (match_len==match_limit || next<=match_len)) {
-            tokens[count++]=(match&0xffff0000u)|match_len;
-            pos+=match_len;
-        } else {
-            tokens[count++]=input[history+start+pos]&255;
-            ++pos;
+    const u32 start=segment*segment_bytes,end=min(core,start+segment_bytes);
+    u32 pos=start;
+    while(pos<end) {
+        const u32 token=choices[pos];
+        choices[pos]=token|path_mark;
+        pos+=advance_token(token);
+    }
+    exits[segment]=pos-end;
+}
+// Compute all possible incoming-offset transitions in parallel. On
+// coalescence with the canonical path, its already-known exit is exact.
+// Literal runs merge immediately; long-match runs have few transitions.
+extern "C" __global__ void resident_transitions(const u32* choices,const u32* exits,
+    u16* transitions,u32 core,u32 segment_bytes) {
+    const u32 segment=blockIdx.x,start=segment*segment_bytes,end=min(core,start+segment_bytes);
+    for(u32 incoming=threadIdx.x;incoming<path_states;incoming+=blockDim.x) {
+        u32 pos=min(end,start+incoming);
+        while(pos<end) {
+            const u32 token=choices[pos];
+            if(token&path_mark){pos=end+exits[segment];break;}
+            pos+=advance_token(token);
         }
+        transitions[segment*path_states+incoming]=static_cast<u16>(pos-end);
+    }
+}
+extern "C" __global__ void resident_scan_paths(const u16* transitions,u32* entries,u32 segments) {
+    if(threadIdx.x||blockIdx.x)return;
+    u32 offset=0;
+    for(u32 segment=0;segment<segments;++segment) {
+        entries[segment]=offset;
+        offset=transitions[segment*path_states+offset];
+    }
+    entries[segments]=0;
+}
+extern "C" __global__ void resident_parse_paths(const u32* choices,u32* tokens_all,
+    const u32* entries,u32* counts,u32 core,u32 segment_bytes,u32 segments) {
+    const u32 segment=blockIdx.x*blockDim.x+threadIdx.x;
+    if(segment>=segments)return;
+    const u32 start=segment*segment_bytes,end=min(core,start+segment_bytes);
+    u32* tokens=tokens_all+start;
+    u32 count=0;
+    for(u32 pos=start+entries[segment];pos<end;) {
+        const u32 token=choices[pos]&path_token_mask;
+        tokens[count++]=token;
+        pos+=advance_token(token);
     }
     counts[segment]=count;
 }
@@ -60,7 +108,7 @@ extern "C" __global__ void resident_partition(const u32* counts,u32* segment_blo
     if(threadIdx.x || blockIdx.x)return;
     u32 block=0,first=0,tokens=0;
     for(u32 i=0;i<segments;++i) {
-        if(i>first && (tokens+counts[i]>target_tokens || i-first>=max_segments)) {
+        if(i>first && counts[i] && (tokens+counts[i]>target_tokens || i-first>=max_segments)) {
             blocks[block].first=first;blocks[block].last=i;++block;first=i;tokens=0;
         }
         segment_blocks[i]=block;tokens+=counts[i];
@@ -91,8 +139,11 @@ extern "C" __global__ void resident_histogram(const u32* matches,const u32* coun
     u32* dest=histograms+segment_blocks[segment]*hist_count;
     for(u32 i=threadIdx.x;i<hist_count;i+=blockDim.x)if(histogram[i])atomicAdd(dest+i,histogram[i]);
 }
-__device__ __forceinline__ u32 block_core(const EntropyBlock& block,u32 core,u32 segment_bytes) {
-    return min(core,block.last*segment_bytes)-block.first*segment_bytes;
+__device__ __forceinline__ u32 actual_start(u32 segment,const u32* entries,u32 core,u32 segment_bytes) {
+    return min(core,segment*segment_bytes+entries[segment]);
+}
+__device__ __forceinline__ u32 block_core(const EntropyBlock& block,const u32* entries,u32 core,u32 segment_bytes) {
+    return actual_start(block.last,entries,core,segment_bytes)-actual_start(block.first,entries,core,segment_bytes);
 }
 __device__ __forceinline__ u32 fixed_code(u32 sym) {
     const u32 code=sym<144 ? 48+sym : sym<256 ? 400+sym-144 : sym<280 ? sym-256 : 192+sym-280;
@@ -110,7 +161,7 @@ __device__ void stored_header(unsigned char* output,u32 pos,u32 len,bool final) 
 // The header and trailer are written first, then independent segments fill
 // the non-overlapping bit ranges between them.
 extern "C" __global__ void resident_tree(EntropyBlock* blocks,const u32* block_count,u32* histograms,
-    u32* output,u32 core,u32 segment_bytes,u32 arena_stride,u32 final_window) {
+    u32* output,const u32* entries,u32 core,u32 segment_bytes,u32 arena_stride,u32 final_window) {
     const u32 index=blockIdx.x*blockDim.x+threadIdx.x,n=*block_count;
     if(index>=n)return;
     EntropyBlock& block=blocks[index];
@@ -135,7 +186,7 @@ extern "C" __global__ void resident_tree(EntropyBlock* blocks,const u32* block_c
     const u32 align_bits=final ? 0 : 3,align_bytes=final ? 0 : 4;
     const u32 dynamic_bytes=(dynamic_bits+align_bits+7)/8+align_bytes;
     const u32 fixed_bytes=(fixed_bits+align_bits+7)/8+align_bytes;
-    const u32 len=block_core(block,core,segment_bytes);
+    const u32 len=block_core(block,entries,core,segment_bytes);
     const u32 stored_bytes=len+5*((len+65534)/65535);
     u32* dest=output+static_cast<u64>(block.first)*(arena_stride/4);
     if(stored_bytes<=min(dynamic_bytes,fixed_bytes)) {
@@ -201,9 +252,9 @@ extern "C" __global__ void resident_bit_offsets(const EntropyBlock* blocks,const
     u32 pos=block.header_bits;
     for(u32 i=block.first;i<block.last;++i){offsets[i]=pos;pos+=bits[i];}
 }
-extern "C" __global__ void resident_write_segments(const u32* input,const u32* matches,const u32* counts,
+extern "C" __global__ void resident_write_segments(const u32* matches,const u32* counts,
     const u32* segment_blocks,const EntropyBlock* blocks,const u32* offsets,u32* output,
-    u32 core,u32 history,u32 segment_bytes,u32 arena_stride,u32 segments) {
+    u32 segment_bytes,u32 arena_stride,u32 segments) {
     const u32 segment=blockIdx.x*blockDim.x+threadIdx.x;
     if(segment>=segments)return;
     const EntropyBlock& block=blocks[segment_blocks[segment]];
@@ -223,14 +274,16 @@ extern "C" __global__ void resident_write_segments(const u32* input,const u32* m
 }
 // Stored payload is bulk-copied in parallel, excluding its five-byte headers.
 extern "C" __global__ void resident_write_stored(const u32* input,const u32* segment_blocks,
-    const EntropyBlock* blocks,u32* output,u32 core,u32 history,u32 segment_bytes,u32 arena_stride) {
+    const EntropyBlock* blocks,u32* output,const u32* entries,u32 core,u32 history,u32 segment_bytes,u32 arena_stride) {
     const u32 segment=blockIdx.x;
     const EntropyBlock& block=blocks[segment_blocks[segment]];
     if(block.mode)return;
     unsigned char* dest=reinterpret_cast<unsigned char*>(output)+static_cast<u64>(block.first)*arena_stride;
-    const u32 start=segment*segment_bytes,len=segment_length(segment,core,segment_bytes);
+    const u32 start=actual_start(segment,entries,core,segment_bytes);
+    const u32 len=actual_start(segment+1,entries,core,segment_bytes)-start;
+    const u32 block_start=actual_start(block.first,entries,core,segment_bytes);
     for(u32 i=threadIdx.x;i<len;i+=blockDim.x) {
-        const u32 pos=(segment-block.first)*segment_bytes+i;
+        const u32 pos=start-block_start+i;
         dest[pos+5*(pos/65535+1)]=static_cast<unsigned char>(input[history+start+i]);
     }
 }

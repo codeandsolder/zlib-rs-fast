@@ -161,7 +161,7 @@ __device__ void build_huffman(const u32* freq,u32 n,u32 max_bits,Huffman& out) {
     u16 heap[ll_count], parent[2*ll_count], order[ll_count];
     u32 used=0, leaves=0;
     for(u32 i=0;i<n;++i) {
-        out.lengths[i]=0;
+        out.lengths[i]=0;out.codes[i]=0;
         weights[i]=freq[i];
         if(freq[i]) {push_heap(heap,used,static_cast<u16>(i),weights);++leaves;}
     }
