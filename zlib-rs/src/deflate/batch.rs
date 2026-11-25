@@ -1085,6 +1085,68 @@ mod tests {
     }
 
     #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", feature = "parallel"))]
+    #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn mixed_gpu_batch_matches_sequential_partitions() -> Result<(), Box<dyn std::error::Error>> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let repeated = b"PDF compression repeated input ".repeat(20_000);
+        let varied = (0u8..=255).cycle().take(160_123).collect::<Vec<_>>();
+        let cpu_inputs = [b"".as_slice(), &repeated[..], &varied[..], b"small"];
+        let gpu_inputs = [&varied[..], b"short", &repeated[..], &varied[..]];
+        let caps = [64, 128, 0, 1024];
+        let config = DeflateConfig::new(9);
+        for workers in [1, 4] {
+            let pool = BatchCodec::new(NonZeroUsize::new(workers).ok_or("workers")?)?;
+            for window in [None, NonZeroUsize::new(65_537)] {
+                let run = |mixed: bool| -> Result<_, Box<dyn std::error::Error>> {
+                    let mut cpu_outputs = vec![Vec::new(); cpu_inputs.len()];
+                    let mut gpu_outputs = vec![Vec::new(); gpu_inputs.len()];
+                    let mut cpu_jobs = cpu_inputs
+                        .iter()
+                        .zip(&mut cpu_outputs)
+                        .zip(caps)
+                        .map(|((&input, output), cap)| BatchJob::with_vec(input, output, cap))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut gpu_jobs = gpu_inputs
+                        .iter()
+                        .zip(&mut gpu_outputs)
+                        .zip(caps)
+                        .map(|((&input, output), cap)| BatchJob::with_vec(input, output, cap))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let (cpu, gpu) = if mixed {
+                        pool.compress_mixed_gpu(
+                            &mut cpu_jobs,
+                            &mut gpu_jobs,
+                            config,
+                            &searcher,
+                            32,
+                            window,
+                        )?
+                    } else {
+                        let cpu = pool.compress(&mut cpu_jobs, config);
+                        let gpu = match window {
+                            Some(window) => pool.compress_gpu_windowed(
+                                &mut gpu_jobs,
+                                config,
+                                &searcher,
+                                32,
+                                window,
+                            )?,
+                            None => pool.compress_gpu(&mut gpu_jobs, config, &searcher, 32)?,
+                        };
+                        (cpu, gpu)
+                    };
+                    drop(cpu_jobs);
+                    drop(gpu_jobs);
+                    Ok((cpu, gpu, cpu_outputs, gpu_outputs))
+                };
+                assert_eq!(run(true)?, run(false)?);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a Vulkan compute adapter"]
     fn windowed_gpu_matches_whole_input_and_stops_on_exhausted_output(

@@ -205,6 +205,44 @@ impl BatchCodec {
         self.pool.current_num_threads()
     }
 
+    /// Run CPU-only and GPU-assisted streams concurrently on the same
+    /// owned worker pool. Independent destinations and results retain their
+    /// order within each partition; no additional CPU workers are created.
+    ///
+    /// When a window size is supplied, GPU search stops requesting windows
+    /// as soon as the respective capped stream exhausts its output.
+    ///
+    /// # Errors
+    /// Returns the same device search errors as the GPU-only batch methods.
+    #[cfg(feature = "gpu")]
+    pub fn compress_mixed_gpu(
+        &self,
+        cpu_jobs: &mut [BatchJob<'_>],
+        gpu_jobs: &mut [BatchJob<'_>],
+        config: crate::DeflateConfig,
+        searcher: &crate::GpuMatchSearcher,
+        search_budget: u32,
+        window_bytes: Option<core::num::NonZeroUsize>,
+    ) -> Result<
+        (
+            Vec<crate::BatchCompressResult>,
+            Vec<crate::BatchCompressResult>,
+        ),
+        crate::GpuMatchError,
+    > {
+        let mut gpu = || match window_bytes {
+            Some(window) => {
+                self.compress_gpu_windowed(gpu_jobs, config, searcher, search_budget, window)
+            }
+            None => self.compress_gpu(gpu_jobs, config, searcher, search_budget),
+        };
+        if cpu_jobs.is_empty() {
+            return Ok((Vec::new(), gpu()?));
+        }
+        let (cpu_results, gpu_results) = self.pool.join(|| self.compress(cpu_jobs, config), gpu);
+        Ok((cpu_results, gpu_results?))
+    }
+
     /// Decode streams concurrently. Each job's input consumption, initialized
     /// output, and return code match an independent whole-slice decode.
     pub fn decompress(
