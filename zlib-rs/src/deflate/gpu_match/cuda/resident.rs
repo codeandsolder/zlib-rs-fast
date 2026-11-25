@@ -398,7 +398,7 @@ impl ResidentEncoder {
             .map_err(failure)?;
         launch!(self, resident_histogram, all_segments, WORKGROUP_SIZE;
             &b.matches, &b.counts, &b.block_ids, &mut b.hist, &SEGMENT);
-        launch!(self, resident_tree, all_segments, 1;
+        launch!(self, resident_tree, segment_grid, 32;
             &mut b.blocks, &b.block_count, &mut b.hist, &mut b.arena, &b.entries,
             &g.core, &SEGMENT, &ARENA_STRIDE, &g.final_window, &g.strategy);
         launch!(self, resident_segment_bits, all_segments, WORKGROUP_SIZE;
