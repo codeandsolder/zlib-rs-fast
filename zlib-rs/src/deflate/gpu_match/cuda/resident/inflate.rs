@@ -387,7 +387,7 @@ impl ResidentEncoder {
 }
 
 impl ResidentPool {
-    pub(super) fn recompress_zlib(
+    pub(in crate::deflate::gpu_match::cuda) fn recompress_zlib(
         &self,
         source: &[u8],
         limit: usize,
