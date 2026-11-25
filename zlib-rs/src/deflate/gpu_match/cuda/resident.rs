@@ -497,7 +497,7 @@ impl ResidentEncoder {
         let mut device = self.host_input.lock().map_err(failure)?;
         reserve(&self.stream, &mut device, input.len().next_multiple_of(4))?;
         self.stream
-            .memcpy_htod(input, &mut device)
+            .memcpy_htod(input, &mut *device)
             .map_err(failure)?;
         let source = DeviceInput::new(&device, 0, g.size)?;
         let mut b = self.buffers.lock().map_err(failure)?;
@@ -889,7 +889,7 @@ mod tests {
         )?;
         encoder
             .stream
-            .memcpy_htod(&padded, &mut device)
+            .memcpy_htod(&padded, &mut *device)
             .map_err(failure)?;
         let source = DeviceInput::new(&device, 3, g.size)?;
         encoder.index_and_match(&mut b, g, source)?;
