@@ -108,6 +108,7 @@ struct TilePath {
     u32 length,required_history,step,status;
 };
 static_assert(sizeof(TileBlock)==24 && sizeof(TileTask)==8 && sizeof(TilePath)==16);
+static_assert(sizeof(TileTrees)==2392);
 
 extern "C" __global__ void inflate_prepare_tiles(const u8* input,const TileBlock* blocks,
     u32 count,TileTrees* trees) {
@@ -260,7 +261,7 @@ extern "C" __global__ void inflate_compose_segments(const TileBlock* blocks,cons
 // speculative interval contained a false header. No candidate assumption
 // is used here. The absolute output position checks the history bound.
 __device__ bool scan_emit(const u8* input,u64 end,u64& bit,u32& decoded,u32 window,u32 limit,
-    Segment* segments,u32 capacity,u32& count,bool& last,u32& status) {
+    Segment* segments,u32 capacity,u32& count,bool& last,u32& status,u32& serial_tokens) {
     const u64 header=bit;
     Reader r{input,0,bit,end};
     last=r.take(1)!=0;
@@ -284,6 +285,8 @@ __device__ bool scan_emit(const u8* input,u64 end,u64& bit,u32& decoded,u32 wind
     u64 start_bit=header_end;
     u32 start=decoded;
     while(r.good){
+        if(!serial_tokens){status=3;return false;}
+        --serial_tokens;
         const u64 token_bit=r.position;
         const u32 symbol=ll.decode(r);
         if(!r.good)return false;
@@ -325,7 +328,7 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
     info->window=window;
     const u64 body_end=(size-4)*8;
     u64 bit=16;
-    u32 decoded=0,count=0,candidate=0;
+    u32 decoded=0,count=0,candidate=0,serial_tokens=1u<<20;
     bool last=false;
     while(!last){
         if(bit>=body_end)return;
@@ -344,7 +347,7 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
             ++candidate;
         }else{
             u32 status=1;
-            if(!scan_emit(input,body_end,bit,decoded,window,limit,segments,capacity,count,last,status)){
+            if(!scan_emit(input,body_end,bit,decoded,window,limit,segments,capacity,count,last,status,serial_tokens)){
                 info->status=status;return;
             }
         }
@@ -353,5 +356,74 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
     const u32 adler=(static_cast<u32>(input[size-4])<<24)|(static_cast<u32>(input[size-3])<<16)|
         (static_cast<u32>(input[size-2])<<8)|input[size-1];
     *info={0,count,decoded,window,adler,0};
+}
+} // namespace resident_inflate
+
+namespace resident_inflate {
+// Ordered compaction of validated dynamic headers. The bitmap is one bit
+// per compressed bit; unlike an atomic append, compaction preserves order
+// without a host sort. Each chunk covers 128 words (four warps).
+constexpr u32 header_chunk_words=128;
+extern "C" __global__ void inflate_validate_bitmap(const u8* input,u64 end,
+    const u64* candidates,u32 count,u32* bitmap) {
+    const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=count)return;
+    const u64 bit=candidates[i];
+    Reader r{input,0,bit,end};
+    r.take(1);
+    if(r.take(2)!=2)return;
+    Tree ll,dd;
+    if(tables(r,2,ll,dd))atomicOr(bitmap+bit/32,1u<<(bit%32));
+}
+extern "C" __global__ void inflate_count_header_chunks(const u32* bitmap,u32 words,u32* offsets) {
+    const u32 i=blockIdx.x*header_chunk_words+threadIdx.x;
+    u32 count=i<words?__popc(bitmap[i]):0;
+    for(u32 delta=16;delta;delta/=2)count+=__shfl_down_sync(0xffffffffu,count,delta);
+    __shared__ u32 warp_counts[4];
+    if(threadIdx.x%32==0)warp_counts[threadIdx.x/32]=count;
+    __syncthreads();
+    if(!threadIdx.x)offsets[blockIdx.x]=warp_counts[0]+warp_counts[1]+warp_counts[2]+warp_counts[3];
+}
+extern "C" __global__ void inflate_header_offsets(u32* offsets,u32 chunks) {
+    if(threadIdx.x||blockIdx.x)return;
+    u32 sum=0;
+    for(u32 i=0;i<chunks;++i){const u32 n=offsets[i];offsets[i]=sum;sum+=n;}
+    offsets[chunks]=sum;
+}
+extern "C" __global__ void inflate_scatter_headers(const u32* bitmap,u32 words,const u32* offsets,u64* headers) {
+    const u32 i=blockIdx.x*header_chunk_words+threadIdx.x;
+    u32 bits=i<words?bitmap[i]:0;
+    const u32 count=__popc(bits),lane=threadIdx.x%32,warp=threadIdx.x/32;
+    u32 prefix=count;
+    for(u32 delta=1;delta<32;delta*=2){
+        const u32 prev=__shfl_up_sync(0xffffffffu,prefix,delta);
+        if(lane>=delta)prefix+=prev;
+    }
+    __shared__ u32 warp_counts[4];
+    if(lane==31)warp_counts[warp]=prefix;
+    __syncthreads();
+    u32 slot=offsets[blockIdx.x]+prefix-count;
+    for(u32 j=0;j<warp;++j)slot+=warp_counts[j];
+    while(bits){
+        const u32 bit=__ffs(bits)-1;
+        headers[slot++]=static_cast<u64>(i)*32+bit;
+        bits&=bits-1;
+    }
+}
+extern "C" __global__ void inflate_make_tile_specs(const u64* headers,u32 count,u64 end,
+    TileBlock* blocks,u32* total_tiles) {
+    if(threadIdx.x||blockIdx.x)return;
+    u32 first=0;
+    for(u32 i=0;i<count;++i){
+        const u64 bit=headers[i],upper=i+1<count?headers[i+1]:end;
+        const u32 tiles=static_cast<u32>((upper-bit+tile_bits-1)/tile_bits);
+        blocks[i]={bit,upper,first,tiles};first+=tiles;
+    }
+    *total_tiles=first;
+}
+extern "C" __global__ void inflate_make_tile_tasks(const TileBlock* blocks,TileTask* tasks) {
+    const TileBlock b=blocks[blockIdx.x];
+    for(u32 tile=threadIdx.x;tile<b.tile_count;tile+=blockDim.x)
+        tasks[b.first_tile+tile]={blockIdx.x,tile};
 }
 } // namespace resident_inflate
