@@ -156,7 +156,7 @@ impl CudaBackend {
         input: &[u8],
         options: GpuTranscodeOptions,
         distance: u32,
-    ) -> Result<GpuTranscodeResult, GpuMatchError> {
+    ) -> Result<Option<GpuTranscodeResult>, GpuMatchError> {
         self.resident
             .as_ref()
             .ok_or_else(|| GpuMatchError("resident CUDA encoder not selected".into()))?

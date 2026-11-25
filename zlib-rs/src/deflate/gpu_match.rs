@@ -46,6 +46,8 @@ pub struct GpuTranscodeResult {
 pub struct GpuTranscodeOptions {
     pub output_limit: usize,
     pub decoded_limit: u32,
+    /// Return no job result if the source decodes to fewer bytes.
+    pub minimum_decoded_len: u32,
     pub config: crate::DeflateConfig,
     pub search_budget: u32,
     pub window: core::num::NonZeroUsize,
@@ -1079,7 +1081,7 @@ impl GpuMatchSearcher {
         &self,
         input: &[u8],
         options: GpuTranscodeOptions,
-    ) -> Result<GpuTranscodeResult, GpuMatchError> {
+    ) -> Result<Option<GpuTranscodeResult>, GpuMatchError> {
         if !self.supports_zlib_transcode(options.config) {
             return Err(GpuMatchError(
                 "resident CUDA zlib transcoding is unavailable".into(),

@@ -29,6 +29,7 @@ pub struct InflateSegment {
 
 /// A validated structural index of a single RFC 1950 member.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "__internal-api"))]
 pub struct InflateIndex {
     pub segments: Vec<InflateSegment>,
     pub decoded_len: u32,
@@ -39,7 +40,7 @@ pub struct InflateIndex {
 struct Counter {
     position: usize,
     limit: usize,
-    window: usize,
+    window: u32,
 }
 
 impl FastDecodeOutput for Counter {
@@ -60,7 +61,7 @@ impl FastDecodeOutput for Counter {
         distance: usize,
         length: usize,
     ) -> Result<(), &'static str> {
-        if distance > self.position || distance > self.window || distance == 0 {
+        if distance > self.position || distance > self.window as usize || distance == 0 {
             return Err("invalid distance too far back\0");
         }
         self.position = self
@@ -179,7 +180,7 @@ impl<'a> IndexScanner<'a> {
         let counter = Counter {
             position: 0,
             limit: output_limit as usize,
-            window: state.dmax,
+            window: u32::try_from(state.dmax).map_err(|_| ReturnCode::DataError)?,
         };
         Ok(Self {
             input,
@@ -201,9 +202,8 @@ impl<'a> IndexScanner<'a> {
     pub(crate) const fn adler(&self) -> Option<u32> {
         self.adler
     }
-    pub(crate) fn window(&self) -> u32 {
-        // RFC 1950 validated the window size before constructing the scanner.
-        self.counter.window.try_into().unwrap_or(32_768)
+    pub(crate) const fn window(&self) -> u32 {
+        self.counter.window
     }
 
     fn bit(&self) -> u64 {
@@ -305,6 +305,7 @@ impl<'a> IndexScanner<'a> {
 /// # Errors
 /// Returns DataError for invalid/truncated members or distances, BufError when
 /// the decoded size or descriptor limit is exceeded.
+#[cfg(any(test, feature = "__internal-api"))]
 pub fn index_zlib(
     input: &[u8],
     output_limit: u32,

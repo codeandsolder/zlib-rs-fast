@@ -8,7 +8,7 @@ use super::{
 use crate::{
     deflate::gpu_match::{GpuMatchError, GpuTranscodeOptions, GpuTranscodeResult},
     inflate::gpu_index::{IndexScanner, InflateSegment},
-    DeflateConfig, ReturnCode,
+    ReturnCode,
 };
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -450,26 +450,40 @@ impl ResidentPool {
         source: &[u8],
         options: GpuTranscodeOptions,
         distance: u32,
-    ) -> Result<GpuTranscodeResult, GpuMatchError> {
-        let scan = match ScanAhead::new(source, options.decoded_limit) {
+    ) -> Result<Option<GpuTranscodeResult>, GpuMatchError> {
+        if options.minimum_decoded_len > options.decoded_limit {
+            return Ok(None);
+        }
+        let mut scan = match ScanAhead::new(source, options.decoded_limit) {
             Ok(scan) => scan,
             Err(code) => {
-                return Ok(GpuTranscodeResult {
+                return Ok(Some(GpuTranscodeResult {
                     output: Vec::new(),
                     decoded_len: None,
                     decoded_bytes_indexed: 0,
                     code,
-                })
+                }))
             }
         };
+        if options.minimum_decoded_len != 0 {
+            let minimum = options.minimum_decoded_len as usize;
+            if let Err(code) = scan.fill_to(minimum - 1) {
+                return Ok(Some(scan.result(Vec::new(), code)));
+            }
+            if scan.scanner.decoded() < minimum {
+                return Ok(None);
+            }
+        }
         self.acquire()?
             .transcode(source, scan, options, distance, self.index_tiles)
+            .map(Some)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeflateConfig;
     use crate::{
         compress_bound, compress_slice, compress_slices_batch_gpu_windowed, decompress_slice,
         BatchJob, GpuMatchSearcher, InflateConfig, Strategy,
@@ -530,12 +544,15 @@ mod tests {
                 let options = |cap, decoded_limit| GpuTranscodeOptions {
                     output_limit: cap,
                     decoded_limit,
+                    minimum_decoded_len: 0,
                     config,
                     search_budget: 128,
                     window,
                 };
                 for cap in [0, 1, expected.len() / 2, expected.len(), expected.len() + 1] {
-                    let actual = searcher.recompress_zlib(source, options(cap, max))?;
+                    let actual = searcher
+                        .recompress_zlib(source, options(cap, max))?
+                        .ok_or("unexpected transcode routing")?;
                     if actual.code == ReturnCode::Ok {
                         assert_eq!(actual.decoded_len, Some(input.len()));
                     }
@@ -552,18 +569,22 @@ mod tests {
                 let mut corrupt = source.to_vec();
                 let last = corrupt.last_mut().ok_or("trailer")?;
                 *last ^= 1;
-                let result =
-                    searcher.recompress_zlib(&corrupt, options(expected.len() + 512, max))?;
+                let result = searcher
+                    .recompress_zlib(&corrupt, options(expected.len() + 512, max))?
+                    .ok_or("unexpected transcode routing")?;
                 assert_eq!(result.code, ReturnCode::DataError);
                 assert!(result.output.is_empty());
-                let truncated = searcher.recompress_zlib(
-                    &source[..source.len() - 1],
-                    options(expected.len() + 512, max),
-                )?;
+                let truncated = searcher
+                    .recompress_zlib(
+                        &source[..source.len() - 1],
+                        options(expected.len() + 512, max),
+                    )?
+                    .ok_or("unexpected transcode routing")?;
                 assert_eq!(truncated.code, ReturnCode::DataError);
                 if max != 0 {
-                    let bounded =
-                        searcher.recompress_zlib(source, options(expected.len() + 512, max - 1))?;
+                    let bounded = searcher
+                        .recompress_zlib(source, options(expected.len() + 512, max - 1))?
+                        .ok_or("unexpected transcode routing")?;
                     assert_eq!(bounded.code, ReturnCode::BufError);
                 }
             }

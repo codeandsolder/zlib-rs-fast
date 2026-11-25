@@ -48,16 +48,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let run_transcode = || -> Result<_, Box<dyn std::error::Error>> {
             let t = Instant::now();
-            let result = searcher.recompress_zlib(
-                &source,
-                GpuTranscodeOptions {
-                    output_limit: cap,
-                    decoded_limit: u32::try_from(decoded.len())?,
-                    config,
-                    search_budget: budget,
-                    window,
-                },
-            )?;
+            let result = searcher
+                .recompress_zlib(
+                    &source,
+                    GpuTranscodeOptions {
+                        output_limit: cap,
+                        decoded_limit: u32::try_from(decoded.len())?,
+                        minimum_decoded_len: 0,
+                        config,
+                        search_budget: budget,
+                        window,
+                    },
+                )?
+                .ok_or("unexpected transcode routing")?;
             println!(
                 "{round},transcode,{:.3},{},{},{:?}",
                 t.elapsed().as_secs_f64() * 1000.0,
