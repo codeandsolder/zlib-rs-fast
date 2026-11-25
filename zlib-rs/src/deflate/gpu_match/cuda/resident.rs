@@ -291,6 +291,8 @@ struct LaneState {
     idle: Vec<CachedLane>,
     active: usize,
     reserved: usize,
+    peak_reserved: usize,
+    peak_active: usize,
 }
 
 /// Independent CUDA streams share a VRAM budget. Small jobs can occupy
@@ -355,6 +357,21 @@ impl ResidentPool {
         })
     }
 
+    pub(super) fn stats(&self) -> crate::GpuResidentStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::GpuResidentStats {
+            memory_budget_bytes: self.budget,
+            reserved_bytes: state.reserved,
+            peak_reserved_bytes: state.peak_reserved,
+            active_lanes: state.active,
+            idle_lanes: state.idle.len(),
+            peak_active_lanes: state.peak_active,
+        }
+    }
+
     fn acquire(&self, capacity: LaneCapacity) -> Result<Lane<'_>, GpuMatchError> {
         let bytes = capacity.bytes()?;
         let mut state = self.state.lock().map_err(failure)?;
@@ -368,6 +385,7 @@ impl ResidentPool {
             {
                 let cached = state.idle.swap_remove(index);
                 state.active += 1;
+                state.peak_active = state.peak_active.max(state.active);
                 return Ok(Lane { pool: self, cached });
             }
             if state.active < MAX_LANES {
@@ -398,6 +416,8 @@ impl ResidentPool {
                     )?);
                     state.reserved += bytes;
                     state.active += 1;
+                    state.peak_active = state.peak_active.max(state.active);
+                    state.peak_reserved = state.peak_reserved.max(state.reserved);
                     return Ok(Lane {
                         pool: self,
                         cached: CachedLane {
@@ -958,6 +978,36 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_resident_admission_reclaims_idle_size_classes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (backend, _) = super::super::CudaBackend::new(0, true)?;
+        let pool = backend.resident.as_deref().ok_or("resident encoder")?;
+        let small = LaneCapacity::compression(MIB);
+        let small_bytes = small.bytes()?;
+        let count = (pool.budget / small_bytes).clamp(1, MAX_LANES);
+        let leases = (0..count)
+            .map(|_| pool.acquire(small))
+            .collect::<Result<Vec<_>, _>>()?;
+        let stats = pool.stats();
+        assert_eq!(stats.active_lanes, count);
+        assert_eq!(stats.peak_active_lanes, count);
+        assert_eq!(stats.reserved_bytes, count * small_bytes);
+        drop(leases);
+        assert_eq!(pool.stats().idle_lanes, count);
+        let large = LaneCapacity::transcode(16 * MIB, 8 * MIB);
+        let lease = pool.acquire(large)?;
+        let stats = pool.stats();
+        assert_eq!(stats.active_lanes, 1);
+        assert!(stats.reserved_bytes <= pool.budget || stats.idle_lanes == 0);
+        assert!(stats.idle_lanes < MAX_LANES);
+        assert!(lease.cached.capacity.fits(large));
+        drop(lease);
+        assert_eq!(pool.stats().active_lanes, 0);
         Ok(())
     }
 

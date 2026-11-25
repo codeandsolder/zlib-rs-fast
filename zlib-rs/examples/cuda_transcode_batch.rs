@@ -77,14 +77,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             totals[3] += result.source_bytes_uploaded;
             totals[4] += result.descriptor_bytes_uploaded;
         }
+        let stats = searcher.cuda_resident_stats().ok_or("resident stats")?;
         println!(
-            "{workers},{round},{elapsed:.3},{},{},{},{},{},{}",
+            "{workers},{round},{elapsed:.3},{},{},{},{},{},{},{},{},{}",
             entries.len(),
             totals[0],
             totals[1],
             totals[2],
             totals[3],
-            totals[4]
+            totals[4],
+            stats.peak_active_lanes,
+            stats.peak_reserved_bytes,
+            stats.memory_budget_bytes
         );
     }
     Ok(())

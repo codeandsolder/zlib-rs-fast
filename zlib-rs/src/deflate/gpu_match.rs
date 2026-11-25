@@ -50,6 +50,19 @@ pub struct GpuTranscodeResult {
     pub code: crate::ReturnCode,
 }
 
+/// Session-wide CUDA resident workspace statistics. Reserved bytes are
+/// conservative admission bounds, not a measurement of actual allocations.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuResidentStats {
+    pub memory_budget_bytes: usize,
+    pub reserved_bytes: usize,
+    pub peak_reserved_bytes: usize,
+    pub active_lanes: usize,
+    pub idle_lanes: usize,
+    pub peak_active_lanes: usize,
+}
+
 /// Bounds and compression settings for a compressed-input CUDA job.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy)]
@@ -1075,14 +1088,25 @@ impl GpuMatchSearcher {
         }
     }
 
+    /// Return cumulative resident CUDA lane admission statistics, when
+    /// using the native resident backend.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_resident_stats(&self) -> Option<GpuResidentStats> {
+        match &self.backend {
+            GpuBackend::Cuda(backend) => backend.resident_stats(),
+            GpuBackend::Vulkan(_) => None,
+        }
+    }
+
     /// Whether this adapter supports compressed-input zlib recompression.
     #[cfg(feature = "cuda")]
     pub fn supports_zlib_transcode(&self, config: crate::DeflateConfig) -> bool {
         (8..=15).contains(&config.window_bits) && self.supports_resident(config)
     }
 
-    /// Structurally scan a zlib member on the host, then decode and recompress
-    /// it in bounded GPU windows. On success the source Adler is verified.
+    /// Index, decode and recompress a zlib member in bounded GPU windows.
+    /// A resource-bounded device index falls back to the exact streaming
+    /// structural scanner when necessary. On success the source Adler is verified.
     /// A cap-exhausted prefix is returned without decoding the remaining tail.
     /// Returns None if the decoded source is below the configured minimum.
     /// # Errors

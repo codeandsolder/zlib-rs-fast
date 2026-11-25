@@ -56,6 +56,10 @@ fn reserve<T: DeviceRepr + ValidAsZeroBits>(
 }
 
 impl CudaBackend {
+    pub(super) fn resident_stats(&self) -> Option<super::GpuResidentStats> {
+        self.resident.as_deref().map(resident::ResidentPool::stats)
+    }
+
     #[expect(
         unsafe_code,
         reason = "cudarc requires unsafe dynamic library availability probes"

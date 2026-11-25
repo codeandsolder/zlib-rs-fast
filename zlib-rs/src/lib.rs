@@ -60,7 +60,7 @@ pub use deflate::{
     GpuMatchSearcher, GpuMatchTable,
 };
 #[cfg(feature = "cuda")]
-pub use deflate::{GpuTranscodeOptions, GpuTranscodeResult};
+pub use deflate::{GpuResidentStats, GpuTranscodeOptions, GpuTranscodeResult};
 pub use inflate::decompress_slice;
 
 macro_rules! traceln {

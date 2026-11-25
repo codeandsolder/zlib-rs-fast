@@ -49,7 +49,7 @@ pub use batch::{compress_slices_batch_gpu, compress_slices_batch_gpu_windowed};
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 #[cfg(feature = "cuda")]
-pub use gpu_match::{GpuTranscodeOptions, GpuTranscodeResult};
+pub use gpu_match::{GpuResidentStats, GpuTranscodeOptions, GpuTranscodeResult};
 
 pub type Pos = u16;
 
