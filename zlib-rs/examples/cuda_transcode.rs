@@ -42,10 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t.elapsed().as_secs_f64() * 1000.0,
                 decoded.len(),
                 result.written,
-                result.code,
-                result.decoded_bytes_processed,
-                result.source_bytes_uploaded,
-                result.descriptor_bytes_uploaded
+                result.code
             );
             Ok(result)
         };
@@ -69,7 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t.elapsed().as_secs_f64() * 1000.0,
                 result.decoded_len.unwrap_or(result.decoded_bytes_indexed),
                 result.output.len(),
-                result.code
+                result.code,
+                result.decoded_bytes_processed,
+                result.source_bytes_uploaded,
+                result.descriptor_bytes_uploaded
             );
             Ok(result)
         };
