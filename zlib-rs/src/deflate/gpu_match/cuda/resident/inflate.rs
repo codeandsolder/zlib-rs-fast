@@ -774,6 +774,17 @@ mod tests {
         Ok(())
     }
 
+    fn check_resident_index(result: &GpuTranscodeResult, source: &[u8], cap: usize) {
+        if cap > 2 {
+            assert!(
+                result.device_indexed,
+                "valid fixture must use the GPU index"
+            );
+            assert_eq!(result.source_bytes_uploaded, source.len());
+            assert_eq!(result.descriptor_bytes_uploaded, 0);
+        }
+    }
+
     #[test]
     #[ignore = "requires CUDA hardware and NVRTC"]
     fn cuda_transcode_matches_raw_encoder_and_checks_source(
@@ -846,6 +857,7 @@ mod tests {
                     let actual = searcher
                         .recompress_zlib(source, options(cap, max))?
                         .ok_or("unexpected transcode routing")?;
+                    check_resident_index(&actual, source, cap);
                     if actual.code == ReturnCode::Ok {
                         assert_eq!(actual.decoded_len, Some(input.len()));
                     }

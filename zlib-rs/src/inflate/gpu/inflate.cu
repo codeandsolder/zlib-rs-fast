@@ -41,7 +41,7 @@ struct Tree {
     u16 lookup[lookup_size];
     u16 counts[16], first[16], offsets[16];
     u32 width;
-    __device__ bool build(const u8* lengths,u32 n,bool allow_empty=false,bool allow_single=true) {
+    __device__ bool build(const u8* lengths,u32 n,bool allow_empty=false,bool allow_single=true,bool materialize=true) {
         for(u32 i=0;i<=max_bits;++i)counts[i]=first[i]=offsets[i]=0;
         width=0;
         for(u32 i=0;i<n;++i){
@@ -58,6 +58,7 @@ struct Tree {
             offset+=counts[i];
         }
         if(code+counts[width]!=(1u<<width) && !(allow_single&&width==1&&offset==1))return false;
+        if(!materialize)return true;
         u16 next[16];
         for(u32 i=0;i<=width;++i)next[i]=offsets[i];
         for(u32 i=0;i<n;++i)if(lengths[i])symbols[next[lengths[i]]++]=static_cast<u16>(i);
@@ -91,13 +92,13 @@ struct Tree {
     }
 };
 __device__ __constant__ u8 cl_order[19]={16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
-__device__ bool tables(Reader& r,u32 type,Tree& ll,Tree& dd) {
+__device__ bool tables(Reader& r,u32 type,Tree& ll,Tree& dd,bool materialize=true) {
     u8 lengths[320]={};
     if(type==1){
         for(u32 i=0;i<288;++i)lengths[i]=i<144?8:i<256?9:i<280?7:8;
-        if(!ll.build(lengths,288))return false;
+        if(!ll.build(lengths,288,false,true,materialize))return false;
         for(u32 i=0;i<32;++i)lengths[i]=5;
-        return dd.build(lengths,32);
+        return dd.build(lengths,32,false,true,materialize);
     }
     const u32 nl=r.take(5)+257,nd=r.take(5)+1,nc=r.take(4)+4;
     if(nl>286 || nd>30 || nc>19)return false;
@@ -116,7 +117,7 @@ __device__ bool tables(Reader& r,u32 type,Tree& ll,Tree& dd) {
             for(u32 j=0;j<n;++j)lengths[i++]=value;
         }
     }
-    return r.good && lengths[256] && ll.build(lengths,nl) && dd.build(lengths+nl,nd,true);
+    return r.good && lengths[256] && ll.build(lengths,nl,false,true,materialize) && dd.build(lengths+nl,nd,true,true,materialize);
 }
 __device__ bool match(Reader& r,const Tree& dd,u32 code,u32& length,u32& dist) {
     if(code<257||code>285)return false;

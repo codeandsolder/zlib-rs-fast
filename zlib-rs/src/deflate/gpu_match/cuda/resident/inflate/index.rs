@@ -175,7 +175,7 @@ impl Indexer {
         launch!(self,inflate_header_offsets,(1,1,1),1;&mut w.offsets,&chunks);
         let valid = self
             .stream
-            .clone_dtoh(&w.offsets.slice(chunks as usize..chunks as usize + 1))
+            .clone_dtoh(&w.offsets.slice(chunks as usize..=chunks as usize))
             .map_err(failure)?[0];
         if valid as usize > MAX_HEADERS {
             return Ok(None);
@@ -301,7 +301,8 @@ fn validate_groups(
     let mut groups = Vec::with_capacity(words.len() / 4);
     let mut position = 0;
     let mut offset = 0;
-    for g in words.chunks_exact(4) {
+    let (records, remainder) = words.as_chunks::<4>();
+    for g in records {
         let count = g[1];
         let target = (u64::from(position) / u64::from(window) + 1) * u64::from(window);
         if g[0] as usize != offset
@@ -325,7 +326,7 @@ fn validate_groups(
             .ok_or_else(|| GpuMatchError("CUDA group offset overflow".into()))?;
         position = g[3];
     }
-    if offset != segments || position != decoded || words.len() % 4 != 0 {
+    if offset != segments || position != decoded || !remainder.is_empty() {
         return Err(GpuMatchError(
             "CUDA decode groups do not cover member".into(),
         ));

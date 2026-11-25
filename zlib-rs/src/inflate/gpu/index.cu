@@ -29,66 +29,14 @@ extern "C" __global__ void inflate_header_candidates(const u32* input,u64 end,
     const u32 slot=atomicAdd(count,1u);
     if(slot<capacity)candidates[slot]=i;
 }
-// Fully validate candidate code trees before attempting any token walk.
-extern "C" __global__ void inflate_validate_headers(const u8* input,u64 end,
-    const u64* candidates,u32 count,u64* validated,u32 capacity,u32* valid_count) {
-    const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i>=count)return;
-    const u64 bit=candidates[i];
-    Reader r{input,0,bit,end};
-    r.take(1);
-    if(r.take(2)!=2)return;
-    Tree ll,dd;
-    if(!tables(r,2,ll,dd))return;
-    const u32 slot=atomicAdd(valid_count,1u);
-    if(slot<capacity)validated[slot]=bit;
-}
-// Count tokens without materializing output. A valid candidate describes a
-// block-relative result; required_history is the smallest amount of decoded
-// history that makes every distance legal. A caller must check that when
-// assembling the real chain. Length and bit bounds contain false positives.
+// Exact block-relative extents. Required history is validated when the
+// real chain reaches a candidate.
 struct BlockExtent {
     u64 header_bit,header_end_bit,end_bit;
     u32 length,required_history,kind,last,status,reserved;
 };
 static_assert(sizeof(BlockExtent)==48);
-__device__ BlockExtent scan_extent(const u8* input,u64 end,u64 bit,u32 limit,u32 window) {
-    BlockExtent out{bit,0,0,0,0,0,0,1,0};
-    Reader r{input,0,bit,end};
-    out.last=r.take(1);out.kind=r.take(2);
-    if(!r.good || out.kind==3)return out;
-    if(out.kind==0){
-        r.position=(r.position+7)&~7ull;
-        const u32 length=r.take(16),inverse=r.take(16);
-        if(!r.good || (length^inverse)!=65535 || length>limit)return out;
-        out.header_end_bit=r.position;
-        if(r.position+8ull*length>end)return out;
-        out.length=length;out.end_bit=r.position+8ull*length;out.status=0;
-        return out;
-    }
-    Tree ll,dd;
-    if(!tables(r,out.kind,ll,dd))return out;
-    out.header_end_bit=r.position;
-    while(r.good){
-        const u32 symbol=ll.decode(r);
-        if(!r.good)return out;
-        if(symbol==256){out.end_bit=r.position;out.status=0;return out;}
-        u32 length=1,distance=0;
-        if(symbol>=257 && !match(r,dd,symbol,length,distance))return out;
-        if(length>limit-out.length || distance>window)return out;
-        if(distance>out.length)out.required_history=max(out.required_history,distance-out.length);
-        out.length+=length;
-    }
-    return out;
-}
-extern "C" __global__ void inflate_candidate_extents(const u8* input,u64 end,
-    const u64* candidates,u32 count,u32 limit,u32 window,BlockExtent* extents) {
-    const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<count)extents[i]=scan_extent(input,end,candidates[i],limit,window);
-}
-} // namespace resident_inflate
 
-namespace resident_inflate {
 // Speculative tiles are bounded by the next plausible header. Such a
 // header may occur inside a real entropy block: reaching the bound without
 // EOB is not success. The exact scanner can then extend the interval.
@@ -172,33 +120,7 @@ extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* b
         paths[static_cast<u64>(blockIdx.x)*max_token_bits+threadIdx.x]={length,need,position,status};
     }
 }
-extern "C" __global__ void inflate_compose_tiles(const TileBlock* blocks,const TileTrees* trees,
-    const TilePath* paths,u32 count,u32 limit,BlockExtent* extents) {
-    const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i>=count)return;
-    const TileBlock b=blocks[i];
-    const TileTrees& t=trees[i];
-    BlockExtent out{b.bit,t.payload,0,0,0,2,t.last,1,0};
-    if(!t.status){
-        u32 entry=0;
-        for(u32 tile=0;tile<b.tile_count;++tile){
-            const u64 start=t.payload+static_cast<u64>(tile)*tile_bits;
-            if(start>=b.upper)break;
-            const TilePath path=paths[(static_cast<u64>(b.first_tile)+tile)*max_token_bits+entry];
-            if(path.status==2 || path.length>limit-out.length)break;
-            if(path.required_history>out.length)
-                out.required_history=max(out.required_history,path.required_history-out.length);
-            out.length+=path.length;
-            if(path.status==1){out.end_bit=start+path.step;out.status=0;break;}
-            if(path.step<tile_bits || path.step>=tile_bits+max_token_bits)break;
-            entry=path.step-tile_bits;
-        }
-    }
-    extents[i]=out;
-}
-} // namespace resident_inflate
 
-namespace resident_inflate {
 // GPU index ABI. Segments have the same layout as the bounded decoder's
 // descriptors; intermediate descriptors use block-relative output offsets.
 constexpr u32 segment_bytes=128*1024;
@@ -357,9 +279,7 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
         (static_cast<u32>(input[size-2])<<8)|input[size-1];
     *info={0,count,decoded,window,adler,0};
 }
-} // namespace resident_inflate
 
-namespace resident_inflate {
 // Ordered compaction of validated dynamic headers. The bitmap is one bit
 // per compressed bit; unlike an atomic append, compaction preserves order
 // without a host sort. Each chunk covers 128 words (four warps).
@@ -373,7 +293,7 @@ extern "C" __global__ void inflate_validate_bitmap(const u8* input,u64 end,
     r.take(1);
     if(r.take(2)!=2)return;
     Tree ll,dd;
-    if(tables(r,2,ll,dd))atomicOr(bitmap+bit/32,1u<<(bit%32));
+    if(tables(r,2,ll,dd,false))atomicOr(bitmap+bit/32,1u<<(bit%32));
 }
 extern "C" __global__ void inflate_count_header_chunks(const u32* bitmap,u32 words,u32* offsets) {
     const u32 i=blockIdx.x*header_chunk_words+threadIdx.x;
@@ -426,9 +346,7 @@ extern "C" __global__ void inflate_make_tile_tasks(const TileBlock* blocks,TileT
     for(u32 tile=threadIdx.x;tile<b.tile_count;tile+=blockDim.x)
         tasks[b.first_tile+tile]={blockIdx.x,tile};
 }
-} // namespace resident_inflate
 
-namespace resident_inflate {
 struct DecodeGroup {
     u32 offset,count,start,end;
 };
