@@ -543,6 +543,9 @@ impl ResidentPool {
             }
             checksum.update(&first, end - start);
             if let Some(second) = second {
+                if output.len() == limit {
+                    return Ok((output, ReturnCode::BufError));
+                }
                 // Commit only in logical input order. The second fragment
                 // was bounded to the prior remaining capacity; truncate
                 // to the new remaining capacity if the first consumed it.
@@ -720,6 +723,40 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
         })?;
         assert_eq!(serial, parallel);
+        #[cfg(feature = "parallel")]
+        {
+            let workers = rayon_core::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()?;
+            for (input, (full, code)) in inputs.iter().zip(&serial) {
+                assert_eq!(*code, ReturnCode::Ok);
+                for cap in [0, 1, full.len() / 2, full.len(), full.len() + 1] {
+                    let actual = workers.install(|| {
+                        pool.compress(
+                            input,
+                            cap,
+                            DeflateConfig::new(9),
+                            128,
+                            ResidentSchedule {
+                                window,
+                                parallel: true,
+                            },
+                            32_506,
+                        )
+                    })?;
+                    assert_eq!(actual.0, full[..cap.min(full.len())]);
+                    assert_eq!(
+                        actual.1,
+                        if cap < full.len() {
+                            ReturnCode::BufError
+                        } else {
+                            ReturnCode::Ok
+                        }
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
