@@ -55,6 +55,10 @@ struct TileTrees {
 struct TilePath {
     u32 length,required_history,step,status;
 };
+struct TileSelection {
+    u32 entry,offset,count,end;
+};
+static_assert(sizeof(TileSelection)==16);
 static_assert(sizeof(TileBlock)==24 && sizeof(TileTask)==8 && sizeof(TilePath)==16);
 static_assert(sizeof(TileTrees)==2392);
 
@@ -105,7 +109,7 @@ extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* b
     }
     __syncthreads();
     if(threadIdx.x<max_token_bits){
-        u32 position=threadIdx.x,length=0,need=0,status=0;
+        u32 position=threadIdx.x,length=0,need=0,status=0,tokens=0;
         if(position>=size)status=2;
         while(position<size){
             const u32 edge=edges[position],step=edge&63;
@@ -114,10 +118,10 @@ extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* b
             position+=step;
             if(!bytes){status=1;break;}
             if(distance>length)need=max(need,distance-length);
-            length+=bytes;
+            length+=bytes;++tokens;
         }
         if(status==0 && size<tile_bits)status=2;
-        paths[static_cast<u64>(blockIdx.x)*max_token_bits+threadIdx.x]={length,need,position,status};
+        paths[static_cast<u64>(blockIdx.x)*max_token_bits+threadIdx.x]={length,need,position,status|(tokens<<2)};
     }
 }
 
@@ -125,9 +129,9 @@ extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* b
 // descriptors; intermediate descriptors use block-relative output offsets.
 constexpr u32 segment_bytes=128*1024;
 struct IndexInfo {
-    u32 status,count,decoded,window,adler,reserved;
+    u32 status,count,decoded,window,adler,groups,tokens,reserved;
 };
-static_assert(sizeof(IndexInfo)==24);
+static_assert(sizeof(IndexInfo)==32);
 
 __device__ bool emit_segment(Segment* out,u32 capacity,u32& count,
     u64 header,u64 header_end,u64 start_bit,u64 end_bit,
@@ -138,12 +142,22 @@ __device__ bool emit_segment(Segment* out,u32 capacity,u32& count,
     return true;
 }
 
+__device__ bool emit_token_segment(Segment* dest,TokenRange* ranges,u32 capacity,u32& emitted,
+    u64 header,u64 header_end,u64 start_bit,u64 end_bit,u32 start,u32 end,bool last,
+    u32 first_token,u32 token_end) {
+    const u32 slot=emitted;
+    if(!emit_segment(dest,capacity,emitted,header,header_end,start_bit,end_bit,start,end,2,last))
+        return false;
+    if(emitted!=slot)ranges[slot]={first_token,token_end-first_token};
+    return true;
+}
+
 // Produce independently indexed block-relative segments by composing only
 // the token paths reachable from the real beginning of this candidate.
 // Each tile consumes at most 559 bits (at least two bits per match), so its
 // decoded span is strictly smaller than the 128 KiB segment bound.
 extern "C" __global__ void inflate_compose_segments(const TileBlock* blocks,const TileTrees* trees,
-    const TilePath* paths,u32 count,u32 limit,BlockExtent* extents,Segment* segments,u32* counts) {
+    const TilePath* paths,u32 count,u32 limit,BlockExtent* extents,Segment* segments,u32* counts,TokenRange* ranges,TileSelection* selected) {
     const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=count)return;
     const TileBlock b=blocks[i];
@@ -151,24 +165,32 @@ extern "C" __global__ void inflate_compose_segments(const TileBlock* blocks,cons
     BlockExtent out{b.bit,t.payload,0,0,0,2,t.last,1,0};
     u32 emitted=0;
     Segment* dest=segments+b.first_tile;
+    TokenRange* token_ranges=ranges+b.first_tile;
     if(!t.status){
-        u32 entry=0,seg_start=0;
+        u32 entry=0,seg_start=0,token_total=0,seg_token=0;
         u64 seg_bit=t.payload;
         for(u32 tile=0;tile<b.tile_count;++tile){
             const u64 start=t.payload+static_cast<u64>(tile)*tile_bits;
             if(start>=b.upper)break;
             const TilePath path=paths[(static_cast<u64>(b.first_tile)+tile)*max_token_bits+entry];
-            if(path.status==2 || path.length>limit-out.length || path.length>segment_bytes)break;
+            const u32 status=path.status&3,tokens=path.status>>2;
+            if(status==2 || path.length>limit-out.length || path.length>segment_bytes)break;
             if(path.required_history>out.length)
                 out.required_history=max(out.required_history,path.required_history-out.length);
             if(out.length-seg_start+path.length>segment_bytes){
-                if(!emit_segment(dest,b.tile_count,emitted,b.bit,t.payload,seg_bit,start+entry,seg_start,out.length,2,false))break;
-                seg_start=out.length;seg_bit=start+entry;
+                if(!emit_token_segment(dest,token_ranges,b.tile_count,emitted,b.bit,t.payload,seg_bit,start+entry,
+                    seg_start,out.length,false,seg_token,token_total))break;
+                seg_start=out.length;seg_bit=start+entry;seg_token=token_total;
             }
+            selected[b.first_tile+tile]={entry,token_total,tokens,path.step|(status<<16)};
+            token_total+=tokens;
             out.length+=path.length;
-            if(path.status==1){
+            if(status==1){
                 out.end_bit=start+path.step;
-                if(emit_segment(dest,b.tile_count,emitted,b.bit,t.payload,seg_bit,out.end_bit,seg_start,out.length,2,true))out.status=0;
+                if(emit_token_segment(dest,token_ranges,b.tile_count,emitted,b.bit,t.payload,seg_bit,out.end_bit,
+                    seg_start,out.length,true,seg_token,token_total)){
+                    out.status=0;out.reserved=token_total;
+                }
                 break;
             }
             if(path.step<tile_bits || path.step>=tile_bits+max_token_bits)break;
@@ -235,9 +257,9 @@ __device__ bool scan_emit(const u8* input,u64 end,u64& bit,u32& decoded,u32 wind
 }
 
 struct Placement {
-    u32 dest,decoded,count;
+    u32 dest,decoded,count,token_base;
 };
-static_assert(sizeof(Placement)==12);
+static_assert(sizeof(Placement)==16);
 // Walk only proven edges from the zlib member's actual first bit. Dynamic
 // candidate extents never authorize a jump unless their exact header offset
 // is reached, their history is legal, and their decoded bound is satisfied.
@@ -246,7 +268,7 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
     const TileBlock* blocks,const BlockExtent* extents,
     const u32* counts,u32 candidates,u32 limit,Segment* segments,u32 capacity,Placement* placements,IndexInfo* info) {
     if(threadIdx.x||blockIdx.x)return;
-    *info={1,0,0,0,0,0};
+    *info={1,0,0,0,0,0,0,0};
     if(size<6)return;
     const u32 cmf=input[0],flg=input[1];
     if((cmf&15)!=8 || (cmf>>4)>7 || ((cmf<<8)|flg)%31 || (flg&32))return;
@@ -254,7 +276,7 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
     info->window=window;
     const u64 body_end=(size-4)*8;
     u64 bit=16;
-    u32 decoded=0,count=0,candidate=0,serial_tokens=1u<<20;
+    u32 decoded=0,count=0,candidate=0,serial_tokens=1u<<20,tokens=0;
     bool last=false;
     while(!last){
         if(bit>=body_end)return;
@@ -265,8 +287,8 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
             if(extent.length>limit-decoded){info->status=2;return;}
             const u32 n=counts[candidate];
             if(n>capacity-count){info->status=3;return;}
-            placements[candidate]={count,decoded,n};
-            count+=n;
+            placements[candidate]={count,decoded,n,tokens};
+            count+=n;tokens+=extent.reserved;
             decoded+=extent.length;bit=extent.end_bit;last=extent.last!=0;
             ++candidate;
         }else{
@@ -279,20 +301,59 @@ extern "C" __global__ void inflate_assemble_index(const u8* input,u64 size,
     if((bit+7)/8!=size-4)return;
     const u32 adler=(static_cast<u32>(input[size-4])<<24)|(static_cast<u32>(input[size-3])<<16)|
         (static_cast<u32>(input[size-2])<<8)|input[size-1];
-    *info={0,count,decoded,window,adler,0};
+    *info={0,count,decoded,window,adler,0,tokens,0};
 }
 
 // Copy only the candidates reached by the exact chain. Destinations are
 // disjoint, with serial fixed/stored fallback segments already written.
 extern "C" __global__ void inflate_place_segments(const TileBlock* blocks,
-    const Segment* relative,const Placement* placements,Segment* segments,const IndexInfo* info) {
+    const Segment* relative,const Placement* placements,Segment* segments,const IndexInfo* info,
+    const TokenRange* relative_ranges,TokenRange* ranges) {
     if(info->status)return;
     const Placement p=placements[blockIdx.x];
     const Segment* source=relative+blocks[blockIdx.x].first_tile;
     for(u32 i=threadIdx.x;i<p.count;i+=blockDim.x){
         Segment seg=source[i];seg.start+=p.decoded;seg.end+=p.decoded;
         segments[p.dest+i]=seg;
+        TokenRange range=relative_ranges[blocks[blockIdx.x].first_tile+i];
+        range.offset+=p.token_base;
+        ranges[p.dest+i]=range;
     }
+}
+
+// Decode only the proven token path inside each tile, in parallel across
+// the full member. The compact token list avoids serial Huffman parsing
+// in the dictionary expansion stage. The same exact bit endpoint is
+// checked again, including the terminal EOB.
+extern "C" __global__ void inflate_emit_tokens(const u8* input,const TileBlock* blocks,
+    const TileTrees* trees,const TileTask* tasks,const TileSelection* selected,
+    const Placement* placements,u32 tiles,u32 capacity,u32* tokens,IndexInfo* info,u32 window) {
+    const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=tiles||info->status||info->tokens>capacity)return;
+    const TileTask task=tasks[i];
+    const Placement p=placements[task.block];
+    const TileSelection select=selected[i];
+    if(!p.count||!select.count)return;
+    const TileBlock b=blocks[task.block];
+    const TileTrees& t=trees[task.block];
+    const u64 start=t.payload+static_cast<u64>(task.tile)*tile_bits;
+    Reader r{input,0,start+select.entry,b.upper};
+    if(p.token_base>info->tokens || select.offset>info->tokens-p.token_base ||
+        select.count>info->tokens-p.token_base-select.offset){atomicOr(&info->status,4u);return;}
+    for(u32 j=0;j<select.count;++j){
+        const u32 symbol=t.ll.decode(r);
+        u32 value=0;
+        if(!r.good||symbol==256){atomicOr(&info->status,4u);return;}
+        if(symbol<256)value=symbol;
+        else {
+            u32 length=0,distance=0;
+            if(!match(r,t.dd,symbol,length,distance)||distance>window){atomicOr(&info->status,4u);return;}
+            value=(length<<16)|distance;
+        }
+        tokens[p.token_base+select.offset+j]=value;
+    }
+    if((select.end>>16)==1 && t.ll.decode(r)!=256)r.good=false;
+    if(!r.good||r.position!=start+(select.end&65535))atomicOr(&info->status,4u);
 }
 
 // Ordered compaction of validated dynamic headers. The bitmap is one bit
@@ -389,6 +450,6 @@ extern "C" __global__ void inflate_schedule_groups(const Segment* segments,Index
         groups[group_count++]={begin,offset-begin,start,position};
     }
     if(position!=info->decoded){info->status=1;return;}
-    info->reserved=group_count;
+    info->groups=group_count;
 }
 } // namespace resident_inflate

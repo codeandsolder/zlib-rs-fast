@@ -12,6 +12,8 @@ constexpr u32 history_limit=32768;
 constexpr u32 warp_width=32;
 struct Segment { u64 header_bit,header_end_bit,start_bit,end_bit; u32 start,end,kind,ends_block; };
 static_assert(sizeof(Segment)==48);
+struct TokenRange {u32 offset,count;};
+static_assert(sizeof(TokenRange)==8);
 struct Reader {
     const u8* input;
     u64 origin, position, end;
@@ -141,6 +143,7 @@ __device__ bool match(Reader& r,const Tree& dd,u32 code,u32& length,u32& dist) {
 // One warp decodes independently, using symbolic preceding history.
 extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_header,
     u64 input_origin,u64 header_origin,u64 first_header_bit,const Segment* segments,u32 count,
+    const u32* tokens,const TokenRange* ranges,u32 total_tokens,
     u16* symbolic,u32* status,u32* used_seeds,u32 window,u32 base) {
     const u32 index=(blockIdx.x*blockDim.x+threadIdx.x)/warp_width,lane=threadIdx.x%warp_width;
     if(index>=count)return;
@@ -149,8 +152,13 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_head
     Reader header{first?first_header:input,first?header_origin:input_origin,seg.header_bit,seg.header_end_bit};
     Reader r{input,input_origin,seg.start_bit,seg.end_bit};
     Tree ll,dd;
+    const TokenRange range=total_tokens?ranges[index]:TokenRange{0,0};
+    const bool predecoded=range.count!=0;
     u32 ok=1,stored=0;
     if(!lane){
+        if(predecoded){
+            ok=seg.kind==2 && range.offset<=total_tokens && range.count<=total_tokens-range.offset;
+        }else{
         header.take(1);const u32 type=header.take(2);
         ok=header.good && type==seg.kind && type!=3;
         if(ok && type==0){
@@ -161,6 +169,7 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_head
         }else if(ok){
             ok=tables(header,type,ll,dd) && header.position==seg.header_end_bit && header.position<=seg.start_bit;
         }
+        }
     }
     ok=__shfl_sync(0xffffffffu,ok,0);
     stored=__shfl_sync(0xffffffffu,stored,0);
@@ -170,11 +179,19 @@ extern "C" __global__ void inflate_symbolic(const u8* input,const u8* first_head
         for(u32 i=lane;i<stored;i+=warp_width)symbolic[seg.start-base+i]=input[start+i-input_origin];
         if(!lane)status[index]=0;return;
     }
-    u32 pos=seg.start;
+    u32 pos=seg.start,token_index=0;
     for(;;){
         u32 symbol=0,length=0,distance=0;
         if(!lane){
-            if(!seg.ends_block && pos==seg.end){
+            if(predecoded){
+                if(token_index==range.count){symbol=256;ok=pos==seg.end;}
+                else {
+                    const u32 token=tokens[range.offset+token_index++];
+                    length=token>>16;distance=token&65535;
+                    if(!length){symbol=distance;length=1;distance=0;ok=symbol<256&&pos<seg.end;}
+                    else {symbol=257;ok=length>=3&&length<=258&&distance&&distance<=min(pos,window)&&length<=seg.end-pos;}
+                }
+            }else if(!seg.ends_block && pos==seg.end){
                 symbol=256;ok=r.position==seg.end_bit;
             } else {
                 symbol=ll.decode(r);
