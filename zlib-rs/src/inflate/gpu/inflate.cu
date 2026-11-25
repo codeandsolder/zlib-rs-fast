@@ -23,6 +23,10 @@ struct Reader {
         for(u32 i=0;i<4 && (byte+i)*8<end;++i) v|=static_cast<u32>(input[byte+i-origin])<<(8*i);
         return (v>>(position%8))&((1u<<n)-1);
     }
+    __device__ void skip(u32 n) {
+        if(position>end || n>end-position){good=false;return;}
+        position+=n;
+    }
     __device__ u32 take(u32 n) {
         if(n==0)return 0;
         if(position>end || n>end-position){good=false;return 0;}
@@ -30,8 +34,11 @@ struct Reader {
     }
 };
 constexpr u32 max_bits=15;
+constexpr u32 lookup_bits=8;
+constexpr u32 lookup_size=1u<<lookup_bits;
 struct Tree {
     u16 symbols[288];
+    u16 lookup[lookup_size];
     u16 counts[16], first[16], offsets[16];
     u32 width=0;
     __device__ bool build(const u8* lengths,u32 n,bool allow_empty=false,bool allow_single=true) {
@@ -54,16 +61,30 @@ struct Tree {
         u16 next[16];
         for(u32 i=0;i<=width;++i)next[i]=offsets[i];
         for(u32 i=0;i<n;++i)if(lengths[i])symbols[next[lengths[i]]++]=static_cast<u16>(i);
+        // Store (symbol << 4) | code length. Zero marks a long or absent
+        // code. Canonical prefixes are contiguous in reversed bit order.
+        for(u32 i=0;i<lookup_size;++i)lookup[i]=0;
+        for(u32 bits=1;bits<=min(width,lookup_bits);++bits){
+            for(u32 j=0;j<counts[bits];++j){
+                const u32 start=(static_cast<u32>(first[bits])+j)<<(lookup_bits-bits);
+                const u16 entry=static_cast<u16>((symbols[offsets[bits]+j]<<4)|bits);
+                for(u32 k=0;k<(1u<<(lookup_bits-bits));++k)lookup[start+k]=entry;
+            }
+        }
         return true;
     }
     __device__ u32 decode(Reader& r) const {
         if(!width){r.good=false;return 0;}
         // Reverse the lookahead once, then compare canonical prefixes.
-        const u32 bits=__brev(r.peek(width));
-        for(u32 n=1;n<=width;++n){
+        const u32 bits=__brev(r.peek(max(width,lookup_bits)));
+        const u16 entry=lookup[bits>>(32-lookup_bits)];
+        if(entry){
+            r.skip(entry&15);return entry>>4;
+        }
+        for(u32 n=lookup_bits+1;n<=width;++n){
             const u32 code=bits>>(32-n);
             if(code>=first[n] && code-first[n]<counts[n]){
-                r.take(n);return symbols[offsets[n]+code-first[n]];
+                r.skip(n);return symbols[offsets[n]+code-first[n]];
             }
         }
         r.good=false;return 0;
