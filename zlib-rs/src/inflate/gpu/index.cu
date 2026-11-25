@@ -427,3 +427,35 @@ extern "C" __global__ void inflate_make_tile_tasks(const TileBlock* blocks,TileT
         tasks[b.first_tile+tile]={blockIdx.x,tile};
 }
 } // namespace resident_inflate
+
+namespace resident_inflate {
+struct DecodeGroup {
+    u32 offset,count,start,end;
+};
+static_assert(sizeof(DecodeGroup)==16);
+// The full segment list remains resident. Only these bounded group
+// descriptors are needed by the host to launch the compression windows.
+// Jump directly to the next needed window even if a segment crosses
+// thousands of very small windows.
+extern "C" __global__ void inflate_schedule_groups(const Segment* segments,IndexInfo* info,
+    u32 compression_window,u32 max_group,DecodeGroup* groups) {
+    if(threadIdx.x||blockIdx.x||info->status)return;
+    if(!compression_window||!max_group){info->status=1;return;}
+    u32 offset=0,position=0,group_count=0;
+    while(offset<info->count){
+        const u32 target=static_cast<u32>(min(static_cast<u64>(info->decoded),
+            (static_cast<u64>(position)/compression_window+1)*compression_window));
+        const u32 begin=offset,start=position;
+        do {
+            const Segment seg=segments[offset++];
+            if(seg.start!=position||seg.end<=position||seg.end>info->decoded){
+                info->status=1;return;
+            }
+            position=seg.end;
+        }while(offset<info->count && offset-begin<max_group && position<target);
+        groups[group_count++]={begin,offset-begin,start,position};
+    }
+    if(position!=info->decoded){info->status=1;return;}
+    info->reserved=group_count;
+}
+} // namespace resident_inflate
