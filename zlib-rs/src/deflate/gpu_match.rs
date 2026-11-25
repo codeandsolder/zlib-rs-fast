@@ -421,6 +421,26 @@ fn prepare_input(
     max_workgroups: u32,
     forced_layout: Option<InputLayout>,
 ) -> Result<PreparedSearch, GpuMatchError> {
+    prepare_indexed_input(
+        input_index,
+        input,
+        search_budget,
+        max_dist,
+        max_workgroups,
+        forced_layout,
+        build_predecessors,
+    )
+}
+
+fn prepare_indexed_input(
+    input_index: usize,
+    input: &[u8],
+    search_budget: u32,
+    max_dist: u32,
+    max_workgroups: u32,
+    forced_layout: Option<InputLayout>,
+    build_index: impl FnOnce(&[u8], u32) -> Result<Vec<u32>, GpuMatchError>,
+) -> Result<PreparedSearch, GpuMatchError> {
     let input_len = u32::try_from(input.len())
         .map_err(|_| GpuMatchError("GPU match search input exceeds u32::MAX bytes".into()))?;
     // No match can start before position one and still have three bytes
@@ -431,7 +451,7 @@ fn prepare_input(
         }));
     }
 
-    let predecessors = build_predecessors(input, max_dist)?;
+    let predecessors = build_index(input, max_dist)?;
     // A zero chain contains no eligible candidate at any position.
     // Such an input needs neither a GPU dispatch nor a packed input copy.
     if predecessors.iter().all(|&word| word == 0) {
@@ -489,7 +509,17 @@ fn prepare_parallel(
     pool.run_items(
         &mut inputs,
         || Ok(PreparedSearch::Local(GpuMatchTable::default())),
-        |index, input| prepare_input(index, input, search_budget, max_dist, max_workgroups, None),
+        |index, input| {
+            prepare_indexed_input(
+                index,
+                input,
+                search_budget,
+                max_dist,
+                max_workgroups,
+                None,
+                |bytes, distance| build_predecessors_parallel(bytes, distance, pool),
+            )
+        },
     )
     .into_iter()
     .collect()
@@ -1388,20 +1418,91 @@ fn build_predecessor_words(
     input: &[u8],
     positions: u32,
     max_dist: u32,
-    mut replace_head: impl FnMut(usize, u32) -> u32,
+    replace_head: impl FnMut(usize, u32) -> u32,
 ) -> Vec<u32> {
     // Nonempty short inputs still require a nonzero-sized array.
     let mut predecessors = vec![0; (positions as usize).div_ceil(2).max(1)];
-    for (position, bytes) in (0..positions).zip(input.windows(3)) {
+    fill_predecessor_words(
+        input,
+        0..positions,
+        max_dist,
+        &mut predecessors,
+        replace_head,
+    );
+    predecessors
+}
+
+/// Warm up only the history that can contain a valid predecessor. Each shard
+/// starts on an even position, so packed words never straddle worker ownership.
+fn fill_predecessor_words(
+    input: &[u8],
+    positions: Range<u32>,
+    max_dist: u32,
+    predecessors: &mut [u32],
+    mut replace_head: impl FnMut(usize, u32) -> u32,
+) {
+    let start = positions.start;
+    let history_start = start.saturating_sub(max_dist - 1);
+    for (position, bytes) in (history_start..start).zip(input[history_start as usize..].windows(3))
+    {
+        replace_head(hash3(bytes), position);
+    }
+    for (position, bytes) in positions.zip(input[start as usize..].windows(3)) {
         let previous = replace_head(hash3(bytes), position);
         if previous != NO_PREDECESSOR {
             let distance = position - previous;
             if distance < max_dist {
-                predecessors[position as usize / 2] |= distance << ((position & 1) * 16);
+                let local = position - start;
+                predecessors[local as usize / 2] |= distance << ((local & 1) * 16);
             }
         }
     }
-    predecessors
+}
+
+#[cfg(feature = "parallel")]
+fn build_predecessors_parallel(
+    input: &[u8],
+    max_dist: u32,
+    pool: &crate::BatchCodec,
+) -> Result<Vec<u32>, GpuMatchError> {
+    let positions = input.len().saturating_sub(2);
+    u32::try_from(positions)
+        .map_err(|_| GpuMatchError("GPU hash index exceeds u32::MAX positions".into()))?;
+    let words = positions.div_ceil(2);
+    // Bound duplicated warmup and dense head-table allocation. Divide large
+    // streams among the existing pool, without splitting the GPU dispatch
+    // or duplicating its input/result transfers.
+    const MIN_SHARD_WORDS: usize = 128 * 1024;
+    let shard_words = words.div_ceil(pool.workers()).max(MIN_SHARD_WORDS);
+    if words <= shard_words {
+        return build_predecessors(input, max_dist);
+    }
+    let mut predecessors = vec![0; words];
+    let mut shards = predecessors.chunks_mut(shard_words).collect::<Vec<_>>();
+    pool.run_items(
+        &mut shards,
+        || Ok(()),
+        |index, shard| {
+            let start = index * shard_words * 2;
+            let end = start.saturating_add(shard.len() * 2).min(positions);
+            let to_position = |offset| {
+                u32::try_from(offset)
+                    .map_err(|_| GpuMatchError("GPU hash shard exceeds u32::MAX positions".into()))
+            };
+            let mut heads = vec![NO_PREDECESSOR; HASH_SIZE];
+            fill_predecessor_words(
+                input,
+                to_position(start)?..to_position(end)?,
+                max_dist,
+                shard,
+                |hash, position| core::mem::replace(&mut heads[hash], position),
+            );
+            Ok(())
+        },
+    )
+    .into_iter()
+    .collect::<Result<(), _>>()?;
+    Ok(predecessors)
 }
 
 const fn predecessor_distance(words: &[u32], position: usize) -> usize {
@@ -1416,6 +1517,40 @@ fn hash3(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_predecessors_preserve_every_serial_word() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut seed = 0x1234_5678u32;
+        let random = (0..1_200_003)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let periodic = random[..32_505].repeat(38);
+        let repetitive = vec![b'a'; 700_001];
+        for workers in [1, 2, 4] {
+            let pool = crate::BatchCodec::new(
+                core::num::NonZeroUsize::new(workers)
+                    .ok_or_else(|| GpuMatchError("zero workers".into()))?,
+            )?;
+            for input in [&random, &periodic, &repetitive] {
+                for distance in [1, 17, DEFAULT_MAX_DIST, PACKED_DISTANCE_LIMIT] {
+                    assert_eq!(
+                        build_predecessors_parallel(input, distance, &pool)?,
+                        build_predecessors(input, distance)?,
+                        "workers={workers}, len={}, distance={distance}",
+                        input.len()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn batch_plan_retains_local_slots_and_aligned_gpu_ranges() -> Result<(), GpuMatchError> {
