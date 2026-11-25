@@ -6,6 +6,8 @@ use core::ptr::NonNull;
 
 mod back_io;
 mod bitreader;
+#[cfg(feature = "cuda")]
+pub mod gpu_index;
 mod infback;
 mod inffixed_tbl;
 mod inftrees;
