@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+#[cfg(feature = "cuda")]
+mod cuda;
 
 use std::{
     fmt,
@@ -882,72 +885,60 @@ struct SearchPart<'a> {
     keep: Range<usize>,
 }
 
-/// Persistent Vulkan whole-input match-search engine.
-///
-/// Device selection, shader compilation, and compute-pipeline creation happen once in [`Self::new`].
-/// Individual searches build a direct predecessor index, upload one input, dispatch the already-compiled
-/// kernel, and read back one packed length/distance record per input byte.
+/// Persistent hardware match-search engine. Host predecessor preparation,
+/// table representation and partition geometry are shared across backends.
 pub struct GpuMatchSearcher {
+    backend: GpuBackend,
+    limits: Limits,
+    adapter_name: String,
+}
+
+enum GpuBackend {
+    Vulkan(VulkanBackend),
+    #[cfg(feature = "cuda")]
+    Cuda(cuda::CudaBackend),
+}
+
+struct VulkanBackend {
     device: Device,
     queue: Queue,
     packed_pipeline: ComputePipeline,
     aligned_pipeline: ComputePipeline,
-    adapter_name: String,
     workspace: Mutex<GpuWorkspace>,
 }
 
 impl GpuMatchSearcher {
-    /// Create a persistent Vulkan search engine on the selected adapter.
+    /// Create a Vulkan search engine, or use `cuda:N` to explicitly select
+    /// CUDA device ordinal N when compiled with the cuda feature.
     ///
     /// # Errors
-    /// Returns an error if no matching adapter is available or device
-    /// initialization fails.
+    /// Returns an error for invalid device selection or initialization failure.
     pub fn new(adapter_filter: Option<&str>) -> Result<Self, GpuMatchError> {
-        let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::VULKAN,
-            ..InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = select_adapter(&instance, adapter_filter)?;
-        let adapter_name = adapter.get_info().name;
-        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
-            required_features: Features::default(),
-            required_limits: Limits::default(),
-            memory_hints: MemoryHints::default(),
-            experimental_features: ExperimentalFeatures::disabled(),
-            trace: Trace::default(),
-            label: Some("zlib-rs gpu match search"),
-        }))
-        .map_err(|error| GpuMatchError(format!("failed to create GPU device: {error}")))?;
-
-        let create_pipeline = |aligned: bool| {
-            // Generate a constant-specialized module, rather than leaving
-            // per-candidate layout branches or driver override resolution.
-            let module = device.create_shader_module(ShaderModuleDescriptor {
-                label: Some("zlib whole-input match search"),
-                source: wgpu::ShaderSource::Wgsl(
-                    format!("const aligned_input: bool = {aligned};\nconst max_match: u32 = {MAX_MATCH}u;\nconst group_size: u32 = {WORKGROUP_SIZE}u;\nconst cooperative_span: u32 = {COOPERATIVE_SPAN}u;\n{SHADER}").into(),
-                ),
-            });
-            device.create_compute_pipeline(&ComputePipelineDescriptor {
-                label: Some("whole-input match search"),
-                layout: None,
-                module: &module,
-                entry_point: Some("search"),
-                compilation_options: PipelineCompilationOptions::default(),
-                cache: None,
-            })
-        };
-        let packed_pipeline = create_pipeline(false);
-        let aligned_pipeline = create_pipeline(true);
-
-        let workspace = Mutex::new(GpuWorkspace::new(&device));
+        if let Some(ordinal) = adapter_filter.and_then(|filter| filter.strip_prefix("cuda:")) {
+            #[cfg(feature = "cuda")]
+            {
+                let ordinal = ordinal.parse::<usize>().map_err(|error| {
+                    GpuMatchError(format!("invalid CUDA device ordinal: {error}"))
+                })?;
+                let (backend, adapter_name) = cuda::CudaBackend::new(ordinal)?;
+                return Ok(Self {
+                    backend: GpuBackend::Cuda(backend),
+                    limits: Limits::default(),
+                    adapter_name,
+                });
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = ordinal;
+                return Err(GpuMatchError("CUDA requires the cuda feature".into()));
+            }
+        }
+        let (backend, adapter_name) = VulkanBackend::new(adapter_filter)?;
+        let limits = backend.device.limits();
         Ok(Self {
-            device,
-            queue,
-            packed_pipeline,
-            aligned_pipeline,
+            backend: GpuBackend::Vulkan(backend),
+            limits,
             adapter_name,
-            workspace,
         })
     }
 
@@ -1047,7 +1038,7 @@ impl GpuMatchSearcher {
             inputs,
             search_budget,
             max_dist,
-            SearchGeometry::from_limits(&self.device.limits())?,
+            SearchGeometry::from_limits(&self.limits)?,
             prepare,
         )
     }
@@ -1152,7 +1143,7 @@ impl GpuMatchSearcher {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let limits = self.device.limits();
+        let limits = &self.limits;
         let prepared = prepare(
             inputs,
             search_budget,
@@ -1160,20 +1151,82 @@ impl GpuMatchSearcher {
             limits.max_compute_workgroups_per_dimension,
         )?;
         debug_assert_eq!(prepared.len(), inputs.len());
-        let mut batch = GpuBatch::plan(prepared, &limits)?;
+        let mut batch = GpuBatch::plan(prepared, limits)?;
         if batch.dispatches.is_empty() {
             return Ok(batch.tables);
         }
+        match &self.backend {
+            GpuBackend::Vulkan(backend) => backend.execute(&mut batch, limits.max_buffer_size)?,
+            #[cfg(feature = "cuda")]
+            GpuBackend::Cuda(backend) => backend.execute(&mut batch)?,
+        }
+        Ok(batch.tables)
+    }
+}
+
+impl VulkanBackend {
+    fn new(adapter_filter: Option<&str>) -> Result<(Self, String), GpuMatchError> {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::VULKAN,
+            ..InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = select_adapter(&instance, adapter_filter)?;
+        let adapter_name = adapter.get_info().name;
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            required_features: Features::default(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::default(),
+            experimental_features: ExperimentalFeatures::disabled(),
+            trace: Trace::default(),
+            label: Some("zlib-rs gpu match search"),
+        }))
+        .map_err(|error| GpuMatchError(format!("failed to create GPU device: {error}")))?;
+
+        let create_pipeline = |aligned: bool| {
+            // Generate a constant-specialized module, rather than leaving
+            // per-candidate layout branches or driver override resolution.
+            let module = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("zlib whole-input match search"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!("const aligned_input: bool = {aligned};\nconst max_match: u32 = {MAX_MATCH}u;\nconst group_size: u32 = {WORKGROUP_SIZE}u;\nconst cooperative_span: u32 = {COOPERATIVE_SPAN}u;\n{SHADER}").into(),
+                ),
+            });
+            device.create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("whole-input match search"),
+                layout: None,
+                module: &module,
+                entry_point: Some("search"),
+                compilation_options: PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let packed_pipeline = create_pipeline(false);
+        let aligned_pipeline = create_pipeline(true);
+
+        let workspace = Mutex::new(GpuWorkspace::new(&device));
+        Ok((
+            Self {
+                device,
+                queue,
+                packed_pipeline,
+                aligned_pipeline,
+                workspace,
+            },
+            adapter_name,
+        ))
+    }
+
+    fn execute(&self, batch: &mut GpuBatch, max_buffer_size: u64) -> Result<(), GpuMatchError> {
         let mut workspace = self
             .workspace
             .lock()
             .map_err(|_| GpuMatchError("GPU match workspace lock was poisoned".into()))?;
-        workspace.ensure_batch(&self.device, &batch.layout, limits.max_buffer_size)?;
+        workspace.ensure_batch(&self.device, &batch.layout, max_buffer_size)?;
         workspace.upload(&self.queue, &batch.dispatches);
         self.dispatch_batch(&workspace, &batch.dispatches);
-        workspace.readback(&self.device, &mut batch)?;
+        workspace.readback(&self.device, batch)?;
         drop(workspace);
-        Ok(batch.tables)
+        Ok(())
     }
 
     fn dispatch_batch(&self, workspace: &GpuWorkspace, dispatches: &[GpuDispatch]) {
@@ -1813,6 +1866,55 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_matches_independent_oracle() -> Result<(), GpuMatchError> {
+        let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
+        let mut seed = 0x1234_5678u32;
+        let random = (0..4_097)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0] & 15
+            })
+            .collect::<Vec<_>>();
+        let mut repeated = b"PDF-stream-pattern-0123456789".repeat(600);
+        repeated[8193] = b'!';
+        let inputs = [&random[..], &repeated[..]];
+        let geometry = SearchGeometry::from_limits(&searcher.limits)?;
+        for layout in [InputLayout::Packed, InputLayout::Aligned] {
+            for budget in [1, 32, 128] {
+                let tables = searcher.search_with_geometry(
+                    &inputs,
+                    budget,
+                    128,
+                    geometry,
+                    &|inputs, budget, distance, groups| {
+                        inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(index, input)| {
+                                prepare_input(index, input, budget, distance, groups, Some(layout))
+                            })
+                            .collect()
+                    },
+                )?;
+                for (input, table) in inputs.iter().zip(tables) {
+                    for (position, actual) in table.iter().enumerate() {
+                        assert_eq!(
+                            actual,
+                            oracle_match(input, position, 128, budget)?,
+                            "pos={position}, budget={budget}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a Vulkan compute adapter"]
     fn cooperative_groups_preserve_exact_match_tables() -> Result<(), GpuMatchError> {
@@ -1822,7 +1924,7 @@ mod tests {
         periodic[12_060] = b'?';
         let repeated = vec![b'a'; 16_513];
         let inputs = [&periodic[..], &repeated[..]];
-        let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let geometry = SearchGeometry::from_limits(&searcher.limits)?;
         for layout in [InputLayout::Packed, InputLayout::Aligned] {
             for max_dist in [64, DEFAULT_MAX_DIST] {
                 let run = |enabled| {
@@ -2039,7 +2141,7 @@ mod tests {
         let repetitive = b"abc".repeat(100);
         let inputs = [b"".as_slice(), b"a", b"ab", b"abc", &mixed, &repetitive];
         for (max_dist, budget) in [(1, 1), (8, 7), (64, 1), (64, 31), (DEFAULT_MAX_DIST, 64)] {
-            let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+            let geometry = SearchGeometry::from_limits(&searcher.limits)?;
             for layout in [InputLayout::Packed, InputLayout::Aligned] {
                 let tables = searcher.search_with_geometry(
                     &inputs,
@@ -2231,7 +2333,7 @@ mod tests {
         assert_eq!(resolved.get(query).map(|entry| entry.length), Some(26));
 
         let searcher = GpuMatchSearcher::new(None)?;
-        let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let geometry = SearchGeometry::from_limits(&searcher.limits)?;
         let tables = searcher.search_with_geometry(
             &[&input],
             DEFAULT_MAX_DIST,
@@ -2431,7 +2533,7 @@ mod tests {
     fn partitioned_search_preserves_full_history_and_lookahead(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let searcher = GpuMatchSearcher::new(None)?;
-        let actual_geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let actual_geometry = SearchGeometry::from_limits(&searcher.limits)?;
         let mut mixed = b"abc0123456".repeat(210);
         for position in (0..mixed.len()).step_by(119) {
             mixed[position] = b'X';
@@ -2514,7 +2616,7 @@ mod tests {
     #[ignore = "requires Vulkan and crosses the actual storage-binding limit"]
     fn search_crosses_actual_binding_limit() -> Result<(), GpuMatchError> {
         let searcher = GpuMatchSearcher::new(None)?;
-        let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let geometry = SearchGeometry::from_limits(&searcher.limits)?;
         let length = geometry.max_part_len + 17;
         verify_periodic_search(&searcher, length)
     }
@@ -2523,10 +2625,7 @@ mod tests {
     #[ignore = "requires Vulkan and dispatches over eight MiB"]
     fn gpu_search_crosses_single_axis_limit() -> Result<(), GpuMatchError> {
         let searcher = GpuMatchSearcher::new(None)?;
-        let limit = searcher
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension;
+        let limit = searcher.limits.max_compute_workgroups_per_dimension;
         let length = usize::try_from(limit)
             .map_err(|_| GpuMatchError("grid limit too large".into()))?
             * WORKGROUP_SIZE as usize
