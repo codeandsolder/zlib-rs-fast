@@ -6,11 +6,11 @@ use crate::{
     DeflateConfig, ReturnCode,
 };
 use cudarc::driver::{
-    CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 const MIB: usize = 1024 * 1024;
@@ -88,7 +88,26 @@ kernel_set! {
 macro_rules! buffer_set {
     ($($name:ident: $ty:ty),+ $(,)?) => {
         struct Buffers { $($name: CudaSlice<$ty>),+ }
-        impl Buffers {
+        // Keep the reservation and the accounting in one place. All products
+// are bounded by the validated MAX_WINDOW and fixed kernel geometry.
+macro_rules! workspace_geometry {
+    ($macro:ident, $g:ident) => {
+        $macro! {
+            input: u8 => $g.size.next_multiple_of(4), aligned: u32 => $g.size,
+            heads: u32 => $g.tiles * HASH_COUNT, predecessors: u16 => $g.tiles * $g.stride,
+            matches: u32 => $g.tiles * $g.tile, choices: u32 => $g.core,
+            exits: u32 => $g.segments, transitions: u16 => $g.segments * MAX_MATCH,
+            entries: u32 => $g.segments + 1, counts: u32 => $g.segments,
+            block_ids: u32 => $g.segments, blocks: u32 => $g.segments * BLOCK_WORDS,
+            hist: u32 => $g.segments * HIST_WORDS, arena: u32 => $g.arena_bytes() / 4,
+            bits: u32 => $g.segments, bit_offsets: u32 => $g.segments,
+            checksums: u32 => $g.tiles * 2, offsets: u32 => $g.segments, meta: u32 => 4,
+            compact: u8 => $g.arena_bytes(),
+        }
+    };
+}
+
+impl Buffers {
             fn new(stream: &Arc<CudaStream>) -> Result<Self, GpuMatchError> {
                 Ok(Self { $($name: stream.alloc_zeros(1).map_err(failure)?),+ })
             }
@@ -180,26 +199,22 @@ impl Geometry {
 
 impl Buffers {
     fn prepare(&mut self, stream: &Arc<CudaStream>, g: Geometry) -> Result<(), GpuMatchError> {
-        // All products are bounded by the validated MAX_WINDOW and fixed
-        // geometry (including the history/lookahead and per-block overhead).
         macro_rules! grow {
-            ($($field:ident => $count:expr),+ $(,)?) => {
+            ($($field:ident : $ty:ty => $count:expr),+ $(,)?) => {
                 $(reserve(stream, &mut self.$field, $count as usize)?;)+
             };
         }
-        grow! {
-            input => g.size.next_multiple_of(4), aligned => g.size,
-            heads => g.tiles * HASH_COUNT, predecessors => g.tiles * g.stride,
-            matches => g.tiles * g.tile, choices => g.core,
-            exits => g.segments, transitions => g.segments * MAX_MATCH,
-            entries => g.segments + 1, counts => g.segments,
-            block_ids => g.segments, blocks => g.segments * BLOCK_WORDS,
-            hist => g.segments * HIST_WORDS, arena => g.arena_bytes() / 4,
-            bits => g.segments, bit_offsets => g.segments,
-            checksums => g.tiles * 2, offsets => g.segments, meta => 4,
-            compact => g.arena_bytes(),
-        }
+        workspace_geometry!(grow, g);
         Ok(())
+    }
+
+    fn upper_bound(g: Geometry) -> usize {
+        macro_rules! count {
+            ($($field:ident : $ty:ty => $count:expr),+ $(,)?) => {
+                0 $(+ ($count as usize).next_power_of_two() * core::mem::size_of::<$ty>())+
+            };
+        }
+        workspace_geometry!(count, g)
     }
 }
 
@@ -207,7 +222,97 @@ pub(super) struct ResidentEncoder {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     buffers: Mutex<Buffers>,
+}
+
+/// Independent CUDA streams may overlap kernel execution, transfers and
+/// launch latency. The lane count is bounded by the largest supported
+/// workspace rather than by the host worker count.
+pub(super) struct ResidentPool {
+    lanes: Vec<ResidentEncoder>,
+    available: Mutex<Vec<usize>>,
+    ready: Condvar,
     index_tiles: u32,
+}
+
+struct Lane<'a> {
+    pool: &'a ResidentPool,
+    index: usize,
+}
+
+impl core::ops::Deref for Lane<'_> {
+    type Target = ResidentEncoder;
+    fn deref(&self) -> &Self::Target {
+        &self.pool.lanes[self.index]
+    }
+}
+
+impl Drop for Lane<'_> {
+    fn drop(&mut self) {
+        let mut available = self
+            .pool
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        available.push(self.index);
+        drop(available);
+        self.pool.ready.notify_one();
+    }
+}
+
+impl ResidentPool {
+    pub(super) fn new(
+        context: &Arc<CudaContext>,
+        module: &Arc<CudaModule>,
+        multiprocessors: u32,
+    ) -> Result<Self, GpuMatchError> {
+        let index_tiles = multiprocessors.saturating_mul(4).max(1);
+        // The peak is the full window with maximum history, at the smallest
+        // tile size that the adaptive geometry can select for that window.
+        let worst = Geometry::new(
+            MAX_WINDOW + 32_767,
+            32_767,
+            32_768,
+            1,
+            false,
+            DeflateConfig::new(9),
+            Wrapper::Zlib(15),
+        )?
+        .with_index_tiles(index_tiles);
+        let bytes = Buffers::upper_bound(worst);
+        context.bind_to_thread().map_err(failure)?;
+        let (free, _) = cudarc::driver::result::mem_get_info().map_err(failure)?;
+        // Leave space for display, context, other workloads and transient
+        // reallocation. A single lane remains usable on small devices.
+        let count = (free.saturating_sub(free / 4) / bytes).clamp(1, 4);
+        let lanes = (0..count)
+            .map(|_| ResidentEncoder::new(context.new_stream().map_err(failure)?, module))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            lanes,
+            available: Mutex::new((0..count).rev().collect()),
+            ready: Condvar::new(),
+            index_tiles,
+        })
+    }
+
+    fn acquire(&self) -> Result<Lane<'_>, GpuMatchError> {
+        let mut available = self.available.lock().map_err(failure)?;
+        loop {
+            if let Some(index) = available.pop() {
+                return Ok(Lane { pool: self, index });
+            }
+            available = self.ready.wait(available).map_err(failure)?;
+        }
+    }
+
+    fn window(
+        &self,
+        input: &[u8],
+        g: Geometry,
+        limit: usize,
+    ) -> Result<WindowOutput, GpuMatchError> {
+        self.acquire()?.window(input, g, limit)
+    }
 }
 
 // All launches share one stream and a locked buffer set. Each kernel's ABI
@@ -230,14 +335,12 @@ impl ResidentEncoder {
     pub(super) fn new(
         stream: Arc<CudaStream>,
         module: &Arc<CudaModule>,
-        multiprocessors: u32,
     ) -> Result<Self, GpuMatchError> {
         let buffers = Mutex::new(Buffers::new(&stream)?);
         Ok(Self {
             stream,
             kernels: Kernels::new(module)?,
             buffers,
-            index_tiles: multiprocessors.saturating_mul(4).max(1),
         })
     }
 
@@ -367,7 +470,9 @@ impl ResidentEncoder {
             b: checksum_b,
         })
     }
+}
 
+impl ResidentPool {
     pub(super) fn compress(
         &self,
         input: &[u8],
@@ -530,7 +635,8 @@ mod tests {
     #[ignore = "requires CUDA hardware and NVRTC"]
     fn cuda_resident_index_and_parse_are_exact() -> Result<(), Box<dyn std::error::Error>> {
         let (backend, _) = super::super::CudaBackend::new(0, true)?;
-        let encoder = backend.resident.as_deref().ok_or("resident encoder")?;
+        let pool = backend.resident.as_deref().ok_or("resident encoder")?;
+        let encoder = pool.acquire()?;
         let reference = GpuMatchSearcher::new(Some("cuda-match:0"))?;
         let mut seed = 0x9e37_79b9u32;
         let random = (0..70_013)
@@ -557,7 +663,7 @@ mod tests {
             config,
             Wrapper::Zlib(15),
         )?
-        .with_index_tiles(encoder.index_tiles);
+        .with_index_tiles(pool.index_tiles);
         let mut b = encoder.buffers.lock().map_err(failure)?;
         b.prepare(&encoder.stream, g)?;
         encoder
