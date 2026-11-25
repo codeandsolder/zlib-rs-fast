@@ -208,3 +208,40 @@ extern "C" __global__ void inflate_resolve(const Segment* segments,u32 count,con
         output[pos]=static_cast<u8>(value);
     }
 }
+
+// Resolve each possible seed byte once per segment, rather than repeating
+// a potentially long cross-segment dependency chain for every output byte.
+extern "C" __global__ void inflate_seed(const Segment* segments,u32 count,const u16* symbolic,
+    u8* seeds,u32* error,u32 window) {
+    if(*error)return;
+    const u32 index=blockIdx.y;
+    const u32 start=segments[index].start;
+    const u32 available=min(start,window);
+    for(u32 d=1+blockIdx.x*blockDim.x+threadIdx.x;d<=available;d+=gridDim.x*blockDim.x) {
+        u32 origin=start,block=index,distance=d;
+        u16 value;
+        for(;;){
+            if(distance>origin||!block){atomicOr(error,4u);return;}
+            const u32 source=origin-distance;
+            u32 lo=0,hi=block;
+            while(lo+1<hi){
+                const u32 middle=lo+(hi-lo)/2;
+                if(segments[middle].start<=source)lo=middle;else hi=middle;
+            }
+            block=lo;origin=segments[block].start;value=symbolic[source];
+            if(value<256)break;
+            distance=static_cast<u32>(value)-255;
+        }
+        seeds[static_cast<u64>(index)*window+d-1]=static_cast<u8>(value);
+    }
+}
+extern "C" __global__ void inflate_resolve_seeded(const Segment* segments,u32 count,const u16* symbolic,
+    const u8* seeds,u8* output,const u32* error,u32 window) {
+    if(*error)return;
+    const u32 index=blockIdx.y,start=segments[index].start,end=segments[index].end;
+    const u8* dictionary=seeds+static_cast<u64>(index)*window;
+    for(u32 pos=start+blockIdx.x*blockDim.x+threadIdx.x;pos<end;pos+=gridDim.x*blockDim.x){
+        const u16 value=symbolic[pos];
+        output[pos]=value<256?static_cast<u8>(value):dictionary[value-256];
+    }
+}
