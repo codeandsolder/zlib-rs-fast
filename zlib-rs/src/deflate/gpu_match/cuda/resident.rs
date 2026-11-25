@@ -460,10 +460,23 @@ impl ResidentEncoder {
         g: Geometry,
         limit: usize,
     ) -> Result<WindowOutput, GpuMatchError> {
+        self.submit_window(b, g)?;
+        self.read_window(b, g, limit)
+    }
+
+    fn submit_window(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
         self.index_and_match(b, g)?;
         self.parse(b, g)?;
         self.encode(b, g)?;
-        self.compact(b, g)?;
+        self.compact(b, g)
+    }
+
+    fn read_window(
+        &self,
+        b: &Buffers,
+        g: Geometry,
+        limit: usize,
+    ) -> Result<WindowOutput, GpuMatchError> {
         let meta = self
             .stream
             .clone_dtoh(&b.meta.slice(..4))

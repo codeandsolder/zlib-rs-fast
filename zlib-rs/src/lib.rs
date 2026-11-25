@@ -51,8 +51,6 @@ pub use batch::BatchCodec;
 pub use batch::{decompress_slices_batch, BatchDecompressResult, BatchJob};
 #[cfg(feature = "near-optimal")]
 pub use deflate::compress_slice_near_optimal;
-#[cfg(feature = "cuda")]
-pub use deflate::GpuTranscodeResult;
 pub use deflate::{compress_bound, compress_slice};
 #[cfg(feature = "std")]
 pub use deflate::{compress_slices_batch, BatchCompressResult};
@@ -61,6 +59,8 @@ pub use deflate::{
     compress_slices_batch_gpu, compress_slices_batch_gpu_windowed, GpuMatch, GpuMatchError,
     GpuMatchSearcher, GpuMatchTable,
 };
+#[cfg(feature = "cuda")]
+pub use deflate::{GpuTranscodeOptions, GpuTranscodeResult};
 pub use inflate::decompress_slice;
 
 macro_rules! traceln {

@@ -149,6 +149,155 @@ fn read_huffman_segment(
     }
 }
 
+/// Incremental scanner. The caller can overlap token-boundary discovery
+/// with GPU expansion of the preceding window.
+pub(crate) struct IndexScanner<'a> {
+    input: &'a [u8],
+    state: State<'static>,
+    reader: BitReader<'a>,
+    counter: Counter,
+    output_limit: usize,
+    header_bit: u64,
+    header_end_bit: u64,
+    kind: u32,
+    in_block: bool,
+    adler: Option<u32>,
+}
+
+impl<'a> IndexScanner<'a> {
+    pub(crate) fn new(input: &'a [u8], output_limit: u32) -> Result<Self, ReturnCode> {
+        if input.len() < 6 || input.len() > u32::MAX as usize {
+            return Err(ReturnCode::DataError);
+        }
+        let mut state = State::new(InflateStateKind::Regular);
+        state.wrap = 1;
+        state.wbits = 15;
+        let mut reader = BitReader::from_buffer(BitBuffer::default(), input);
+        if !matches!(state.decode_wrapper_head(&mut reader), Ok(Mode::Type)) {
+            return Err(ReturnCode::DataError);
+        }
+        let counter = Counter {
+            position: 0,
+            limit: output_limit as usize,
+            window: state.dmax,
+        };
+        Ok(Self {
+            input,
+            state,
+            reader,
+            counter,
+            output_limit: output_limit as usize,
+            header_bit: 0,
+            header_end_bit: 0,
+            kind: 0,
+            in_block: false,
+            adler: None,
+        })
+    }
+
+    pub(crate) const fn decoded(&self) -> usize {
+        self.counter.position
+    }
+    pub(crate) const fn adler(&self) -> Option<u32> {
+        self.adler
+    }
+    pub(crate) fn window(&self) -> u32 {
+        // RFC 1950 validated the window size before constructing the scanner.
+        self.counter.window.try_into().unwrap_or(32_768)
+    }
+
+    fn bit(&self) -> u64 {
+        offset(&self.reader, self.input.len())
+    }
+
+    fn begin_block(&mut self) -> Result<(), ReturnCode> {
+        self.header_bit = self.bit();
+        self.kind = match self
+            .state
+            .decode_block_type(&mut self.reader)
+            .map_err(|_| ReturnCode::DataError)?
+        {
+            Mode::Stored => {
+                self.reader.return_unused_bytes();
+                self.state
+                    .decode_stored_header(&mut self.reader)
+                    .map_err(|_| ReturnCode::DataError)?;
+                0
+            }
+            Mode::Len_ => 1,
+            Mode::Table => {
+                self.state
+                    .decode_dynamic_table_header(&mut self.reader)
+                    .map_err(|_| ReturnCode::DataError)?;
+                self.state
+                    .decode_code_length_alphabet(&mut self.reader)
+                    .map_err(|_| ReturnCode::DataError)?;
+                self.state
+                    .decode_code_lengths(&mut self.reader)
+                    .map_err(|_| ReturnCode::DataError)?;
+                2
+            }
+            _ => return Err(ReturnCode::DataError),
+        };
+        self.header_end_bit = self.bit();
+        self.in_block = true;
+        Ok(())
+    }
+
+    fn finish_member(&mut self) -> Result<(), ReturnCode> {
+        let trailer = usize::try_from(self.bit().div_ceil(8)).map_err(|_| ReturnCode::DataError)?;
+        let bytes = self.input.get(trailer..).ok_or(ReturnCode::DataError)?;
+        self.adler = Some(u32::from_be_bytes(
+            bytes.try_into().map_err(|_| ReturnCode::DataError)?,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn next_segment(&mut self) -> Result<Option<InflateSegment>, ReturnCode> {
+        if self.adler.is_some() {
+            return Ok(None);
+        }
+        if !self.in_block {
+            self.begin_block()?;
+        }
+        let start_bit = self.bit();
+        let start = self.counter.position;
+        let ends_block = if self.kind == 0 {
+            if self.state.length > self.reader.bytes_remaining() {
+                return Err(ReturnCode::DataError);
+            }
+            self.counter.position = start
+                .checked_add(self.state.length)
+                .filter(|&n| n <= self.output_limit)
+                .ok_or(ReturnCode::BufError)?;
+            self.reader.advance(self.state.length);
+            true
+        } else {
+            read_huffman_segment(
+                &mut self.state,
+                &mut self.reader,
+                &mut self.counter,
+                self.output_limit,
+            )?
+        };
+        let segment = InflateSegment {
+            header_bit: self.header_bit,
+            header_end_bit: self.header_end_bit,
+            start_bit,
+            end_bit: self.bit(),
+            start: u32::try_from(start).map_err(|_| ReturnCode::BufError)?,
+            end: u32::try_from(self.counter.position).map_err(|_| ReturnCode::BufError)?,
+            kind: self.kind,
+            ends_block,
+        };
+        self.in_block = !ends_block;
+        if ends_block && self.state.flags.contains(Flags::IS_LAST_BLOCK) {
+            self.finish_member()?;
+        }
+        Ok(Some(segment))
+    }
+}
+
 /// Structurally index an RFC 1950 member, without output bytes or checksum work.
 /// The caller supplies a decoded-byte bound and a descriptor bound to prevent
 /// untrusted input from causing unbounded allocation. A dictionary member or
@@ -161,115 +310,19 @@ pub fn index_zlib(
     output_limit: u32,
     segment_limit: usize,
 ) -> Result<InflateIndex, ReturnCode> {
-    if input.len() < 6 || input.len() > u32::MAX as usize {
-        return Err(ReturnCode::DataError);
-    }
-    let mut state = State::new(InflateStateKind::Regular);
-    state.wrap = 1;
-    state.wbits = 15;
-    let mut reader = BitReader::from_buffer(BitBuffer::default(), input);
-    if !matches!(state.decode_wrapper_head(&mut reader), Ok(Mode::Type)) {
-        return Err(ReturnCode::DataError);
-    }
-    let mut counter = Counter {
-        position: 0,
-        limit: output_limit as usize,
-        window: state.dmax,
-    };
+    let mut scanner = IndexScanner::new(input, output_limit)?;
     let mut segments = Vec::new();
-    loop {
-        let header_bit = offset(&reader, input.len());
-        let mode = state
-            .decode_block_type(&mut reader)
-            .map_err(|_| ReturnCode::DataError)?;
-        let kind = match mode {
-            Mode::Stored => {
-                reader.return_unused_bytes();
-                state
-                    .decode_stored_header(&mut reader)
-                    .map_err(|_| ReturnCode::DataError)?;
-                let start_bit = offset(&reader, input.len());
-                let start = counter.position;
-                if state.length > reader.bytes_remaining() {
-                    return Err(ReturnCode::DataError);
-                }
-                counter.position = start
-                    .checked_add(state.length)
-                    .filter(|&n| n <= output_limit as usize)
-                    .ok_or(ReturnCode::BufError)?;
-                reader.advance(state.length);
-                if segments.len() == segment_limit {
-                    return Err(ReturnCode::BufError);
-                }
-                segments.push(InflateSegment {
-                    header_bit,
-                    header_end_bit: start_bit,
-                    start_bit,
-                    end_bit: offset(&reader, input.len()),
-                    start: u32::try_from(start).map_err(|_| ReturnCode::BufError)?,
-                    end: u32::try_from(counter.position).map_err(|_| ReturnCode::BufError)?,
-                    kind: 0,
-                    ends_block: true,
-                });
-                0
-            }
-            Mode::Len_ => 1,
-            Mode::Table => {
-                state
-                    .decode_dynamic_table_header(&mut reader)
-                    .map_err(|_| ReturnCode::DataError)?;
-                state
-                    .decode_code_length_alphabet(&mut reader)
-                    .map_err(|_| ReturnCode::DataError)?;
-                state
-                    .decode_code_lengths(&mut reader)
-                    .map_err(|_| ReturnCode::DataError)?;
-                2
-            }
-            _ => return Err(ReturnCode::DataError),
-        };
-        if kind != 0 {
-            let header_end_bit = offset(&reader, input.len());
-            loop {
-                if segments.len() == segment_limit {
-                    return Err(ReturnCode::BufError);
-                }
-                let start_bit = offset(&reader, input.len());
-                let start = counter.position;
-                let ends_block = read_huffman_segment(
-                    &mut state,
-                    &mut reader,
-                    &mut counter,
-                    output_limit as usize,
-                )?;
-                segments.push(InflateSegment {
-                    header_bit,
-                    header_end_bit,
-                    start_bit,
-                    end_bit: offset(&reader, input.len()),
-                    start: u32::try_from(start).map_err(|_| ReturnCode::BufError)?,
-                    end: u32::try_from(counter.position).map_err(|_| ReturnCode::BufError)?,
-                    kind,
-                    ends_block,
-                });
-                if ends_block {
-                    break;
-                }
-            }
+    while let Some(segment) = scanner.next_segment()? {
+        if segments.len() == segment_limit {
+            return Err(ReturnCode::BufError);
         }
-        if state.flags.contains(Flags::IS_LAST_BLOCK) {
-            break;
-        }
+        segments.push(segment);
     }
-    let trailer = usize::try_from(offset(&reader, input.len()).div_ceil(8))
-        .map_err(|_| ReturnCode::DataError)?;
-    let bytes = input.get(trailer..).ok_or(ReturnCode::DataError)?;
-    let adler = u32::from_be_bytes(bytes.try_into().map_err(|_| ReturnCode::DataError)?);
     Ok(InflateIndex {
         segments,
-        decoded_len: u32::try_from(counter.position).map_err(|_| ReturnCode::BufError)?,
-        window: u32::try_from(counter.window).map_err(|_| ReturnCode::DataError)?,
-        adler,
+        decoded_len: u32::try_from(scanner.decoded()).map_err(|_| ReturnCode::BufError)?,
+        window: scanner.window(),
+        adler: scanner.adler().ok_or(ReturnCode::DataError)?,
     })
 }
 

@@ -6,17 +6,14 @@ use super::{
     WORKGROUP_SIZE,
 };
 use crate::{
-    deflate::gpu_match::{GpuMatchError, GpuTranscodeResult},
-    inflate::gpu_index::{index_zlib, InflateIndex, InflateSegment},
+    deflate::gpu_match::{GpuMatchError, GpuTranscodeOptions, GpuTranscodeResult},
+    inflate::gpu_index::{IndexScanner, InflateSegment},
     DeflateConfig, ReturnCode,
 };
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use std::{
-    num::NonZeroUsize,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 const HISTORY: usize = 32_768;
 const MAX_SEGMENT: usize = 128 * 1024 + 258;
@@ -280,15 +277,56 @@ impl Decoder {
         &self,
         w: &mut Workspace,
         source: &[u8],
-        index: &InflateIndex,
+        segments: &[InflateSegment],
+        window: u32,
         cursor: &mut Cursor,
         target: u32,
     ) -> Result<(), GpuMatchError> {
         while cursor.decoded < target {
-            let group = Group::next(source, &index.segments[cursor.segment..], target)?;
-            self.decode_group(w, &group, cursor, index.window)?;
+            let group = Group::next(source, &segments[cursor.segment..], target)?;
+            self.decode_group(w, &group, cursor, window)?;
         }
         Ok(())
+    }
+}
+
+struct ScanAhead<'a> {
+    scanner: IndexScanner<'a>,
+    pending: Vec<InflateSegment>,
+    count: usize,
+}
+
+impl<'a> ScanAhead<'a> {
+    fn new(source: &'a [u8], limit: u32) -> Result<Self, ReturnCode> {
+        Ok(Self {
+            scanner: IndexScanner::new(source, limit)?,
+            pending: Vec::new(),
+            count: 0,
+        })
+    }
+
+    fn fill_to(&mut self, target: usize) -> Result<(), ReturnCode> {
+        // One extra segment decides BFINAL at an exact window boundary.
+        while self.scanner.adler().is_none() && self.scanner.decoded() <= target {
+            let segment = self.scanner.next_segment()?.ok_or(ReturnCode::DataError)?;
+            self.count += 1;
+            if self.count > MAX_INDEX_SEGMENTS {
+                return Err(ReturnCode::BufError);
+            }
+            if segment.start != segment.end {
+                self.pending.push(segment);
+            }
+        }
+        Ok(())
+    }
+
+    fn result(&self, output: Vec<u8>, code: ReturnCode) -> GpuTranscodeResult {
+        GpuTranscodeResult {
+            output,
+            decoded_len: self.scanner.adler().map(|_| self.scanner.decoded()),
+            decoded_bytes_indexed: self.scanner.decoded(),
+            code,
+        }
     }
 }
 
@@ -296,43 +334,45 @@ impl ResidentEncoder {
     fn transcode(
         &self,
         source: &[u8],
-        index: &InflateIndex,
-        limit: usize,
-        config: DeflateConfig,
-        budget: u32,
-        window: NonZeroUsize,
+        mut scan: ScanAhead<'_>,
+        options: GpuTranscodeOptions,
         distance: u32,
         index_tiles: u32,
     ) -> Result<GpuTranscodeResult, GpuMatchError> {
+        let config = options.config;
         let wrapper = Wrapper::from_bits(config.window_bits)
             .ok_or_else(|| GpuMatchError("invalid transcode wrapper".into()))?;
+        let limit = options.output_limit;
         let mut output = Vec::new();
         let (header, n) = stream_header(wrapper, config.level);
-        let total = index.decoded_len as usize;
-        let result = |output, code| GpuTranscodeResult {
-            output,
-            decoded_len: total,
-            code,
-        };
         if !append(&mut output, &header[..n], limit) {
-            return Ok(result(output, ReturnCode::BufError));
+            return Ok(scan.result(output, ReturnCode::BufError));
         }
         let mut checksum = Checksum::new(wrapper);
-        if total == 0 && !append(&mut output, &[3, 0], limit) {
-            return Ok(result(output, ReturnCode::BufError));
+        let window = options.window.get().min(MAX_WINDOW);
+        if let Err(code) = scan.fill_to(window) {
+            return Ok(scan.result(Vec::new(), code));
         }
-        let window = window.get().min(MAX_WINDOW);
+        if scan.scanner.decoded() == 0 && !append(&mut output, &[3, 0], limit) {
+            return Ok(scan.result(output, ReturnCode::BufError));
+        }
         let mut w = self.decoder.workspace.lock().map_err(failure)?;
-        reserve(&self.stream, &mut w.raw, window.min(total) + CARRY_BYTES)?;
+        reserve(
+            &self.stream,
+            &mut w.raw,
+            window.min(options.decoded_limit as usize) + CARRY_BYTES,
+        )?;
         reserve(&self.stream, &mut w.carry, CARRY_BYTES)?;
         let mut cursor = Cursor::default();
-        let history = (index.window as usize).max(distance as usize - 1);
+        let source_window = scan.scanner.window();
+        let history = (source_window as usize).max(distance as usize - 1);
         let mut b = self.buffers.lock().map_err(failure)?;
-        for start in (0..total).step_by(window) {
+        let mut start = 0;
+        while start < scan.scanner.decoded() {
             if output.len() == limit {
-                return Ok(result(output, ReturnCode::BufError));
+                return Ok(scan.result(output, ReturnCode::BufError));
             }
-            let end = start.saturating_add(window).min(total);
+            let end = start.saturating_add(window).min(scan.scanner.decoded());
             let origin = start.saturating_sub(history);
             self.decoder.retain_history(
                 &mut w,
@@ -342,17 +382,21 @@ impl ResidentEncoder {
             self.decoder.decode_to(
                 &mut w,
                 source,
-                index,
+                &scan.pending,
+                source_window,
                 &mut cursor,
                 u32::try_from(end).map_err(failure)?,
             )?;
+            scan.pending.drain(..cursor.segment);
+            cursor.segment = 0;
             let input_origin = start.saturating_sub(distance as usize - 1);
+            let final_window = scan.scanner.adler().is_some() && end == scan.scanner.decoded();
             let g = Geometry::new(
                 end - input_origin,
                 start - input_origin,
                 distance,
-                budget,
-                end == total,
+                options.search_budget,
+                final_window,
                 config,
                 wrapper,
             )?
@@ -364,25 +408,39 @@ impl ResidentEncoder {
                     &mut b.input,
                 )
                 .map_err(failure)?;
-            let piece = self.window_loaded(&mut b, g, limit - output.len())?;
+            self.submit_window(&mut b, g)?;
+            // The stream is now busy with index, parse and entropy kernels.
+            // Discover the next window's token boundaries on the host before
+            // synchronizing for the compact result. No extra thread pool.
+            let next = if final_window {
+                Ok(())
+            } else {
+                scan.fill_to(end.saturating_add(window))
+            };
+            let piece = self.read_window(&b, g, limit - output.len())?;
             output.extend_from_slice(&piece.output);
             if !piece.complete {
-                return Ok(result(output, ReturnCode::BufError));
+                return Ok(scan.result(output, ReturnCode::BufError));
+            }
+            if let Err(code) = next {
+                return Ok(scan.result(Vec::new(), code));
             }
             checksum.update(&piece, end - start);
+            start = end;
         }
-        let (trailer, n) = checksum.trailer(total);
-        // This API emits zlib; the output Adler also authenticates the
-        // original member. Never publish an accepted corrupt source.
-        if trailer[..n] != index.adler.to_be_bytes() {
-            return Ok(result(Vec::new(), ReturnCode::DataError));
+        let (trailer, n) = checksum.trailer(start);
+        if Some(u32::from_be_bytes(
+            trailer[..n].try_into().map_err(failure)?,
+        )) != scan.scanner.adler()
+        {
+            return Ok(scan.result(Vec::new(), ReturnCode::DataError));
         }
         let code = if append(&mut output, &trailer[..n], limit) {
             ReturnCode::Ok
         } else {
             ReturnCode::BufError
         };
-        Ok(result(output, code))
+        Ok(scan.result(output, code))
     }
 }
 
@@ -390,36 +448,22 @@ impl ResidentPool {
     pub(in crate::deflate::gpu_match::cuda) fn recompress_zlib(
         &self,
         source: &[u8],
-        limit: usize,
-        decoded_limit: u32,
-        config: DeflateConfig,
-        budget: u32,
-        window: NonZeroUsize,
+        options: GpuTranscodeOptions,
         distance: u32,
     ) -> Result<GpuTranscodeResult, GpuMatchError> {
-        let mut index = match index_zlib(source, decoded_limit, MAX_INDEX_SEGMENTS) {
-            Ok(index) => index,
+        let scan = match ScanAhead::new(source, options.decoded_limit) {
+            Ok(scan) => scan,
             Err(code) => {
                 return Ok(GpuTranscodeResult {
                     output: Vec::new(),
-                    decoded_len: 0,
+                    decoded_len: None,
+                    decoded_bytes_indexed: 0,
                     code,
                 })
             }
         };
-        // Empty blocks have no bytes to reconstruct; the structural
-        // scanner has already validated their headers and EOB symbols.
-        index.segments.retain(|s| s.start != s.end);
-        self.acquire()?.transcode(
-            source,
-            &index,
-            limit,
-            config,
-            budget,
-            window,
-            distance,
-            self.index_tiles,
-        )
+        self.acquire()?
+            .transcode(source, scan, options, distance, self.index_tiles)
     }
 }
 
@@ -430,6 +474,7 @@ mod tests {
         compress_bound, compress_slice, compress_slices_batch_gpu_windowed, decompress_slice,
         BatchJob, GpuMatchSearcher, InflateConfig, Strategy,
     };
+    use std::num::NonZeroUsize;
 
     #[test]
     #[ignore = "requires CUDA hardware and NVRTC"]
@@ -482,9 +527,18 @@ mod tests {
                 );
                 assert_eq!(code, ReturnCode::Ok);
                 let max = u32::try_from(input.len())?;
+                let options = |cap, decoded_limit| GpuTranscodeOptions {
+                    output_limit: cap,
+                    decoded_limit,
+                    config,
+                    search_budget: 128,
+                    window,
+                };
                 for cap in [0, 1, expected.len() / 2, expected.len(), expected.len() + 1] {
-                    let actual = searcher.recompress_zlib(source, cap, max, config, 128, window)?;
-                    assert_eq!(actual.decoded_len, input.len());
+                    let actual = searcher.recompress_zlib(source, options(cap, max))?;
+                    if actual.code == ReturnCode::Ok {
+                        assert_eq!(actual.decoded_len, Some(input.len()));
+                    }
                     assert_eq!(actual.output, expected[..expected.len().min(cap)]);
                     assert_eq!(
                         actual.code,
@@ -498,34 +552,18 @@ mod tests {
                 let mut corrupt = source.to_vec();
                 let last = corrupt.last_mut().ok_or("trailer")?;
                 *last ^= 1;
-                let result = searcher.recompress_zlib(
-                    &corrupt,
-                    expected.len() + 512,
-                    max,
-                    config,
-                    128,
-                    window,
-                )?;
+                let result =
+                    searcher.recompress_zlib(&corrupt, options(expected.len() + 512, max))?;
                 assert_eq!(result.code, ReturnCode::DataError);
                 assert!(result.output.is_empty());
                 let truncated = searcher.recompress_zlib(
                     &source[..source.len() - 1],
-                    expected.len() + 512,
-                    max,
-                    config,
-                    128,
-                    window,
+                    options(expected.len() + 512, max),
                 )?;
                 assert_eq!(truncated.code, ReturnCode::DataError);
                 if max != 0 {
-                    let bounded = searcher.recompress_zlib(
-                        source,
-                        expected.len() + 512,
-                        max - 1,
-                        config,
-                        128,
-                        window,
-                    )?;
+                    let bounded =
+                        searcher.recompress_zlib(source, options(expected.len() + 512, max - 1))?;
                     assert_eq!(bounded.code, ReturnCode::BufError);
                 }
             }

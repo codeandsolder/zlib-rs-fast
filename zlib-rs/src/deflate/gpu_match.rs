@@ -33,8 +33,22 @@ pub(super) struct ResidentSchedule {
 #[derive(Debug)]
 pub struct GpuTranscodeResult {
     pub output: Vec<u8>,
-    pub decoded_len: usize,
+    /// Exact source decoded length, known only after its final block is scanned.
+    pub decoded_len: Option<usize>,
+    /// Bytes structurally indexed, including lookahead for pipelining.
+    pub decoded_bytes_indexed: usize,
     pub code: crate::ReturnCode,
+}
+
+/// Bounds and compression settings for a compressed-input CUDA job.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuTranscodeOptions {
+    pub output_limit: usize,
+    pub decoded_limit: u32,
+    pub config: crate::DeflateConfig,
+    pub search_budget: u32,
+    pub window: core::num::NonZeroUsize,
 }
 
 const HASH_SIZE: usize = 1 << 16;
@@ -1064,30 +1078,18 @@ impl GpuMatchSearcher {
     pub fn recompress_zlib(
         &self,
         input: &[u8],
-        limit: usize,
-        decoded_limit: u32,
-        config: crate::DeflateConfig,
-        budget: u32,
-        window: core::num::NonZeroUsize,
+        options: GpuTranscodeOptions,
     ) -> Result<GpuTranscodeResult, GpuMatchError> {
-        if !self.supports_zlib_transcode(config) {
+        if !self.supports_zlib_transcode(options.config) {
             return Err(GpuMatchError(
                 "resident CUDA zlib transcoding is unavailable".into(),
             ));
         }
-        let distance = super::batch::configured_max_dist(config)
+        let distance = super::batch::configured_max_dist(options.config)
             .ok_or_else(|| GpuMatchError("invalid transcode distance".into()))?;
-        validate_search_parameters(budget, distance)?;
+        validate_search_parameters(options.search_budget, distance)?;
         match &self.backend {
-            GpuBackend::Cuda(backend) => backend.recompress_zlib(
-                input,
-                limit,
-                decoded_limit,
-                config,
-                budget,
-                window,
-                distance,
-            ),
+            GpuBackend::Cuda(backend) => backend.recompress_zlib(input, options, distance),
             GpuBackend::Vulkan(_) => Err(GpuMatchError("CUDA backend not selected".into())),
         }
     }

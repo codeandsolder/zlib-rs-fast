@@ -46,10 +46,10 @@ mod window;
 pub use batch::{compress_slices_batch, BatchCompressResult};
 #[cfg(feature = "gpu")]
 pub use batch::{compress_slices_batch_gpu, compress_slices_batch_gpu_windowed};
-#[cfg(feature = "cuda")]
-pub use gpu_match::GpuTranscodeResult;
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
+#[cfg(feature = "cuda")]
+pub use gpu_match::{GpuTranscodeOptions, GpuTranscodeResult};
 
 pub type Pos = u16;
 

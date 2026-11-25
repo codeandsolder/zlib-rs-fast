@@ -1,8 +1,8 @@
 mod resident;
 
 use super::{
-    GpuBatch, GpuMatchError, GpuMatchTable, GpuTranscodeResult, InputLayout, PreparedGpuInput,
-    ResidentSchedule, MAX_MATCH, WORKGROUP_SIZE,
+    GpuBatch, GpuMatchError, GpuMatchTable, GpuTranscodeOptions, GpuTranscodeResult, InputLayout,
+    PreparedGpuInput, ResidentSchedule, MAX_MATCH, WORKGROUP_SIZE,
 };
 use cudarc::{
     driver::{
@@ -154,25 +154,13 @@ impl CudaBackend {
     pub(super) fn recompress_zlib(
         &self,
         input: &[u8],
-        limit: usize,
-        decoded_limit: u32,
-        config: crate::DeflateConfig,
-        budget: u32,
-        window: core::num::NonZeroUsize,
+        options: GpuTranscodeOptions,
         distance: u32,
     ) -> Result<GpuTranscodeResult, GpuMatchError> {
         self.resident
             .as_ref()
             .ok_or_else(|| GpuMatchError("resident CUDA encoder not selected".into()))?
-            .recompress_zlib(
-                input,
-                limit,
-                decoded_limit,
-                config,
-                budget,
-                window,
-                distance,
-            )
+            .recompress_zlib(input, options, distance)
     }
 
     pub(super) fn execute(&self, batch: &mut GpuBatch) -> Result<(), GpuMatchError> {

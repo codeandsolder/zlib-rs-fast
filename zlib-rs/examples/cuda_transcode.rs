@@ -3,7 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, num::NonZeroUsize, time::Instant};
     use zlib_rs::{
         compress_slices_batch_gpu_windowed, decompress_slice, BatchJob, DeflateConfig,
-        GpuMatchSearcher, InflateConfig, ReturnCode,
+        GpuMatchSearcher, GpuTranscodeOptions, InflateConfig, ReturnCode,
     };
     let mut args = std::env::args().skip(1);
     let source = fs::read(args.next().ok_or("source path")?)?;
@@ -50,16 +50,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = Instant::now();
             let result = searcher.recompress_zlib(
                 &source,
-                cap,
-                u32::try_from(decoded.len())?,
-                config,
-                budget,
-                window,
+                GpuTranscodeOptions {
+                    output_limit: cap,
+                    decoded_limit: u32::try_from(decoded.len())?,
+                    config,
+                    search_budget: budget,
+                    window,
+                },
             )?;
             println!(
                 "{round},transcode,{:.3},{},{},{:?}",
                 t.elapsed().as_secs_f64() * 1000.0,
-                result.decoded_len,
+                result.decoded_len.unwrap_or(result.decoded_bytes_indexed),
                 result.output.len(),
                 result.code
             );
@@ -71,7 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let b = run_transcode()?;
             (run_raw(&mut raw_output)?, b)
         };
-        assert_eq!(b.decoded_len, decoded.len());
+        if b.code == ReturnCode::Ok {
+            assert_eq!(b.decoded_len, Some(decoded.len()));
+        }
         assert_eq!(a.code, b.code);
         assert_eq!(raw_output, b.output);
         if b.code == ReturnCode::Ok {
