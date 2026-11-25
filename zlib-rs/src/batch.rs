@@ -205,6 +205,15 @@ impl BatchCodec {
         self.pool.current_num_threads()
     }
 
+    /// Execute independent mutable tasks on this codec's existing worker pool.
+    ///
+    /// This allows callers to fuse their own input preparation, decoding,
+    /// compression, and result handling into one bounded worker task without
+    /// constructing another pool. Each task is visited exactly once.
+    pub fn for_each<T: Send>(&self, tasks: &mut [T], run: impl Fn(&mut T) + Sync) {
+        self.run_with_state(tasks, || (), || (), |(), _, task| run(task));
+    }
+
     /// Run CPU-only and GPU-assisted streams concurrently on the same
     /// owned worker pool. Independent destinations and results retain their
     /// order within each partition; no additional CPU workers are created.
@@ -374,6 +383,20 @@ impl BatchCodec {
 mod tests {
     use super::*;
     use crate::{compress_bound, compress_slice, DeflateConfig};
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn caller_tasks_share_the_owned_pool() -> Result<(), &'static str> {
+        let codec = BatchCodec::new(core::num::NonZeroUsize::new(4).ok_or("workers")?)
+            .map_err(|_| "worker pool")?;
+        let mut tasks = [0; 113];
+        codec.for_each(&mut tasks, |task| {
+            assert_eq!(rayon_core::current_num_threads(), 4);
+            *task += 1;
+        });
+        assert_eq!(tasks, [1; 113]);
+        Ok(())
+    }
 
     #[cfg(feature = "parallel")]
     #[test]
