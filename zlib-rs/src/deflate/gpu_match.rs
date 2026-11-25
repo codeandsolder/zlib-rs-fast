@@ -934,6 +934,20 @@ impl GpuMatchSearcher {
         )
     }
 
+    #[cfg(feature = "parallel")]
+    pub(crate) fn search_with_pool(
+        &self,
+        input: &[u8],
+        search_budget: u32,
+        max_dist: u32,
+        pool: &crate::BatchCodec,
+    ) -> Result<GpuMatchTable, GpuMatchError> {
+        let mut tables = self.search_batch_with_pool(&[input], search_budget, max_dist, pool)?;
+        tables.pop().ok_or_else(|| {
+            GpuMatchError("GPU search did not produce a result for its input".into())
+        })
+    }
+
     fn search_batch_with_preparation(
         &self,
         inputs: &[&[u8]],
@@ -941,16 +955,7 @@ impl GpuMatchSearcher {
         max_dist: u32,
         prepare: &PrepareInputs<'_>,
     ) -> Result<Vec<GpuMatchTable>, GpuMatchError> {
-        if !(1..=PACKED_DISTANCE_LIMIT).contains(&max_dist) {
-            return Err(GpuMatchError(format!(
-                "GPU match distance must be between 1 and {PACKED_DISTANCE_LIMIT}"
-            )));
-        }
-        if search_budget == 0 {
-            return Err(GpuMatchError(
-                "GPU match search budget must be nonzero".into(),
-            ));
-        }
+        validate_search_parameters(search_budget, max_dist)?;
 
         self.search_with_geometry(
             inputs,
@@ -1157,6 +1162,23 @@ impl GpuMatchSearcher {
         }
         self.queue.submit(Some(encoder.finish()));
     }
+}
+
+pub(super) fn validate_search_parameters(
+    search_budget: u32,
+    max_dist: u32,
+) -> Result<(), GpuMatchError> {
+    if !(1..=PACKED_DISTANCE_LIMIT).contains(&max_dist) {
+        return Err(GpuMatchError(format!(
+            "GPU match distance must be between 1 and {PACKED_DISTANCE_LIMIT}"
+        )));
+    }
+    if search_budget == 0 {
+        return Err(GpuMatchError(
+            "GPU match search budget must be nonzero".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn select_adapter(instance: &Instance, filter: Option<&str>) -> Result<Adapter, GpuMatchError> {

@@ -72,3 +72,7 @@ required-features = ["std"]
 [[example]]
 name = "pdf_gpu_corpus"
 required-features = ["gpu", "parallel"]
+
+[[example]]
+name = "pdf_gpu_capped_corpus"
+required-features = ["gpu", "parallel"]

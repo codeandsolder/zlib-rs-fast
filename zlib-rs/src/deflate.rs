@@ -42,10 +42,10 @@ mod trees_tbl;
 mod window;
 
 // Position relative to the current window
-#[cfg(feature = "gpu")]
-pub use batch::compress_slices_batch_gpu;
 #[cfg(feature = "std")]
 pub use batch::{compress_slices_batch, BatchCompressResult};
+#[cfg(feature = "gpu")]
+pub use batch::{compress_slices_batch_gpu, compress_slices_batch_gpu_windowed};
 #[cfg(feature = "gpu")]
 pub use gpu_match::{GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable};
 

@@ -97,6 +97,9 @@ pub enum MatchSearchError {
     /// Hash-chain work was routed to an external/device-only match backend.
     #[cfg(feature = "gpu")]
     WrongBackend,
+    /// External GPU search failed before returning a match.
+    #[cfg(feature = "gpu")]
+    ExternalSearchFailed,
     /// The initialized window end cannot be represented in host index space.
     WindowPositionOverflow,
     /// The advertised lookahead includes bytes not initialized in the window.

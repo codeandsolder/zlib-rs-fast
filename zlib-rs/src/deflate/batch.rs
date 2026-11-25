@@ -1,13 +1,15 @@
 #[cfg(any(feature = "gpu", test))]
 use core::marker::PhantomData;
+#[cfg(feature = "gpu")]
+use core::{num::NonZeroUsize, ops::Range};
 use std::vec::Vec;
 
 #[cfg(test)]
 use super::compress_slice;
 #[cfg(feature = "gpu")]
-use super::gpu_match::{GpuMatchError, GpuMatchSearcher, GpuMatchTable};
-#[cfg(feature = "gpu")]
-use super::STD_MIN_MATCH;
+use super::gpu_match::{
+    validate_search_parameters, GpuMatchError, GpuMatchSearcher, GpuMatchTable,
+};
 #[cfg(any(feature = "gpu", test))]
 use super::{
     algorithm::{
@@ -22,6 +24,8 @@ use super::{
     compress_into_stream, reset_impl, DeflateConfig, DeflateFlush, DeflateStream, HashHistoryReset,
     ReturnCode,
 };
+#[cfg(feature = "gpu")]
+use super::{STD_MAX_MATCH, STD_MIN_MATCH};
 #[cfg(any(feature = "gpu", test))]
 use crate::abi_cursor::SliceBudget;
 #[cfg(any(feature = "gpu", test))]
@@ -122,6 +126,53 @@ impl BatchCodec {
             },
         ))
     }
+    /// Encode independent capped streams using bounded GPU match windows.
+    ///
+    /// Match tables are fetched only when the token producer reaches a new
+    /// window, preserving the exact whole-input search semantics and avoiding
+    /// search of an unconsumed tail after output exhaustion. Workers overlap
+    /// independent CPU encoding and device searches through the existing pool.
+    ///
+    /// # Errors
+    /// Returns a GPU search error if initialization, preparation or execution fails.
+    #[cfg(feature = "gpu")]
+    pub fn compress_gpu_windowed(
+        &self,
+        jobs: &mut [BatchJob<'_>],
+        config: DeflateConfig,
+        searcher: &GpuMatchSearcher,
+        search_budget: u32,
+        window_bytes: NonZeroUsize,
+    ) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
+        let Some((algorithm, max_dist)) = gpu_configuration(config) else {
+            return Ok(self.compress(jobs, config));
+        };
+        validate_search_parameters(search_budget, max_dist)?;
+        self.run_items(
+            jobs,
+            || {
+                Ok(BatchCompressResult {
+                    written: 0,
+                    code: ReturnCode::StreamError,
+                })
+            },
+            |index, job| {
+                compress_windowed_job(
+                    index,
+                    job,
+                    config,
+                    algorithm,
+                    max_dist,
+                    window_bytes,
+                    |input, distance| {
+                        searcher.search_with_pool(input, search_budget, distance, self)
+                    },
+                )
+            },
+        )
+        .into_iter()
+        .collect()
+    }
 }
 
 /// Compress complete input buffers using a persistent GPU whole-input match table.
@@ -159,18 +210,120 @@ pub fn compress_slices_batch_gpu(
     ))
 }
 
+/// Compress independent streams with demand-driven, bounded GPU match tables.
+///
+/// The window size bounds the core searched positions, with additional exact
+/// DEFLATE history and lookahead. Output exhaustion stops future searches.
+/// Produced bytes and partial prefixes match the whole-input GPU API.
+///
+/// # Errors
+/// Returns a GPU search error when preparation, execution or readback fails.
+#[cfg(feature = "gpu")]
+pub fn compress_slices_batch_gpu_windowed(
+    jobs: &mut [BatchJob<'_>],
+    config: DeflateConfig,
+    searcher: &GpuMatchSearcher,
+    search_budget: u32,
+    window_bytes: NonZeroUsize,
+) -> Result<Vec<BatchCompressResult>, GpuMatchError> {
+    let Some((algorithm, max_dist)) = gpu_configuration(config) else {
+        return Ok(compress_synchronously(jobs, config));
+    };
+    validate_search_parameters(search_budget, max_dist)?;
+    jobs.iter_mut()
+        .enumerate()
+        .map(|(index, job)| {
+            compress_windowed_job(
+                index,
+                job,
+                config,
+                algorithm,
+                max_dist,
+                window_bytes,
+                |input, distance| searcher.search_with_max_dist(input, search_budget, distance),
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_configuration(config: DeflateConfig) -> Option<(Algorithm, u32)> {
+    let algorithm =
+        configured_algorithm(config).filter(|&algorithm| uses_match_search(algorithm))?;
+    Some((algorithm, configured_max_dist(config)?))
+}
+
+#[cfg(feature = "gpu")]
+struct MatchWindow {
+    core: Range<usize>,
+    origin: usize,
+    table: GpuMatchTable,
+}
+
+#[cfg(feature = "gpu")]
+fn compress_windowed_job(
+    job_index: usize,
+    job: &mut BatchJob<'_>,
+    config: DeflateConfig,
+    algorithm: Algorithm,
+    max_dist: u32,
+    window_bytes: NonZeroUsize,
+    mut search: impl FnMut(&[u8], u32) -> Result<GpuMatchTable, GpuMatchError>,
+) -> Result<BatchCompressResult, GpuMatchError> {
+    let input = job.input;
+    let mut window: Option<MatchWindow> = None;
+    let mut search_error = None;
+    let result = compress_external_job(
+        job_index,
+        job,
+        config,
+        algorithm,
+        &mut |_, state, position, work| {
+            if !work.is_external() {
+                return Err(MatchSearchError::WrongBackend);
+            }
+            let Some(position) = position.filter(|&position| position < input.len()) else {
+                return Ok(match_from_entry(state, position, None));
+            };
+            if !window
+                .as_ref()
+                .is_some_and(|window| window.core.contains(&position))
+            {
+                let core_start = position / window_bytes.get() * window_bytes.get();
+                let core_end = core_start
+                    .saturating_add(window_bytes.get())
+                    .min(input.len());
+                let origin = core_start.saturating_sub(max_dist as usize - 1);
+                let end = core_end.saturating_add(STD_MAX_MATCH - 1).min(input.len());
+                let table = match search(&input[origin..end], max_dist) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        search_error = Some(error);
+                        return Err(MatchSearchError::ExternalSearchFailed);
+                    }
+                };
+                window = Some(MatchWindow {
+                    core: core_start..core_end,
+                    origin,
+                    table,
+                });
+            }
+            let entry = window
+                .as_ref()
+                .and_then(|window| window.table.length_distance(position - window.origin));
+            Ok(match_from_entry(state, Some(position), entry))
+        },
+    );
+    search_error.map_or(Ok(result), Err)
+}
+
 #[cfg(feature = "gpu")]
 fn prepare_gpu_matches(
     jobs: &[BatchJob<'_>],
     config: DeflateConfig,
     search: impl FnOnce(&[&[u8]], u32) -> Result<Vec<GpuMatchTable>, GpuMatchError>,
 ) -> Result<Option<(Algorithm, Vec<GpuMatchTable>)>, GpuMatchError> {
-    let Some(algorithm) =
-        configured_algorithm(config).filter(|&algorithm| uses_match_search(algorithm))
-    else {
-        return Ok(None);
-    };
-    let Some(max_dist) = configured_max_dist(config) else {
+    let Some((algorithm, max_dist)) = gpu_configuration(config) else {
         return Ok(None);
     };
     let inputs = jobs.iter().map(|job| job.input).collect::<Vec<_>>();
@@ -566,6 +719,19 @@ fn match_from_table(
     absolute_position: Option<usize>,
     table: &GpuMatchTable,
 ) -> MatchSearchResult {
+    match_from_entry(
+        state,
+        absolute_position,
+        absolute_position.and_then(|position| table.length_distance(position)),
+    )
+}
+
+#[cfg(feature = "gpu")]
+fn match_from_entry(
+    state: &State<'_>,
+    absolute_position: Option<usize>,
+    entry: Option<(u16, u16)>,
+) -> MatchSearchResult {
     let incumbent_length = if state.prev_length == 0 {
         STD_MIN_MATCH - 1
     } else {
@@ -577,7 +743,7 @@ fn match_from_table(
     let Some(absolute_position) = absolute_position else {
         return incumbent;
     };
-    let Some((length, distance)) = table.length_distance(absolute_position) else {
+    let Some((length, distance)) = entry else {
         return incumbent;
     };
     let candidate_length = usize::from(length).min(state.lookahead);
@@ -914,6 +1080,108 @@ mod tests {
                 assert_eq!(code, ReturnCode::Ok, "level {level} index {index}");
                 assert_eq!(decoded, input.as_slice());
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn windowed_gpu_matches_whole_input_and_stops_on_exhausted_output(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let mut seed = 0x9e37_79b9u32;
+        let random = (0..230_013)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let periodic = random[..32_503].repeat(9);
+        let repeated = b"periodic/PDF/stream/".repeat(17_000);
+        let window_bytes = NonZeroUsize::new(65_537).ok_or("nonzero window")?;
+        for (level, window_bits) in [(2, -15), (6, 9), (9, 31)] {
+            let config = DeflateConfig {
+                level,
+                window_bits,
+                ..DeflateConfig::default()
+            };
+            let inputs: [&[u8]; 7] = [
+                b"", b"abc", &random, &periodic, &repeated, &random, &periodic,
+            ];
+            let caps = [
+                64,
+                64,
+                1_024,
+                compress_bound(periodic.len()) + 64,
+                compress_bound(repeated.len()) + 64,
+                compress_bound(random.len()) + 64,
+                0,
+            ];
+            let run = |windowed: bool| -> Result<_, Box<dyn std::error::Error>> {
+                let mut outputs = vec![Vec::new(); inputs.len()];
+                let results = {
+                    let mut jobs = inputs
+                        .iter()
+                        .zip(&mut outputs)
+                        .zip(caps)
+                        .map(|((&input, output), cap)| BatchJob::with_vec(input, output, cap))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if windowed {
+                        compress_slices_batch_gpu_windowed(
+                            &mut jobs,
+                            config,
+                            &searcher,
+                            32,
+                            window_bytes,
+                        )?
+                    } else {
+                        compress_slices_batch_gpu(&mut jobs, config, &searcher, 32)?
+                    }
+                };
+                Ok((outputs, results))
+            };
+            let expected = run(false)?;
+            assert_eq!(run(true)?, expected);
+            #[cfg(feature = "parallel")]
+            {
+                let pool = BatchCodec::new(NonZeroUsize::new(4).ok_or("workers")?)?;
+                let mut outputs = vec![Vec::new(); inputs.len()];
+                let mut jobs = inputs
+                    .iter()
+                    .zip(&mut outputs)
+                    .zip(caps)
+                    .map(|((&input, output), cap)| BatchJob::with_vec(input, output, cap))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let results =
+                    pool.compress_gpu_windowed(&mut jobs, config, &searcher, 32, window_bytes)?;
+                drop(jobs);
+                assert_eq!((outputs, results), expected);
+            }
+            let (algorithm, max_dist) = gpu_configuration(config).ok_or("GPU configuration")?;
+            let mut output = Vec::new();
+            let mut job = BatchJob::with_vec(&random, &mut output, 1024)?;
+            let mut searched = 0;
+            let result = compress_windowed_job(
+                0,
+                &mut job,
+                config,
+                algorithm,
+                max_dist,
+                window_bytes,
+                |input, distance| {
+                    searched += input.len();
+                    searcher.search_with_max_dist(input, 32, distance)
+                },
+            )?;
+            assert_eq!(result.code, ReturnCode::BufError);
+            assert!(
+                searched < random.len(),
+                "searched {searched} of {} bytes",
+                random.len()
+            );
         }
         Ok(())
     }

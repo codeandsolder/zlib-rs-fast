@@ -55,7 +55,8 @@ pub use deflate::{compress_bound, compress_slice};
 pub use deflate::{compress_slices_batch, BatchCompressResult};
 #[cfg(feature = "gpu")]
 pub use deflate::{
-    compress_slices_batch_gpu, GpuMatch, GpuMatchError, GpuMatchSearcher, GpuMatchTable,
+    compress_slices_batch_gpu, compress_slices_batch_gpu_windowed, GpuMatch, GpuMatchError,
+    GpuMatchSearcher, GpuMatchTable,
 };
 pub use inflate::decompress_slice;
 
