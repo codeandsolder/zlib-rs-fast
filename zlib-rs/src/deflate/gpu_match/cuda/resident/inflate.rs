@@ -531,6 +531,7 @@ mod tests {
         let input = b"independent CUDA decode lane payload".repeat(27_000);
         let mut source = vec![0; compress_bound(input.len())];
         let (source, code) = compress_slice(&mut source, &input, DeflateConfig::new(6));
+        let source: &[u8] = source;
         assert_eq!(code, ReturnCode::Ok);
         let options = GpuTranscodeOptions {
             output_limit: compress_bound(input.len()),
