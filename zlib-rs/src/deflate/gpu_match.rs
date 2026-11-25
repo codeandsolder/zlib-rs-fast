@@ -27,7 +27,7 @@ const SHADER: &str = r"
 struct Params {
     input_len: u32,
     max_dist: u32,
-    max_match: u32,
+    repeat_groups: u32,
     search_budget: u32,
 }
 
@@ -112,6 +112,42 @@ fn shifted_offset(candidate: u32, length: u32) -> u32 {
     return offset;
 }
 
+// The entire group shares one nearest-distance candidate. Collectively
+// compare the union of the 128 overlapping maximum-length matches.
+// This is an exact shortcut: lanes with different predecessors still search.
+var<workgroup> repeat_distance: u32;
+var<workgroup> repeat_equal: atomic<u32>;
+
+fn cooperative_distance(base: u32, lane: u32) -> u32 {
+    // 128 starts with 258 bytes of lookahead span 385 bytes; round
+    // to complete words so each participating lane performs one load.
+    let span = 388u;
+    if params.repeat_groups == 0u || params.input_len - base < span {
+        return 0u;
+    }
+    if lane == 0u {
+        let first = predecessor_distance(base);
+        let last = predecessor_distance(base + 127u);
+        var selected = 0u;
+        if first != 0u && first == last && first <= base && first < params.max_dist {
+            selected = first;
+        }
+        repeat_distance = selected;
+        atomicStore(&repeat_equal, 1u);
+    }
+    let distance = workgroupUniformLoad(&repeat_distance);
+    if distance == 0u { return 0u; }
+    if lane < span / 4u {
+        let offset = base + lane * 4u;
+        if load_u32(offset) != load_u32(offset - distance) {
+            atomicStore(&repeat_equal, 0u);
+        }
+    }
+    workgroupBarrier();
+    if atomicLoad(&repeat_equal) == 0u { return 0u; }
+    return distance;
+}
+
 @compute @workgroup_size(128)
 fn search(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -122,8 +158,14 @@ fn search(
     // position arithmetic is valid even at the u32 input-length boundary.
     let group_index = group.y * grid.x + group.x;
     if group_index > (params.input_len - 1u) / 128u { return; }
-    let position = group_index * 128u + lane;
+    let base = group_index * 128u;
+    let shared_distance = cooperative_distance(base, lane);
+    let position = base + lane;
     if position >= params.input_len { return; }
+    if shared_distance != 0u && predecessor_distance(position) == shared_distance {
+        results[position] = (shared_distance << 16u) | max_match;
+        return;
+    }
     if params.input_len - position < 3u {
         results[position] = 0u;
         return;
@@ -138,7 +180,7 @@ fn search(
     var cursor = position;
     var chain_offset = 0u;
     var distance = predecessor_distance(cursor);
-    let max_len = min(params.max_match, params.input_len - position);
+    let max_len = min(max_match, params.input_len - position);
     var probe = 0u;
     if max_len >= 4u { probe = load_u32(position); }
 
@@ -510,6 +552,7 @@ fn prepare_indexed_input(
         }
     }
     let dispatch = dispatch_grid(input_len, max_workgroups)?;
+    let repeat_groups = u32::from(cooperative_groups_likely(input, &predecessors));
     let input_words = input_layout.pack(input);
     Ok(PreparedSearch::Gpu(PreparedGpuInput {
         input_index,
@@ -518,7 +561,7 @@ fn prepare_indexed_input(
         input_layout,
         input_words,
         predecessors,
-        params: [input_len, max_dist, MAX_MATCH, search_budget],
+        params: [input_len, max_dist, repeat_groups, search_budget],
     }))
 }
 
@@ -879,7 +922,7 @@ impl GpuMatchSearcher {
             let module = device.create_shader_module(ShaderModuleDescriptor {
                 label: Some("zlib whole-input match search"),
                 source: wgpu::ShaderSource::Wgsl(
-                    format!("const aligned_input: bool = {aligned};\n{SHADER}").into(),
+                    format!("const aligned_input: bool = {aligned};\nconst max_match: u32 = {MAX_MATCH}u;\n{SHADER}").into(),
                 ),
             });
             device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -1253,6 +1296,33 @@ const fn device_type_rank(device_type: DeviceType) -> u8 {
         DeviceType::Cpu => 2,
         DeviceType::Other => 1,
     }
+}
+
+/// Estimate the fraction of workgroups that can use the exact cooperative
+/// full-match shortcut. Only enable synchronization when at least a quarter
+/// of the sampled groups have a verified full-length common predecessor.
+fn cooperative_groups_likely(input: &[u8], predecessors: &[u32]) -> bool {
+    const SAMPLES: usize = 64;
+    const GROUP: usize = WORKGROUP_SIZE as usize;
+    const SPAN: usize = (GROUP + MAX_MATCH as usize - 1).next_multiple_of(4);
+    let groups = input.len().saturating_sub(SPAN) / GROUP;
+    if groups < SAMPLES {
+        return false;
+    }
+    let mut repeated = 0;
+    for sample in 0..SAMPLES {
+        let group = sample * (groups / SAMPLES);
+        let base = group * GROUP;
+        let distance = predecessor_distance(predecessors, base);
+        if distance != 0
+            && distance == predecessor_distance(predecessors, base + GROUP - 1)
+            && distance <= base
+            && input[base..base + SPAN] == input[base - distance..base - distance + SPAN]
+        {
+            repeated += 1;
+        }
+    }
+    repeated >= SAMPLES / 4
 }
 
 /// Choose a compact byte-packed layout for cheap searches, and one
@@ -1737,6 +1807,57 @@ mod tests {
             }
         )
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn cooperative_groups_preserve_exact_match_tables() -> Result<(), GpuMatchError> {
+        let searcher = GpuMatchSearcher::new(None)?;
+        let mut periodic = b"PDF-stream-pattern-0123456789".repeat(600);
+        periodic[12_001] = b'!';
+        periodic[12_060] = b'?';
+        let repeated = vec![b'a'; 16_513];
+        let inputs = [&periodic[..], &repeated[..]];
+        let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        for layout in [InputLayout::Packed, InputLayout::Aligned] {
+            for max_dist in [64, DEFAULT_MAX_DIST] {
+                let run = |enabled| {
+                    searcher.search_with_geometry(
+                        &inputs,
+                        32,
+                        max_dist,
+                        geometry,
+                        &|inputs, budget, distance, groups| {
+                            inputs
+                                .iter()
+                                .enumerate()
+                                .map(|(index, input)| {
+                                    let mut prepared = prepare_input(
+                                        index,
+                                        input,
+                                        budget,
+                                        distance,
+                                        groups,
+                                        Some(layout),
+                                    )?;
+                                    if let PreparedSearch::Gpu(item) = &mut prepared {
+                                        assert_eq!(item.params[2], 1);
+                                        item.params[2] = u32::from(enabled);
+                                    }
+                                    Ok(prepared)
+                                })
+                                .collect()
+                        },
+                    )
+                };
+                let ordinary = run(false)?;
+                let cooperative = run(true)?;
+                for (a, b) in ordinary.iter().zip(cooperative) {
+                    assert_eq!(a.entries, b.entries);
+                }
+            }
+        }
         Ok(())
     }
 
