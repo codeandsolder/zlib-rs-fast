@@ -40,7 +40,7 @@ struct Tree {
     u16 symbols[288];
     u16 lookup[lookup_size];
     u16 counts[16], first[16], offsets[16];
-    u32 width=0;
+    u32 width;
     __device__ bool build(const u8* lengths,u32 n,bool allow_empty=false,bool allow_single=true) {
         for(u32 i=0;i<=max_bits;++i)counts[i]=first[i]=offsets[i]=0;
         width=0;
