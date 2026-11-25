@@ -315,7 +315,7 @@ impl ResidentPool {
     }
 }
 
-// All launches share one stream and a locked buffer set. Each kernel's ABI
+// All launches within a lane share one stream and a locked buffer set. Each kernel's ABI
 // is declared in resident.cu / resident_parallel.cu. Geometry::new and
 // Buffers::prepare establish the exact index, token, tree and arena bounds.
 // Input/output buffers use the element widths expected by those kernels.
@@ -637,6 +637,57 @@ impl Checksum {
 mod tests {
     use super::*;
     use crate::deflate::gpu_match::{build_predecessors, predecessor_distance, GpuMatchSearcher};
+
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_resident_concurrent_windows_match_serial() -> Result<(), Box<dyn std::error::Error>> {
+        let (backend, _) = super::super::CudaBackend::new(0, true)?;
+        let pool = backend.resident.as_deref().ok_or("resident encoder")?;
+        let mut seed = 0x1234_5678u32;
+        let random = (0..100_013)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let repeated = b"PDF resident concurrent CUDA windows/".repeat(20_000);
+        let periodic = random[..32_503].repeat(8);
+        let inputs = [random, repeated, periodic, vec![0; 300_013]];
+        let window = NonZeroUsize::new(65_537).ok_or("window")?;
+        let compress = |input: &[u8]| {
+            pool.compress(
+                input,
+                input.len() + 512,
+                DeflateConfig::new(9),
+                128,
+                window,
+                32_506,
+            )
+        };
+        let serial = inputs
+            .iter()
+            .map(|input| compress(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let parallel = std::thread::scope(|scope| {
+            let workers = inputs
+                .iter()
+                .map(|input| scope.spawn(|| compress(input)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| "resident worker panicked")?
+                        .map_err(|_| "resident compression failed")
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        assert_eq!(serial, parallel);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUDA hardware and NVRTC"]

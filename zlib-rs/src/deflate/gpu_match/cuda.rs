@@ -63,6 +63,15 @@ impl CudaBackend {
             ));
         }
         let ctx = CudaContext::new(ordinal).map_err(failure)?;
+        // SAFETY: all device allocations in this private context are
+        // exclusively owned by one workspace and never cross streams.
+        // The dense matcher always uses its own default stream. Each
+        // resident lane allocates, uses and releases its buffers on its
+        // own nonblocking stream, under the lane lease. Stream ordering
+        // covers allocation, reuse and free; no inter-stream buffer
+        // dependencies exist. Avoid redundant events on every argument.
+        unsafe { ctx.disable_event_tracking() };
+
         let adapter_name = ctx.name().map_err(failure)?;
         let stream = ctx.default_stream();
         let (major, minor) = ctx.compute_capability().map_err(failure)?;
