@@ -16,7 +16,8 @@ use std::{
 const MIB: usize = 1024 * 1024;
 pub(in crate::deflate) const DEFAULT_WINDOW: usize = 16 * MIB;
 const MAX_WINDOW: usize = 64 * MIB;
-const MATCH_TILE: u32 = 128 * 1024;
+const MIN_MATCH_TILE: u32 = 16 * 1024;
+const MAX_MATCH_TILE: u32 = 128 * 1024;
 const SEGMENT: u32 = 8 * 1024;
 const HASH_COUNT: u32 = 1 << 16;
 const LITERAL_SYMBOLS: u32 = 286;
@@ -110,6 +111,7 @@ struct Geometry {
     history: u32,
     distance: u32,
     budget: u32,
+    tile: u32,
     tiles: u32,
     stride: u32,
     segments: u32,
@@ -146,14 +148,29 @@ impl Geometry {
             history,
             distance,
             budget,
-            tiles: core.div_ceil(MATCH_TILE),
-            stride: (MATCH_TILE + distance - 1 + MAX_MATCH - 1).next_multiple_of(2),
+            tile: MAX_MATCH_TILE,
+            tiles: core.div_ceil(MAX_MATCH_TILE),
+            stride: (MAX_MATCH_TILE + distance - 1 + MAX_MATCH - 1).next_multiple_of(2),
             segments: core.div_ceil(SEGMENT),
             target_tokens: (1u32 << (config.mem_level + 6)) - 1,
             final_window: u32::from(final_window),
             strategy: config.strategy as u32,
             checksum_kind: wrapper.checksum_kind(),
         })
+    }
+
+    // Target enough independent index warps to distribute four per SM.
+    // Limit the lower end to avoid excessive duplicated history/hash heads.
+    // Geometry affects throughput only: each tile sees exact history and lookahead.
+    fn with_index_tiles(mut self, target: u32) -> Self {
+        self.tile = self
+            .core
+            .div_ceil(target.max(1))
+            .next_power_of_two()
+            .clamp(MIN_MATCH_TILE, MAX_MATCH_TILE);
+        self.tiles = self.core.div_ceil(self.tile);
+        self.stride = (self.tile + self.distance - 1 + MAX_MATCH - 1).next_multiple_of(2);
+        self
     }
 
     const fn arena_bytes(self) -> u32 {
@@ -173,7 +190,7 @@ impl Buffers {
         grow! {
             input => g.size.next_multiple_of(4), aligned => g.size,
             heads => g.tiles * HASH_COUNT, predecessors => g.tiles * g.stride,
-            matches => g.tiles * MATCH_TILE, choices => g.core,
+            matches => g.tiles * g.tile, choices => g.core,
             exits => g.segments, transitions => g.segments * MAX_MATCH,
             entries => g.segments + 1, counts => g.segments,
             block_ids => g.segments, blocks => g.segments * BLOCK_WORDS,
@@ -190,6 +207,7 @@ pub(super) struct ResidentEncoder {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     buffers: Mutex<Buffers>,
+    index_tiles: u32,
 }
 
 // All launches share one stream and a locked buffer set. Each kernel's ABI
@@ -212,12 +230,14 @@ impl ResidentEncoder {
     pub(super) fn new(
         stream: Arc<CudaStream>,
         module: &Arc<CudaModule>,
+        multiprocessors: u32,
     ) -> Result<Self, GpuMatchError> {
         let buffers = Mutex::new(Buffers::new(&stream)?);
         Ok(Self {
             stream,
             kernels: Kernels::new(module)?,
             buffers,
+            index_tiles: multiprocessors.saturating_mul(4).max(1),
         })
     }
 
@@ -227,10 +247,10 @@ impl ResidentEncoder {
             &b.input, &mut b.aligned, &g.size);
         launch!(self, resident_index, (g.tiles.div_ceil(WORKGROUP_SIZE / 32), 1, 1), WORKGROUP_SIZE;
             &b.aligned, &mut b.heads, &mut b.predecessors, &g.size, &g.history,
-            &MATCH_TILE, &g.stride, &g.distance, &g.tiles);
-        launch!(self, resident_match, (MATCH_TILE.div_ceil(WORKGROUP_SIZE), g.tiles, 1), WORKGROUP_SIZE;
+            &g.tile, &g.stride, &g.distance, &g.tiles);
+        launch!(self, resident_match, (g.tile.div_ceil(WORKGROUP_SIZE), g.tiles, 1), WORKGROUP_SIZE;
             &b.aligned, &b.predecessors, &mut b.matches, &g.size, &g.history,
-            &MATCH_TILE, &g.stride, &g.distance, &g.budget);
+            &g.tile, &g.stride, &g.distance, &g.budget);
         Ok(())
     }
 
@@ -294,14 +314,14 @@ impl ResidentEncoder {
     fn compact(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
         if g.checksum_kind == 1 {
             launch!(self, resident_adler, (g.tiles, 1, 1), WORKGROUP_SIZE;
-                &b.aligned, &mut b.checksums, &g.size, &g.history, &MATCH_TILE, &g.distance);
+                &b.aligned, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
         } else if g.checksum_kind == 2 {
             launch!(self, resident_crc, (g.tiles, 1, 1), WORKGROUP_SIZE;
-                &b.aligned, &mut b.checksums, &g.size, &g.history, &MATCH_TILE, &g.distance);
+                &b.aligned, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
         }
         launch!(self, resident_parallel_offsets, (1, 1, 1), 1;
             &b.blocks, &b.block_count, &b.checksums, &mut b.offsets, &mut b.meta,
-            &g.core, &MATCH_TILE, &g.tiles, &g.checksum_kind);
+            &g.core, &g.tile, &g.tiles, &g.checksum_kind);
         launch!(self, resident_parallel_compact, (g.segments, 1, 1), WORKGROUP_SIZE;
             &b.blocks, &b.block_count, &b.offsets, &b.arena, &mut b.compact, &ARENA_STRIDE);
         Ok(())
@@ -383,7 +403,8 @@ impl ResidentEncoder {
                 end == input.len(),
                 config,
                 wrapper,
-            )?;
+            )?
+            .with_index_tiles(self.index_tiles);
             let result = self.window(&input[origin..end], g, limit - output.len())?;
             output.extend_from_slice(&result.output);
             if !result.complete {
@@ -414,7 +435,7 @@ fn append(output: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bool {
     count == bytes.len()
 }
 
-fn stream_header(wrapper: Wrapper, level: i32) -> ([u8; 10], usize) {
+const fn stream_header(wrapper: Wrapper, level: i32) -> ([u8; 10], usize) {
     let mut header = [0; 10];
     let len = match wrapper {
         Wrapper::Raw => 0,
@@ -535,7 +556,8 @@ mod tests {
             true,
             config,
             Wrapper::Zlib(15),
-        )?;
+        )?
+        .with_index_tiles(encoder.index_tiles);
         let mut b = encoder.buffers.lock().map_err(failure)?;
         b.prepare(&encoder.stream, g)?;
         encoder
@@ -552,9 +574,9 @@ mod tests {
             .clone_dtoh(&b.matches.slice(..g.core as usize))
             .map_err(failure)?;
         for tile in 0..g.tiles as usize {
-            let start = history + tile * MATCH_TILE as usize;
+            let start = history + tile * g.tile as usize;
             let origin = start.saturating_sub(distance as usize - 1);
-            let end = (start + MATCH_TILE as usize + MAX_MATCH as usize - 1).min(input.len());
+            let end = (start + g.tile as usize + MAX_MATCH as usize - 1).min(input.len());
             let expected = build_predecessors(&input[origin..end], distance)?;
             let actual = &pred[tile * g.stride as usize..][..end - origin - 2];
             for (position, &value) in actual.iter().enumerate() {
@@ -575,6 +597,7 @@ mod tests {
             .stream
             .clone_dtoh(&b.matches.slice(..g.core as usize))
             .map_err(failure)?;
+        drop(b);
         let mut expected = Vec::new();
         let mut pos = 0;
         while pos < matches.len() {

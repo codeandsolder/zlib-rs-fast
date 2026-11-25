@@ -961,8 +961,9 @@ struct VulkanBackend {
 }
 
 impl GpuMatchSearcher {
-    /// Create a Vulkan search engine, or use `cuda:N` to explicitly select
-    /// CUDA device ordinal N when compiled with the cuda feature.
+    /// Create a Vulkan search engine, or select CUDA device ordinal N using
+    /// `cuda:N` (resident compression) or `cuda-match:N` (dense reference).
+    /// Both CUDA modes require the cuda feature.
     ///
     /// # Errors
     /// Returns an error for invalid device selection or initialization failure.

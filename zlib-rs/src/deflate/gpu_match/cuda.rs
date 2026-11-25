@@ -96,7 +96,10 @@ impl CudaBackend {
             results: stream.alloc_zeros(1).map_err(failure)?,
         });
         let resident = use_resident
-            .then(|| resident::ResidentEncoder::new(Arc::clone(&stream), &module).map(Box::new))
+            .then(|| resident::ResidentEncoder::new(
+                Arc::clone(&stream), &module,
+                u32::try_from(ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).map_err(failure)?).map_err(failure)?,
+            ).map(Box::new))
             .transpose()?;
         Ok((
             Self {
