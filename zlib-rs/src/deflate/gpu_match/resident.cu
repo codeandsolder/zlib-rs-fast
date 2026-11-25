@@ -244,7 +244,7 @@ extern "C" __global__ void resident_adler(const u32* input,u32* checksums,
     const Tile t=tile_at(tile,size,history,tile_bytes,max_dist);
     u64 a=0,b=0;
     for(u32 i=threadIdx.x;i<t.core;i+=blockDim.x) {
-        const u32 value=input[t.start+i]&255;
+        const u32 value=byte_at<false>(input,t.start+i);
         a+=value;b+=static_cast<u64>(t.core-i)*value;
     }
     for(u32 shift=16;shift;shift>>=1){a+=__shfl_down_sync(0xffffffffu,a,shift);b+=__shfl_down_sync(0xffffffffu,b,shift);}
@@ -290,7 +290,7 @@ extern "C" __global__ void resident_crc(const u32* input,u32* checksums,
     const u32 chunk=(t.core+blockDim.x-1)/blockDim.x;
     const u32 start=min(t.core,threadIdx.x*chunk),end=min(t.core,start+chunk);
     u32 crc=0xffffffffu;
-    for(u32 i=start;i<end;++i)crc=crc_update(crc,input[t.start+i]&255);
+    for(u32 i=start;i<end;++i)crc=crc_update(crc,byte_at<false>(input,t.start+i));
     __shared__ u32 crcs[128],lengths[128];
     crcs[threadIdx.x]=~crc;lengths[threadIdx.x]=end-start;
     __syncthreads();

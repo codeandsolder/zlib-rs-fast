@@ -47,7 +47,7 @@ extern "C" __global__ void resident_choices(const u32* input,const u32* matches,
     const u32 len=strategy==1 && raw_len<=5 ? 0 : raw_len;
     const u32 next=strategy==1 && raw_next<=5 ? 0 : raw_next;
     choices[pos]=len>=3 && (len==match_limit || next<=len)
-        ? match : input[history+pos]&255;
+        ? match : byte_at<false>(input,history+pos);
 }
 // Mark a canonical path starting at each segment boundary. Each path
 // exclusively modifies its own segment and may end up to 257 bytes beyond it.
@@ -286,7 +286,7 @@ extern "C" __global__ void resident_write_stored(const u32* input,const u32* seg
     const u32 block_start=actual_start(block.first,entries,core,segment_bytes);
     for(u32 i=threadIdx.x;i<len;i+=blockDim.x) {
         const u32 pos=start-block_start+i;
-        dest[pos+5*(pos/65535+1)]=static_cast<unsigned char>(input[history+start+i]);
+        dest[pos+5*(pos/65535+1)]=static_cast<unsigned char>(byte_at<false>(input,history+start+i));
     }
 }
 extern "C" __global__ void resident_parallel_offsets(const EntropyBlock* blocks,const u32* block_count,

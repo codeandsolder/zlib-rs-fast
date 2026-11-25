@@ -95,7 +95,7 @@ macro_rules! workspace_geometry {
         $macro! {
             input: u8 => $g.size.next_multiple_of(4), aligned: u32 => $g.size,
             heads: u32 => $g.index_tiles * HASH_COUNT, predecessors: u16 => $g.size.next_multiple_of(2),
-            matches: u32 => $g.core, choices: u32 => $g.core,
+            matches: u32 => $g.core,
             exits: u32 => $g.segments, transitions: u16 => $g.segments * MAX_MATCH,
             entries: u32 => $g.segments + 1, counts: u32 => $g.segments,
             block_ids: u32 => $g.segments, blocks: u32 => $g.segments * BLOCK_WORDS,
@@ -117,7 +117,7 @@ impl Buffers {
 
 buffer_set! {
     input: u8, aligned: u32, heads: u32, predecessors: u16, matches: u32,
-    choices: u32, exits: u32, transitions: u16, entries: u32, counts: u32,
+    exits: u32, transitions: u16, entries: u32, counts: u32,
     block_ids: u32, blocks: u32, block_count: u32, hist: u32, arena: u32,
     bits: u32, bit_offsets: u32, checksums: u32, offsets: u32, meta: u32,
     compact: u8,
@@ -367,16 +367,19 @@ impl ResidentEncoder {
     )]
     fn parse(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
         let segment_grid = (g.segments.div_ceil(32), 1, 1);
+        // The aligned match-search input is dead after resident_match.
+        // Reuse that allocation for choices; original literals, stored
+        // blocks and checksum kernels read the compact immutable input.
         launch!(self, resident_choices, (g.core.div_ceil(WORKGROUP_SIZE), 1, 1), WORKGROUP_SIZE;
-            &b.aligned, &b.matches, &mut b.choices, &g.core, &g.history, &g.strategy);
+            &b.input, &b.matches, &mut b.aligned, &g.core, &g.history, &g.strategy);
         launch!(self, resident_mark_paths, segment_grid, 32;
-            &mut b.choices, &mut b.exits, &g.core, &SEGMENT, &g.segments);
+            &mut b.aligned, &mut b.exits, &g.core, &SEGMENT, &g.segments);
         launch!(self, resident_transitions, (g.segments, 1, 1), 256;
-            &b.choices, &b.exits, &mut b.transitions, &g.core, &SEGMENT);
+            &b.aligned, &b.exits, &mut b.transitions, &g.core, &SEGMENT);
         launch!(self, resident_scan_paths, (1, 1, 1), 1;
             &b.transitions, &mut b.entries, &g.segments);
         launch!(self, resident_parse_paths, segment_grid, 32;
-            &b.choices, &mut b.matches, &b.entries, &mut b.counts, &g.core, &SEGMENT, &g.segments);
+            &b.aligned, &mut b.matches, &b.entries, &mut b.counts, &g.core, &SEGMENT, &g.segments);
         launch!(self, resident_partition, (1, 1, 1), 1;
             &b.counts, &mut b.block_ids, &mut b.blocks, &mut b.block_count,
             &g.segments, &g.target_tokens, &(MAX_BLOCK_SPAN / SEGMENT));
@@ -409,7 +412,7 @@ impl ResidentEncoder {
             &b.matches, &b.counts, &b.block_ids, &b.blocks, &b.bit_offsets,
             &mut b.arena, &SEGMENT, &ARENA_STRIDE, &g.segments);
         launch!(self, resident_write_stored, all_segments, WORKGROUP_SIZE;
-            &b.aligned, &b.block_ids, &b.blocks, &mut b.arena, &b.entries,
+            &b.input, &b.block_ids, &b.blocks, &mut b.arena, &b.entries,
             &g.core, &g.history, &SEGMENT, &ARENA_STRIDE);
         Ok(())
     }
@@ -421,10 +424,10 @@ impl ResidentEncoder {
     fn compact(&self, b: &mut Buffers, g: Geometry) -> Result<(), GpuMatchError> {
         if g.checksum_kind == 1 {
             launch!(self, resident_adler, (g.tiles, 1, 1), WORKGROUP_SIZE;
-                &b.aligned, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
+                &b.input, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
         } else if g.checksum_kind == 2 {
             launch!(self, resident_crc, (g.tiles, 1, 1), WORKGROUP_SIZE;
-                &b.aligned, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
+                &b.input, &mut b.checksums, &g.size, &g.history, &g.tile, &g.distance);
         }
         launch!(self, resident_parallel_offsets, (1, 1, 1), 1;
             &b.blocks, &b.block_count, &b.checksums, &mut b.offsets, &mut b.meta,
