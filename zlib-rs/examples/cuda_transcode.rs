@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DeflateConfig::new(9);
     let searcher = GpuMatchSearcher::new(Some("cuda:0"))?;
     let mut scratch = vec![0; decoded.len()];
-    println!("round,mode,ms,decoded,encoded,code,processed,source_upload,descriptor_upload");
+    println!("round,mode,ms,decoded,encoded,code,processed,source_upload,descriptor_upload,device_indexed");
     for round in 0..4 {
         let t = Instant::now();
         let (raw, code) = decompress_slice(&mut scratch, &source, InflateConfig::default());
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(code, ReturnCode::Ok);
         assert_eq!(raw, decoded);
         println!(
-            "{round},cpu-inflate,{ms:.3},{},{},{code:?},0,0,0",
+            "{round},cpu-inflate,{ms:.3},{},{},{code:?},0,0,0,false",
             decoded.len(),
             source.len()
         );
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 window,
             )?[0];
             println!(
-                "{round},raw-gpu,{:.3},{},{},{:?},0,0,0",
+                "{round},raw-gpu,{:.3},{},{},{:?},0,0,0,false",
                 t.elapsed().as_secs_f64() * 1000.0,
                 decoded.len(),
                 result.written,
@@ -62,14 +62,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?
                 .ok_or("unexpected transcode routing")?;
             println!(
-                "{round},transcode,{:.3},{},{},{:?},{},{},{}",
+                "{round},transcode,{:.3},{},{},{:?},{},{},{},{}",
                 t.elapsed().as_secs_f64() * 1000.0,
                 result.decoded_len.unwrap_or(result.decoded_bytes_indexed),
                 result.output.len(),
                 result.code,
                 result.decoded_bytes_processed,
                 result.source_bytes_uploaded,
-                result.descriptor_bytes_uploaded
+                result.descriptor_bytes_uploaded,
+                result.device_indexed
             );
             Ok(result)
         };

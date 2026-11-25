@@ -43,6 +43,8 @@ pub struct GpuTranscodeResult {
     pub source_bytes_uploaded: usize,
     /// Structural segment descriptor bytes uploaded.
     pub descriptor_bytes_uploaded: usize,
+    /// True when the complete entropy index was constructed on CUDA.
+    pub device_indexed: bool,
     pub code: crate::ReturnCode,
 }
 
