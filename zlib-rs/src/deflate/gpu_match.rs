@@ -262,7 +262,7 @@ pub struct GpuMatch {
 }
 
 #[derive(Debug)]
-pub struct GpuMatchError(String);
+pub struct GpuMatchError(pub(super) String);
 
 impl fmt::Display for GpuMatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
