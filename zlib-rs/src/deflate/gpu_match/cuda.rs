@@ -1,5 +1,6 @@
 use super::{
-    GpuBatch, GpuMatchError, GpuMatchTable, InputLayout, PreparedGpuInput, WORKGROUP_SIZE,
+    GpuBatch, GpuMatchError, GpuMatchTable, InputLayout, PreparedGpuInput, MAX_MATCH,
+    WORKGROUP_SIZE,
 };
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg},
@@ -38,14 +39,35 @@ fn reserve(
 }
 
 impl CudaBackend {
+    #[expect(
+        unsafe_code,
+        reason = "cudarc requires unsafe dynamic library availability probes"
+    )]
     pub(super) fn new(ordinal: usize) -> Result<(Self, String), GpuMatchError> {
+        // SAFETY: these probes only load and immediately close the named
+        // CUDA driver/NVRTC libraries; no device pointers or kernels are used.
+        if !unsafe {
+            cudarc::driver::sys::is_culib_present() && cudarc::nvrtc::sys::is_culib_present()
+        } {
+            return Err(GpuMatchError(
+                "CUDA driver or NVRTC runtime library not found".into(),
+            ));
+        }
         let ctx = CudaContext::new(ordinal).map_err(failure)?;
         let adapter_name = ctx.name().map_err(failure)?;
         let stream = ctx.default_stream();
+        let (major, minor) = ctx.compute_capability().map_err(failure)?;
+        let source = format!(
+            "#define MATCH_LIMIT {MAX_MATCH}u\n#define GROUP_SIZE {WORKGROUP_SIZE}u\n{}",
+            include_str!("search.cu")
+        );
         let ptx = compile_ptx_with_opts(
-            include_str!("search.cu"),
+            source,
             CompileOptions {
-                options: vec!["--std=c++17".into(), "--gpu-architecture=compute_75".into()],
+                options: vec![
+                    "--std=c++17".into(),
+                    format!("--gpu-architecture=compute_{major}{minor}"),
+                ],
                 ..CompileOptions::default()
             },
         )

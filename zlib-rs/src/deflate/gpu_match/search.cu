@@ -2,8 +2,8 @@
 // Distances are unsigned 16-bit predecessors; results use the same packed ABI.
 // Every logical input position owns its result word.
 using u32 = unsigned int;
-constexpr u32 match_limit = 258;
-constexpr u32 group_size = 128;
+constexpr u32 match_limit = MATCH_LIMIT;
+constexpr u32 group_size = GROUP_SIZE;
 constexpr u32 cooperative_span = (group_size + match_limit - 1 + 3) & ~3u;
 
 template<bool aligned> __device__ __forceinline__

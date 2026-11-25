@@ -29,10 +29,10 @@ concurrency:
 
 jobs:
   optional-codecs:
-    name: GPU, parallel and near-optimal
+    name: GPU, CUDA, parallel and near-optimal
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
       validation-tier: routine
       rustflags: ""
       command: |
-        cargo test --locked --workspace --lib --features gz,gpu,parallel,near-optimal
+        cargo test --locked --workspace --lib --features gz,gpu,cuda,parallel,near-optimal

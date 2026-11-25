@@ -64,3 +64,7 @@ assert_eq!(decoded, input);
 For multiple independent streams, pass the same jobs to
 `compress_slices_batch` or `decompress_slices_batch`; the optional
 `BatchCodec` executes jobs concurrently on a caller-owned pool.
+
+### Native CUDA match search
+
+The optional `cuda` feature enables the same GPU match-search API on NVIDIA CUDA devices, including WSL2. Select a device explicitly with `GpuMatchSearcher::new(Some("cuda:0"))`. A CUDA driver and NVRTC runtime compatible with the selected toolkit ABI are required at runtime; Vulkan remains the default backend. Both backends use the same predecessor index, match table representation, bounded search and stream encoder.
