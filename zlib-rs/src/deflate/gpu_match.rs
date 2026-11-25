@@ -93,6 +93,25 @@ fn common_length(position: u32, candidate: u32, max_len: u32, probe: u32) -> u32
     return length;
 }
 
+// A longer match must contain every triple in the known matching prefix.
+// Intersect three chain bounds by choosing the farthest safe predecessor.
+fn shifted_offset(candidate: u32, length: u32) -> u32 {
+    let tail = length - 3u;
+    let middle = tail / 2u;
+    var offset = 0u;
+    var distance = predecessor_distance(candidate);
+    if distance == 0u { return 0u; }
+    let tail_distance = predecessor_distance(candidate + tail);
+    if tail_distance == 0u { return tail; }
+    if tail_distance > distance {
+        offset = tail;
+        distance = tail_distance;
+    }
+    let middle_distance = predecessor_distance(candidate + middle);
+    if middle_distance == 0u || middle_distance > distance { return middle; }
+    return offset;
+}
+
 @compute @workgroup_size(128)
 fn search(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -117,6 +136,7 @@ fn search(
     }
 
     var cursor = position;
+    var chain_offset = 0u;
     var distance = predecessor_distance(cursor);
     let max_len = min(params.max_match, params.input_len - position);
     var probe = 0u;
@@ -127,16 +147,17 @@ fn search(
     var best_probe = probe;
     var visited = 0u;
 
-    // The predecessor index walks the same hash bucket newest to oldest.
-    // Once one entry is outside the history bound, all later entries are too.
+    // Walk newest to oldest, shifting to a more selective interior triple
+    // when a longer prefix proves that the skipped candidates cannot improve it.
     loop {
         if best_len == max_len || distance == 0u || visited >= params.search_budget {
             break;
         }
+        if distance > cursor { break; }
         let candidate = cursor - distance;
         if candidate < minimum_start { break; }
         cursor = candidate;
-        distance = predecessor_distance(cursor);
+        distance = predecessor_distance(cursor + chain_offset);
         visited += 1u;
 
         if best_len >= 3u {
@@ -153,6 +174,10 @@ fn search(
         if length >= 3u && length > best_len {
             best_len = length;
             best_distance = position - candidate;
+            if best_len < max_len && best_len > 3u {
+                chain_offset = shifted_offset(candidate, best_len);
+                distance = predecessor_distance(candidate + chain_offset);
+            }
             // A three-byte best match uses the existing first-word probe.
             // Complete matches never read a following byte.
             if aligned_input && best_len > 3u && best_len < max_len {
@@ -1305,6 +1330,31 @@ impl InputLayout {
     }
 }
 
+/// Pick the first, last or middle triple giving the tightest upper bound
+/// on the next candidate's start. A missing predecessor proves exhaustion.
+const fn shifted_offset(predecessors: &[u32], candidate: usize, length: usize) -> usize {
+    let tail = length - 3;
+    let middle = tail / 2;
+    let mut offset = 0;
+    let mut distance = predecessor_distance(predecessors, candidate);
+    if distance == 0 {
+        return 0;
+    }
+    let tail_distance = predecessor_distance(predecessors, candidate + tail);
+    if tail_distance == 0 {
+        return tail;
+    }
+    if tail_distance > distance {
+        offset = tail;
+        distance = tail_distance;
+    }
+    let middle_distance = predecessor_distance(predecessors, candidate + middle);
+    if middle_distance == 0 || middle_distance > distance {
+        return middle;
+    }
+    offset
+}
+
 /// Resolve the same nearest-first, budgeted search as the shader. Return
 /// None when the bounded local effort would be exceeded; a caller can then
 /// dispatch the original unmodified index on the GPU.
@@ -1329,17 +1379,21 @@ fn resolve_bounded(
         let min_start = position.saturating_sub(max_dist as usize - 1);
         let query = &input[position..position + max_len];
         let mut cursor = position;
+        let mut chain_offset = 0;
         let mut best_len = 0;
         let mut best_distance = 0;
         for _ in 0..budget {
             if distance == 0 || best_len == max_len {
                 break;
             }
+            if distance > cursor {
+                break;
+            }
             cursor -= distance;
             if cursor < min_start {
                 break;
             }
-            distance = predecessor_distance(predecessors, cursor);
+            distance = predecessor_distance(predecessors, cursor + chain_offset);
             work_left = work_left.checked_sub(1)?;
             if best_len >= 3 && query[best_len] != input[cursor + best_len] {
                 continue;
@@ -1353,6 +1407,11 @@ fn resolve_bounded(
             if len > best_len {
                 best_len = len;
                 best_distance = position - cursor;
+                if len < max_len && len > 3 {
+                    work_left = work_left.checked_sub(3)?;
+                    chain_offset = shifted_offset(predecessors, cursor, len);
+                    distance = predecessor_distance(predecessors, cursor + chain_offset);
+                }
             }
         }
         *entry = (u32::try_from(best_distance).ok()? << 16) | u32::try_from(best_len).ok()?;
@@ -1932,13 +1991,18 @@ mod tests {
         if len < 3 {
             return Ok(best);
         }
-        let hash = hash3(&input[pos..pos + 3]);
         let minimum = pos.saturating_sub(max_dist as usize - 1);
-        for start in (minimum..pos)
-            .rev()
-            .filter(|&start| hash3(&input[start..start + 3]) == hash)
-            .take(budget as usize)
-        {
+        let mut cursor = pos;
+        let mut offset = 0;
+        for _ in 0..budget {
+            let hash = hash3(&input[pos + offset..pos + offset + 3]);
+            let Some(start) = (minimum..cursor)
+                .rev()
+                .find(|&start| hash3(&input[start + offset..start + offset + 3]) == hash)
+            else {
+                break;
+            };
+            cursor = start;
             let n = input[pos..pos + len]
                 .iter()
                 .zip(&input[start..start + len])
@@ -1949,9 +2013,92 @@ mod tests {
                     length: u32::try_from(n).map_err(|e| GpuMatchError(e.to_string()))?,
                     start: u32::try_from(start).map_err(|e| GpuMatchError(e.to_string()))?,
                 };
+                if n == len {
+                    break;
+                }
+                if n > 3 {
+                    let mut selected = 0;
+                    let mut nearest = (minimum..start).rev().find(|&candidate| {
+                        hash3(&input[candidate..candidate + 3]) == hash3(&input[pos..pos + 3])
+                    });
+                    for probe_offset in [n - 3, (n - 3) / 2] {
+                        let key = hash3(&input[pos + probe_offset..pos + probe_offset + 3]);
+                        let next = (minimum..start).rev().find(|&candidate| {
+                            hash3(&input[candidate + probe_offset..candidate + probe_offset + 3])
+                                == key
+                        });
+                        if next < nearest {
+                            nearest = next;
+                            selected = probe_offset;
+                        }
+                    }
+                    offset = selected;
+                }
             }
         }
         Ok(best)
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan compute adapter"]
+    fn shifted_chains_skip_only_impossible_improvements() -> Result<(), GpuMatchError> {
+        let mut input = b"abcDEFGHIJKLMNOPQRSTUVWXYZ".to_vec();
+        for index in (0..100u8).filter(|&index| index != b'E') {
+            input.extend_from_slice(&[b'a', b'b', b'c', b'D', index, b'!']);
+        }
+        input.extend_from_slice(b"abcDE!");
+        input.extend_from_slice(b"abcDEFGHIJKLMNOPQRSTUVWXYZ");
+        let position = input.len() - 26;
+        let predecessors = build_predecessors(&input, DEFAULT_MAX_DIST)?;
+        let table = resolve_bounded(&input, &predecessors, 4, DEFAULT_MAX_DIST)
+            .ok_or_else(|| GpuMatchError("bounded test exceeded work".into()))?;
+        assert_eq!(table.get(position).map(|entry| entry.length), Some(26));
+        let searcher = GpuMatchSearcher::new(None)?;
+        let geometry = SearchGeometry::from_limits(&searcher.device.limits())?;
+        let tables = searcher.search_with_geometry(
+            &[&input],
+            DEFAULT_MAX_DIST,
+            DEFAULT_MAX_DIST,
+            geometry,
+            &|inputs, budget, distance, groups| {
+                inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        prepare_input(
+                            index,
+                            input,
+                            budget,
+                            distance,
+                            groups,
+                            Some(InputLayout::Aligned),
+                        )
+                    })
+                    .collect()
+            },
+        )?;
+        let table = tables
+            .first()
+            .ok_or_else(|| GpuMatchError("missing exhaustive table".into()))?;
+        for (pos, actual) in table.iter().enumerate() {
+            let length = (input.len() - pos).min(MAX_MATCH as usize);
+            let mut best = GpuMatch::default();
+            for start in (0..pos).rev() {
+                let n = input[pos..pos + length]
+                    .iter()
+                    .zip(&input[start..start + length])
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if n >= 3 && n > best.length as usize {
+                    best = GpuMatch {
+                        length: u32::try_from(n).map_err(|e| GpuMatchError(e.to_string()))?,
+                        start: u32::try_from(start).map_err(|e| GpuMatchError(e.to_string()))?,
+                    };
+                }
+            }
+            assert_eq!(actual, best, "pos={pos}");
+        }
+        Ok(())
     }
 
     #[test]
