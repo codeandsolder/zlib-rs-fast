@@ -34,6 +34,14 @@ fn failure(error: impl core::fmt::Debug) -> GpuMatchError {
     GpuMatchError(format!("CUDA match search: {error:?}"))
 }
 
+// Small allocations still grow geometrically. Large allocations use
+// eight steps per power-of-two interval so adding a history halo does
+// not double a large window's capacity.
+fn allocation_capacity(len: usize) -> usize {
+    let power = len.next_power_of_two();
+    len.next_multiple_of((power / 8).max(1))
+}
+
 fn reserve<T: DeviceRepr + ValidAsZeroBits>(
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<T>,
@@ -41,7 +49,7 @@ fn reserve<T: DeviceRepr + ValidAsZeroBits>(
 ) -> Result<(), GpuMatchError> {
     if buffer.len() < len {
         *buffer = stream
-            .alloc_zeros(len.next_power_of_two())
+            .alloc_zeros(allocation_capacity(len))
             .map_err(failure)?;
     }
     Ok(())

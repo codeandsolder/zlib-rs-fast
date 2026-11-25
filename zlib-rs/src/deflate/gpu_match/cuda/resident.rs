@@ -1,6 +1,6 @@
 //! Whole GPU-resident DEFLATE windows. The only host-device payloads are
 //! decoded input, compact compressed output and four metadata words.
-use super::{failure, reserve};
+use super::{allocation_capacity, failure, reserve};
 use crate::{
     deflate::gpu_match::{GpuMatchError, ResidentSchedule, MAX_MATCH, WORKGROUP_SIZE},
     DeflateConfig, ReturnCode,
@@ -209,7 +209,7 @@ impl Buffers {
     fn upper_bound(g: Geometry) -> usize {
         macro_rules! count {
             ($($field:ident : $ty:ty => $count:expr),+ $(,)?) => {
-                0 $(+ ($count as usize).next_power_of_two() * core::mem::size_of::<$ty>())+
+                0 $(+ allocation_capacity($count as usize) * core::mem::size_of::<$ty>())+
             };
         }
         workspace_geometry!(count, g)
