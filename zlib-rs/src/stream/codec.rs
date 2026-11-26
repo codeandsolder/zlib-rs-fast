@@ -134,10 +134,7 @@ impl Inflate {
     }
 
     pub(super) fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, DecompressError> {
-        match self.inner.set_dictionary(dictionary) {
-            Ok(v) => Ok(v),
-            Err(_) => self.decompress_error(),
-        }
+        self.inner.set_dictionary(dictionary).or_else(|_| self.decompress_error())
     }
 }
 
@@ -189,10 +186,7 @@ impl Deflate {
 
         let result = self.inner.compress(input, output, flush);
 
-        match result {
-            Ok(status) => Ok(status),
-            Err(_) => self.compress_error(),
-        }
+        result.or_else(|_| self.compress_error())
     }
 
     pub(super) fn compress_uninit(
@@ -205,10 +199,7 @@ impl Deflate {
 
         let result = self.inner.compress_uninit(input, output, flush);
 
-        match result {
-            Ok(status) => Ok(status),
-            Err(_) => self.compress_error(),
-        }
+        result.or_else(|_| self.compress_error())
     }
 
     pub(super) fn reset(&mut self) {
@@ -234,26 +225,17 @@ impl Deflate {
     }
 
     pub(super) fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, CompressError> {
-        match self.inner.set_dictionary(dictionary) {
-            Ok(v) => Ok(v),
-            Err(_) => self.compress_error(),
-        }
+        self.inner.set_dictionary(dictionary).or_else(|_| self.compress_error())
     }
 
     pub(super) fn set_level(&mut self, level: Compression) -> Result<(), CompressError> {
         use crate::Status;
 
-        match self
-            .inner
-            .set_level(i32::try_from(level.level()).unwrap_or(i32::MAX))
-        {
-            Ok(status) => match status {
-                Status::Ok => Ok(()),
-                Status::BufError => compress_failed(ErrorMessage(Some("insufficient space"))),
-                Status::StreamEnd => {
-                    unreachable!("zlib-rs is known to never return the StreamEnd status")
-                }
-            },
+        let result = self.inner.set_level(i32::try_from(level.level()).unwrap_or(i32::MAX));
+        match result {
+            Ok(Status::Ok) => Ok(()),
+            Ok(Status::BufError) => compress_failed(ErrorMessage(Some("insufficient space"))),
+            Ok(Status::StreamEnd) => compress_failed(ErrorMessage(Some("unexpected stream end"))),
             Err(_) => self.compress_error(),
         }
     }

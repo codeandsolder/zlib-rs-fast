@@ -24,6 +24,21 @@ mod zio;
 #[path = "tests/zlib_tests.rs"]
 mod zlib_tests;
 
+// Each I/O direction uses the same framing selection and public type names.
+macro_rules! framing_aliases {
+    () => {
+        /// Raw DEFLATE encoder.
+        pub type DeflateEncoder<T> = Encoder<T, false>;
+        /// Raw DEFLATE decoder.
+        pub type DeflateDecoder<T> = Decoder<T, false>;
+        /// Zlib-framed encoder.
+        pub type ZlibEncoder<T> = Encoder<T, true>;
+        /// Zlib-framed decoder.
+        pub type ZlibDecoder<T> = Decoder<T, true>;
+    };
+}
+use framing_aliases;
+
 /// Types which operate over [`Read`] streams, both encoders and decoders for
 /// various formats.
 ///

@@ -161,6 +161,45 @@ pub(super) const fn compress_failed<T>(msg: ErrorMessage) -> Result<T, CompressE
     Err(CompressError { msg })
 }
 
+// Both codec directions expose exactly the same bounded-output contract.
+macro_rules! stream_methods {
+    ($run:ident, $uninit:ident, $vec:ident, $flush:ty, $error:ty) => {
+        /// Process as much input as the output buffer permits. Inspect the
+        /// stream's total_in and total_out counters for exact progress.
+        ///
+        /// # Errors
+        /// Returns a codec error for invalid input, configuration, or state.
+        pub fn $run(&mut self, input: &[u8], output: &mut [u8], flush: $flush) -> Result<Status, $error> {
+            self.inner.$run(input, output, flush)
+        }
+
+        /// Process input into possibly uninitialized output memory.
+        ///
+        /// # Errors
+        /// Returns a codec error for invalid input, configuration, or state.
+        pub fn $uninit(&mut self, input: &[u8], output: &mut [MaybeUninit<u8>], flush: $flush) -> Result<Status, $error> {
+            self.inner.$uninit(input, output, flush)
+        }
+
+        /// Append output into the vector's existing spare capacity.
+        /// Does not allocate or extend capacity. Inspect stream counters
+        /// to determine how much input was consumed.
+        ///
+        /// # Errors
+        /// Returns a codec error for invalid input, configuration, or state.
+        pub fn $vec(&mut self, input: &[u8], output: &mut Vec<u8>, flush: $flush) -> Result<Status, $error> {
+            let before = self.total_out();
+            // SAFETY: native codec counters track the initialized output prefix.
+            unsafe {
+                write_to_spare_capacity_of_vec(output, |out| {
+                    let result = self.$uninit(input, out, flush);
+                    (self.total_out() - before, result)
+                })
+            }
+        }
+    };
+}
+
 impl Compress {
     /// Creates a new object ready for compressing data that it's given.
     ///
@@ -270,71 +309,7 @@ impl Compress {
         self.inner.set_level(level)
     }
 
-    /// Compresses the input data into the output, consuming only as much
-    /// input as needed and writing as much output as possible.
-    ///
-    /// The flush option can be any of the available `FlushCompress` parameters.
-    ///
-    /// To learn how much data was consumed or how much output was produced, use
-    /// the `total_in` and `total_out` functions before/after this is called.
-    ///
-    /// # Errors
-    ///
-    /// The compression state or configuration is invalid.
-    pub fn compress(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        flush: FlushCompress,
-    ) -> Result<Status, CompressError> {
-        self.inner.compress(input, output, flush)
-    }
-
-    /// Similar to [`Self::compress`] but accepts uninitialized buffer.
-    ///
-    /// If you want to avoid the overhead of zero initializing the
-    /// buffer and you don't want to use a [`Vec`], then please use
-    /// this API.
-    ///
-    /// # Errors
-    ///
-    /// The compression state or configuration is invalid.
-    pub fn compress_uninit(
-        &mut self,
-        input: &[u8],
-        output: &mut [MaybeUninit<u8>],
-        flush: FlushCompress,
-    ) -> Result<Status, CompressError> {
-        self.inner.compress_uninit(input, output, flush)
-    }
-
-    /// Compresses the input data into the extra space of the output, consuming
-    /// only as much input as needed and writing as much output as possible.
-    ///
-    /// This function has the same semantics as `compress`, except that the
-    /// length of `vec` is managed by this function. This will not reallocate
-    /// the vector provided or attempt to grow it, so space for the output must
-    /// be reserved in the output vector by the caller before calling this
-    /// function.
-    ///
-    /// # Errors
-    ///
-    /// The compression state or configuration is invalid.
-    pub fn compress_vec(
-        &mut self,
-        input: &[u8],
-        output: &mut Vec<u8>,
-        flush: FlushCompress,
-    ) -> Result<Status, CompressError> {
-        let before = self.total_out();
-        // SAFETY: native codec counters track the initialized output prefix.
-        unsafe {
-            write_to_spare_capacity_of_vec(output, |out| {
-                let result = self.compress_uninit(input, out, flush);
-                (self.total_out() - before, result)
-            })
-        }
-    }
+    stream_methods!(compress, compress_uninit, compress_vec, FlushCompress, CompressError);
 }
 
 impl Decompress {
@@ -404,85 +379,8 @@ impl Decompress {
         self.inner.total_out()
     }
 
-    /// Decompresses the input data into the output, consuming only as much
-    /// input as needed and writing as much output as possible.
-    ///
-    /// The flush option can be any of the available `FlushDecompress` parameters.
-    ///
-    /// If the first call passes `FlushDecompress::Finish` it is assumed that
-    /// the input and output buffers are both sized large enough to decompress
-    /// the entire stream in a single call.
-    ///
-    /// A flush value of `FlushDecompress::Finish` indicates that there are no
-    /// more source bytes available beside what's already in the input buffer,
-    /// and the output buffer is large enough to hold the rest of the
-    /// decompressed data.
-    ///
-    /// To learn how much data was consumed or how much output was produced, use
-    /// the `total_in` and `total_out` functions before/after this is called.
-    ///
-    /// # Errors
-    ///
-    /// If the input data to this instance of `Decompress` is not a valid
-    /// zlib/deflate stream then this function may return an instance of
-    /// `DecompressError` to indicate that the stream of input bytes is corrupted.
-    pub fn decompress(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        flush: FlushDecompress,
-    ) -> Result<Status, DecompressError> {
-        self.inner.decompress(input, output, flush)
-    }
-
-    /// Similar to [`Self::decompress`] but accepts uninitialized buffer
-    ///
-    /// If you want to avoid the overhead of zero initializing the
-    /// buffer and you don't want to use a [`Vec`], then please use
-    /// this API.
-    ///
-    /// # Errors
-    ///
-    /// The input is invalid or the codec requires a dictionary.
-    pub fn decompress_uninit(
-        &mut self,
-        input: &[u8],
-        output: &mut [MaybeUninit<u8>],
-        flush: FlushDecompress,
-    ) -> Result<Status, DecompressError> {
-        self.inner.decompress_uninit(input, output, flush)
-    }
-
-    /// Decompresses the input data into the extra space in the output vector
-    /// specified by `output`.
-    ///
-    /// This function has the same semantics as `decompress`, except that the
-    /// length of `vec` is managed by this function. This will not reallocate
-    /// the vector provided or attempt to grow it, so space for the output must
-    /// be reserved in the output vector by the caller before calling this
-    /// function.
-    ///
-    /// # Errors
-    ///
-    /// If the input data to this instance of `Decompress` is not a valid
-    /// zlib/deflate stream then this function may return an instance of
-    /// `DecompressError` to indicate that the stream of input bytes is corrupted.
-    pub fn decompress_vec(
-        &mut self,
-        input: &[u8],
-        output: &mut Vec<u8>,
-        flush: FlushDecompress,
-    ) -> Result<Status, DecompressError> {
-        let before = self.total_out();
-        // SAFETY: native codec counters track the initialized output prefix.
-        unsafe {
-            write_to_spare_capacity_of_vec(output, |out| {
-                let result = self.decompress_uninit(input, out, flush);
-                (self.total_out() - before, result)
-            })
-        }
-    }
-
+    stream_methods!(decompress, decompress_uninit, decompress_vec, FlushDecompress, DecompressError);
+    
     /// Specifies the decompression dictionary to use.
     ///
     /// # Errors

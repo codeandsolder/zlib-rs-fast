@@ -42,6 +42,20 @@ pub trait Ops {
         Self: Sized;
 }
 
+// Map the common I/O engine to each named native codec API.
+macro_rules! codec_forwarding {
+    ($run:ident, $vec:ident) => {
+        fn total_in(&self) -> u64 { self.total_in() }
+        fn total_out(&self) -> u64 { self.total_out() }
+        fn run(&mut self, input: &[u8], output: &mut [u8], flush: Self::Flush) -> Result<Status, Self::Error> {
+            self.$run(input, output, flush)
+        }
+        fn run_vec(&mut self, input: &[u8], output: &mut Vec<u8>, flush: Self::Flush) -> Result<Status, Self::Error> {
+            self.$vec(input, output, flush)
+        }
+    };
+}
+
 impl Ops for Compress {
     fn reset_stream(&mut self, _zlib: bool) {
         self.reset();
@@ -53,28 +67,7 @@ impl Ops for Compress {
     /// input cannot indicate truncation, so `Writer::finish` keeps the encoder's
     /// existing no-more-output completion rule instead of requiring `StreamEnd`.
     const REQUIRES_STREAM_END: bool = false;
-    fn total_in(&self) -> u64 {
-        self.total_in()
-    }
-    fn total_out(&self) -> u64 {
-        self.total_out()
-    }
-    fn run(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        flush: FlushCompress,
-    ) -> Result<Status, CompressError> {
-        self.compress(input, output, flush)
-    }
-    fn run_vec(
-        &mut self,
-        input: &[u8],
-        output: &mut Vec<u8>,
-        flush: FlushCompress,
-    ) -> Result<Status, CompressError> {
-        self.compress_vec(input, output, flush)
-    }
+    codec_forwarding!(compress, compress_vec);
 
     fn flush<W: Write>(writer: &mut Writer<W, Self>) -> io::Result<()> {
         loop {
@@ -101,28 +94,7 @@ impl Ops for Decompress {
     /// Once `Writer::finish` can produce no more output, only `StreamEnd` proves
     /// the input was complete. Otherwise, it must report `UnexpectedEof`.
     const REQUIRES_STREAM_END: bool = true;
-    fn total_in(&self) -> u64 {
-        self.total_in()
-    }
-    fn total_out(&self) -> u64 {
-        self.total_out()
-    }
-    fn run(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        flush: FlushDecompress,
-    ) -> Result<Status, DecompressError> {
-        self.decompress(input, output, flush)
-    }
-    fn run_vec(
-        &mut self,
-        input: &[u8],
-        output: &mut Vec<u8>,
-        flush: FlushDecompress,
-    ) -> Result<Status, DecompressError> {
-        self.decompress_vec(input, output, flush)
-    }
+    codec_forwarding!(decompress, decompress_vec);
 
     fn flush<W: Write>(writer: &mut Writer<W, Self>) -> io::Result<()> {
         writer.dump()?;

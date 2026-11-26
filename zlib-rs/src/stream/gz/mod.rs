@@ -291,9 +291,9 @@ fn bad_header() -> Error {
 }
 
 const fn footer(crc: &Crc) -> [u8; 8] {
-    let [a, b, c, d] = crc.sum().to_le_bytes();
-    let [e, f, g, h] = crc.amount().to_le_bytes();
-    [a, b, c, d, e, f, g, h]
+    let checksum = crc.sum().to_le_bytes();
+    let size = crc.amount().to_le_bytes();
+    [checksum[0], checksum[1], checksum[2], checksum[3], size[0], size[1], size[2], size[3]]
 }
 
 fn corrupt() -> Error {

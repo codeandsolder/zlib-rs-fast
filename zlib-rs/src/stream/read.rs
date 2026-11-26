@@ -147,14 +147,7 @@ impl<R: Read + Write, S: BufferedSource<R> + Read> Write for Reader<R, S> {
     }
 }
 
-/// Raw DEFLATE encoder.
-pub type DeflateEncoder<T> = Encoder<T, false>;
-/// Raw DEFLATE decoder.
-pub type DeflateDecoder<T> = Decoder<T, false>;
-/// Zlib-framed encoder.
-pub type ZlibEncoder<T> = Encoder<T, true>;
-/// Zlib-framed decoder.
-pub type ZlibDecoder<T> = Decoder<T, true>;
+super::framing_aliases!();
 
 /// Gzip-framed I/O adapters.
 pub use super::gz::read::{GzDecoder, GzEncoder, MultiGzDecoder};

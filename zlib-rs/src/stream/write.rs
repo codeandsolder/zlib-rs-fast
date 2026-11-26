@@ -154,7 +154,7 @@ impl<W: Write, const ZLIB: bool> Encoder<W, ZLIB> {
     ///
     /// Note that not all bytes written to this object may be accounted for,
     /// there may still be some active buffering.
-    pub fn total_in(&self) -> u64 {
+    pub const fn total_in(&self) -> u64 {
         self.inner.data.total_in()
     }
 
@@ -162,7 +162,7 @@ impl<W: Write, const ZLIB: bool> Encoder<W, ZLIB> {
     ///
     /// Note that not all bytes may have been written yet, some may still be
     /// buffered.
-    pub fn total_out(&self) -> u64 {
+    pub const fn total_out(&self) -> u64 {
         self.inner.data.total_out()
     }
 }
@@ -333,13 +333,13 @@ impl<W: Write, const ZLIB: bool> Decoder<W, ZLIB> {
     ///
     /// Note that this will likely be smaller than the number of bytes
     /// successfully written to this stream due to internal buffering.
-    pub fn total_in(&self) -> u64 {
+    pub const fn total_in(&self) -> u64 {
         self.inner.data.total_in()
     }
 
     /// Returns the number of bytes that the decompressor has written to its
     /// output stream.
-    pub fn total_out(&self) -> u64 {
+    pub const fn total_out(&self) -> u64 {
         self.inner.data.total_out()
     }
 }
@@ -360,14 +360,7 @@ impl<W: Read + Write, const ZLIB: bool> Read for Decoder<W, ZLIB> {
     }
 }
 
-/// Raw DEFLATE encoder.
-pub type DeflateEncoder<T> = Encoder<T, false>;
-/// Raw DEFLATE decoder.
-pub type DeflateDecoder<T> = Decoder<T, false>;
-/// Zlib-framed encoder.
-pub type ZlibEncoder<T> = Encoder<T, true>;
-/// Zlib-framed decoder.
-pub type ZlibDecoder<T> = Decoder<T, true>;
+super::framing_aliases!();
 
 #[cfg(test)]
 #[path = "tests/write_zlib_tests.rs"]

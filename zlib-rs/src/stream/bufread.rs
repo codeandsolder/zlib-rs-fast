@@ -5,6 +5,7 @@ use core::mem;
 use std::io::{self, BufRead, Read, Write};
 
 /// Streaming adapter over a caller-supplied buffered reader.
+///
 /// The codec type determines compression or decompression, while ZLIB
 /// selects the wire framing. Decoders stop after the first member and
 /// leave following bytes in the underlying reader.
@@ -107,14 +108,7 @@ impl<R: BufRead + Write, D: zio::Ops, const ZLIB: bool> Write for Stream<R, D, Z
     }
 }
 
-/// Raw DEFLATE encoder.
-pub type DeflateEncoder<T> = Encoder<T, false>;
-/// Raw DEFLATE decoder.
-pub type DeflateDecoder<T> = Decoder<T, false>;
-/// Zlib-framed encoder.
-pub type ZlibEncoder<T> = Encoder<T, true>;
-/// Zlib-framed decoder.
-pub type ZlibDecoder<T> = Decoder<T, true>;
+super::framing_aliases!();
 
 #[cfg(test)]
 #[path = "tests/bufread_zlib_tests.rs"]
