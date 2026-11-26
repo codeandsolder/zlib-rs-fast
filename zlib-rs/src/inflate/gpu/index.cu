@@ -79,15 +79,16 @@ __device__ u32 token_edge(const Tree& ll,const Tree& dd,Reader r,u32 window) {
     const u32 symbol=ll.decode(r);
     if(!r.good)return 0;
     u32 length=1,distance=0;
-    if(symbol==256)length=0;
+    if(symbol<256)distance=symbol;
+    else if(symbol==256)length=0;
     else if(symbol>=257 && !match(r,dd,symbol,length,distance))return 0;
     const u32 step=static_cast<u32>(r.position-begin);
     if(!step || step>max_token_bits || distance>window)return 0;
-    // 6 bit step, 9 bit output length, 16 bit distance.
+    // 6-bit step, 9-bit output length, 16-bit distance or literal.
     return step|(length<<6)|(distance<<15);
 }
 extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* blocks,
-    const TileTrees* trees,const TileTask* tasks,u32 window,TilePath* paths) {
+    const TileTrees* trees,const TileTask* tasks,u32 window,TilePath* paths,u32* retained) {
     const TileTask task=tasks[blockIdx.x];
     const TileBlock b=blocks[task.block];
     const TileTrees& t=trees[task.block];
@@ -105,7 +106,9 @@ extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* b
     }
     __syncthreads();
     for(u32 j=threadIdx.x;j<size;j+=blockDim.x){
-        edges[j]=token_edge(ll,dd,Reader{input,0,start+j,b.upper},window);
+        const u32 edge=token_edge(ll,dd,Reader{input,0,start+j,b.upper},window);
+        edges[j]=edge;
+        retained[static_cast<u64>(blockIdx.x)*tile_bits+j]=edge;
     }
     __syncthreads();
     if(threadIdx.x<max_token_bits){
@@ -117,7 +120,7 @@ extern "C" __global__ void inflate_tile_paths(const u8* input,const TileBlock* b
             const u32 bytes=(edge>>6)&511,distance=edge>>15;
             position+=step;
             if(!bytes){status=1;break;}
-            if(distance>length)need=max(need,distance-length);
+            if(bytes>1 && distance>length)need=max(need,distance-length);
             length+=bytes;++tokens;
         }
         if(status==0 && size<tile_bits)status=2;
@@ -321,39 +324,37 @@ extern "C" __global__ void inflate_place_segments(const TileBlock* blocks,
     }
 }
 
-// Decode only the proven token path inside each tile, in parallel across
-// the full member. The compact token list avoids serial Huffman parsing
-// in the dictionary expansion stage. The same exact bit endpoint is
-// checked again, including the terminal EOB.
-extern "C" __global__ void inflate_emit_tokens(const u8* input,const TileBlock* blocks,
-    const TileTrees* trees,const TileTask* tasks,const TileSelection* selected,
-    const Placement* placements,u32 tiles,u32 capacity,u32* tokens,IndexInfo* info,u32 window) {
+// Replay the already decoded edges on the selected exact path. No second
+// Huffman decode is needed. Check the bit endpoint and terminal EOB again.
+extern "C" __global__ void inflate_emit_tokens(const u32* retained,
+    const TileTask* tasks,const TileSelection* selected,const Placement* placements,
+    u32 tiles,u32 capacity,u32* tokens,IndexInfo* info,u32 window) {
     const u32 i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=tiles||info->status||info->tokens>capacity)return;
-    const TileTask task=tasks[i];
-    const Placement p=placements[task.block];
+    const Placement p=placements[tasks[i].block];
     const TileSelection select=selected[i];
     if(!p.count||!select.count)return;
-    const TileBlock b=blocks[task.block];
-    const TileTrees& t=trees[task.block];
-    const u64 start=t.payload+static_cast<u64>(task.tile)*tile_bits;
-    Reader r{input,0,start+select.entry,b.upper};
+    const u32* edges=retained+static_cast<u64>(i)*tile_bits;
     if(p.token_base>info->tokens || select.offset>info->tokens-p.token_base ||
         select.count>info->tokens-p.token_base-select.offset){atomicOr(&info->reserved,4u);return;}
+    u32 position=select.entry;
     for(u32 j=0;j<select.count;++j){
-        const u32 symbol=t.ll.decode(r);
-        u32 value=0;
-        if(!r.good||symbol==256){atomicOr(&info->reserved,4u);return;}
-        if(symbol<256)value=symbol;
-        else {
-            u32 length=0,distance=0;
-            if(!match(r,t.dd,symbol,length,distance)||distance>window){atomicOr(&info->reserved,4u);return;}
-            value=(length<<16)|distance;
+        if(position>=tile_bits){atomicOr(&info->reserved,4u);return;}
+        const u32 edge=edges[position],step=edge&63,length=(edge>>6)&511,value=edge>>15;
+        if(!step||step>max_token_bits||!length||
+            (length==1?value>=256:length<3||length>258||!value||value>window)){
+            atomicOr(&info->reserved,4u);return;
         }
-        tokens[p.token_base+select.offset+j]=value;
+        tokens[p.token_base+select.offset+j]=length==1?value:(length<<16)|value;
+        position+=step;
     }
-    if((select.end>>16)==1 && t.ll.decode(r)!=256)r.good=false;
-    if(!r.good||r.position!=start+(select.end&65535))atomicOr(&info->reserved,4u);
+    if((select.end>>16)==1){
+        if(position>=tile_bits){atomicOr(&info->reserved,4u);return;}
+        const u32 edge=edges[position],step=edge&63;
+        if(!step||step>max_token_bits||(edge>>6)){atomicOr(&info->reserved,4u);return;}
+        position+=step;
+    }
+    if(position!=(select.end&65535))atomicOr(&info->reserved,4u);
 }
 
 // Ordered compaction of validated dynamic headers. The bitmap is one bit

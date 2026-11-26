@@ -63,6 +63,7 @@ pub(super) struct Workspace {
     tasks: CudaSlice<u64>,
     trees: CudaSlice<u8>,
     paths: CudaSlice<u64>,
+    edges: CudaSlice<u32>,
     extents: CudaSlice<u64>,
     relative: CudaSlice<u64>,
     relative_ranges: CudaSlice<u32>,
@@ -89,6 +90,7 @@ impl Workspace {
             tasks: stream.alloc_zeros(1).map_err(failure)?,
             trees: stream.alloc_zeros(1).map_err(failure)?,
             paths: stream.alloc_zeros(1).map_err(failure)?,
+            edges: stream.alloc_zeros(1).map_err(failure)?,
             extents: stream.alloc_zeros(1).map_err(failure)?,
             relative: stream.alloc_zeros(1).map_err(failure)?,
             relative_ranges: stream.alloc_zeros(1).map_err(failure)?,
@@ -125,6 +127,7 @@ impl Workspace {
             + allocation(tiles, 8)
             + allocation(headers * TREE_BYTES, 1)
             + allocation(tiles * PATH_WORDS, 8)
+            + allocation(tiles * TILE_BITS, 4)
             + allocation(headers * EXTENT_WORDS, 8)
             + allocation(tiles * WORDS_PER_SEGMENT, 8)
             + allocation(headers, 4)
@@ -244,6 +247,7 @@ impl Indexer {
         reserve(&self.stream, &mut w.tasks, t)?;
         reserve(&self.stream, &mut w.trees, n * TREE_BYTES)?;
         reserve(&self.stream, &mut w.paths, t * PATH_WORDS)?;
+        reserve(&self.stream, &mut w.edges, t * TILE_BITS)?;
         reserve(&self.stream, &mut w.extents, n * EXTENT_WORDS)?;
         reserve(&self.stream, &mut w.relative, t * WORDS_PER_SEGMENT)?;
         reserve(&self.stream, &mut w.counts, n)?;
@@ -257,7 +261,7 @@ impl Indexer {
         launch!(self,inflate_prepare_tiles,(count.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
             &w.source,&w.blocks,&count,&mut w.trees);
         launch!(self,inflate_tile_paths,(tiles,1,1),WORKGROUP_SIZE;
-            &w.source,&w.blocks,&w.trees,&w.tasks,&window,&mut w.paths);
+            &w.source,&w.blocks,&w.trees,&w.tasks,&window,&mut w.paths,&mut w.edges);
         launch!(self,inflate_compose_segments,(count.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
             &w.blocks,&w.trees,&w.paths,&count,&limit,&mut w.extents,&mut w.relative,&mut w.counts,&mut w.relative_ranges,&mut w.selected);
         Ok(Some(tiles))
@@ -310,7 +314,7 @@ impl Indexer {
             launch!(self,inflate_place_segments,(count,1,1),WORKGROUP_SIZE;
                 &w.blocks,&w.relative,&w.placements,&mut w.segments,&w.info,&w.relative_ranges,&mut w.ranges);
             launch!(self,inflate_emit_tokens,(tiles.div_ceil(WORKGROUP_SIZE),1,1),WORKGROUP_SIZE;
-                &w.source,&w.blocks,&w.trees,&w.tasks,&w.selected,&w.placements,
+                &w.edges,&w.tasks,&w.selected,&w.placements,
                 &tiles,&token_capacity,&mut w.tokens,&mut w.info,&window);
         }
         reserve(&self.stream, &mut w.groups, MAX_SEGMENTS * 4)?;
