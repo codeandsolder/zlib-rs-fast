@@ -1,58 +1,31 @@
-//! Streaming adapters for bufread I/O.
+//! Streaming adapters for buffered I/O.
 
-use crate::stream::io;
-use crate::stream::io::{BufRead, Read, Write};
+use super::{zio, Compress, Compression, Decompress};
 use core::mem;
+use std::io::{self, BufRead, Read, Write};
 
-use crate::stream::zio;
-use crate::stream::{Compress, Decompress};
-
-/// A raw DEFLATE or zlib encoder, or compressor.
-///
-/// This structure implements a [`Read`] interface. When read from, it reads
-/// uncompressed data from the underlying [`BufRead`] and provides the compressed data.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-/// [`BufRead`]: https://doc.rust-lang.org/std/io/trait.BufRead.html
-///
-/// # Examples
-///
-/// ```
-/// use std::io::prelude::*;
-/// use zlib_rs::stream::Compression;
-/// use zlib_rs::stream::bufread::ZlibEncoder;
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// // Use a buffered file to compress contents into a Vec<u8>
-///
-/// # fn open_hello_world() -> std::io::Result<Vec<u8>> {
-/// let f = File::open("examples/hello_world.txt")?;
-/// let b = BufReader::new(f);
-/// let mut z = ZlibEncoder::new(b, Compression::fast());
-/// let mut buffer = Vec::new();
-/// z.read_to_end(&mut buffer)?;
-/// # Ok(buffer)
-/// # }
-/// ```
+/// Streaming adapter over a caller-supplied buffered reader.
+/// The codec type determines compression or decompression, while ZLIB
+/// selects the wire framing. Decoders stop after the first member and
+/// leave following bytes in the underlying reader.
 #[derive(Debug)]
-pub struct Encoder<R, const ZLIB: bool> {
+pub struct Stream<R, D, const ZLIB: bool> {
     obj: R,
-    data: Compress,
+    data: D,
 }
 
+/// Buffered compression stream.
+pub type Encoder<R, const ZLIB: bool> = Stream<R, Compress, ZLIB>;
+/// Buffered decompression stream.
+pub type Decoder<R, const ZLIB: bool> = Stream<R, Decompress, ZLIB>;
+
 impl<R: BufRead, const ZLIB: bool> Encoder<R, ZLIB> {
-    /// Creates a new encoder which will read uncompressed data from the given
-    /// stream and emit the compressed stream.
-    pub fn new(r: R, level: crate::stream::Compression) -> Self {
-        Self {
-            obj: r,
-            data: Compress::new(level, ZLIB),
-        }
+    /// Construct a compressor at the given level.
+    pub fn new(r: R, level: Compression) -> Self {
+        Self::new_with_compress(r, Compress::new(level, ZLIB))
     }
 
-    /// Creates a new encoder with the given `compression` settings which will
-    /// read uncompressed data from the given stream `r` and emit the compressed stream.
+    /// Construct a compressor with caller-configured codec state.
     pub const fn new_with_compress(r: R, compression: Compress) -> Self {
         Self {
             obj: r,
@@ -61,134 +34,13 @@ impl<R: BufRead, const ZLIB: bool> Encoder<R, ZLIB> {
     }
 }
 
-pub(super) fn reset_encoder_data<R, const ZLIB: bool>(zlib: &mut Encoder<R, ZLIB>) {
-    zlib.data.reset();
-}
-
-impl<R, const ZLIB: bool> Encoder<R, ZLIB> {
-    /// Resets the state of this encoder entirely, swapping out the input
-    /// stream for another.
-    ///
-    /// This function will reset the internal state of this encoder and replace
-    /// the input stream with the one provided, returning the previous input
-    /// stream. Future data read from this encoder will be the compressed
-    /// version of `r`'s data.
-    pub fn reset(&mut self, r: R) -> R {
-        reset_encoder_data(self);
-        mem::replace(&mut self.obj, r)
-    }
-
-    /// Acquires a reference to the underlying reader
-    pub const fn get_ref(&self) -> &R {
-        &self.obj
-    }
-
-    /// Acquires a mutable reference to the underlying stream
-    ///
-    /// The underlying reader may be mutated as long as its unread input and
-    /// current position are preserved for subsequent reads by this encoder.
-    ///
-    /// To process a new stream, wait for this encoder to reach EOF and use
-    /// [`reset`](Self::reset); replacing the reader directly does not reset it.
-    pub const fn get_mut(&mut self) -> &mut R {
-        &mut self.obj
-    }
-
-    /// Consumes this encoder, returning the underlying reader.
-    pub fn into_inner(self) -> R {
-        self.obj
-    }
-
-    /// Returns the number of bytes that have been read into this compressor.
-    ///
-    /// Note that not all bytes read from the underlying object may be accounted
-    /// for, there may still be some active buffering.
-    pub fn total_in(&self) -> u64 {
-        self.data.total_in()
-    }
-
-    /// Returns the number of bytes that the compressor has produced.
-    ///
-    /// Note that not all bytes may have been read yet, some may still be
-    /// buffered.
-    pub fn total_out(&self) -> u64 {
-        self.data.total_out()
-    }
-}
-
-impl<R: BufRead, const ZLIB: bool> Read for Encoder<R, ZLIB> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        zio::read(&mut self.obj, &mut self.data, buf)
-    }
-}
-
-impl<R: BufRead + Write, const ZLIB: bool> Write for Encoder<R, ZLIB> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
-/// A raw DEFLATE or zlib decoder, or decompressor.
-///
-/// This structure implements a [`Read`] interface. When read from, it reads
-/// compressed data from the underlying [`BufRead`] and provides the uncompressed data.
-///
-/// After reading a single member of the compressed data this reader will return
-/// Ok(0) even if there are more bytes available in the underlying reader.
-/// If you need the following bytes, call `into_inner()` after Ok(0) to
-/// recover the underlying reader.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-/// [`BufRead`]: https://doc.rust-lang.org/std/io/trait.BufRead.html
-///
-/// # Examples
-///
-/// ```
-/// use std::io::prelude::*;
-/// use std::io;
-/// # use zlib_rs::stream::Compression;
-/// # use zlib_rs::stream::write::ZlibEncoder;
-/// use zlib_rs::stream::bufread::ZlibDecoder;
-///
-/// # fn main() {
-/// # let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
-/// # e.write_all(b"Hello World").unwrap();
-/// # let bytes = e.finish().unwrap();
-/// # println!("{}", decode_bufreader(bytes).unwrap());
-/// # }
-/// #
-/// // Uncompresses a Zlib Encoded vector of bytes and returns a string or error
-/// // Here &[u8] implements BufRead
-///
-/// fn decode_bufreader(bytes: Vec<u8>) -> io::Result<String> {
-///     let mut z = ZlibDecoder::new(&bytes[..]);
-///     let mut s = String::new();
-///     z.read_to_string(&mut s)?;
-///     Ok(s)
-/// }
-/// ```
-#[derive(Debug)]
-pub struct Decoder<R, const ZLIB: bool> {
-    obj: R,
-    data: Decompress,
-}
-
 impl<R: BufRead, const ZLIB: bool> Decoder<R, ZLIB> {
-    /// Creates a new decoder which will decompress data read from the given
-    /// stream.
+    /// Construct a decompressor.
     pub fn new(r: R) -> Self {
-        Self {
-            obj: r,
-            data: Decompress::new(ZLIB),
-        }
+        Self::new_with_decompress(r, Decompress::new(ZLIB))
     }
 
-    /// Creates a new decoder which will decompress data read from the given
-    /// stream, using the given `decompression` settings.
+    /// Construct a decompressor with caller-configured codec state.
     pub const fn new_with_decompress(r: R, decompression: Decompress) -> Self {
         Self {
             obj: r,
@@ -197,76 +49,61 @@ impl<R: BufRead, const ZLIB: bool> Decoder<R, ZLIB> {
     }
 }
 
-pub(super) fn reset_decoder_data<R, const ZLIB: bool>(zlib: &mut Decoder<R, ZLIB>) {
-    zlib.data.reset(ZLIB);
-}
-
-impl<R, const ZLIB: bool> Decoder<R, ZLIB> {
-    /// Resets the state of this decoder entirely, swapping out the input
-    /// stream for another.
-    ///
-    /// This will reset the internal state of this decoder and replace the
-    /// input stream with the one provided, returning the previous input
-    /// stream. Future data read from this decoder will be the decompressed
-    /// version of `r`'s data.
-    pub fn reset(&mut self, r: R) -> R {
-        reset_decoder_data(self);
-        mem::replace(&mut self.obj, r)
-    }
-
-    /// Reset the decompression state while retaining the same reader.
-    pub fn reset_data(&mut self) {
-        reset_decoder_data(self);
-    }
-
-    /// Acquires a reference to the underlying stream
+impl<R, D, const ZLIB: bool> Stream<R, D, ZLIB> {
+    /// Borrow the underlying reader.
     pub const fn get_ref(&self) -> &R {
         &self.obj
     }
 
-    /// Acquires a mutable reference to the underlying stream
-    ///
-    /// The underlying reader may be mutated as long as its unread input and
-    /// current position are preserved for subsequent reads by this decoder.
-    ///
-    /// To process a new stream, wait for this decoder to reach EOF and use
-    /// [`reset`](Self::reset); replacing the reader directly does not reset it.
+    /// Borrow the reader mutably. Preserve unread data and its position until
+    /// the compressed member has ended; use reset to start a new stream.
     pub const fn get_mut(&mut self) -> &mut R {
         &mut self.obj
     }
 
-    /// Consumes this decoder, returning the underlying reader.
+    /// Return the underlying reader, retaining unread input.
     pub fn into_inner(self) -> R {
         self.obj
     }
+}
 
-    /// Returns the number of bytes that the decompressor has consumed.
-    ///
-    /// Note that this will likely be smaller than what the decompressor
-    /// actually read from the underlying stream due to buffering.
+impl<R, D: zio::Ops, const ZLIB: bool> Stream<R, D, ZLIB> {
+    /// Reset the codec while retaining the reader.
+    pub fn reset_data(&mut self) {
+        self.data.reset_stream(ZLIB);
+    }
+
+    /// Reset the codec and replace the reader.
+    pub fn reset(&mut self, r: R) -> R {
+        self.reset_data();
+        mem::replace(&mut self.obj, r)
+    }
+
+    /// Bytes consumed by the codec.
+    #[must_use = "The counter reports codec progress."]
     pub fn total_in(&self) -> u64 {
         self.data.total_in()
     }
 
-    /// Returns the number of bytes that the decompressor has produced.
+    /// Bytes produced by the codec.
+    #[must_use = "The counter reports codec progress."]
     pub fn total_out(&self) -> u64 {
         self.data.total_out()
     }
 }
 
-impl<R: BufRead, const ZLIB: bool> Read for Decoder<R, ZLIB> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        zio::read(&mut self.obj, &mut self.data, into)
+impl<R: BufRead, D: zio::Ops, const ZLIB: bool> Read for Stream<R, D, ZLIB> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        zio::read(&mut self.obj, &mut self.data, buf)
     }
 }
 
-impl<R: BufRead + Write, const ZLIB: bool> Write for Decoder<R, ZLIB> {
+impl<R: BufRead + Write, D: zio::Ops, const ZLIB: bool> Write for Stream<R, D, ZLIB> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
+        self.obj.write(buf)
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
+        self.obj.flush()
     }
 }
 
@@ -280,100 +117,12 @@ pub type ZlibEncoder<T> = Encoder<T, true>;
 pub type ZlibDecoder<T> = Decoder<T, true>;
 
 #[cfg(test)]
-mod zlib_tests {
-    use crate::stream::bufread::ZlibDecoder;
-    use crate::stream::io::{Read, Write};
-    use crate::stream::write;
-    use crate::stream::Compression;
-    use alloc::vec::Vec;
-
-    // ZlibDecoder consumes one zlib archive and then returns 0 for subsequent reads, allowing any
-    // additional data to be consumed by the caller.
-    #[test]
-    fn decode_extra_data() {
-        let expected = "Hello World";
-
-        let compressed = {
-            let mut e = write::ZlibEncoder::new(Vec::new(), Compression::default());
-            e.write_all(expected.as_ref()).unwrap();
-            let mut b = e.finish().unwrap();
-            b.push(b'x');
-            b
-        };
-
-        let mut output = Vec::new();
-        let mut decoder = ZlibDecoder::new(compressed.as_slice());
-        let decoded_bytes = decoder.read_to_end(&mut output).unwrap();
-        assert_eq!(decoded_bytes, output.len());
-        let actual = core::str::from_utf8(&output).expect("String parsing error");
-        assert_eq!(
-            actual, expected,
-            "after decompression we obtain the original input"
-        );
-
-        output.clear();
-        assert_eq!(
-            decoder.read(&mut output).unwrap(),
-            0,
-            "subsequent read of decoder returns 0, but inner reader can return additional data"
-        );
-        let mut reader = decoder.into_inner();
-        assert_eq!(
-            reader.read_to_end(&mut output).unwrap(),
-            1,
-            "extra data is accessible in underlying buf-read"
-        );
-        assert_eq!(output, b"x");
-    }
-}
+#[path = "tests/bufread_zlib_tests.rs"]
+mod zlib_tests;
 
 #[cfg(test)]
-mod raw_tests {
-    use crate::stream::bufread::DeflateDecoder;
-    use crate::stream::io::{Read, Write};
-    use crate::stream::write;
-    use crate::stream::Compression;
-    use alloc::vec::Vec;
-
-    // DeflateDecoder consumes one deflate archive and then returns 0 for subsequent reads, allowing any
-    // additional data to be consumed by the caller.
-    #[test]
-    fn decode_extra_data() {
-        let expected = "Hello World";
-
-        let compressed = {
-            let mut e = write::DeflateEncoder::new(Vec::new(), Compression::default());
-            e.write_all(expected.as_ref()).unwrap();
-            let mut b = e.finish().unwrap();
-            b.push(b'x');
-            b
-        };
-
-        let mut output = Vec::new();
-        let mut decoder = DeflateDecoder::new(compressed.as_slice());
-        let decoded_bytes = decoder.read_to_end(&mut output).unwrap();
-        assert_eq!(decoded_bytes, output.len());
-        let actual = core::str::from_utf8(&output).expect("String parsing error");
-        assert_eq!(
-            actual, expected,
-            "after decompression we obtain the original input"
-        );
-
-        output.clear();
-        assert_eq!(
-            decoder.read(&mut output).unwrap(),
-            0,
-            "subsequent read of decoder returns 0, but inner reader can return additional data"
-        );
-        let mut reader = decoder.into_inner();
-        assert_eq!(
-            reader.read_to_end(&mut output).unwrap(),
-            1,
-            "extra data is accessible in underlying buf-read"
-        );
-        assert_eq!(output, b"x");
-    }
-}
+#[path = "tests/bufread_raw_tests.rs"]
+mod raw_tests;
 
 /// Gzip-framed I/O adapters.
 pub use super::gz::bufread::{GzDecoder, GzEncoder, MultiGzDecoder};

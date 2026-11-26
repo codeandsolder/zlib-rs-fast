@@ -4,58 +4,60 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use std::mem::MaybeUninit;
 
 #[test]
-fn uninit_compression_matches_initialized_compression() {
+fn uninit_compression_matches_initialized_compression() -> Result<(), Box<dyn std::error::Error>> {
     let input = highly_compressible_input();
 
     let mut initialized = vec![0; 4096];
     let mut expected = Compress::new(Compression::default(), true);
-    let expected_status = expected
-        .compress(&input, &mut initialized, FlushCompress::Finish)
-        .unwrap();
+    let expected_status = expected.compress(&input, &mut initialized, FlushCompress::Finish)?;
 
     let mut uninitialized = vec![MaybeUninit::uninit(); initialized.len()];
     let mut actual = Compress::new(Compression::default(), true);
-    let actual_status = actual
-        .compress_uninit(&input, &mut uninitialized, FlushCompress::Finish)
-        .unwrap();
+    let actual_status =
+        actual.compress_uninit(&input, &mut uninitialized, FlushCompress::Finish)?;
 
     assert_eq!(actual_status, expected_status);
     assert_eq!(actual.total_in(), expected.total_in());
     assert_eq!(actual.total_out(), expected.total_out());
     assert_eq!(
-        initialized_prefix(&uninitialized, actual.total_out() as usize),
-        &initialized[..expected.total_out() as usize]
+        initialized_prefix(&uninitialized, usize::try_from(actual.total_out())?),
+        &initialized[..usize::try_from(expected.total_out())?]
     );
+
+    Ok(())
 }
 
 #[test]
-fn uninit_decompression_matches_initialized_decompression() {
+fn uninit_decompression_matches_initialized_decompression() -> Result<(), Box<dyn std::error::Error>>
+{
     let input = highly_compressible_input();
 
     let mut compressed = Vec::with_capacity(4096);
-    Compress::new(Compression::default(), true)
-        .compress_vec(&input, &mut compressed, FlushCompress::Finish)
-        .unwrap();
+    Compress::new(Compression::default(), true).compress_vec(
+        &input,
+        &mut compressed,
+        FlushCompress::Finish,
+    )?;
 
     let mut initialized = vec![0; 4096];
     let mut expected = Decompress::new(true);
-    let expected_status = expected
-        .decompress(&compressed, &mut initialized, FlushDecompress::Finish)
-        .unwrap();
+    let expected_status =
+        expected.decompress(&compressed, &mut initialized, FlushDecompress::Finish)?;
 
     let mut uninitialized = vec![MaybeUninit::uninit(); initialized.len()];
     let mut actual = Decompress::new(true);
-    let actual_status = actual
-        .decompress_uninit(&compressed, &mut uninitialized, FlushDecompress::Finish)
-        .unwrap();
+    let actual_status =
+        actual.decompress_uninit(&compressed, &mut uninitialized, FlushDecompress::Finish)?;
 
     assert_eq!(actual_status, expected_status);
     assert_eq!(actual.total_in(), expected.total_in());
     assert_eq!(actual.total_out(), expected.total_out());
     assert_eq!(
-        initialized_prefix(&uninitialized, actual.total_out() as usize),
-        &initialized[..expected.total_out() as usize]
+        initialized_prefix(&uninitialized, usize::try_from(actual.total_out())?),
+        &initialized[..usize::try_from(expected.total_out())?]
     );
+
+    Ok(())
 }
 
 fn highly_compressible_input() -> Vec<u8> {

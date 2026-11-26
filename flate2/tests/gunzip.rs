@@ -9,52 +9,55 @@ use std::path::Path;
 
 // test extraction of a gzipped file
 #[test]
-fn test_extract_success() {
-    let content = extract_file(Path::new("tests/good-file.gz")).unwrap();
+fn test_extract_success() -> Result<(), Box<dyn std::error::Error>> {
+    let content = extract_file(Path::new("tests/good-file.gz"))?;
     let mut expected = Vec::new();
-    File::open("tests/good-file.txt")
-        .unwrap()
-        .read_to_end(&mut expected)
-        .unwrap();
+    File::open("tests/good-file.txt")?.read_to_end(&mut expected)?;
     assert_eq!(content, expected);
+
+    Ok(())
 }
 //
 // test partial extraction of a multistream gzipped file
 #[test]
-fn test_extract_success_partial_multi() {
-    let content = extract_file(Path::new("tests/multi.gz")).unwrap();
+fn test_extract_success_partial_multi() -> Result<(), Box<dyn std::error::Error>> {
+    let content = extract_file(Path::new("tests/multi.gz"))?;
     let mut expected = String::new();
-    BufReader::new(File::open("tests/multi.txt").unwrap())
-        .read_line(&mut expected)
-        .unwrap();
+    BufReader::new(File::open("tests/multi.txt")?).read_line(&mut expected)?;
     assert_eq!(content, expected.as_bytes());
+
+    Ok(())
 }
 
 // test extraction fails on a corrupt file
 #[test]
-fn test_extract_failure() {
+fn test_extract_failure() -> Result<(), Box<dyn std::error::Error>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(b"corrupt me").unwrap();
-    let mut gzip = encoder.finish().unwrap();
+    encoder.write_all(b"corrupt me")?;
+    let mut gzip = encoder.finish()?;
     // The gzip footer stores CRC32 followed by ISIZE; corrupt a CRC byte.
     let crc_offset = gzip.len() - 8;
     gzip[crc_offset] ^= 0xff;
 
     let mut output = Vec::new();
     let result = GzDecoder::new(&gzip[..]).read_to_end(&mut output);
-    assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        result.err().ok_or("expected an error")?.kind(),
+        io::ErrorKind::InvalidInput
+    );
+
+    Ok(())
 }
 
 //test complete extraction of a multistream gzipped file
 #[test]
-fn test_extract_success_multi() {
-    let content = extract_file_multi(Path::new("tests/multi.gz")).unwrap();
+fn test_extract_success_multi() -> Result<(), Box<dyn std::error::Error>> {
+    let content = extract_file_multi(Path::new("tests/multi.gz"))?;
     let mut expected = Vec::new();
-    File::open("tests/multi.txt")
-        .unwrap()
-        .read_to_end(&mut expected)
-        .unwrap();
+    File::open("tests/multi.txt")?.read_to_end(&mut expected)?;
     assert_eq!(content, expected);
+
+    Ok(())
 }
 
 // Tries to extract path into memory (assuming a .gz file).
@@ -75,11 +78,13 @@ fn extract_file_multi(path_compressed: &Path) -> io::Result<Vec<u8>> {
 }
 
 #[test]
-fn empty_error_once() {
+fn empty_error_once() -> Result<(), Box<dyn std::error::Error>> {
     let data: &[u8] = &[];
     let cbjson = GzDecoder::new(data);
     let reader = BufReader::new(cbjson);
     let mut stream = reader.lines();
-    assert!(stream.next().unwrap().is_err());
+    assert!(stream.next().ok_or("missing item")?.is_err());
     assert!(stream.next().is_none());
+
+    Ok(())
 }

@@ -1,43 +1,50 @@
 use std::io::{Read, Write};
 
 #[test]
-fn deflate_decoder_empty_read() {
+fn deflate_decoder_empty_read() -> Result<(), Box<dyn std::error::Error>> {
     let original: &[u8] = b"Lorem ipsum dolor sit amet.";
-    let mut encoder =
+    let mut compressor =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(original).unwrap();
-    let encoded: Vec<u8> = encoder.finish().unwrap();
-    let mut decoder = flate2::read::DeflateDecoder::new(encoded.as_slice());
-    assert_eq!(decoder.read(&mut []).unwrap(), 0);
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded).unwrap();
-    assert_eq!(decoded.as_slice(), original);
+    compressor.write_all(original)?;
+    let packed: Vec<u8> = compressor.finish()?;
+    let mut inflater = flate2::read::DeflateDecoder::new(packed.as_slice());
+    assert_eq!(inflater.read(&mut [])?, 0);
+    let mut plain = Vec::new();
+    inflater.read_to_end(&mut plain)?;
+    assert_eq!(plain.as_slice(), original);
+
+    Ok(())
 }
 
 #[test]
-fn deflate_encoder_empty_read() {
+fn deflate_encoder_empty_read() -> Result<(), Box<dyn std::error::Error>> {
     let original: &[u8] = b"Lorem ipsum dolor sit amet.";
-    let mut encoder = flate2::read::DeflateEncoder::new(original, flate2::Compression::default());
-    assert_eq!(encoder.read(&mut []).unwrap(), 0);
-    let mut encoded = Vec::new();
-    encoder.read_to_end(&mut encoded).unwrap();
-    let mut decoder = flate2::read::DeflateDecoder::new(encoded.as_slice());
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded).unwrap();
-    assert_eq!(decoded.as_slice(), original);
+    let mut compressor =
+        flate2::read::DeflateEncoder::new(original, flate2::Compression::default());
+    assert_eq!(compressor.read(&mut [])?, 0);
+    let mut packed = Vec::new();
+    compressor.read_to_end(&mut packed)?;
+    let mut inflater = flate2::read::DeflateDecoder::new(packed.as_slice());
+    let mut plain = Vec::new();
+    inflater.read_to_end(&mut plain)?;
+    assert_eq!(plain.as_slice(), original);
+
+    Ok(())
 }
 
 #[test]
-fn gzip_decoder_empty_read() {
+fn gzip_decoder_empty_read() -> Result<(), Box<dyn std::error::Error>> {
     let original: &[u8] = b"Lorem ipsum dolor sit amet.";
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(original).unwrap();
-    let encoded: Vec<u8> = encoder.finish().unwrap();
-    let mut decoder = flate2::read::GzDecoder::new(encoded.as_slice());
-    assert_eq!(decoder.read(&mut []).unwrap(), 0);
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded).unwrap();
-    assert_eq!(decoded.as_slice(), original);
+    let mut compressor = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    compressor.write_all(original)?;
+    let packed: Vec<u8> = compressor.finish()?;
+    let mut inflater = flate2::read::GzDecoder::new(packed.as_slice());
+    assert_eq!(inflater.read(&mut [])?, 0);
+    let mut plain = Vec::new();
+    inflater.read_to_end(&mut plain)?;
+    assert_eq!(plain.as_slice(), original);
+
+    Ok(())
 }
 
 fn gzip_encoder(original: &[u8], buffered: bool) -> Box<dyn Read + '_> {
@@ -55,79 +62,82 @@ fn gzip_encoder(original: &[u8], buffered: bool) -> Box<dyn Read + '_> {
 }
 
 #[test]
-fn gzip_encoder_empty_read() {
+fn gzip_encoder_empty_read() -> Result<(), Box<dyn std::error::Error>> {
     for original in [&b""[..], &b"Lorem ipsum dolor sit amet."[..]] {
         for buffered in [false, true] {
             let mut expected = Vec::new();
-            gzip_encoder(original, buffered)
-                .read_to_end(&mut expected)
-                .unwrap();
+            gzip_encoder(original, buffered).read_to_end(&mut expected)?;
             for buffer_size in [1, 9, 10, 11, 64] {
-                let mut encoder = gzip_encoder(original, buffered);
+                let mut compressor = gzip_encoder(original, buffered);
                 let mut buffer = vec![0; buffer_size];
-                let mut encoded = Vec::new();
+                let mut packed = Vec::new();
                 loop {
-                    assert_eq!(encoder.read(&mut []).unwrap(), 0);
-                    assert_eq!(encoder.read(&mut []).unwrap(), 0);
-                    let count = encoder.read(&mut buffer).unwrap();
+                    assert_eq!(compressor.read(&mut [])?, 0);
+                    assert_eq!(compressor.read(&mut [])?, 0);
+                    let count = compressor.read(&mut buffer)?;
                     if count == 0 {
                         break;
                     }
-                    encoded.extend_from_slice(&buffer[..count]);
+                    packed.extend_from_slice(&buffer[..count]);
                 }
-                assert_eq!(encoder.read(&mut []).unwrap(), 0);
-                assert_eq!(encoder.read(&mut buffer).unwrap(), 0);
-                assert_eq!(encoded, expected);
-                let mut decoded = Vec::new();
-                flate2::read::GzDecoder::new(encoded.as_slice())
-                    .read_to_end(&mut decoded)
-                    .unwrap();
-                assert_eq!(decoded.as_slice(), original);
+                assert_eq!(compressor.read(&mut [])?, 0);
+                assert_eq!(compressor.read(&mut buffer)?, 0);
+                assert_eq!(packed, expected);
+                let mut plain = Vec::new();
+                flate2::read::GzDecoder::new(packed.as_slice()).read_to_end(&mut plain)?;
+                assert_eq!(plain.as_slice(), original);
             }
         }
     }
+
+    Ok(())
 }
 
 #[test]
-fn gzip_encoder_empty_read_after_header() {
+fn gzip_encoder_empty_read_after_header() -> Result<(), Box<dyn std::error::Error>> {
     let original: &[u8] = b"An empty read after the header must not finish the stream.";
     for buffered in [false, true] {
-        let mut encoder = gzip_encoder(original, buffered);
+        let mut compressor = gzip_encoder(original, buffered);
         let mut header = [0; 10];
-        encoder.read_exact(&mut header).unwrap();
-        assert_eq!(encoder.read(&mut []).unwrap(), 0);
-        let mut encoded = header.to_vec();
-        encoder.read_to_end(&mut encoded).unwrap();
-        let mut decoded = Vec::new();
-        flate2::read::GzDecoder::new(encoded.as_slice())
-            .read_to_end(&mut decoded)
-            .unwrap();
-        assert_eq!(decoded.as_slice(), original);
+        compressor.read_exact(&mut header)?;
+        assert_eq!(compressor.read(&mut [])?, 0);
+        let mut packed = header.to_vec();
+        compressor.read_to_end(&mut packed)?;
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(packed.as_slice()).read_to_end(&mut plain)?;
+        assert_eq!(plain.as_slice(), original);
     }
+
+    Ok(())
 }
 
 #[test]
-fn zlib_decoder_empty_read() {
+fn zlib_decoder_empty_read() -> Result<(), Box<dyn std::error::Error>> {
     let original: &[u8] = b"Lorem ipsum dolor sit amet.";
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(original).unwrap();
-    let encoded: Vec<u8> = encoder.finish().unwrap();
-    let mut decoder = flate2::read::ZlibDecoder::new(encoded.as_slice());
-    assert_eq!(decoder.read(&mut []).unwrap(), 0);
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded).unwrap();
-    assert_eq!(decoded.as_slice(), original);
+    let mut compressor =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    compressor.write_all(original)?;
+    let packed: Vec<u8> = compressor.finish()?;
+    let mut inflater = flate2::read::ZlibDecoder::new(packed.as_slice());
+    assert_eq!(inflater.read(&mut [])?, 0);
+    let mut plain = Vec::new();
+    inflater.read_to_end(&mut plain)?;
+    assert_eq!(plain.as_slice(), original);
+
+    Ok(())
 }
 
 #[test]
-fn zlib_encoder_empty_read() {
+fn zlib_encoder_empty_read() -> Result<(), Box<dyn std::error::Error>> {
     let original: &[u8] = b"Lorem ipsum dolor sit amet.";
-    let mut encoder = flate2::read::ZlibEncoder::new(original, flate2::Compression::default());
-    assert_eq!(encoder.read(&mut []).unwrap(), 0);
-    let mut encoded = Vec::new();
-    encoder.read_to_end(&mut encoded).unwrap();
-    let mut decoder = flate2::read::ZlibDecoder::new(encoded.as_slice());
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded).unwrap();
-    assert_eq!(decoded.as_slice(), original);
+    let mut compressor = flate2::read::ZlibEncoder::new(original, flate2::Compression::default());
+    assert_eq!(compressor.read(&mut [])?, 0);
+    let mut packed = Vec::new();
+    compressor.read_to_end(&mut packed)?;
+    let mut inflater = flate2::read::ZlibDecoder::new(packed.as_slice());
+    let mut plain = Vec::new();
+    inflater.read_to_end(&mut plain)?;
+    assert_eq!(plain.as_slice(), original);
+
+    Ok(())
 }

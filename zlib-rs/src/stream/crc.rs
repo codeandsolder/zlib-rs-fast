@@ -47,17 +47,17 @@ impl Crc {
     }
 }
 
-/// A wrapper around a [`Read`] that calculates the CRC.
+/// An I/O adapter that calculates the CRC of transferred bytes.
 ///
 /// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
 #[derive(Debug)]
-pub struct CrcReader<R> {
+pub struct CrcIo<R> {
     inner: R,
     crc: Crc,
 }
 
-impl<R: Read> CrcReader<R> {
-    /// Create a new `CrcReader`.
+impl<R> CrcIo<R> {
+    /// Create a checksum-tracking I/O adapter.
     pub const fn new(r: R) -> Self {
         Self {
             inner: r,
@@ -66,34 +66,39 @@ impl<R: Read> CrcReader<R> {
     }
 }
 
-impl<R> CrcReader<R> {
-    /// Get the Crc for this `CrcReader`.
+impl<R> CrcIo<R> {
+    /// Get the Crc for this `CrcIo`.
     pub const fn crc(&self) -> &Crc {
         &self.crc
     }
 
-    /// Get the reader that is wrapped by this `CrcReader`.
+    /// Get the reader that is wrapped by this `CrcIo`.
     pub fn into_inner(self) -> R {
         self.inner
     }
 
-    /// Get the reader that is wrapped by this `CrcReader` by reference.
+    /// Get the reader that is wrapped by this `CrcIo` by reference.
     pub const fn get_ref(&self) -> &R {
         &self.inner
     }
 
-    /// Get a mutable reference to the reader that is wrapped by this `CrcReader`.
+    /// Get a mutable reference to the reader that is wrapped by this `CrcIo`.
     pub const fn get_mut(&mut self) -> &mut R {
         &mut self.inner
     }
 
-    /// Reset the Crc in this `CrcReader`.
+    /// Reset the Crc in this `CrcIo`.
     pub const fn reset(&mut self) {
         self.crc.reset();
     }
 }
 
-impl<R: Read> Read for CrcReader<R> {
+/// Checksum-tracking reader.
+pub type CrcReader<R> = CrcIo<R>;
+/// Checksum-tracking writer.
+pub type CrcWriter<W> = CrcIo<W>;
+
+impl<R: Read> Read for CrcIo<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
         let amt = self.inner.read(into)?;
         self.crc.update(&into[..amt]);
@@ -101,7 +106,7 @@ impl<R: Read> Read for CrcReader<R> {
     }
 }
 
-impl<R: BufRead> BufRead for CrcReader<R> {
+impl<R: BufRead> BufRead for CrcIo<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         self.inner.fill_buf()
     }
@@ -113,53 +118,7 @@ impl<R: BufRead> BufRead for CrcReader<R> {
     }
 }
 
-/// A wrapper around a [`Write`] that calculates the CRC.
-///
-/// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
-#[derive(Debug)]
-pub struct CrcWriter<W> {
-    inner: W,
-    crc: Crc,
-}
-
-impl<W> CrcWriter<W> {
-    /// Get the Crc for this `CrcWriter`.
-    pub const fn crc(&self) -> &Crc {
-        &self.crc
-    }
-
-    /// Get the writer that is wrapped by this `CrcWriter`.
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
-
-    /// Get the writer that is wrapped by this `CrcWriter` by reference.
-    pub const fn get_ref(&self) -> &W {
-        &self.inner
-    }
-
-    /// Get a mutable reference to the writer that is wrapped by this `CrcWriter`.
-    pub const fn get_mut(&mut self) -> &mut W {
-        &mut self.inner
-    }
-
-    /// Reset the Crc in this `CrcWriter`.
-    pub const fn reset(&mut self) {
-        self.crc.reset();
-    }
-}
-
-impl<W: Write> CrcWriter<W> {
-    /// Create a new `CrcWriter`.
-    pub const fn new(w: W) -> Self {
-        Self {
-            inner: w,
-            crc: Crc::new(),
-        }
-    }
-}
-
-impl<W: Write> Write for CrcWriter<W> {
+impl<W: Write> Write for CrcIo<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let amt = self.inner.write(buf)?;
         self.crc.update(&buf[..amt]);
@@ -172,73 +131,5 @@ impl<W: Write> Write for CrcWriter<W> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Crc;
-
-    fn crc_of(data: &[u8]) -> Crc {
-        let mut c = Crc::new();
-        c.update(data);
-        c
-    }
-
-    fn sum_of(data: &[u8]) -> u32 {
-        crc_of(data).sum()
-    }
-
-    #[test]
-    fn new_is_empty() {
-        let c = Crc::new();
-        assert_eq!(c.amount(), 0);
-        assert_eq!(c.sum(), 0);
-    }
-
-    #[test]
-    fn known_vector_hello() {
-        assert_eq!(sum_of(b"hello"), 0x3610_A686);
-    }
-
-    #[test]
-    fn known_vector_quick_brown_fox() {
-        assert_eq!(
-            sum_of(b"The quick brown fox jumps over the lazy dog"),
-            0x414F_A339
-        );
-    }
-
-    #[test]
-    fn update_is_streaming() {
-        let mut c = Crc::new();
-        c.update(b"hello");
-        c.update(b" ");
-        c.update(b"world");
-
-        assert_eq!(c.amount(), 11);
-        assert_eq!(c.sum(), sum_of(b"hello world"));
-    }
-
-    #[test]
-    fn reset_restores_initial_state() {
-        let mut c = Crc::new();
-        c.update(b"abc");
-        assert_ne!(c.sum(), 0);
-        assert_eq!(c.amount(), 3);
-
-        c.reset();
-        assert_eq!(c.amount(), 0);
-        assert_eq!(c.sum(), 0);
-    }
-
-    #[test]
-    fn combine_matches_concatenation() {
-        let a = b"hello ";
-        let b = b"world";
-
-        let mut ca = crc_of(a);
-        let cb = crc_of(b);
-
-        ca.combine(&cb);
-
-        assert_eq!(ca.amount(), 11);
-        assert_eq!(ca.sum(), sum_of(b"hello world"));
-    }
-}
+#[path = "tests/crc_tests.rs"]
+mod tests;

@@ -15,11 +15,13 @@ mod bufreader;
 mod codec;
 mod crc;
 #[cfg(test)]
+#[path = "tests/deflate_tests.rs"]
 mod deflate_tests;
 mod gz;
 mod mem;
 mod zio;
 #[cfg(test)]
+#[path = "tests/zlib_tests.rs"]
 mod zlib_tests;
 
 /// Types which operate over [`Read`] streams, both encoders and decoders for
@@ -47,23 +49,23 @@ pub mod write;
 /// [`BufRead`]: https://doc.rust-lang.org/std/io/trait.BufRead.html
 pub mod bufread;
 
-fn _assert_send_sync() {
-    const fn _assert_send_sync<T: Send + Sync>() {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
 
-    _assert_send_sync::<read::DeflateEncoder<&[u8]>>();
-    _assert_send_sync::<read::DeflateDecoder<&[u8]>>();
-    _assert_send_sync::<read::ZlibEncoder<&[u8]>>();
-    _assert_send_sync::<read::ZlibDecoder<&[u8]>>();
-    _assert_send_sync::<read::GzEncoder<&[u8]>>();
-    _assert_send_sync::<read::GzDecoder<&[u8]>>();
-    _assert_send_sync::<read::MultiGzDecoder<&[u8]>>();
-    _assert_send_sync::<write::DeflateEncoder<Vec<u8>>>();
-    _assert_send_sync::<write::DeflateDecoder<Vec<u8>>>();
-    _assert_send_sync::<write::ZlibEncoder<Vec<u8>>>();
-    _assert_send_sync::<write::ZlibDecoder<Vec<u8>>>();
-    _assert_send_sync::<write::GzEncoder<Vec<u8>>>();
-    _assert_send_sync::<write::GzDecoder<Vec<u8>>>();
-}
+    assert_send_sync::<read::DeflateEncoder<&[u8]>>();
+    assert_send_sync::<read::DeflateDecoder<&[u8]>>();
+    assert_send_sync::<read::ZlibEncoder<&[u8]>>();
+    assert_send_sync::<read::ZlibDecoder<&[u8]>>();
+    assert_send_sync::<read::GzEncoder<&[u8]>>();
+    assert_send_sync::<read::GzDecoder<&[u8]>>();
+    assert_send_sync::<read::MultiGzDecoder<&[u8]>>();
+    assert_send_sync::<write::DeflateEncoder<Vec<u8>>>();
+    assert_send_sync::<write::DeflateDecoder<Vec<u8>>>();
+    assert_send_sync::<write::ZlibEncoder<Vec<u8>>>();
+    assert_send_sync::<write::ZlibDecoder<Vec<u8>>>();
+    assert_send_sync::<write::GzEncoder<Vec<u8>>>();
+    assert_send_sync::<write::GzDecoder<Vec<u8>>>();
+};
 
 /// When compressing data, the compression level can be specified by a value in
 /// this struct.

@@ -10,47 +10,49 @@ mod tests {
     use crate::stream::{read, write};
 
     #[test]
-    fn roundtrip() {
+    fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         let mut real = Vec::new();
         let mut w = write::DeflateEncoder::new(Vec::new(), Compression::default());
         let v = crate::stream::random_bytes().take(1024).collect::<Vec<_>>();
-        let mut rng = SmallRng::seed_from_u64(0x6368_756e_6b);
+        let mut rng = SmallRng::seed_from_u64(0x0063_6875_6e6b);
         for _ in 0..200 {
             let to_write = &v[..rng.random_range(0..v.len())];
             real.extend(to_write.iter().copied());
-            w.write_all(to_write).unwrap();
+            w.write_all(to_write)?;
         }
-        let result = w.finish().unwrap();
+        let result = w.finish()?;
         let mut r = read::DeflateDecoder::new(&result[..]);
         let mut ret = Vec::new();
-        r.read_to_end(&mut ret).unwrap();
+        r.read_to_end(&mut ret)?;
         assert_eq!(ret, real);
+
+        Ok(())
     }
 
     #[test]
-    fn drop_writes() {
+    fn drop_writes() -> Result<(), Box<dyn std::error::Error>> {
         let mut data = Vec::new();
-        write::DeflateEncoder::new(&mut data, Compression::default())
-            .write_all(b"foo")
-            .unwrap();
+        write::DeflateEncoder::new(&mut data, Compression::default()).write_all(b"foo")?;
         let mut r = read::DeflateDecoder::new(&data[..]);
         let mut ret = Vec::new();
-        r.read_to_end(&mut ret).unwrap();
+        r.read_to_end(&mut ret)?;
         assert_eq!(ret, b"foo");
+
+        Ok(())
     }
 
     #[test]
-    fn total_in() {
+    fn total_in() -> Result<(), Box<dyn std::error::Error>> {
         let mut real = Vec::new();
         let mut w = write::DeflateEncoder::new(Vec::new(), Compression::default());
         let v = crate::stream::random_bytes().take(1024).collect::<Vec<_>>();
-        let mut rng = SmallRng::seed_from_u64(0x6368_756e_6b);
+        let mut rng = SmallRng::seed_from_u64(0x0063_6875_6e6b);
         for _ in 0..200 {
             let to_write = &v[..rng.random_range(0..v.len())];
             real.extend(to_write.iter().copied());
-            w.write_all(to_write).unwrap();
+            w.write_all(to_write)?;
         }
-        let mut result = w.finish().unwrap();
+        let mut result = w.finish()?;
 
         let result_len = result.len();
 
@@ -60,25 +62,29 @@ mod tests {
 
         let mut r = read::DeflateDecoder::new(&result[..]);
         let mut ret = Vec::new();
-        r.read_to_end(&mut ret).unwrap();
+        r.read_to_end(&mut ret)?;
         assert_eq!(ret, real);
         assert_eq!(r.total_in(), result_len as u64);
+
+        Ok(())
     }
 
     #[test]
-    fn roundtrip2() {
+    fn roundtrip2() -> Result<(), Box<dyn std::error::Error>> {
         let v = crate::stream::random_bytes()
             .take(1024 * 1024)
             .collect::<Vec<_>>();
         let mut r =
             read::DeflateDecoder::new(read::DeflateEncoder::new(&v[..], Compression::default()));
         let mut ret = Vec::new();
-        r.read_to_end(&mut ret).unwrap();
+        r.read_to_end(&mut ret)?;
         assert_eq!(ret, v);
+
+        Ok(())
     }
 
     #[test]
-    fn roundtrip3() {
+    fn roundtrip3() -> Result<(), Box<dyn std::error::Error>> {
         let v = crate::stream::random_bytes()
             .take(1024 * 1024)
             .collect::<Vec<_>>();
@@ -86,184 +92,196 @@ mod tests {
             write::DeflateDecoder::new(Vec::new()),
             Compression::default(),
         );
-        w.write_all(&v).unwrap();
-        let w = w.finish().unwrap().finish().unwrap();
+        w.write_all(&v)?;
+        let w = w.finish()?.finish()?;
         assert_eq!(w, v);
+
+        Ok(())
     }
 
     #[test]
-    fn reset_writer() {
+    fn reset_writer() -> Result<(), Box<dyn std::error::Error>> {
         let v = crate::stream::random_bytes()
             .take(1024 * 1024)
             .collect::<Vec<_>>();
         let mut w = write::DeflateEncoder::new(Vec::new(), Compression::default());
-        w.write_all(&v).unwrap();
-        let a = w.reset(Vec::new()).unwrap();
-        w.write_all(&v).unwrap();
-        let b = w.finish().unwrap();
+        w.write_all(&v)?;
+        let a = w.reset(Vec::new())?;
+        w.write_all(&v)?;
+        let b = w.finish()?;
 
         let mut w = write::DeflateEncoder::new(Vec::new(), Compression::default());
-        w.write_all(&v).unwrap();
-        let c = w.finish().unwrap();
+        w.write_all(&v)?;
+        let c = w.finish()?;
         assert!(a == b && b == c);
+
+        Ok(())
     }
 
     #[test]
-    fn reset_reader() {
+    fn reset_reader() -> Result<(), Box<dyn std::error::Error>> {
         let v = crate::stream::random_bytes()
             .take(1024 * 1024)
             .collect::<Vec<_>>();
         let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
         let mut r = read::DeflateEncoder::new(&v[..], Compression::default());
-        r.read_to_end(&mut a).unwrap();
+        r.read_to_end(&mut a)?;
         r.reset(&v[..]);
-        r.read_to_end(&mut b).unwrap();
+        r.read_to_end(&mut b)?;
 
         let mut r = read::DeflateEncoder::new(&v[..], Compression::default());
-        r.read_to_end(&mut c).unwrap();
+        r.read_to_end(&mut c)?;
         assert!(a == b && b == c);
+
+        Ok(())
     }
 
     #[test]
-    fn reset_decoder() {
+    fn reset_decoder() -> Result<(), Box<dyn std::error::Error>> {
         let v = crate::stream::random_bytes()
             .take(1024 * 1024)
             .collect::<Vec<_>>();
         let mut w = write::DeflateEncoder::new(Vec::new(), Compression::default());
-        w.write_all(&v).unwrap();
-        let data = w.finish().unwrap();
+        w.write_all(&v)?;
+        let data = w.finish()?;
 
         {
             let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
             let mut r = read::DeflateDecoder::new(&data[..]);
-            r.read_to_end(&mut a).unwrap();
+            r.read_to_end(&mut a)?;
             r.reset(&data);
-            r.read_to_end(&mut b).unwrap();
+            r.read_to_end(&mut b)?;
 
             let mut r = read::DeflateDecoder::new(&data[..]);
-            r.read_to_end(&mut c).unwrap();
+            r.read_to_end(&mut c)?;
             assert!(a == b && b == c && c == v);
         }
 
         {
             let mut w = write::DeflateDecoder::new(Vec::new());
-            w.write_all(&data).unwrap();
-            let a = w.reset(Vec::new()).unwrap();
-            w.write_all(&data).unwrap();
-            let b = w.finish().unwrap();
+            w.write_all(&data)?;
+            let a = w.reset(Vec::new())?;
+            w.write_all(&data)?;
+            let b = w.finish()?;
 
             let mut w = write::DeflateDecoder::new(Vec::new());
-            w.write_all(&data).unwrap();
-            let c = w.finish().unwrap();
+            w.write_all(&data)?;
+            let c = w.finish()?;
             assert!(a == b && b == c && c == v);
         }
+
+        Ok(())
     }
 
     #[test]
-    fn zero_length_read_with_data() {
+    fn zero_length_read_with_data() -> Result<(), Box<dyn std::error::Error>> {
         let m = vec![3u8; 128 * 1024 + 1];
         let mut c = read::DeflateEncoder::new(&m[..], Compression::default());
 
         let mut result = Vec::new();
-        c.read_to_end(&mut result).unwrap();
+        c.read_to_end(&mut result)?;
 
         let mut d = read::DeflateDecoder::new(&result[..]);
-        let mut data = Vec::new();
-        assert_eq!(d.read(&mut data).unwrap(), 0);
+        assert_eq!(d.read(&mut [])?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_incomplete_stream() {
+    fn rejects_incomplete_stream() -> Result<(), Box<dyn std::error::Error>> {
         for input in [b"1".as_slice(), b"12", b"123", b"1234"] {
             let mut decoder = read::DeflateDecoder::new(input);
-            let error =
-                crate::stream::io::copy(&mut decoder, &mut crate::stream::io::sink()).unwrap_err();
+            let error = crate::stream::io::copy(&mut decoder, &mut crate::stream::io::sink())
+                .err()
+                .ok_or("expected an error")?;
             assert_eq!(error.kind(), crate::stream::io::ErrorKind::UnexpectedEof);
             assert_eq!(error.to_string(), "incomplete deflate stream");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn write_decoder_rejects_incomplete_stream() {
+    fn write_decoder_rejects_incomplete_stream() -> Result<(), Box<dyn std::error::Error>> {
+        fn assert_incomplete(error: &crate::stream::io::Error) {
+            assert_eq!(error.kind(), crate::stream::io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.to_string(), "incomplete deflate stream");
+        }
+
         let mut encoder = write::DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"hello").unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.write_all(b"hello")?;
+        let compressed = encoder.finish()?;
 
         for end in 0..compressed.len() {
             let truncated = &compressed[..end];
 
             let mut decoder = write::DeflateDecoder::new(Vec::new());
-            decoder.write_all(truncated).unwrap();
-            assert_incomplete(decoder.finish().unwrap_err());
+            decoder.write_all(truncated)?;
+            assert_incomplete(&decoder.finish().err().ok_or("expected an error")?);
 
             let mut decoder = write::DeflateDecoder::new(Vec::new());
-            decoder.write_all(truncated).unwrap();
-            assert_incomplete(decoder.try_finish().unwrap_err());
-            decoder
-                .reset(Vec::new())
-                .expect("decoder should reset after an incomplete stream");
+            decoder.write_all(truncated)?;
+            assert_incomplete(&decoder.try_finish().err().ok_or("expected an error")?);
+            decoder.reset(Vec::new())?;
         }
 
         let mut decoder = write::DeflateDecoder::new(Vec::new());
-        decoder.write_all(&compressed).unwrap();
-        decoder.try_finish().unwrap();
-        decoder.try_finish().unwrap();
+        decoder.write_all(&compressed)?;
+        decoder.try_finish()?;
+        decoder.try_finish()?;
         assert_eq!(
-            decoder.finish().unwrap(),
+            decoder.finish()?,
             b"hello",
             "finishing an already finished decoder should not change its output"
         );
 
-        fn assert_incomplete(error: crate::stream::io::Error) {
-            assert_eq!(error.kind(), crate::stream::io::ErrorKind::UnexpectedEof);
-            assert_eq!(error.to_string(), "incomplete deflate stream");
-        }
+        Ok(())
     }
 
     #[test]
-    fn write_decoder_reset_drains_pending_output() {
+    fn write_decoder_reset_drains_pending_output() -> Result<(), Box<dyn std::error::Error>> {
         let input = vec![b'a'; 32 * 1024 + 1];
         let mut encoder = write::DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&input).unwrap();
+        encoder.write_all(&input)?;
 
         let mut decoder = write::DeflateDecoder::new(Vec::new());
-        decoder.write_all(&encoder.finish().unwrap()).unwrap();
-        let output = decoder
-            .reset(Vec::new())
-            .expect("decoder should reset after draining pending output");
+        decoder.write_all(&encoder.finish()?)?;
+        let output = decoder.reset(Vec::new())?;
 
         assert!(
             output == input,
             "reset should preserve all decoder output byte-for-byte"
         );
+
+        Ok(())
     }
 
     #[test]
     fn qc_reader() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
-
-        fn test(v: Vec<u8>) -> bool {
+        fn test(v: Vec<u8>) -> Result<bool, Box<dyn std::error::Error>> {
             let mut r = read::DeflateDecoder::new(read::DeflateEncoder::new(
                 &v[..],
                 Compression::default(),
             ));
             let mut v2 = Vec::new();
-            r.read_to_end(&mut v2).unwrap();
-            v == v2
+            r.read_to_end(&mut v2)?;
+            Ok(v.into_iter().eq(v2))
         }
+
+        ::quickcheck::quickcheck(test as fn(_) -> _);
     }
 
     #[test]
     fn qc_writer() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
-
-        fn test(v: Vec<u8>) -> bool {
+        fn test(v: Vec<u8>) -> Result<bool, Box<dyn std::error::Error>> {
             let mut w = write::DeflateEncoder::new(
                 write::DeflateDecoder::new(Vec::new()),
                 Compression::default(),
             );
-            w.write_all(&v).unwrap();
-            v == w.finish().unwrap().finish().unwrap()
+            w.write_all(&v)?;
+            Ok(v.into_iter().eq(w.finish()?.finish()?))
         }
+
+        ::quickcheck::quickcheck(test as fn(_) -> _);
     }
 }

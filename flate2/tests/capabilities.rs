@@ -3,64 +3,57 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 
 // Unsupported for `miniz_oxide`.
 #[test]
-fn compress_new_with_window_bits_is_present_and_works() {
+fn compress_new_with_window_bits_is_present_and_works() -> Result<(), Box<dyn std::error::Error>> {
     let string = b"hello world";
 
     // Test with window_bits = 9 (minimum)
-    let mut encoded = Vec::with_capacity(1024);
-    let mut encoder = Compress::new_with_window_bits(Compression::default(), true, 9);
-    encoder
-        .compress_vec(string, &mut encoded, FlushCompress::Finish)
-        .unwrap();
-    assert_ne!(encoded.len(), 0);
+    let mut packed = Vec::with_capacity(1024);
+    let mut compressor = Compress::new_with_window_bits(Compression::default(), true, 9);
+    compressor.compress_vec(string, &mut packed, FlushCompress::Finish)?;
+    assert_ne!(packed.len(), 0);
 
-    let mut decoder = Decompress::new_with_window_bits(true, 9);
-    let mut decoded = [0; 1024];
-    decoder
-        .decompress(&encoded, &mut decoded, FlushDecompress::Finish)
-        .unwrap();
-    assert_eq!(&decoded[..string.len()], string);
+    let mut inflater = Decompress::new_with_window_bits(true, 9);
+    let mut plain = [0; 1024];
+    inflater.decompress(&packed, &mut plain, FlushDecompress::Finish)?;
+    assert_eq!(&plain[..string.len()], string);
 
     // Test with window_bits = 15 (maximum)
-    let mut encoded = Vec::with_capacity(1024);
-    let mut encoder = Compress::new_with_window_bits(Compression::default(), false, 15);
-    encoder
-        .compress_vec(string, &mut encoded, FlushCompress::Finish)
-        .unwrap();
-    assert_ne!(encoded.len(), 0);
+    let mut packed = Vec::with_capacity(1024);
+    let mut compressor = Compress::new_with_window_bits(Compression::default(), false, 15);
+    compressor.compress_vec(string, &mut packed, FlushCompress::Finish)?;
+    assert_ne!(packed.len(), 0);
 
-    let mut decoder = Decompress::new_with_window_bits(false, 15);
-    let mut decoded = [0; 1024];
-    decoder
-        .decompress(&encoded, &mut decoded, FlushDecompress::Finish)
-        .unwrap();
-    assert_eq!(&decoded[..string.len()], string);
+    let mut inflater = Decompress::new_with_window_bits(false, 15);
+    let mut plain = [0; 1024];
+    inflater.decompress(&packed, &mut plain, FlushDecompress::Finish)?;
+    assert_eq!(&plain[..string.len()], string);
+
+    Ok(())
 }
 
 // Unsupported for `miniz_oxide`.
 #[test]
-fn decompress_new_gzip_window_bits_is_present_and_works() {
+fn decompress_new_gzip_window_bits_is_present_and_works() -> Result<(), Box<dyn std::error::Error>>
+{
     let string = b"hello world";
 
     // Test with different window_bits values
     for window_bits in [9, 12, 15] {
-        let mut encoded = Vec::with_capacity(1024);
-        let mut encoder = Compress::new_gzip(Compression::default(), window_bits);
-        encoder
-            .compress_vec(string, &mut encoded, FlushCompress::Finish)
-            .unwrap();
+        let mut packed = Vec::with_capacity(1024);
+        let mut compressor = Compress::new_gzip(Compression::default(), window_bits);
+        compressor.compress_vec(string, &mut packed, FlushCompress::Finish)?;
 
-        let mut decoder = Decompress::new_gzip(window_bits);
-        let mut decoded = [0; 1024];
-        decoder
-            .decompress(&encoded, &mut decoded, FlushDecompress::Finish)
-            .unwrap();
+        let mut inflater = Decompress::new_gzip(window_bits);
+        let mut plain = [0; 1024];
+        inflater.decompress(&packed, &mut plain, FlushDecompress::Finish)?;
         assert_eq!(
-            &decoded[..string.len()],
+            &plain[..string.len()],
             string,
             "Failed with window_bits={window_bits}"
         );
     }
+
+    Ok(())
 }
 
 // Unsupported for `miniz_oxide`.
@@ -93,100 +86,106 @@ fn compress_new_gzip_invalid_high() {
 
 // Unsupported for `miniz_oxide`.
 #[test]
-fn set_dictionary_with_zlib_header() {
+fn set_dictionary_with_zlib_header() -> Result<(), Box<dyn std::error::Error>> {
     let string = b"hello, hello!";
     let dictionary = b"hello";
 
-    let mut encoded = Vec::with_capacity(1024);
+    let mut packed = Vec::with_capacity(1024);
 
-    let mut encoder = Compress::new(Compression::default(), true);
+    let mut compressor = Compress::new(Compression::default(), true);
 
-    let dictionary_adler = encoder.set_dictionary(dictionary).unwrap();
+    let dictionary_adler = compressor.set_dictionary(dictionary)?;
 
-    encoder
-        .compress_vec(string, &mut encoded, FlushCompress::Finish)
-        .unwrap();
+    compressor.compress_vec(string, &mut packed, FlushCompress::Finish)?;
 
-    assert_eq!(encoder.total_in(), string.len() as u64);
-    assert_eq!(encoder.total_out(), encoded.len() as u64);
+    assert_eq!(compressor.total_in(), string.len() as u64);
+    assert_eq!(compressor.total_out(), packed.len() as u64);
 
-    let mut decoder = Decompress::new(true);
-    let mut decoded = [0; 1024];
-    let decompress_error = decoder
-        .decompress(&encoded, &mut decoded, FlushDecompress::Finish)
-        .expect_err("decompression should fail due to requiring a dictionary");
+    let mut inflater = Decompress::new(true);
+    let mut plain = [0; 1024];
+    let decompress_error = inflater
+        .decompress(&packed, &mut plain, FlushDecompress::Finish)
+        .err()
+        .ok_or("expected an error")?;
 
-    let required_adler = decompress_error.needs_dictionary()
-        .expect("the first call to decompress should indicate a dictionary is required along with the required Adler-32 checksum");
+    let required_adler = decompress_error
+        .needs_dictionary()
+        .ok_or("missing dictionary checksum")?;
 
     assert_eq!(required_adler, dictionary_adler,
                "the Adler-32 checksum should match the value when the dictionary was set on the compressor");
 
-    let actual_adler = decoder.set_dictionary(dictionary).unwrap();
+    let actual_adler = inflater.set_dictionary(dictionary)?;
 
     assert_eq!(required_adler, actual_adler);
 
     // Decompress the rest of the input to the remainder of the output buffer
-    let total_in = decoder.total_in();
-    let total_out = decoder.total_out();
+    let total_in = inflater.total_in();
+    let total_out = inflater.total_out();
 
-    let decompress_result = decoder.decompress(
-        &encoded[total_in as usize..],
-        &mut decoded[total_out as usize..],
+    let decompress_result = inflater.decompress(
+        &packed[usize::try_from(total_in)?..],
+        &mut plain[usize::try_from(total_out)?..],
         FlushDecompress::Finish,
     );
     assert!(decompress_result.is_ok());
 
-    assert_eq!(&decoded[..decoder.total_out() as usize], string);
+    assert_eq!(&plain[..usize::try_from(inflater.total_out())?], string);
+
+    Ok(())
 }
 
 // Unsupported for `miniz_oxide`.
 #[test]
-fn set_dictionary_raw() {
+fn set_dictionary_raw() -> Result<(), Box<dyn std::error::Error>> {
     let string = b"hello, hello!";
     let dictionary = b"hello";
 
-    let mut encoded = Vec::with_capacity(1024);
+    let mut packed = Vec::with_capacity(1024);
 
-    let mut encoder = Compress::new(Compression::default(), false);
+    let mut compressor = Compress::new(Compression::default(), false);
 
-    encoder.set_dictionary(dictionary).unwrap();
+    compressor.set_dictionary(dictionary)?;
 
-    encoder
-        .compress_vec(string, &mut encoded, FlushCompress::Finish)
-        .unwrap();
+    compressor.compress_vec(string, &mut packed, FlushCompress::Finish)?;
 
-    assert_eq!(encoder.total_in(), string.len() as u64);
-    assert_eq!(encoder.total_out(), encoded.len() as u64);
+    assert_eq!(compressor.total_in(), string.len() as u64);
+    assert_eq!(compressor.total_out(), packed.len() as u64);
 
-    let mut decoder = Decompress::new(false);
+    let mut inflater = Decompress::new(false);
 
-    decoder.set_dictionary(dictionary).unwrap();
+    inflater.set_dictionary(dictionary)?;
 
-    let mut decoded = [0; 1024];
-    let decompress_result = decoder.decompress(&encoded, &mut decoded, FlushDecompress::Finish);
+    let mut plain = [0; 1024];
+    let decompress_result = inflater.decompress(&packed, &mut plain, FlushDecompress::Finish);
 
     assert!(decompress_result.is_ok());
 
-    assert_eq!(&decoded[..decoder.total_out() as usize], string);
+    assert_eq!(&plain[..usize::try_from(inflater.total_out())?], string);
+
+    Ok(())
 }
 
 // Unsupported for `miniz_oxide`.
 #[test]
-fn compression_levels_are_effective() {
+fn compression_levels_are_effective() -> Result<(), Box<dyn std::error::Error>> {
     let input = b"hello hello hello hello hello hello hello hello";
 
     // Compress with no compression
     let mut encoded_none = Vec::new();
-    Compress::new(Compression::none(), true)
-        .compress_vec(input, &mut encoded_none, FlushCompress::Finish)
-        .unwrap();
+    Compress::new(Compression::none(), true).compress_vec(
+        input,
+        &mut encoded_none,
+        FlushCompress::Finish,
+    )?;
 
     // Compress with best compression
     let mut encoded_best = Vec::new();
-    Compress::new(Compression::best(), true)
-        .compress_vec(input, &mut encoded_best, FlushCompress::Finish)
-        .unwrap();
+    Compress::new(Compression::best(), true).compress_vec(
+        input,
+        &mut encoded_best,
+        FlushCompress::Finish,
+    )?;
 
     assert!(
         encoded_best.len() <= encoded_none.len(),
@@ -194,11 +193,13 @@ fn compression_levels_are_effective() {
         encoded_best.len(),
         encoded_none.len(),
     );
+
+    Ok(())
 }
 
 // Unsupported for `miniz_oxide`.
 #[test]
-fn set_level_is_effective() {
+fn set_level_is_effective() -> Result<(), Box<dyn std::error::Error>> {
     let input = b"hello hello hello hello hello hello hello hello";
     let no_compression = Compression::none();
     let best_compression = Compression::best();
@@ -206,18 +207,14 @@ fn set_level_is_effective() {
     // Compress with no compression
     let mut encoded_none = Vec::new();
     let mut compress = Compress::new(best_compression, true);
-    compress.set_level(no_compression).unwrap();
-    compress
-        .compress_vec(input, &mut encoded_none, FlushCompress::Finish)
-        .unwrap();
+    compress.set_level(no_compression)?;
+    compress.compress_vec(input, &mut encoded_none, FlushCompress::Finish)?;
 
     // Compress with best compression
     let mut encoded_best = Vec::new();
     let mut compress = Compress::new(no_compression, true);
-    compress.set_level(best_compression).unwrap();
-    compress
-        .compress_vec(input, &mut encoded_best, FlushCompress::Finish)
-        .unwrap();
+    compress.set_level(best_compression)?;
+    compress.compress_vec(input, &mut encoded_best, FlushCompress::Finish)?;
 
     assert!(
         encoded_best.len() <= encoded_none.len(),
@@ -225,4 +222,6 @@ fn set_level_is_effective() {
         encoded_best.len(),
         encoded_none.len(),
     );
+
+    Ok(())
 }

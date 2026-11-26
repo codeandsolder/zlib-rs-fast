@@ -82,7 +82,7 @@ impl Write for ZeroOnGzipFooterThenError {
 }
 
 #[test]
-fn gzip_header_zero_write_is_error() {
+fn gzip_header_zero_write_is_error() -> Result<(), Box<dyn std::error::Error>> {
     // GzEncoder used to spin in write_header when the wrapped writer returned
     // Ok(0) for the non-empty gzip header buffer: the header was not drained,
     // so the loop retried the same write forever. This bounded writer turns
@@ -95,12 +95,14 @@ fn gzip_header_zero_write_is_error() {
     let writer = AlwaysZeroThenError::new(3);
     let mut encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
 
-    let err = encoder.try_finish().unwrap_err();
+    let err = encoder.try_finish().err().ok_or("expected an error")?;
     assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+
+    Ok(())
 }
 
 #[test]
-fn gzip_footer_zero_write_is_error() {
+fn gzip_footer_zero_write_is_error() -> Result<(), Box<dyn std::error::Error>> {
     // GzEncoder also used to spin while writing the 8-byte gzip footer. A
     // writer that accepts the header and deflate payload but returns Ok(0) for
     // the empty-stream footer (CRC32 0, ISIZE 0) left crc_bytes_written
@@ -111,6 +113,8 @@ fn gzip_footer_zero_write_is_error() {
     let writer = ZeroOnGzipFooterThenError::new(3);
     let mut encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
 
-    let err = encoder.try_finish().unwrap_err();
+    let err = encoder.try_finish().err().ok_or("expected an error")?;
     assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+
+    Ok(())
 }

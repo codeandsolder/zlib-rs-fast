@@ -33,16 +33,16 @@ fn encoder(source: FailReads<'_>, buffered: bool) -> Box<dyn Read + '_> {
     }
 }
 
-fn assert_roundtrip(compressed: &[u8], input: &[u8]) {
+fn assert_roundtrip(compressed: &[u8], input: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let mut decoded = Vec::new();
-    flate2::read::GzDecoder::new(compressed)
-        .read_to_end(&mut decoded)
-        .unwrap();
+    flate2::read::GzDecoder::new(compressed).read_to_end(&mut decoded)?;
     assert_eq!(decoded, input);
+
+    Ok(())
 }
 
 #[test]
-fn gzip_header_survives_interrupted_input() {
+fn gzip_header_survives_interrupted_input() -> Result<(), Box<dyn std::error::Error>> {
     let input = b"a signal should not corrupt the gzip header";
     for buffered in [false, true] {
         let reads = Cell::new(0);
@@ -53,15 +53,15 @@ fn gzip_header_survives_interrupted_input() {
             reads: &reads,
         };
         let mut compressed = Vec::new();
-        encoder(source, buffered)
-            .read_to_end(&mut compressed)
-            .unwrap();
-        assert_roundtrip(&compressed, input);
+        encoder(source, buffered).read_to_end(&mut compressed)?;
+        assert_roundtrip(&compressed, input)?;
     }
+
+    Ok(())
 }
 
 #[test]
-fn gzip_reports_one_shot_input_errors() {
+fn gzip_reports_one_shot_input_errors() -> Result<(), Box<dyn std::error::Error>> {
     let input = b"a one-shot error must not disappear after the gzip header";
     for kind in [
         io::ErrorKind::WouldBlock,
@@ -80,19 +80,24 @@ fn gzip_reports_one_shot_input_errors() {
             };
             let mut encoder = encoder(source, buffered);
             let mut compressed = Vec::new();
-            let err = encoder.read_to_end(&mut compressed).unwrap_err();
+            let err = encoder
+                .read_to_end(&mut compressed)
+                .err()
+                .ok_or("expected an error")?;
             assert_eq!(err.kind(), kind);
             assert_eq!(err.to_string(), "injected input error");
             assert_eq!(compressed.len(), 10);
 
-            encoder.read_to_end(&mut compressed).unwrap();
-            assert_roundtrip(&compressed, input);
+            encoder.read_to_end(&mut compressed)?;
+            assert_roundtrip(&compressed, input)?;
         }
     }
+
+    Ok(())
 }
 
 #[test]
-fn gzip_reports_header_progress_before_input_error() {
+fn gzip_reports_header_progress_before_input_error() -> Result<(), Box<dyn std::error::Error>> {
     let input = b"retrying a nonblocking source must preserve the header";
     for kind in [io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock] {
         for remaining in [1, 2] {
@@ -106,21 +111,21 @@ fn gzip_reports_header_progress_before_input_error() {
                 };
                 let mut encoder = encoder(source, buffered);
                 let mut buffer = [0; 64];
-                assert_eq!(encoder.read(&mut []).unwrap(), 0);
+                assert_eq!(encoder.read(&mut [])?, 0);
                 assert_eq!(reads.get(), 0);
-                let count = encoder.read(&mut buffer).unwrap();
+                let count = encoder.read(&mut buffer)?;
                 assert_eq!(count, 10);
                 assert_eq!(reads.get(), 0);
                 let mut compressed = buffer[..count].to_vec();
                 for attempted in 0..remaining {
-                    assert_eq!(encoder.read(&mut []).unwrap(), 0);
-                    assert_eq!(encoder.read(&mut []).unwrap(), 0);
+                    assert_eq!(encoder.read(&mut [])?, 0);
+                    assert_eq!(encoder.read(&mut [])?, 0);
                     assert_eq!(
                         reads.get(),
                         attempted,
                         "only earlier error-producing reads may be counted; header-only and empty reads must not access input"
                     );
-                    let err = encoder.read(&mut buffer).unwrap_err();
+                    let err = encoder.read(&mut buffer).err().ok_or("expected an error")?;
                     assert_eq!(err.kind(), kind);
                     assert_eq!(err.to_string(), "injected input error");
                     assert_eq!(
@@ -129,15 +134,17 @@ fn gzip_reports_header_progress_before_input_error() {
                         "this nonempty read must obtain its error from exactly one new input attempt, not a cached error or an internal retry"
                     );
                 }
-                encoder.read_to_end(&mut compressed).unwrap();
-                assert_roundtrip(&compressed, input);
+                encoder.read_to_end(&mut compressed)?;
+                assert_roundtrip(&compressed, input)?;
             }
         }
     }
+
+    Ok(())
 }
 
 #[test]
-fn gzip_reads_header_separately() {
+fn gzip_reads_header_separately() -> Result<(), Box<dyn std::error::Error>> {
     for input in [
         &b""[..],
         &b"read the header separately from the compressed body"[..],
@@ -153,10 +160,10 @@ fn gzip_reads_header_separately() {
                 };
                 let mut encoder = encoder(source, buffered);
                 let mut compressed = vec![0; header_prefix];
-                encoder.read_exact(&mut compressed).unwrap();
+                encoder.read_exact(&mut compressed)?;
                 assert_eq!(reads.get(), 0);
                 let mut buffer = [0; 64];
-                let count = encoder.read(&mut buffer).unwrap();
+                let count = encoder.read(&mut buffer)?;
                 // The default gzip header is 10 bytes. Until read_exact has
                 // consumed all of it, this read must return only its remaining
                 // bytes without accessing input; afterward, it reads the body.
@@ -182,9 +189,11 @@ fn gzip_reads_header_separately() {
                     );
                 }
                 compressed.extend_from_slice(&buffer[..count]);
-                encoder.read_to_end(&mut compressed).unwrap();
-                assert_roundtrip(&compressed, input);
+                encoder.read_to_end(&mut compressed)?;
+                assert_roundtrip(&compressed, input)?;
             }
         }
     }
+
+    Ok(())
 }

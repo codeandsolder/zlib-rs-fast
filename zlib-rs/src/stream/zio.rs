@@ -22,6 +22,7 @@ pub trait Ops {
     /// Whether running out of input before `Status::StreamEnd` means the
     /// stream is incomplete, as is the case for decompression.
     const REQUIRES_STREAM_END: bool;
+    fn reset_stream(&mut self, zlib: bool);
     fn total_in(&self) -> u64;
     fn total_out(&self) -> u64;
     fn run(
@@ -42,6 +43,9 @@ pub trait Ops {
 }
 
 impl Ops for Compress {
+    fn reset_stream(&mut self, _zlib: bool) {
+        self.reset();
+    }
     type Error = CompressError;
     type Flush = FlushCompress;
     /// Unlike decompression, compression accepts arbitrary, unframed input and
@@ -87,6 +91,9 @@ impl Ops for Compress {
 }
 
 impl Ops for Decompress {
+    fn reset_stream(&mut self, zlib: bool) {
+        self.reset(zlib);
+    }
     type Error = DecompressError;
     type Flush = FlushDecompress;
     /// Unlike compression, decompression must find the stream's ending in the
@@ -180,8 +187,8 @@ where
                 D::Flush::none()
             };
             ret = data.run(input, dst, flush);
-            read = (data.total_out() - before_out) as usize;
-            consumed = (data.total_in() - before_in) as usize;
+            read = usize::try_from(data.total_out() - before_out).map_err(io::Error::other)?;
+            consumed = usize::try_from(data.total_in() - before_in).map_err(io::Error::other)?;
         }
         obj.consume(consumed);
 
@@ -190,7 +197,7 @@ where
             // then we need to keep asking for more data because if we
             // return that 0 bytes of data have been read then it will
             // be interpreted as EOF.
-            Ok(Status::Ok | Status::BufError) if read == 0 && !eof && !dst.is_empty() => continue,
+            Ok(Status::Ok | Status::BufError) if read == 0 && !eof && !dst.is_empty() => {}
             // If we haven't read any data and we have hit EOF, then the
             // deflate stream is incomplete.
             Ok(Status::Ok | Status::BufError) if read == 0 && eof && !dst.is_empty() => {
@@ -269,17 +276,15 @@ impl<W: Write, D: Ops> Writer<W, D> {
     }
 
     pub fn get_ref(&self) -> &W {
-        match &self.obj {
-            Some(obj) => obj,
-            None => unreachable!("writer already consumed"),
-        }
+        self.obj
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("writer already consumed"))
     }
 
     pub fn get_mut(&mut self) -> &mut W {
-        match &mut self.obj {
-            Some(obj) => obj,
-            None => unreachable!("writer already consumed"),
-        }
+        self.obj
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("writer already consumed"))
     }
 
     // Note that this should only be called if the outer object is just about
@@ -287,10 +292,9 @@ impl<W: Write, D: Ops> Writer<W, D> {
     //
     // (e.g. an implementation of `into_inner`)
     pub fn take_inner(&mut self) -> W {
-        match self.obj.take() {
-            Some(obj) => obj,
-            None => unreachable!("writer already consumed"),
-        }
+        self.obj
+            .take()
+            .unwrap_or_else(|| unreachable!("writer already consumed"))
     }
 
     pub const fn is_present(&self) -> bool {
@@ -310,7 +314,8 @@ impl<W: Write, D: Ops> Writer<W, D> {
 
             let before_in = self.data.total_in();
             let ret = self.data.run_vec(buf, &mut self.buf, D::Flush::none());
-            let written = (self.data.total_in() - before_in) as usize;
+            let written =
+                usize::try_from(self.data.total_in() - before_in).map_err(io::Error::other)?;
             let is_stream_end = matches!(ret, Ok(Status::StreamEnd));
 
             // Without input consumed or output to drain, retrying can loop forever.
