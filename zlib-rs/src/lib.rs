@@ -37,6 +37,9 @@ mod cpu_features;
 mod output_buffer;
 mod stable;
 mod state_ptr;
+/// High-level streaming I/O using the native compression engine.
+#[cfg(feature = "std")]
+pub mod stream;
 mod weak_slice;
 
 pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};
