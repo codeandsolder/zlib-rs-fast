@@ -28,7 +28,7 @@ libz-ng-sys = "1.1.24"
 crc32fast = "1.3.2"
 
 [dev-dependencies]
-rstest = "0.28.0"
+rstest = "0.29.0"
 
 [dependencies.zlib-rs]
 path = "../zlib-rs"
