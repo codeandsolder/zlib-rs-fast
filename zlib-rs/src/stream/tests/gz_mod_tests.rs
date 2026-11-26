@@ -171,29 +171,31 @@ fn gzip_encoder_matches_rfc1952() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[track_caller]
+    fn verify_footer(
+        compressed: &[u8],
+        data: &[u8],
+        expected_crc: u32,
+        description: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let expected_size = u32::try_from(data.len())?;
+        let (actual_crc, actual_size) = extract_zip_footer(compressed);
+        assert_eq!(actual_crc, expected_crc, "CRC32 mismatch for {description}");
+        assert_eq!(
+            actual_size, expected_size,
+            "Size mismatch for {description}"
+        );
+        Ok(())
+    }
+
+    #[track_caller]
     fn test_crc_for_write(
         data: &[u8],
         expected_crc: u32,
         description: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Compress data using write::GzEncoder
         let mut encoder = write::GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data)?;
-        let compressed = encoder.finish()?;
-
-        let expected_size = u32::try_from(data.len())?;
-        let (actual_crc, actual_size) = extract_zip_footer(&compressed);
-
-        assert_eq!(
-                expected_crc, actual_crc,
-                "CRC32 mismatch for write {description}: expected {expected_crc:#08x}, got {actual_crc:#08x}"
-            );
-        assert_eq!(
-            expected_size, actual_size,
-            "Size mismatch for write {description}: expected {expected_size}, got {actual_size}"
-        );
-
-        Ok(())
+        verify_footer(&encoder.finish()?, data, expected_crc, description)
     }
 
     #[track_caller]
@@ -202,25 +204,11 @@ fn gzip_encoder_matches_rfc1952() -> Result<(), Box<dyn std::error::Error>> {
         expected_crc: u32,
         description: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Compress data using read::GzEncoder
-        let data_reader = crate::stream::io::Cursor::new(data);
-        let mut encoder = read::GzEncoder::new(data_reader, Compression::default());
+        let mut encoder =
+            read::GzEncoder::new(crate::stream::io::Cursor::new(data), Compression::default());
         let mut compressed = Vec::new();
         encoder.read_to_end(&mut compressed)?;
-
-        let expected_size = u32::try_from(data.len())?;
-        let (actual_crc, actual_size) = extract_zip_footer(&compressed);
-
-        assert_eq!(
-                expected_crc, actual_crc,
-                "CRC32 mismatch for read {description}: expected {expected_crc:#08x}, got {actual_crc:#08x}"
-            );
-        assert_eq!(
-            expected_size, actual_size,
-            "Size mismatch for read {description}: expected {expected_size}, got {actual_size}"
-        );
-
-        Ok(())
+        verify_footer(&compressed, data, expected_crc, description)
     }
 
     #[track_caller]

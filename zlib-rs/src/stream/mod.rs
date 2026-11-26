@@ -120,7 +120,7 @@ impl Compression {
     /// Returns an integer representing the compression level, typically on a
     /// scale of 0-9. See [`new`](Self::new) for details about compression levels.
     #[must_use = "The returned value conveys the requested stream state or configured adapter."]
-    pub const fn level(&self) -> u32 {
+    pub const fn level(self) -> u32 {
         self.0
     }
 }

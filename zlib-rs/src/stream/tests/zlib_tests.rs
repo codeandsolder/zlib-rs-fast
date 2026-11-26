@@ -99,36 +99,36 @@ mod tests {
 
     #[test]
     fn reset_decoder() -> Result<(), Box<dyn std::error::Error>> {
-        let v = crate::stream::random_bytes()
+        let input = crate::stream::random_bytes()
             .take(1024 * 1024)
             .collect::<Vec<_>>();
-        let mut w = write::ZlibEncoder::new(Vec::new(), Compression::default());
-        w.write_all(&v)?;
-        let data = w.finish()?;
+        let mut writer = write::ZlibEncoder::new(Vec::new(), Compression::default());
+        writer.write_all(&input)?;
+        let data = writer.finish()?;
 
         {
-            let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
-            let mut r = read::ZlibDecoder::new(&data[..]);
-            r.read_to_end(&mut a)?;
-            r.reset(&data);
-            r.read_to_end(&mut b)?;
+            let (mut first, mut second, mut fresh) = (Vec::new(), Vec::new(), Vec::new());
+            let mut reader = read::ZlibDecoder::new(&data[..]);
+            reader.read_to_end(&mut first)?;
+            reader.reset(&data);
+            reader.read_to_end(&mut second)?;
 
-            let mut r = read::ZlibDecoder::new(&data[..]);
-            r.read_to_end(&mut c)?;
-            assert!(a == b && b == c && c == v);
+            let mut reader = read::ZlibDecoder::new(&data[..]);
+            reader.read_to_end(&mut fresh)?;
+            assert!(first == second && second == fresh && fresh == input);
         }
 
         {
-            let mut w = write::ZlibDecoder::new(Vec::new());
-            w.write_all(&data)?;
-            let a = w.reset(Vec::new())?;
-            w.write_all(&data)?;
-            let b = w.finish()?;
+            let mut writer = write::ZlibDecoder::new(Vec::new());
+            writer.write_all(&data)?;
+            let first = writer.reset(Vec::new())?;
+            writer.write_all(&data)?;
+            let second = writer.finish()?;
 
-            let mut w = write::ZlibDecoder::new(Vec::new());
-            w.write_all(&data)?;
-            let c = w.finish()?;
-            assert!(a == b && b == c && c == v);
+            let mut writer = write::ZlibDecoder::new(Vec::new());
+            writer.write_all(&data)?;
+            let fresh = writer.finish()?;
+            assert!(first == second && second == fresh && fresh == input);
         }
 
         Ok(())

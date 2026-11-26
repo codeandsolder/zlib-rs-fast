@@ -165,7 +165,7 @@ pub(super) const fn compress_failed<T>(msg: ErrorMessage) -> Result<T, CompressE
 macro_rules! stream_methods {
     ($run:ident, $uninit:ident, $vec:ident, $flush:ty, $error:ty) => {
         /// Process as much input as the output buffer permits. Inspect the
-        /// stream's total_in and total_out counters for exact progress.
+        /// stream's `total_in` and `total_out` counters for exact progress.
         ///
         /// # Errors
         /// Returns a codec error for invalid input, configuration, or state.
