@@ -169,7 +169,7 @@ jobs:
 
       # Install dependencies
       - name: Install cargo-llvm-cov & cargo-nextest
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - name: Cache apt packages
@@ -710,7 +710,7 @@ jobs:
           sudo apt-get install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
           x86_64-w64-mingw32-gcc --help
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest
       - name: Test with miri
@@ -755,7 +755,7 @@ jobs:
           sudo apt-get install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
           x86_64-w64-mingw32-gcc --help
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest
       - name: Test public C api with NULL arguments
@@ -806,7 +806,7 @@ jobs:
           rustup target add --toolchain "${{ steps.compiler.outputs.channel }}" ${{ matrix.target }}
           cargo +${{ steps.compiler.outputs.channel }} miri setup
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest
       - name: Test avx512 crc32 implementation
@@ -851,7 +851,7 @@ jobs:
           cargo +${{ steps.compiler.outputs.channel }} miri setup
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-nextest
       - name: Test aarch64 with `+neon,+crc`
