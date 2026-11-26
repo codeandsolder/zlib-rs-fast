@@ -20,10 +20,21 @@ struct Reader {
     bool good=true;
     __device__ u32 peek(u32 n) {
         if(position>=end || position/8<origin) {good=false;return 0;}
-        const u64 byte=position/8;
+        const u64 byte=position/8-origin;
+        const u64 available=(end+7)/8-origin;
+        const u64 word=byte&~3ull;
+        const u32 shift=static_cast<u32>((byte-word)*8+position%8);
+        const u32 mask=(1u<<n)-1;
+        // Every Reader uses an allocation-aligned base. Only read complete
+        // words within the declared byte extent, including the partial last
+        // byte when present. Boundary lookahead retains the bytewise path.
+        if(word+8<=available){
+            const u32* words=reinterpret_cast<const u32*>(input+word);
+            return __funnelshift_r(words[0],words[1],shift)&mask;
+        }
         u32 v=0;
-        for(u32 i=0;i<4 && (byte+i)*8<end;++i) v|=static_cast<u32>(input[byte+i-origin])<<(8*i);
-        return (v>>(position%8))&((1u<<n)-1);
+        for(u32 i=0;i<4 && byte+i<available;++i)v|=static_cast<u32>(input[byte+i])<<(8*i);
+        return (v>>(position%8))&mask;
     }
     __device__ void skip(u32 n) {
         if(position>end || n>end-position){good=false;return;}
