@@ -293,7 +293,16 @@ fn bad_header() -> Error {
 const fn footer(crc: &Crc) -> [u8; 8] {
     let checksum = crc.sum().to_le_bytes();
     let size = crc.amount().to_le_bytes();
-    [checksum[0], checksum[1], checksum[2], checksum[3], size[0], size[1], size[2], size[3]]
+    [
+        checksum[0],
+        checksum[1],
+        checksum[2],
+        checksum[3],
+        size[0],
+        size[1],
+        size[2],
+        size[3],
+    ]
 }
 
 fn corrupt() -> Error {

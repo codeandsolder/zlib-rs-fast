@@ -45,12 +45,26 @@ pub trait Ops {
 // Map the common I/O engine to each named native codec API.
 macro_rules! codec_forwarding {
     ($run:ident, $vec:ident) => {
-        fn total_in(&self) -> u64 { self.total_in() }
-        fn total_out(&self) -> u64 { self.total_out() }
-        fn run(&mut self, input: &[u8], output: &mut [u8], flush: Self::Flush) -> Result<Status, Self::Error> {
+        fn total_in(&self) -> u64 {
+            self.total_in()
+        }
+        fn total_out(&self) -> u64 {
+            self.total_out()
+        }
+        fn run(
+            &mut self,
+            input: &[u8],
+            output: &mut [u8],
+            flush: Self::Flush,
+        ) -> Result<Status, Self::Error> {
             self.$run(input, output, flush)
         }
-        fn run_vec(&mut self, input: &[u8], output: &mut Vec<u8>, flush: Self::Flush) -> Result<Status, Self::Error> {
+        fn run_vec(
+            &mut self,
+            input: &[u8],
+            output: &mut Vec<u8>,
+            flush: Self::Flush,
+        ) -> Result<Status, Self::Error> {
             self.$vec(input, output, flush)
         }
     };

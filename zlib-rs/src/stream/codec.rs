@@ -134,7 +134,9 @@ impl Inflate {
     }
 
     pub(super) fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, DecompressError> {
-        self.inner.set_dictionary(dictionary).or_else(|_| self.decompress_error())
+        self.inner
+            .set_dictionary(dictionary)
+            .or_else(|_| self.decompress_error())
     }
 }
 
@@ -225,13 +227,17 @@ impl Deflate {
     }
 
     pub(super) fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, CompressError> {
-        self.inner.set_dictionary(dictionary).or_else(|_| self.compress_error())
+        self.inner
+            .set_dictionary(dictionary)
+            .or_else(|_| self.compress_error())
     }
 
     pub(super) fn set_level(&mut self, level: Compression) -> Result<(), CompressError> {
         use crate::Status;
 
-        let result = self.inner.set_level(i32::try_from(level.level()).unwrap_or(i32::MAX));
+        let result = self
+            .inner
+            .set_level(i32::try_from(level.level()).unwrap_or(i32::MAX));
         match result {
             Ok(Status::Ok) => Ok(()),
             Ok(Status::BufError) => compress_failed(ErrorMessage(Some("insufficient space"))),
