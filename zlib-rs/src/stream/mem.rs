@@ -169,7 +169,12 @@ macro_rules! stream_methods {
         ///
         /// # Errors
         /// Returns a codec error for invalid input, configuration, or state.
-        pub fn $run(&mut self, input: &[u8], output: &mut [u8], flush: $flush) -> Result<Status, $error> {
+        pub fn $run(
+            &mut self,
+            input: &[u8],
+            output: &mut [u8],
+            flush: $flush,
+        ) -> Result<Status, $error> {
             self.inner.$run(input, output, flush)
         }
 
@@ -177,7 +182,12 @@ macro_rules! stream_methods {
         ///
         /// # Errors
         /// Returns a codec error for invalid input, configuration, or state.
-        pub fn $uninit(&mut self, input: &[u8], output: &mut [MaybeUninit<u8>], flush: $flush) -> Result<Status, $error> {
+        pub fn $uninit(
+            &mut self,
+            input: &[u8],
+            output: &mut [MaybeUninit<u8>],
+            flush: $flush,
+        ) -> Result<Status, $error> {
             self.inner.$uninit(input, output, flush)
         }
 
@@ -187,7 +197,12 @@ macro_rules! stream_methods {
         ///
         /// # Errors
         /// Returns a codec error for invalid input, configuration, or state.
-        pub fn $vec(&mut self, input: &[u8], output: &mut Vec<u8>, flush: $flush) -> Result<Status, $error> {
+        pub fn $vec(
+            &mut self,
+            input: &[u8],
+            output: &mut Vec<u8>,
+            flush: $flush,
+        ) -> Result<Status, $error> {
             let before = self.total_out();
             // SAFETY: native codec counters track the initialized output prefix.
             unsafe {
@@ -309,7 +324,13 @@ impl Compress {
         self.inner.set_level(level)
     }
 
-    stream_methods!(compress, compress_uninit, compress_vec, FlushCompress, CompressError);
+    stream_methods!(
+        compress,
+        compress_uninit,
+        compress_vec,
+        FlushCompress,
+        CompressError
+    );
 }
 
 impl Decompress {
@@ -379,8 +400,14 @@ impl Decompress {
         self.inner.total_out()
     }
 
-    stream_methods!(decompress, decompress_uninit, decompress_vec, FlushDecompress, DecompressError);
-    
+    stream_methods!(
+        decompress,
+        decompress_uninit,
+        decompress_vec,
+        FlushDecompress,
+        DecompressError
+    );
+
     /// Specifies the decompression dictionary to use.
     ///
     /// # Errors
