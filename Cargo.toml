@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "flate2",
     "zlib-rs",
     "libz-rs-sys",
     "test-libz-rs-sys",

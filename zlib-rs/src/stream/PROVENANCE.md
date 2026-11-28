@@ -1,0 +1,1 @@
+Derived from flate2 1.1.11 (rust-lang/flate2-rs commit cd06529164c5447958f309e649ffe6c9d6329865), crate SHA-256 626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4. Original MIT/Apache-2.0 licenses are retained. Modified to use the zlib-rs native engine exclusively.

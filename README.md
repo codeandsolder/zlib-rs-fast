@@ -7,12 +7,14 @@
 
 This repository contains a Rust implementation of the zlib file format that is compatible with the zlib API.
 
-This repository contains two public crates:
+This workspace contains three public packages:
 
 * [zlib-rs](https://crates.io/crates/zlib-rs/), a Rust implementation based on [zlib](https://www.zlib.net/manual.html)
   with a safe rust API. This API is under development and still unstable.
 * [libz-rs-sys](https://crates.io/crates/libz-rs-sys/), a zlib-compatible C API for usage in non-Rust
   applications.
+* `flate2` (workspace package), a thin facade for external Rust consumers of the Flate2 API.
+  It has no alternative codec implementations.
 
 ## How to use zlib-rs in your project
 
@@ -20,8 +22,14 @@ zlib-rs can be used in both Rust and C projects.
 
 ### Rust projects
 
-By far the easiest way to use zlib-rs is through the [flate2](https://crates.io/crates/flate2) crate, by simply enabling the `zlib-rs` feature gate. This will enable the `zlib-rs`
-backend.
+Use `zlib_rs::stream::{read, write, bufread}` for streaming raw DEFLATE, zlib and gzip.
+The I/O adapters require the `std` feature; the existing native codec and C ABI remain separate.
+The same public streaming types are re-exported by the workspace's `flate2` package.
+For dependency graphs that need the upstream Flate2 package name, patch `flate2` and
+`zlib-rs` together at the same Git source and revision; the workspace facade has no
+alternate compression backend. External backend feature names only satisfy Cargo
+resolution and never select a different engine. See the stream module's
+[provenance and licenses](zlib-rs/src/stream/PROVENANCE.md).
 
 ### C projects
 
