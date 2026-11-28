@@ -1,0 +1,4 @@
+[[allow_overlap]]
+package = "zlib-rs-fuzz"
+providers = ["zlib-rs", "libz-ng-sys"]
+reason = "Independent zlib-ng oracle for differential fuzz targets, intentionally isolated in its own workspace."
