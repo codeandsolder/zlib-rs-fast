@@ -1,0 +1,5 @@
+
+[[allow_overlap]]
+package = "test-libz-rs-sys"
+providers = ["zlib-rs", "libz-sys"]
+reason = "Native zlib-ng in compatibility mode is the independent C oracle for differential zlib-rs tests and benchmarks."
